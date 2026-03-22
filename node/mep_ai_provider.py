@@ -44,7 +44,8 @@ class R2Storage:
             self.client = None
 
     def generate_presigned_url(self, object_name, expiration=3600):
-        if not self.client: return None
+        if not self.client:
+            return None
         try:
             url = self.client.generate_presigned_url(
                 'get_object',
@@ -119,7 +120,7 @@ class MEPAIProvider:
                         except asyncio.TimeoutError:
                             try:
                                 await ws.ping()
-                            except:
+                            except Exception:
                                 break
                             continue
                         except websockets.exceptions.ConnectionClosed:

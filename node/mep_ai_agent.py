@@ -5,12 +5,11 @@ import requests
 import json
 import google.generativeai as genai
 from dotenv import load_dotenv
+from zhipuai import ZhipuAI
+from search_tool import google_search
 
 # Load environment variables
 load_dotenv()
-
-from zhipuai import ZhipuAI
-from search_tool import google_search
 
 # Configuration
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")

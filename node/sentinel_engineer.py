@@ -4,7 +4,6 @@ import sys
 import subprocess
 import json
 import requests
-import time
 from dotenv import load_dotenv
 import google.generativeai as genai
 from zhipuai import ZhipuAI
@@ -22,7 +21,8 @@ class MultiBrain:
         self.history = [] # Stores {"role": "user/model", "content": "..."} (Normalized)
 
     def _call_gemini(self, prompt, history):
-        if not GEMINI_API_KEY: raise Exception("No Gemini Key")
+        if not GEMINI_API_KEY:
+            raise Exception("No Gemini Key")
         genai.configure(api_key=GEMINI_API_KEY)
         model = genai.GenerativeModel('gemini-3.1-pro-preview')
         
@@ -37,7 +37,8 @@ class MultiBrain:
         return response.text
 
     def _call_deepseek(self, prompt, history):
-        if not DEEPSEEK_API_KEY: raise Exception("No DeepSeek Key")
+        if not DEEPSEEK_API_KEY:
+            raise Exception("No DeepSeek Key")
         messages = [{"role": m["role"], "content": m["content"]} for m in history]
         messages.append({"role": "user", "content": prompt})
         
@@ -47,11 +48,13 @@ class MultiBrain:
             json={"model": "deepseek-chat", "messages": messages, "response_format": {"type": "json_object"}},
             timeout=60
         )
-        if resp.status_code != 200: raise Exception(f"DeepSeek {resp.status_code}: {resp.text}")
+        if resp.status_code != 200:
+            raise Exception(f"DeepSeek {resp.status_code}: {resp.text}")
         return resp.json()["choices"][0]["message"]["content"]
 
     def _call_glm(self, prompt, history):
-        if not GLM_API_KEY: raise Exception("No GLM Key")
+        if not GLM_API_KEY:
+            raise Exception("No GLM Key")
         client = ZhipuAI(api_key=GLM_API_KEY)
         messages = [{"role": m["role"], "content": m["content"]} for m in history]
         messages.append({"role": "user", "content": prompt})
@@ -94,7 +97,8 @@ class SentinelEngineer:
 
     def execute_code(self, code, language="python"):
         filename = "temp_script.py" if language == "python" else "temp_script.sh"
-        with open(filename, "w") as f: f.write(code)
+        with open(filename, "w") as f:
+            f.write(code)
         cmd = ["python3", filename] if language == "python" else ["bash", filename]
         try:
             result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
@@ -137,11 +141,13 @@ class SentinelEngineer:
                     return action.get("final_answer")
                 
                 if action.get("code"):
-                    print(f"💻 Executing Code...")
+                    print("💻 Executing Code...")
                     out, err, rc = self.execute_code(action["code"])
                     print(f"   Exit: {rc}")
-                    if out: print(f"   Stdout: {out[:100]}...")
-                    if err: print(f"   Stderr: {err[:100]}...")
+                    if out:
+                        print(f"   Stdout: {out[:100]}...")
+                    if err:
+                        print(f"   Stderr: {err[:100]}...")
                     
                     # Update History
                     self.brain.history.append({"role": "user", "content": current_prompt})

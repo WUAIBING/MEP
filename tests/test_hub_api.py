@@ -17,14 +17,14 @@ os.environ.setdefault("MEP_DATABASE_URL", "")  # force SQLite
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(__file__)), "hub"))
 
-from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
-from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey  # noqa: E402
+from cryptography.hazmat.primitives import serialization  # noqa: E402
 
-# Import hub app AFTER env vars are set
-import db  # noqa: E402 — triggers init_db()
+# Import hub app AFTER env vars are set — db import triggers init_db()
+import db  # noqa: E402, F401
 from main import app  # noqa: E402
 
-from fastapi.testclient import TestClient
+from fastapi.testclient import TestClient  # noqa: E402
 
 client = TestClient(app)
 

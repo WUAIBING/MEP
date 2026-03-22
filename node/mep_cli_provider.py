@@ -206,7 +206,9 @@ class MEPCLIProvider:
 
     async def _handle_dm(self, dm_data: dict):
         """Handle direct messages (0 bounty tasks) by writing to inbox."""
-        import json, time, datetime
+        import json
+        import time
+        import datetime
         
         inbox_entry = {
             "time": time.time(),
@@ -227,7 +229,9 @@ class MEPCLIProvider:
 
     async def handle_task_result(self, result_data: dict):
         """Handle task_result events (results from tasks we submitted)."""
-        import json, time, datetime
+        import json
+        import time
+        import datetime
         
         task_id = result_data.get("task_id", "unknown")
         provider_id = result_data.get("provider_id", "unknown")

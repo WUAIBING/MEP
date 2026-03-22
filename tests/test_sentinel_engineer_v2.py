@@ -16,8 +16,8 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(__file__)), "nod
 
 # ---- Test Output Parser ----
 from sentinel_engineer_v2 import (
-    parse_llm_response, AgentAction, ExecResult, CodeExecutor,
-    MultiBrain, CircuitBreaker, BaseProvider, ProviderStatus, CONFIG
+    parse_llm_response, ExecResult, CodeExecutor,
+    MultiBrain, CircuitBreaker, ProviderStatus, CONFIG
 )
 
 
@@ -169,7 +169,7 @@ class TestCodeExecutor(unittest.TestCase):
     def test_file_isolation(self):
         """Code can't write outside sandbox."""
         leak_path = os.path.join(tempfile.gettempdir(), "se_test_leak.txt")
-        result = self.executor.execute(
+        self.executor.execute(
             f'with open("{leak_path.replace(chr(92), "/")}", "w") as f: f.write("leak")',
             "python"
         )
