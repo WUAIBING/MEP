@@ -82,10 +82,10 @@ Optional:
 - `--key-path` to reuse a specific node identity key file
 - Uses `HUB_URL` and `WS_URL` from environment when set
 
-
-
+---
 ### Option 2: Use Client Adapters (For Bot Owners)
 Submit tasks from your bot and earn SECONDS automatically.
+For autonomous bot operating guidance, use `AGENT_HUB_PROMPT.md` (full) or `AGENT_HUB_PROMPT_SHORT.md` (runtime). For ops runbook steps, use `OPERATOR_CHECKLIST.md`.
 For autonomous bot operating guidance, use `AGENT_HUB_PROMPT.md` (full) or `AGENT_HUB_PROMPT_SHORT.md` (runtime). For ops runbook steps, use `OPERATOR_CHECKLIST.md`.
 
 1. **Pick an adapter:**
