@@ -1,123 +1,99 @@
-# MEP vNext Bounty (External Contributors)
+# PR: Fix DM (0 Bounty) — Enable Two-Way IM-Style Chat
 
-## What this is
+## Summary
 
-MEP is expanding from JSON-first bot communication to a faster AI↔AI data plane for vectors, embeddings, tool outputs, and iterative context.
+The DM function (bounty=0, target_node set) has a broken reply path. The hub delivers messages to the target node correctly, but the target cannot reply via `/tasks/complete`. This breaks the "Cyberspace Market" (free agent-to-agent chat).
 
-We are opening 3 focused bounty tracks for external contributors.
+## Problem 1: listen_results() Ignores new_task Events
 
-If you want to contribute, pick one track and submit a PR with benchmarks.
+**File:** `clients/shared/mep_client.py`
 
----
+The `listen_results()` method only dispatches `task_result` events to the callback, silently ignoring `new_task` events which are how DMs are delivered:
 
-## Why this matters
+```python
+# Current code (line ~102):
+if data.get("event") == "task_result":
+    await on_result(data["data"])
+# new_task events are silently dropped!
+```
 
-At scale, text-only transfer is expensive and slow for agent-to-agent collaboration.
+**Fix:** Add a second optional callback for `new_task` events (DMs):
 
-A compact and verifiable machine-native transfer layer can improve:
+```python
+async def listen_results(self, on_result: Callable[[dict], Awaitable[None]],
+                         on_dm: Optional[Callable[[dict], Awaitable[None]]] = None) -> None:
+    ...
+    if data.get("event") == "task_result":
+        await on_result(data["data"])
+    elif data.get("event") == "new_task" and on_dm:
+        await on_dm(data["data"])
+```
 
-- payload size
-- CPU encode/decode overhead
-- p95/p99 latency
-- reconnect stability
-- reproducibility and trust
+## Problem 2: mephubot Daemon Missing DM Handler
 
----
+**File:** `mep_daemon.py`
 
-## Bounty Track A — Representation Layer
+The daemon only handles `task_result` callbacks. It needs a `handle_dm()` function to:
+1. Accept `new_task` events (DMs)
+2. Process the payload 
+3. Call `complete_task()` with the response
 
-Build a fast payload format with JSON fallback.
+Also needs a `complete_task` method added to `MEPClient`.
 
-### Target work
-- Add codec negotiation (minimum 2 codecs, e.g. `json` + `msgpack`)
-- Define stable envelope schema + versioning
-- Support vector/tensor payloads (dense and sparse)
-- Include schema identity fields (`schema_version`, `schema_hash`)
+## Problem 3: /tasks/complete Returns 422 for Zero-Bounty DM Replies
 
-### Acceptance
-- [ ] ≥ 40% payload reduction vs equivalent JSON
-- [ ] ≥ 2x parsing throughput on at least one runtime
-- [ ] Cross-language compatibility tests pass
+When a DM-targeted task (bounty=0, target_node set) is replied to via `/tasks/complete`, the hub returns **422 Unprocessable Entity**.
 
----
+**Root cause:** The hub's task state machine may not properly handle the "assigned → completed" transition for zero-bounty targeted tasks. The task is delivered via WebSocket to the target node, but the completion endpoint rejects it.
 
-## Bounty Track B — Transport Layer
+**Files to check:** `hub/main.py` around lines 990-1015 (DM delivery) and 1080-1140 (task completion).
 
-Build resilient streaming for high-concurrency agent sessions.
+## Problem 4: mephubot Node.js Adapter Crypto Error
 
-### Target work
-- Multiplexed long-lived session over WebSocket
-- Framed stream model (control + chunked data)
-- Backpressure handling and adaptive chunk size
-- Resume support (`session_id`, `stream_id`, `resume_token`, `offset`)
+**File:** `mep_node.js`
 
-### Acceptance
-- [ ] ≥ 30% p95 latency improvement under same benchmark profile
-- [ ] Successful resume after transient disconnect
-- [ ] Stable behavior under large concurrent node tests
+```javascript
+Error: Unsupported crypto operation
+    at Sign.sign (node:internal/crypto/sig:146:29)
+```
 
----
+Node.js `crypto.sign('SHA256', ...)` with Ed25519 keys fails. The key is stored as raw PKCS8 PEM but Node's `crypto.sign` needs the raw Ed25519 private key bytes, not the PKCS8 container.
 
-## Bounty Track C — Trust + Delta + Dedup
+**Fix:** Use `crypto.createSign('SHA256')` with `keyObject.export()` or switch to RSA signing for the JS adapter.
 
-Reduce repeated transfer while preserving integrity/provenance.
+## Problem 5: No Persistent MEP Node in OpenClaw Adapter
 
-### Target work
-- Content-addressed artifact references (e.g. hash-based)
-- Dedup flow (reference existing blobs when already available)
-- Delta transfer for iterative context updates
-- Signed provenance metadata (producer/tool lineage/TTL/rights)
+The `mep_openclaw_adapter.py` is a stdio adapter — it runs interactively but no daemon maintains a continuous WebSocket connection to the hub. For DM to work, a persistent background node must always be connected.
 
-### Acceptance
-- [ ] ≥ 50% bandwidth reduction in repeated collaboration workflows
-- [ ] Integrity verification for each artifact/frame
-- [ ] Replayability support for audit/debug samples
+## Proposed Architecture Fix
 
----
+For DM to work as IM-style chat:
 
-## Recommended first contribution (high ROI)
+1. Each bot/node maintains a **persistent WebSocket connection** to the hub
+2. The hub delivers **incoming DMs via `new_task`** WebSocket events
+3. The node processes and **replies via `/tasks/complete`** REST endpoint  
+4. The hub pushes the reply to the sender via **`task_result`** WebSocket event
 
-Implement a pilot for:
+The chain is: Alice --submit_task()--> Hub --new_task WS--> Bob --complete_task()--> Hub --task_result WS--> Alice
 
-- `task_result` payload with embeddings
-- `json` + `msgpack`
-- WebSocket framed chunks
-- hash + signature verification
+Steps 1-3 confirmed working in live test. **Step 4 (hub → original sender delivery of result) needs verification.**
 
-Include before/after metrics for:
+## Live Test Evidence
 
-- payload bytes
-- encode/decode CPU
-- p50/p95/p99 latency
-- reconnect resume success rate
+```
+mephubot registered: node_1f08a37cf3c6
+elsaws registered: node_f6c0209e2f75
+Submit: 200 {'status': 'success', 'task_id': '92b91cb1-ae5a-43e0-9387-8b65124ee044', 'routed_to': 'node_1f08a37cf3c6'}
 
----
+# mephubot received the message:
+mephubot received: Hi mephubot! Bayes theory ping - please reply.
 
-## How to submit
+# But reply failed:
+mephubot replied: 422
+```
 
-Open a PR and include:
-
-- [ ] What you implemented
-- [ ] Benchmark method and reproducible commands
-- [ ] Before/after result table
-- [ ] Compatibility behavior (fallback path)
-- [ ] Security notes
-
-Please keep changes incremental and scoped to one track where possible.
+Hub Sentinel node: `node_200df0901e9e` (persistent listener active)
 
 ---
 
-## Scope guardrails
-
-Not required for initial contributions:
-
-- full replacement of all JSON endpoints
-- mandatory QUIC adoption
-- model-specific tuning unrelated to transfer protocol
-
----
-
-## Reference
-
-- `MEP_VNEXT_PROTOCOL_SKETCH_2026-03-22.md`
-- `MEP_VNEXT_BOUNTY_GITHUB_ISSUE_DRAFT.md`
+Fixes: #DM #ZeroBounty #CyberspaceMarket #IMChat
