@@ -1614,8 +1614,19 @@ async def websocket_endpoint(
                 break
     try:
         while True:
-            await websocket.receive_text()
+            try:
+                msg = await asyncio.wait_for(websocket.receive_text(), timeout=30)
+                # Optional: handle incoming messages here if needed
+            except asyncio.TimeoutError:
+                # Keepalive: send ping to detect dead connections
+                try:
+                    await websocket.ping()
+                except Exception:
+                    # Connection is dead — break and cleanup
+                    break
     except WebSocketDisconnect:
+        pass  # Clean close is also handled below
+    finally:
         async with node_lock:
             if connected_nodes.get(node_id) is websocket:
                 del connected_nodes[node_id]
