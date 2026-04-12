@@ -676,6 +676,9 @@ async def _maintenance_worker():
         try:
             await _evict_completed_tasks_cache()
             _sweep_idempotency_records()
+            removed = db.cleanup_expired_pending_dms()
+            if removed > 0:
+                log_event("pending_dms_cleaned", f"Removed {removed} expired pending DMs", removed=removed)
         except Exception as exc:
             log_event("maintenance_sweep_failed", f"Maintenance sweep failed: {exc}")
         await asyncio.sleep(max(1, MAINTENANCE_SWEEP_INTERVAL_SECONDS))
@@ -1033,6 +1036,11 @@ async def submit_task(
                     if connected_nodes.get(task.target_node) is target_ws:
                         del connected_nodes[task.target_node]
                 raise HTTPException(status_code=409, detail="Target node disconnected")
+        # Target offline — queue DM for delivery when they reconnect
+        if task.target_node:
+            db.queue_offline_dm(task_id, task.consumer_id, task.target_node, payload, now)
+            log_event("dm_queued_offline", f"DM {task_id[:8]} queued for offline target {task.target_node}", task_id=task_id, target=task.target_node)
+            return {"status": "success", "task_id": task_id, "routed_to": task.target_node, "queued": True}
         raise HTTPException(status_code=404, detail="Target node not currently connected to Hub")
 
     model_requirement = _normalize_model_requirement(task.model_requirement)
@@ -1576,6 +1584,34 @@ async def websocket_endpoint(
     async with node_lock:
         connected_nodes[node_id] = websocket
     db.update_registry_availability(node_id, "online", time.time())
+    # Deliver any DMs that were queued while this node was offline
+    pending_dms = db.get_pending_dms(node_id)
+    failed_deliveries = 0
+    for dm in pending_dms:
+        try:
+            delivery = {
+                "event": "new_task",
+                "data": {
+                    "id": dm["task_id"],
+                    "consumer_id": dm["consumer_id"],
+                    "payload": dm["payload"],
+                    "bounty": 0.0,
+                    "status": "assigned",
+                    "provider_id": node_id,
+                    "queued": True
+                }
+            }
+            await websocket.send_json(delivery)
+            db.delete_pending_dm(dm["task_id"])
+            log_event("dm_delivered_online", f"Queued DM {dm['task_id'][:8]} delivered to {node_id}", task_id=dm["task_id"])
+            failed_deliveries = 0  # reset after successful delivery
+        except Exception as exc:
+            log_event("dm_delivery_failed", f"Failed to deliver queued DM to {node_id}: {exc}", task_id=dm["task_id"])
+            failed_deliveries += 1
+            # continue to deliver remaining DMs instead of dropping them on first failure
+            if failed_deliveries >= 3:
+                log_event("dm_delivery_aborted", f"Too many consecutive failures ({failed_deliveries}), aborting pending DM delivery for {node_id}", node_id=node_id)
+                break
     try:
         while True:
             await websocket.receive_text()
