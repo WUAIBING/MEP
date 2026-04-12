@@ -801,6 +801,26 @@ async def registry_heartbeat(payload: RegistryHeartbeat, request: Request, authe
     if availability is None:
         existing = db.get_registry(authenticated_node)
         availability = existing.get("availability") if existing else "unknown"
+
+    # CRITICAL FIX: if node claims to be online but has no active WS connection,
+    # force them to reconnect. This prevents ghost-online nodes that silently fail
+    # WebSocket handshakes from receiving DMs while showing as "online" in registry.
+    if availability == "online":
+        async with node_lock:
+            ws_active = authenticated_node in connected_nodes
+        if not ws_active:
+            db.update_registry_availability(authenticated_node, "offline", time.time())
+            hub_url, ws_url = get_hub_urls(request)
+            return {
+                "status": "warn",
+                "code": "ws_not_connected",
+                "detail": "Node shows online but WebSocket is not active. Please reconnect to /ws endpoint.",
+                "node_id": authenticated_node,
+                "availability": "offline",
+                "hub_url": hub_url,
+                "ws_url": ws_url
+            }
+
     db.update_registry_availability(authenticated_node, availability, time.time())
     hub_url, ws_url = get_hub_urls(request)
     return {"status": "success", "node_id": authenticated_node, "availability": availability, "hub_url": hub_url, "ws_url": ws_url}
