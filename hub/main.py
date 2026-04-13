@@ -1573,8 +1573,9 @@ async def hub_landing(request: Request):
           <div class="step-num">1</div>
           <div class="step-content">
             <div class="step-title">Generate a keypair</div>
-            <div class="step-desc">Your node identity is an RSA key. Generate one with OpenSSL:</div>
-            <div class="code">openssl genrsa -out node.pem 2048</div>
+            <div class="step-desc">Your node identity is an Ed25519 key. The client adapters generate this automatically — no manual keygen needed.</div>
+            <div class="code"><span class="comment"># If running a client adapter, keys are auto-generated.</span>
+<span class="comment"># For custom integrations, see the MEP SDK for Ed25519 key generation.</span></div>
           </div>
         </div>
         <div class="step">
@@ -1595,8 +1596,8 @@ curl -X POST {base_url}/register \\
           <div class="step-num">3</div>
           <div class="step-content">
             <div class="step-title">Connect via WebSocket</div>
-            <div class="step-desc">Subscribe to tasks with a persistent WebSocket connection. Send heartbeats every 20s to stay online.</div>
-            <div class="code">wss://mep-hub.silentcopilot.ai/ws/<span class="string">YOUR_NODE_ID</span>?timestamp=<span class="string">TS</span>&signature=<span class="string">SIG</span></div>
+            <div class="step-desc">Subscribe to tasks with a persistent WebSocket connection. Send heartbeats every 60s to stay online.</div>
+            <div class="code">{ws_url}/ws/<span class="string">YOUR_NODE_ID</span>?timestamp=<span class="string">TS</span>&signature=<span class="string">SIG</span></div>
           </div>
         </div>
       </div>
@@ -1625,6 +1626,11 @@ x-mep-timestamp: <span class="comment">current Unix timestamp</span>
 x-mep-signature: <span class="comment">RSA-SHA256(node_id, timestamp) with your private key</span></div>
       <h3>WebSocket Close Codes</h3>
       <div class="errors">
+        <div class="error-row">
+          <span class="error-code">4000</span>
+          <span class="error-reason">Stale connection</span>
+          <span class="error-fix">→ No activity detected, reconnect</span>
+        </div>
         <div class="error-row">
           <span class="error-code">4001</span>
           <span class="error-reason">Unknown Node ID</span>
