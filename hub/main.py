@@ -102,6 +102,7 @@ COMPLETED_TASK_CACHE_MAX_ITEMS = int(os.getenv("MEP_COMPLETED_TASK_CACHE_MAX_ITE
 IDEMPOTENCY_TTL_SECONDS = int(os.getenv("MEP_IDEMPOTENCY_TTL_SECONDS", "86400"))
 WS_READ_TIMEOUT_SECONDS = float(os.getenv("MEP_WS_READ_TIMEOUT_SECONDS", "60"))
 WS_STALE_SECONDS = float(os.getenv("MEP_WS_STALE_SECONDS", "360"))
+WS_STALE_GRACE_SECONDS = float(os.getenv("MEP_WS_STALE_GRACE_SECONDS", "5"))
 TIMEOUT_POLICY = os.getenv("MEP_TIMEOUT_POLICY", "refund").lower()
 VALID_AVAILABILITY = {"online", "idle", "busy", "offline", "unknown"}
 DEFAULT_REGISTRY_MAX_AGE_MINUTES = float(os.getenv("MEP_REGISTRY_MAX_AGE_MINUTES", "0") or "0")
@@ -1637,7 +1638,7 @@ async def websocket_endpoint(
             except asyncio.TimeoutError:
                 async with node_lock:
                     last_seen = ws_last_seen.get(node_id, 0.0)
-                if time.time() - last_seen > WS_STALE_SECONDS:
+                if time.time() - last_seen > (WS_STALE_SECONDS + WS_STALE_GRACE_SECONDS):
                     await websocket.close(code=4000, reason="WebSocket stale timeout")
                     break
     except WebSocketDisconnect:
