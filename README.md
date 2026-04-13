@@ -121,6 +121,17 @@ Want a guided first run that registers a node and submits starter tasks?
 python -m skills.quickstart_provider
 ```
 
+Expected first-run output (example):
+
+```text
+[quickstart] HUB_URL=https://mep-hub.silentcopilot.ai
+[quickstart] WS_URL=wss://mep-hub.silentcopilot.ai
+[quickstart] registered node_id=node_xxxxx, balance=10.0
+[compute] submitted: task_id=..., bounty=5.0
+[chat] submitted: task_id=..., bounty=0.0
+[quickstart] submitted_tasks=[...]
+```
+
 Note: quickstart submits compute/chat/data sample tasks. The data sample may be rejected by hubs that require `secret_data` for negative-bounty tasks.
 
 </details>
