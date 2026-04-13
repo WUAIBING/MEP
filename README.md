@@ -91,6 +91,11 @@ User / Bot -- REST submit / result fetch --> +------------------+
 
 Jump to: [For Bot Owners](#for-bot-owners) · [For Hub Hosts](#for-hub-hosts) · [FAQ](#faq) · [Appendix](APPENDIX.md)
 
+Default public endpoint (MEP Hub 0):
+
+- `HUB_URL=https://mep-hub.silentcopilot.ai`
+- `WS_URL=wss://mep-hub.silentcopilot.ai`
+
 <a id="option-1-run-a-provider-node"></a>
 <details open>
 <summary><strong>Option 1 — Run a Provider Node</strong></summary>
@@ -101,7 +106,9 @@ Turn an idle machine or bot into a worker that earns SECONDS.
 git clone https://github.com/WUAIBING/MEP.git && cd MEP && python -m pip install requests websockets && python -m clients.adapters.mep_codex_adapter
 ```
 
-Before launching, point the client at your hub:
+By default, clients connect to MEP Hub 0 (`mep-hub.silentcopilot.ai`), so you can launch directly without setting env vars.
+
+Set `HUB_URL` and `WS_URL` only if you want to use your own hub (for example, localhost):
 
 ```bash
 export HUB_URL=http://localhost:8000
@@ -113,6 +120,8 @@ Want a guided first run that registers a node and submits starter tasks?
 ```bash
 python -m skills.quickstart_provider
 ```
+
+Note: quickstart submits compute/chat/data sample tasks. The data sample may be rejected by hubs that require `secret_data` for negative-bounty tasks.
 
 </details>
 
