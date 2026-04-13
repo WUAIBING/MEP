@@ -24,6 +24,7 @@ app = FastAPI(title="MEP Hub", description="The Time Exchange Clearinghouse", ve
 active_tasks: Dict[str, dict] = {}
 completed_tasks: Dict[str, dict] = {}
 connected_nodes: Dict[str, WebSocket] = {}
+ws_last_seen: Dict[str, float] = {}
 rate_limits: Dict[str, List[float]] = {}
 task_lock = asyncio.Lock()
 node_lock = asyncio.Lock()
@@ -99,6 +100,9 @@ MAINTENANCE_SWEEP_INTERVAL_SECONDS = int(os.getenv("MEP_MAINTENANCE_SWEEP_INTERV
 COMPLETED_TASK_CACHE_TTL_SECONDS = int(os.getenv("MEP_COMPLETED_TASK_CACHE_TTL_SECONDS", "3600"))
 COMPLETED_TASK_CACHE_MAX_ITEMS = int(os.getenv("MEP_COMPLETED_TASK_CACHE_MAX_ITEMS", "1000"))
 IDEMPOTENCY_TTL_SECONDS = int(os.getenv("MEP_IDEMPOTENCY_TTL_SECONDS", "86400"))
+WS_READ_TIMEOUT_SECONDS = float(os.getenv("MEP_WS_READ_TIMEOUT_SECONDS", "60"))
+WS_STALE_SECONDS = float(os.getenv("MEP_WS_STALE_SECONDS", "360"))
+WS_STALE_GRACE_SECONDS = float(os.getenv("MEP_WS_STALE_GRACE_SECONDS", "5"))
 TIMEOUT_POLICY = os.getenv("MEP_TIMEOUT_POLICY", "refund").lower()
 VALID_AVAILABILITY = {"online", "idle", "busy", "offline", "unknown"}
 DEFAULT_REGISTRY_MAX_AGE_MINUTES = float(os.getenv("MEP_REGISTRY_MAX_AGE_MINUTES", "0") or "0")
@@ -804,6 +808,7 @@ async def registry_heartbeat(payload: RegistryHeartbeat, request: Request, authe
     if availability is None:
         existing = db.get_registry(authenticated_node)
         availability = existing.get("availability") if existing else "unknown"
+    now = time.time()
 
     # CRITICAL FIX: if node claims to be online but has no active WS connection,
     # force them to reconnect. This prevents ghost-online nodes that silently fail
@@ -811,8 +816,10 @@ async def registry_heartbeat(payload: RegistryHeartbeat, request: Request, authe
     if availability == "online":
         async with node_lock:
             ws_active = authenticated_node in connected_nodes
+            if ws_active:
+                ws_last_seen[authenticated_node] = now
         if not ws_active:
-            db.update_registry_availability(authenticated_node, "offline", time.time())
+            db.update_registry_availability(authenticated_node, "offline", now)
             hub_url, ws_url = get_hub_urls(request)
             return {
                 "status": "warn",
@@ -824,7 +831,7 @@ async def registry_heartbeat(payload: RegistryHeartbeat, request: Request, authe
                 "ws_url": ws_url
             }
 
-    db.update_registry_availability(authenticated_node, availability, time.time())
+    db.update_registry_availability(authenticated_node, availability, now)
     hub_url, ws_url = get_hub_urls(request)
     return {"status": "success", "node_id": authenticated_node, "availability": availability, "hub_url": hub_url, "ws_url": ws_url}
 
@@ -1581,9 +1588,11 @@ async def websocket_endpoint(
         return
 
     await websocket.accept()
+    now = time.time()
     async with node_lock:
         connected_nodes[node_id] = websocket
-    db.update_registry_availability(node_id, "online", time.time())
+        ws_last_seen[node_id] = now
+    db.update_registry_availability(node_id, "online", now)
     # Deliver any DMs that were queued while this node was offline
     pending_dms = db.get_pending_dms(node_id)
     failed_deliveries = 0
@@ -1614,9 +1623,29 @@ async def websocket_endpoint(
                 break
     try:
         while True:
-            await websocket.receive_text()
+            try:
+                message = await asyncio.wait_for(websocket.receive_text(), timeout=WS_READ_TIMEOUT_SECONDS)
+                async with node_lock:
+                    if connected_nodes.get(node_id) is websocket:
+                        ws_last_seen[node_id] = time.time()
+                if message:
+                    try:
+                        payload = json.loads(message)
+                    except json.JSONDecodeError:
+                        payload = None
+                    if payload and payload.get("event") == "heartbeat":
+                        continue
+            except asyncio.TimeoutError:
+                async with node_lock:
+                    last_seen = ws_last_seen.get(node_id, 0.0)
+                if time.time() - last_seen > (WS_STALE_SECONDS + WS_STALE_GRACE_SECONDS):
+                    await websocket.close(code=4000, reason="WebSocket stale timeout")
+                    break
     except WebSocketDisconnect:
+        pass
+    finally:
         async with node_lock:
             if connected_nodes.get(node_id) is websocket:
                 del connected_nodes[node_id]
+            ws_last_seen.pop(node_id, None)
         db.update_registry_availability(node_id, "offline", time.time())
