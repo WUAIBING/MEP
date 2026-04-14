@@ -229,9 +229,11 @@ async def http_exception_handler(_: Request, exc: HTTPException):
 
 @app.exception_handler(RequestValidationError)
 async def validation_exception_handler(_: Request, exc: RequestValidationError):
+    # Format Pydantic errors into readable field:message pairs
+    formatted = "; ".join(f"{'.'.join(str(p) for p in e['loc'])}: {e['msg']}" for e in exc.errors())
     return JSONResponse(
         status_code=422,
-        content={"status": "error", "detail": exc.errors()}
+        content={"status": "error", "detail": formatted}
     )
 
 @app.exception_handler(Exception)
