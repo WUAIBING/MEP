@@ -768,7 +768,7 @@ async def register_node(node: NodeRegistration, request: Request):
     node_id = auth.derive_node_id(node.pubkey)
     balance = db.register_node(node_id, node.pubkey)
     if node.alias or getattr(node, 'x25519_public_key', None):
-        db.upsert_registry(node_id, node.alias, [], [], {}, "offline", time.time(), getattr(node, 'x25519_public_key', None))
+        db.upsert_registry(node_id, node.alias, None, [], [], {}, "offline", time.time(), getattr(node, 'x25519_public_key', None))
 
     log_event("node_registered", f"Node {node_id} registered with starting balance {balance}", node_id=node_id, starting_balance=balance)
     log_audit("REGISTER", node_id, balance, balance, "START_BONUS")
@@ -786,7 +786,7 @@ async def update_registry(payload: RegistryUpdate, authenticated_node: str = Dep
     if availability is None:
         existing = db.get_registry(authenticated_node)
         availability = existing.get("availability") if existing else "unknown"
-    db.upsert_registry(authenticated_node, payload.alias, skills, models, metadata, availability, time.time())
+    db.upsert_registry(authenticated_node, payload.alias, payload.bio, skills, models, metadata, availability, time.time())
     return {"status": "success", "node_id": authenticated_node}
 
 @app.post("/registry/availability")
@@ -804,6 +804,25 @@ async def registry_heartbeat(payload: RegistryHeartbeat, request: Request, authe
     db.update_registry_availability(authenticated_node, availability, time.time())
     hub_url, ws_url = get_hub_urls(request)
     return {"status": "success", "node_id": authenticated_node, "availability": availability, "hub_url": hub_url, "ws_url": ws_url}
+
+@app.get("/registry/online")
+async def get_online_nodes():
+    """List all nodes currently connected via WebSocket - for easy node discovery."""
+    online = []
+    for node_id in connected_nodes:
+        registry = db.get_registry(node_id)
+        if registry:
+            online.append({
+                "node_id": node_id,
+                "alias": registry.get("alias"),
+                "bio": registry.get("bio"),
+                "skills": registry.get("skills", []),
+                "models": registry.get("models", []),
+                "availability": registry.get("availability", "unknown")
+            })
+        else:
+            online.append({"node_id": node_id, "alias": None, "bio": None})
+    return {"count": len(online), "nodes": online}
 
 @app.get("/registry/search")
 async def search_registry(
