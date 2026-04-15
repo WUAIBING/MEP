@@ -295,6 +295,7 @@ Nothing was removed. Advanced configuration and full operator references now liv
 - Deployment notes: `DEPLOYMENT.md`
 - Testing notes: `TESTING.md`
 - Legal constraints and usage boundaries: `LEGAL.md`
+- Background scheduler and idle-autopilot roadmap: `MEP_IDLE_AUTOPILOT_DESIGN_MAP.md`
 
 ## Roadmap Snapshot
 
