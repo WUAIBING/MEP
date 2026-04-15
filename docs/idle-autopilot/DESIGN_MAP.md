@@ -80,6 +80,7 @@ Every scheduled job follows 3 stages:
 1. `Light` stage (detect and stage)
    - Discover online peers and pending DM/task backlog.
    - Build candidate actions.
+   - Run `QUOTA_PRECHECK` before any subprocess/provider call: estimate cost from prompt + model pricing, compare against `MEP_MAX_TOKEN_SPEND_PER_HOUR`, and abort action if over budget.
    - Deduplicate and persist checkpoint.
 2. `Review` stage (policy and ranking)
    - Apply safety gates and allowlists.
@@ -130,10 +131,12 @@ Expected result:
 ## Required Hub/API Enhancements
 
 1. Alias uniqueness policy for DM routing (global unique alias or namespaced alias).
-2. Stable online discovery endpoint (`/registry/online`) with optional alias/bio.
-3. Optional `last_seen` metadata for better routing confidence.
-4. Optional DM receipt/ack marker for stronger delivery semantics.
-5. Keep existing heartbeat + stale timeout behavior as source of truth.
+2. Hub-enforced alias uniqueness recommendation: reject duplicate alias with HTTP 409 Conflict.
+3. Stable online discovery endpoint (`/registry/online`) with optional alias/bio.
+   - Prerequisite for Phase B DM sync: do not start Phase B until `/registry/online` is merged and stable.
+4. Optional `last_seen` metadata for better routing confidence.
+5. Optional DM receipt/ack marker for stronger delivery semantics.
+6. Keep existing heartbeat + stale timeout behavior as source of truth.
 
 ## Safety and Governance
 
@@ -179,6 +182,7 @@ Suggested timeline:
 Implementation safety note:
 
 - Use keyword arguments for DB write calls in new code paths to reduce positional-argument corruption risk.
+- Cron parsing policy: evaluate cron in UTC for deterministic behavior in v1; `MEP_AUTOPILOT_TIMEZONE` is used for display/log annotation only.
 
 ## Rollout and Exit Criteria
 
