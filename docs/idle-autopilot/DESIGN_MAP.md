@@ -23,7 +23,6 @@ This borrows the OpenClaw Dreaming style of `enabled + scheduled + staged` execu
 - One background daemon with explicit job phases.
 - Idempotent periodic jobs that tolerate restarts.
 - Explainable state transitions and operator-visible logs.
-- Prefer keyword arguments for safety in DB write paths.
 
 ## Proposed Config Schema
 
@@ -44,7 +43,7 @@ MEP_AUTOPILOT_TIMEZONE=UTC
 MEP_IDLE_REQUIRED=true
 MEP_MAX_TASKS_PER_HOUR=20
 MEP_MAX_RUNTIME_SECONDS=600
-MEP_MAX_TOKEN_SPEND_PER_HOUR=0
+MEP_MAX_TOKEN_SPEND_PER_HOUR=1000
 MEP_ALLOWED_MODELS=cli-agent,gemini,deepseek
 MEP_MIN_BOUNTY=0.0
 MEP_MAX_BOUNTY=20.0
@@ -130,10 +129,11 @@ Expected result:
 
 ## Required Hub/API Enhancements
 
-1. Stable online discovery endpoint (`/registry/online`) with optional alias/bio.
-2. Optional `last_seen` metadata for better routing confidence.
-3. Optional DM receipt/ack marker for stronger delivery semantics.
-4. Keep existing heartbeat + stale timeout behavior as source of truth.
+1. Alias uniqueness policy for DM routing (global unique alias or namespaced alias).
+2. Stable online discovery endpoint (`/registry/online`) with optional alias/bio.
+3. Optional `last_seen` metadata for better routing confidence.
+4. Optional DM receipt/ack marker for stronger delivery semantics.
+5. Keep existing heartbeat + stale timeout behavior as source of truth.
 
 ## Safety and Governance
 
@@ -154,7 +154,7 @@ Phase A (Docs + Skeleton):
 Phase B (DM Reliability):
 
 1. Implement DM sync pipeline (Light/Review/Commit).
-2. Add retry backoff state store.
+2. Add retry backoff state store (SQLite-backed durable queue; in-memory cache allowed for hot path only).
 3. Add alias resolution cache and fallback behavior.
 
 Phase C (Compute Reliability):
@@ -168,6 +168,17 @@ Phase D (Autonomous Workflows):
 1. Add bot-to-bot orchestration examples (Hermes <-> OpenClaw).
 2. Add policy templates for trusted bot groups.
 3. Add operator dashboard views for queue and health.
+
+Suggested timeline:
+
+- Phase A: 3-5 days
+- Phase B: 1-2 weeks
+- Phase C: 1-2 weeks
+- Phase D: 1 week
+
+Implementation safety note:
+
+- Use keyword arguments for DB write calls in new code paths to reduce positional-argument corruption risk.
 
 ## Rollout and Exit Criteria
 
@@ -188,6 +199,4 @@ Exit criteria:
 
 1. Should scheduler live fully in clients, hub, or split roles?
 2. Should `mep_autopilot_daemon` be adapter-agnostic or adapter-specific?
-3. Do we standardize alias uniqueness at hub level for easier DM routing?
-4. Should we add signed job checkpoints for multi-tenant trust?
-
+3. Should we add signed job checkpoints for multi-tenant trust?
