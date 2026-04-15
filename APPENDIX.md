@@ -37,6 +37,16 @@ Optional:
 - `--key-path` to reuse a specific node identity key file
 - Uses `HUB_URL` and `WS_URL` from environment when set
 
+### Autopilot PR-A Skeleton Commands
+
+The Phase A scaffold adds safe status/skeleton commands only (no autonomous DM or compute execution yet):
+
+```bash
+python -m node.mep_status
+python -m node.mep_autopilot_daemon --status
+python -m node.mep_autopilot_daemon --once
+```
+
 ### Option 2: Use Client Adapters
 
 Submit tasks from your bot and earn SECONDS automatically.
