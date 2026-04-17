@@ -67,6 +67,19 @@ def _ensure_registry_availability_column(cursor):
         if "availability" not in columns:
             cursor.execute("ALTER TABLE agent_registry ADD COLUMN availability TEXT NOT NULL DEFAULT 'unknown'")
 
+def _ensure_registry_bio_column(cursor):
+    if _is_postgres():
+        cursor.execute(
+            "SELECT column_name FROM information_schema.columns WHERE table_name = 'agent_registry' AND column_name = 'bio'"
+        )
+        if not cursor.fetchone():
+            cursor.execute("ALTER TABLE agent_registry ADD COLUMN bio TEXT")
+    else:
+        cursor.execute("PRAGMA table_info(agent_registry)")
+        columns = [row[1] for row in cursor.fetchall()]
+        if "bio" not in columns:
+            cursor.execute("ALTER TABLE agent_registry ADD COLUMN bio TEXT")
+
 def init_db():
     conn = _get_conn()
     cursor = conn.cursor()
@@ -118,6 +131,7 @@ def init_db():
         CREATE TABLE IF NOT EXISTS agent_registry (
             node_id TEXT PRIMARY KEY,
             alias TEXT,
+            bio TEXT,
             skills TEXT NOT NULL,
             models TEXT NOT NULL,
             metadata TEXT NOT NULL,
@@ -126,6 +140,7 @@ def init_db():
             x25519_public_key TEXT
         )
     ''')
+    _ensure_registry_bio_column(cursor)
     _ensure_registry_availability_column(cursor)
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS reputation (
@@ -556,43 +571,46 @@ def delete_idempotency_before(cutoff_ts: float) -> int:
     _release_conn(conn)
     return int(deleted or 0)
 
-def upsert_registry(node_id: str, alias: Optional[str], skills: list[str], models: list[str], metadata: dict, availability: str, updated_at: float, x25519_public_key: Optional[str] = None):
+def upsert_registry(node_id: str, alias: Optional[str], skills: list[str], models: list[str], metadata: dict, availability: str, updated_at: float, x25519_public_key: Optional[str] = None, bio: Optional[str] = None):
     conn = _get_conn()
     cursor = conn.cursor()
     _ensure_registry_availability_column(cursor)
+    _ensure_registry_bio_column(cursor)
     skills_payload = json.dumps(skills)
     models_payload = json.dumps(models)
     metadata_payload = json.dumps(metadata)
     
     if _is_postgres():
         query = """
-            INSERT INTO agent_registry (node_id, alias, skills, models, metadata, availability, updated_at, x25519_public_key)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+            INSERT INTO agent_registry (node_id, alias, bio, skills, models, metadata, availability, updated_at, x25519_public_key)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
             ON CONFLICT (node_id) DO UPDATE SET
                 alias = EXCLUDED.alias,
+                bio = EXCLUDED.bio,
                 skills = EXCLUDED.skills,
                 models = EXCLUDED.models,
                 metadata = EXCLUDED.metadata,
                 availability = EXCLUDED.availability,
                 updated_at = EXCLUDED.updated_at
         """
-        params = [node_id, alias, skills_payload, models_payload, metadata_payload, availability, updated_at, x25519_public_key]
+        params = [node_id, alias, bio, skills_payload, models_payload, metadata_payload, availability, updated_at, x25519_public_key]
         if x25519_public_key:
             query += ", x25519_public_key = EXCLUDED.x25519_public_key"
         cursor.execute(query, tuple(params))
     else:
         query = """
-            INSERT INTO agent_registry (node_id, alias, skills, models, metadata, availability, updated_at, x25519_public_key)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO agent_registry (node_id, alias, bio, skills, models, metadata, availability, updated_at, x25519_public_key)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(node_id) DO UPDATE SET
                 alias=excluded.alias,
+                bio=excluded.bio,
                 skills=excluded.skills,
                 models=excluded.models,
                 metadata=excluded.metadata,
                 availability=excluded.availability,
                 updated_at=excluded.updated_at
         """
-        params = [node_id, alias, skills_payload, models_payload, metadata_payload, availability, updated_at, x25519_public_key]
+        params = [node_id, alias, bio, skills_payload, models_payload, metadata_payload, availability, updated_at, x25519_public_key]
         if x25519_public_key:
             query += ", x25519_public_key=excluded.x25519_public_key"
         cursor.execute(query, tuple(params))
