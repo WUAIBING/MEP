@@ -22,5 +22,17 @@ def test_autopilot_config_rejects_invalid_boolean() -> None:
 
 
 def test_autopilot_config_rejects_min_bounty_above_max() -> None:
-    with pytest.raises(ConfigValidationError, match="cannot be greater"):
+    with pytest.raises(ConfigValidationError) as exc:
         AutopilotConfig.from_env({"MEP_MIN_BOUNTY": "10", "MEP_MAX_BOUNTY": "5"})
+    assert str(exc.value) == "MEP_MIN_BOUNTY cannot be greater than MEP_MAX_BOUNTY"
+
+
+def test_autopilot_config_rejects_negative_bounty_bounds() -> None:
+    with pytest.raises(ConfigValidationError) as exc:
+        AutopilotConfig.from_env({"MEP_MIN_BOUNTY": "-1", "MEP_MAX_BOUNTY": "5"})
+    assert str(exc.value) == "MEP_MIN_BOUNTY and MEP_MAX_BOUNTY must be >= 0"
+
+
+def test_autopilot_config_rejects_invalid_hub_url_prefix() -> None:
+    with pytest.raises(ConfigValidationError, match="HUB_URL must start with"):
+        AutopilotConfig.from_env({"HUB_URL": "ftp://invalid.example.com"})

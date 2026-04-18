@@ -102,6 +102,8 @@ class AutopilotConfig:
             raise ConfigValidationError("MEP_MAX_RUNTIME_SECONDS must be > 0")
         if cfg.max_token_spend_per_hour < 0:
             raise ConfigValidationError("MEP_MAX_TOKEN_SPEND_PER_HOUR must be >= 0")
+        if cfg.min_bounty < 0 or cfg.max_bounty < 0:
+            raise ConfigValidationError("MEP_MIN_BOUNTY and MEP_MAX_BOUNTY must be >= 0")
         if cfg.min_bounty > cfg.max_bounty:
             raise ConfigValidationError("MEP_MIN_BOUNTY cannot be greater than MEP_MAX_BOUNTY")
         if not cfg.allowed_models:
