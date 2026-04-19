@@ -13,6 +13,8 @@ class TaskCreate(BaseModel):
     model_requirement: Optional[str] = None
     secret_data: Optional[str] = None
     payload_uri: Optional[str] = None  # IPFS or HTTP link to payload
+    conversation_id: Optional[str] = None  # Thread related tasks together
+    end_of_turn: Optional[bool] = False  # Signal conversation endpoint
 
 class TaskBid(BaseModel):
     task_id: str
