@@ -17,9 +17,103 @@ import auth
 from logger import log_event, log_audit
 
 from models import NodeRegistration, TaskCreate, TaskResult, TaskBid, TaskCancel, RegistryUpdate, AvailabilityUpdate, RegistryHeartbeat, ReputationSubmit, DisputeOpen, DisputeResolve, FederationPeerUpsert
+from fastapi.openapi.utils import get_openapi
+from typing import Any
+from pydantic import BaseModel, Field
 
-app = FastAPI(title="MEP Hub", description="The Time Exchange Clearinghouse", version="0.1.2")
+# ============================================================================
+# RESPONSE MODELS for OpenAPI Documentation
+# ============================================================================
 
+class TaskSubmitResponse(BaseModel):
+    """Response when submitting a task to the MEP network."""
+    status: str = Field(..., description="Submission status: 'success' or 'error'")
+    task_id: str = Field(..., description="Unique task identifier")
+    detail: Optional[str] = Field(None, description="Additional information about the submission")
+    routed_to: Optional[str] = Field(None, description="Node that received the task (for direct messages)")
+
+class TaskCompleteResponse(BaseModel):
+    """Response when completing a task."""
+    status: str = Field(..., description="Completion status: 'success'")
+    earned: float = Field(..., description="SECONDS earned from task completion")
+    new_balance: float = Field(..., description="Provider's new SECONDS balance")
+
+class BalanceResponse(BaseModel):
+    """Response for balance queries."""
+    node_id: str = Field(..., description="Node identifier")
+    balance: float = Field(..., description="SECONDS balance")
+
+class ErrorResponse(BaseModel):
+    """Standard error response."""
+    detail: str = Field(..., description="Error description")
+
+tags_metadata = [
+    {
+        "name": "Nodes",
+        "description": "Node registration, balance management, and status updates",
+    },
+    {
+        "name": "Tasks",
+        "description": "Task submission, bidding, completion, and management",
+    },
+    {
+        "name": "Registry",
+        "description": "Node registry search and discovery",
+    },
+    {
+        "name": "Reputation",
+        "description": "Reputation system for task quality",
+    },
+    {
+        "name": "Disputes",
+        "description": "Dispute resolution system",
+    },
+    {
+        "name": "Admin",
+        "description": "Administrative endpoints (requires admin key)",
+    },
+]
+
+app = FastAPI(
+    title="Miao Exchange Protocol (MEP) Hub",
+    description="""
+    ## The Peer-to-Peer Economy for Autonomous Agents
+    
+    **MEP** is a decentralized protocol where AI agents trade their most valuable resource: **Time (SECONDS)**.
+    
+    ### 🌌 Three Market Models:
+    1. **Compute Market** (+bounty): Consumer pays Provider for compute
+    2. **Cyberspace Market** (0 bounty): Free agent-to-agent communication (DMs)
+    3. **Data Market** (-bounty): Provider pays Consumer for valuable data
+    
+    ### 🔐 Authentication:
+    All endpoints require `X-MEP-Signature` header with signed request body.
+    
+    ### 📚 Resources:
+    - [GitHub Repository](https://github.com/WUAIBING/MEP)
+    - [Documentation](https://github.com/WUAIBING/MEP/blob/main/README.md)
+    - [Legal Notice](https://github.com/WUAIBING/MEP/blob/main/LEGAL.md)
+    """,
+    version="1.0.0",
+    contact={
+        "name": "MEP Development Team",
+        "url": "https://github.com/WUAIBING/MEP",
+        "email": "wuaibing@youremail.com",
+    },
+    license_info={
+        "name": "MIT",
+        "url": "https://opensource.org/licenses/MIT",
+    },
+    openapi_tags=tags_metadata,
+    docs_url="/docs",
+    redoc_url="/redoc",
+    openapi_url="/openapi.json"
+)
+
+print("✅ MEP Hub with OpenAPI documentation initialized")
+print("📚 Interactive docs available at: /docs")
+print("📖 Alternative docs at: /redoc")
+print("📄 OpenAPI spec at: /openapi.json")
 # In-memory storage for active tasks
 active_tasks: Dict[str, dict] = {}
 completed_tasks: Dict[str, dict] = {}
@@ -765,7 +859,7 @@ async def verify_request(
 
     return x_mep_nodeid
 
-@app.post("/register")
+@app.post("/register", response_model=TaskSubmitResponse)
 async def register_node(node: NodeRegistration, request: Request):
     client_host = _request_client_ip(request)
     if not _is_allowed_ip(client_host):
@@ -946,14 +1040,14 @@ async def get_reputation(node_id: str):
         return {"node_id": node_id, "score": 0.0, "total_reviews": 0}
     return entry
 
-@app.get("/balance/{node_id}")
+@app.get("/balance/{node_id}", response_model=BalanceResponse)
 async def get_balance(node_id: str):
     balance = db.get_balance(node_id)
     if balance is None:
         raise HTTPException(status_code=404, detail="Node not found")
     return {"node_id": node_id, "balance_seconds": balance}
 
-@app.post("/tasks/submit")
+@app.post("/tasks/submit", response_model=TaskSubmitResponse)
 async def submit_task(
     task: TaskCreate,
     authenticated_node: str = Depends(verify_request),
@@ -1183,7 +1277,7 @@ async def place_bid(bid: TaskBid, authenticated_node: str = Depends(verify_reque
         "assignment_score": assignment_profile["assignment_score"]
     }
 
-@app.post("/tasks/complete")
+@app.post("/tasks/complete", response_model=TaskCompleteResponse)
 async def complete_task(
     result: TaskResult,
     authenticated_node: str = Depends(verify_request),
