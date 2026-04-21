@@ -16,6 +16,14 @@ import db
 import auth
 from logger import log_event, log_audit
 
+# Welcome & FAQ system for new node operators (served via /register response)
+try:
+    from welcome import get_welcome, get_faq, WELCOME_MARKDOWN, OLLAMA_SYSTEM_PROMPT
+    WELCOME_AVAILABLE = True
+except ImportError:
+    WELCOME_AVAILABLE = False
+    get_welcome = lambda node_id, alias, balance: {}  # type: ignore
+
 from models import NodeRegistration, TaskCreate, TaskResult, TaskBid, TaskCancel, RegistryUpdate, AvailabilityUpdate, RegistryHeartbeat, ReputationSubmit, DisputeOpen, DisputeResolve, FederationPeerUpsert
 
 app = FastAPI(title="MEP Hub", description="The Time Exchange Clearinghouse", version="0.1.2")
@@ -775,7 +783,31 @@ async def register_node(node: NodeRegistration, request: Request):
 
     hub_url, ws_url = get_hub_urls(request)
 
-    return {"status": "success", "node_id": node_id, "balance": balance, "hub_url": hub_url, "ws_url": ws_url}
+    response = {
+        "status": "success",
+        "node_id": node_id,
+        "balance": balance,
+        "hub_url": hub_url,
+        "ws_url": ws_url,
+    }
+
+    # Attach welcome package for new nodes
+    if WELCOME_AVAILABLE:
+        welcome = get_welcome(node_id, node.alias, balance)
+        response["welcome"] = welcome.get("text", "")
+        response["welcome_markdown"] = welcome.get("markdown", "")
+        response["faq"] = get_faq()
+
+    return response
+
+
+@app.get("/faq")
+async def get_faq_endpoint():
+    """Public FAQ endpoint — no auth required. Returns troubleshooting guide for node operators."""
+    if not WELCOME_AVAILABLE:
+        raise HTTPException(status_code=503, detail="FAQ not available on this Hub")
+    return {"faq": get_faq(), "system_prompt": OLLAMA_SYSTEM_PROMPT}
+
 
 @app.post("/registry/update")
 async def update_registry(payload: RegistryUpdate, authenticated_node: str = Depends(verify_request)):
