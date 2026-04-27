@@ -2,6 +2,7 @@ import base64
 import hashlib
 import os
 import time
+import warnings
 from dataclasses import dataclass
 
 from cryptography.hazmat.primitives import serialization
@@ -27,6 +28,12 @@ class MEPIdentity:
         if os.path.exists(key_path):
             with open(key_path, "rb") as f:
                 data = f.read()
+            if b"ENCRYPTED" not in data:
+                warnings.warn(
+                    "MEP identity key is stored unencrypted at rest. Protect this file with strict filesystem permissions.",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
             key = serialization.load_pem_private_key(data, password=None)
             if not isinstance(key, ed25519.Ed25519PrivateKey):
                 raise ValueError("Unsupported private key type")
@@ -36,6 +43,11 @@ class MEPIdentity:
             encoding=serialization.Encoding.PEM,
             format=serialization.PrivateFormat.PKCS8,
             encryption_algorithm=serialization.NoEncryption(),
+        )
+        warnings.warn(
+            "Generating unencrypted MEP identity key. Use strict filesystem permissions or switch to encrypted-key handling for production.",
+            RuntimeWarning,
+            stacklevel=2,
         )
         with open(key_path, "wb") as f:
             f.write(pem)

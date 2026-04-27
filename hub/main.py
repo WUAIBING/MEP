@@ -12,6 +12,8 @@ import os
 import ctypes
 from urllib.parse import urlparse, urlencode
 from urllib.request import Request as UrlRequest, urlopen
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric import ed25519
 import db
 import auth
 from logger import log_event, log_audit
@@ -24,7 +26,6 @@ app = FastAPI(title="MEP Hub", description="The Time Exchange Clearinghouse", ve
 active_tasks: Dict[str, dict] = {}
 completed_tasks: Dict[str, dict] = {}
 connected_nodes: Dict[str, WebSocket] = {}
-ws_last_seen: Dict[str, float] = {}
 rate_limits: Dict[str, List[float]] = {}
 task_lock = asyncio.Lock()
 node_lock = asyncio.Lock()
@@ -43,7 +44,7 @@ def get_hub_urls(request: Request) -> tuple:
     return base_url, ws_url
 MAX_SKEW_SECONDS = 300
 ALLOWED_IPS = [ip.strip() for ip in os.getenv("MEP_ALLOWED_IPS", "").split(",") if ip.strip()]
-REQUIRE_TLS = os.getenv("MEP_REQUIRE_TLS", "false").lower() in ("1", "true", "yes")
+REQUIRE_TLS = os.getenv("MEP_REQUIRE_TLS", "true").lower() in ("1", "true", "yes")
 TRUST_PROXY_PROTO = os.getenv("MEP_TRUST_PROXY_PROTO", "true").lower() in ("1", "true", "yes")
 TRUST_PROXY_CLIENT_IP = os.getenv("MEP_TRUST_PROXY_CLIENT_IP", "false").lower() in ("1", "true", "yes")
 TRUSTED_HOSTS = {
@@ -100,9 +101,6 @@ MAINTENANCE_SWEEP_INTERVAL_SECONDS = int(os.getenv("MEP_MAINTENANCE_SWEEP_INTERV
 COMPLETED_TASK_CACHE_TTL_SECONDS = int(os.getenv("MEP_COMPLETED_TASK_CACHE_TTL_SECONDS", "3600"))
 COMPLETED_TASK_CACHE_MAX_ITEMS = int(os.getenv("MEP_COMPLETED_TASK_CACHE_MAX_ITEMS", "1000"))
 IDEMPOTENCY_TTL_SECONDS = int(os.getenv("MEP_IDEMPOTENCY_TTL_SECONDS", "86400"))
-WS_READ_TIMEOUT_SECONDS = float(os.getenv("MEP_WS_READ_TIMEOUT_SECONDS", "60"))
-WS_STALE_SECONDS = float(os.getenv("MEP_WS_STALE_SECONDS", "360"))
-WS_STALE_GRACE_SECONDS = float(os.getenv("MEP_WS_STALE_GRACE_SECONDS", "5"))
 TIMEOUT_POLICY = os.getenv("MEP_TIMEOUT_POLICY", "refund").lower()
 VALID_AVAILABILITY = {"online", "idle", "busy", "offline", "unknown"}
 DEFAULT_REGISTRY_MAX_AGE_MINUTES = float(os.getenv("MEP_REGISTRY_MAX_AGE_MINUTES", "0") or "0")
@@ -340,6 +338,20 @@ def _normalize_hub_url(value: str) -> str:
     parsed = urlparse(normalized)
     if parsed.scheme not in ("http", "https") or not parsed.netloc:
         raise HTTPException(status_code=400, detail="hub_url must be an http(s) URL")
+    return normalized
+
+def _validate_registration_pubkey(pubkey: str) -> str:
+    normalized = (pubkey or "").strip()
+    if not normalized:
+        raise HTTPException(status_code=400, detail="pubkey is required")
+    if len(normalized) > 8_192:
+        raise HTTPException(status_code=413, detail="pubkey too large")
+    try:
+        public_key = serialization.load_pem_public_key(normalized.encode("utf-8"))
+    except (ValueError, TypeError):
+        raise HTTPException(status_code=400, detail="Invalid PEM public key")
+    if not isinstance(public_key, ed25519.Ed25519PublicKey):
+        raise HTTPException(status_code=400, detail="Unsupported key type; expected Ed25519 public key")
     return normalized
 
 async def _list_federation_peers() -> list[str]:
@@ -680,9 +692,6 @@ async def _maintenance_worker():
         try:
             await _evict_completed_tasks_cache()
             _sweep_idempotency_records()
-            removed = db.cleanup_expired_pending_dms()
-            if removed > 0:
-                log_event("pending_dms_cleaned", f"Removed {removed} expired pending DMs", removed=removed)
         except Exception as exc:
             log_event("maintenance_sweep_failed", f"Maintenance sweep failed: {exc}")
         await asyncio.sleep(max(1, MAINTENANCE_SWEEP_INTERVAL_SECONDS))
@@ -771,9 +780,10 @@ async def register_node(node: NodeRegistration, request: Request):
     if not _is_allowed_ip(client_host):
         raise HTTPException(status_code=403, detail="Client IP not allowed")
     _apply_rate_limit(f"{client_host or 'unknown'}:/register")
-    # Registration derives the Node ID from the provided Public Key PEM
-    node_id = auth.derive_node_id(node.pubkey)
-    balance = db.register_node(node_id, node.pubkey)
+    validated_pubkey = _validate_registration_pubkey(node.pubkey)
+    # Registration derives the Node ID from the validated Ed25519 public key PEM
+    node_id = auth.derive_node_id(validated_pubkey)
+    balance = db.register_node(node_id, validated_pubkey)
     if node.alias or getattr(node, 'x25519_public_key', None):
         db.upsert_registry(node_id, node.alias, [], [], {}, "offline", time.time(), getattr(node, 'x25519_public_key', None))
 
@@ -808,30 +818,7 @@ async def registry_heartbeat(payload: RegistryHeartbeat, request: Request, authe
     if availability is None:
         existing = db.get_registry(authenticated_node)
         availability = existing.get("availability") if existing else "unknown"
-    now = time.time()
-
-    # CRITICAL FIX: if node claims to be online but has no active WS connection,
-    # force them to reconnect. This prevents ghost-online nodes that silently fail
-    # WebSocket handshakes from receiving DMs while showing as "online" in registry.
-    if availability == "online":
-        async with node_lock:
-            ws_active = authenticated_node in connected_nodes
-            if ws_active:
-                ws_last_seen[authenticated_node] = now
-        if not ws_active:
-            db.update_registry_availability(authenticated_node, "offline", now)
-            hub_url, ws_url = get_hub_urls(request)
-            return {
-                "status": "warn",
-                "code": "ws_not_connected",
-                "detail": "Node shows online but WebSocket is not active. Please reconnect to /ws endpoint.",
-                "node_id": authenticated_node,
-                "availability": "offline",
-                "hub_url": hub_url,
-                "ws_url": ws_url
-            }
-
-    db.update_registry_availability(authenticated_node, availability, now)
+    db.update_registry_availability(authenticated_node, availability, time.time())
     hub_url, ws_url = get_hub_urls(request)
     return {"status": "success", "node_id": authenticated_node, "availability": availability, "hub_url": hub_url, "ws_url": ws_url}
 
@@ -1042,13 +1029,8 @@ async def submit_task(
                 async with node_lock:
                     if connected_nodes.get(task.target_node) is target_ws:
                         del connected_nodes[task.target_node]
-                raise HTTPException(status_code=409, detail="Target node disconnected")
-        # Target offline — queue DM for delivery when they reconnect
-        if task.target_node:
-            db.queue_offline_dm(task_id, task.consumer_id, task.target_node, payload, now)
-            log_event("dm_queued_offline", f"DM {task_id[:8]} queued for offline target {task.target_node}", task_id=task_id, target=task.target_node)
-            return {"status": "success", "task_id": task_id, "routed_to": task.target_node, "queued": True}
-        raise HTTPException(status_code=404, detail="Target node not currently connected to Hub")
+                return {"status": "error", "detail": "Target node disconnected"}
+        return {"status": "error", "detail": "Target node not currently connected to Hub"}
 
     model_requirement = _normalize_model_requirement(task.model_requirement)
     rfc_data = {
@@ -1208,7 +1190,7 @@ async def complete_task(
         task = active_tasks.get(result.task_id)
     if not task:
         db_task = db.get_task(result.task_id)
-        if not db_task or db_task["status"] not in ("bidding", "assigned", "pending"):
+        if not db_task or db_task["status"] not in ("bidding", "assigned"):
             raise HTTPException(status_code=404, detail="Task not found or already claimed")
         task = {
             "id": db_task["task_id"],
@@ -1225,11 +1207,9 @@ async def complete_task(
         async with task_lock:
             active_tasks[result.task_id] = task
 
-    expected_provider = task.get("provider_id") or task.get("target_node")
-    if expected_provider and expected_provider != result.provider_id:
-        raise HTTPException(status_code=403, detail="Task is assigned to a different provider")
-    if task.get("status") == "assigned" and not expected_provider:
-        raise HTTPException(status_code=409, detail="Assigned task is missing provider assignment")
+    assigned_provider = task.get("provider_id")
+    if assigned_provider and assigned_provider != result.provider_id:
+        raise HTTPException(status_code=409, detail="Task assigned to another provider")
 
     provider_balance = db.get_balance(result.provider_id)
     if provider_balance is None:
@@ -1588,64 +1568,14 @@ async def websocket_endpoint(
         return
 
     await websocket.accept()
-    now = time.time()
     async with node_lock:
         connected_nodes[node_id] = websocket
-        ws_last_seen[node_id] = now
-    db.update_registry_availability(node_id, "online", now)
-    # Deliver any DMs that were queued while this node was offline
-    pending_dms = db.get_pending_dms(node_id)
-    failed_deliveries = 0
-    for dm in pending_dms:
-        try:
-            delivery = {
-                "event": "new_task",
-                "data": {
-                    "id": dm["task_id"],
-                    "consumer_id": dm["consumer_id"],
-                    "payload": dm["payload"],
-                    "bounty": 0.0,
-                    "status": "assigned",
-                    "provider_id": node_id,
-                    "queued": True
-                }
-            }
-            await websocket.send_json(delivery)
-            db.delete_pending_dm(dm["task_id"])
-            log_event("dm_delivered_online", f"Queued DM {dm['task_id'][:8]} delivered to {node_id}", task_id=dm["task_id"])
-            failed_deliveries = 0  # reset after successful delivery
-        except Exception as exc:
-            log_event("dm_delivery_failed", f"Failed to deliver queued DM to {node_id}: {exc}", task_id=dm["task_id"])
-            failed_deliveries += 1
-            # continue to deliver remaining DMs instead of dropping them on first failure
-            if failed_deliveries >= 3:
-                log_event("dm_delivery_aborted", f"Too many consecutive failures ({failed_deliveries}), aborting pending DM delivery for {node_id}", node_id=node_id)
-                break
+    db.update_registry_availability(node_id, "online", time.time())
     try:
         while True:
-            try:
-                message = await asyncio.wait_for(websocket.receive_text(), timeout=WS_READ_TIMEOUT_SECONDS)
-                async with node_lock:
-                    if connected_nodes.get(node_id) is websocket:
-                        ws_last_seen[node_id] = time.time()
-                if message:
-                    try:
-                        payload = json.loads(message)
-                    except json.JSONDecodeError:
-                        payload = None
-                    if payload and payload.get("event") == "heartbeat":
-                        continue
-            except asyncio.TimeoutError:
-                async with node_lock:
-                    last_seen = ws_last_seen.get(node_id, 0.0)
-                if time.time() - last_seen > (WS_STALE_SECONDS + WS_STALE_GRACE_SECONDS):
-                    await websocket.close(code=4000, reason="WebSocket stale timeout")
-                    break
+            await websocket.receive_text()
     except WebSocketDisconnect:
-        pass
-    finally:
         async with node_lock:
             if connected_nodes.get(node_id) is websocket:
                 del connected_nodes[node_id]
-            ws_last_seen.pop(node_id, None)
         db.update_registry_availability(node_id, "offline", time.time())
