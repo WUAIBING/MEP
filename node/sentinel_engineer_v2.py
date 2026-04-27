@@ -131,20 +131,25 @@ class DeepSeekProvider(BaseProvider):
     def __init__(self):
         self.api_key = os.getenv("DEEPSEEK_API_KEY")
         self.base_url = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
+        self.model_name = os.getenv("SE_DEEPSEEK_MODEL", "deepseek-v4-pro")
+        self._supports_thinking = self.model_name in ("deepseek-reasoner", "deepseek-r1")
 
     def call(self, prompt: str, history: list[dict]) -> str:
         if not self.api_key:
             raise RuntimeError("DEEPSEEK_API_KEY not set")
         messages = [{"role": m["role"], "content": m["content"]} for m in history]
         messages.append({"role": "user", "content": prompt})
+        payload = {
+            "model": self.model_name,
+            "messages": messages,
+        }
+        # Only use response_format for non-reasoning models to avoid reasoning_content requirement
+        if not self._supports_thinking:
+            payload["response_format"] = {"type": "json_object"}
         resp = requests.post(
             f"{self.base_url}/chat/completions",
             headers={"Authorization": f"Bearer {self.api_key}"},
-            json={
-                "model": "deepseek-chat",
-                "messages": messages,
-                "response_format": {"type": "json_object"},
-            },
+            json=payload,
             timeout=CONFIG.llm_timeout,
         )
         resp.raise_for_status()

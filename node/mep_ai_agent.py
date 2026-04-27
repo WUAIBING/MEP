@@ -91,12 +91,12 @@ def try_deepseek(prompt):
     url = "https://api.deepseek.com/chat/completions"
     
     payload = {
-        "model": "deepseek-chat", # V3.2 non-reasoning
+        "model": "deepseek-v4-pro", # Reasoning model - no response_format
         "messages": [
             {"role": "user", "content": prompt}
         ],
         "temperature": 0.7,
-        "max_tokens": 2048
+        "max_tokens": 4096
     }
     
     headers = {
