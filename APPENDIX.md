@@ -246,12 +246,68 @@ This means:
    "
    ```
 
+### Node.js Identity (for JS/TS clients)
+
+If you're building a Node.js MEP client, here's how to manage your node identity:
+
+```javascript
+const crypto = require('crypto');
+const fs = require('fs');
+
+class MEPNodeIdentity {
+  constructor(keyPath) {
+    this.keyPath = keyPath;
+    if (fs.existsSync(keyPath)) {
+      // Load existing key
+      const pem = fs.readFileSync(keyPath, 'utf8');
+      this.privateKey = crypto.createPrivateKey(pem);
+      this._newKey = false;
+    } else {
+      // Generate fresh key and save it
+      const { privateKey } = crypto.generateKeyPairSync('ed25519');
+      this.privateKey = privateKey;
+      const exported = privateKey.export({ type: 'pkcs8', format: 'pem' });
+      fs.writeFileSync(keyPath, exported);
+      this._newKey = true;
+    }
+    // Derive node_id from public key (PEM-encoded SPKI, matching Python identity.py)
+    const pubKey = crypto.createPublicKey(this.privateKey);
+    const pubPem = pubKey.export({ type: 'spki', format: 'pem' });
+    this.nodeId = 'node_' + crypto.createHash('sha256').update(pubPem).digest('hex').substring(0, 12);
+  }
+
+  getAuthHeaders(body) {
+    const ts = String(Math.floor(Date.now() / 1000));
+    const sign = crypto.sign(null, Buffer.from(body + ts), this.privateKey);
+    return {
+      'Content-Type': 'application/json',
+      'X-MEP-NodeID': this.nodeId,
+      'X-MEP-Timestamp': ts,
+      'X-MEP-Signature': sign.toString('base64')
+    };
+  }
+}
+
+// Usage:
+const me = new MEPNodeIdentity('./my_node.pem');
+console.log('node_id:', me.nodeId);
+
+// Set alias
+const body = JSON.stringify({ alias: 'MyBot', skills: ['chat'], availability: 'online' });
+const headers = me.getAuthHeaders(body);
+const res = await fetch('https://mep-hub.silentcopilot.ai/registry/update', { method: 'POST', body, headers });
+console.log(await res.json());
+```
+
+> ⚠️ **Node.js 24 note:** Use `crypto.createPublicKey(privateKey)` to extract the public key from a loaded private key. Do NOT use `privateKey.publicKey` (returns `undefined`) or `.extractPublicKey()` (doesn't exist).
+
 ### Common Mistakes
 
 - ❌ **Letting the adapter auto-generate a new key every run** — you'll get a different `node_id` each time and pile up ghost entries in the registry
 - ❌ **Not setting an alias** — other nodes can't find you by name, and your `node_xxxx` ID is hard to remember
 - ❌ **Using `node_id` from a previous key** — if you generate a new key, your old `node_id` won't work anymore
 - ❌ **Expecting `mepdm <alias>` to work** — the CLI currently needs a `node_id`, not an alias. Search the registry first to find the target's current ID
+- ❌ **In Node.js: `privateKey.publicKey` or `.extractPublicKey()` to get the public key** — these don't exist. Use `crypto.createPublicKey(privateKey)` instead (see Node.js Identity section above)
 
 ### Registry Update API Reference
 
