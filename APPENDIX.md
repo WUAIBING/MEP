@@ -376,6 +376,30 @@ async function submitResult(taskId, payload) {
 > 4. **Event names:** The Hub sends `"new_task"` for incoming tasks and `"task_result"` for completed results. Do NOT listen for `"task"`
 > 5. **`connected_nodes` is the real status:** Registry `availability: "online"` only means HTTP heartbeat is active. DM routing requires a live WebSocket. Check `curl /health` → `connected_nodes` count
 > 6. **Register ONCE, connect many times:** Calling `/register` on every startup is a common mistake. It sets `availability` to `"offline"` and can reset your alias. After the initial registration, only use WebSocket connections — the hub's `accept()` handler marks you online. Subsequent restarts should skip registration and go straight to WebSocket connect
+> 7. **Never send manual ping/pong JSON:** The hub uses a separate heartbeat mechanism. Sending `{"event": "pong"}` over WS will be treated as unexpected traffic and may trigger disconnection. Use the ws library's built-in `pingInterval` option instead
+
+### WebSocket Close Code Reference
+
+When the hub rejects or disconnects your WebSocket, the close code tells you why. Log it with `ws.on('close', (code, reason) => console.log('WS closed:', code, reason.toString()))`:
+
+| Code | Meaning | Fix |
+|------|---------|-----|
+| 4001 | Unknown Node ID | Your public key isn't in the DB — call `/register` first |
+| 4002 | Invalid Signature | Wrong payload for sign, or clock skew. Verify `sign(nodeId + ts)` |
+| 4003 | IP Not Allowed | Your IP isn't in the Hub's allowlist — contact hub admin |
+| 4004 | Missing/Bad Auth | `timestamp` or `signature` missing from query params |
+| 1008 | Untrusted Host | Host header mismatch — set correct `Host` header |
+| 1006 | Abnormal Closure | Network issue or server-side crash — auto-reconnect |
+
+### Debugging "WS connected but hub shows 0 connected_nodes"
+
+This is the most common silent failure mode. Your client thinks it's connected (WebSocket handshake completed at TCP level) but the hub never called `accept()`. Checklist:
+
+1. **Log the close code** — if you see 4001/4002/4003/4004, see table above
+2. **Check if you're re-registering** — calling `/register` on startup resets availability to `"offline"`
+3. **Verify clock sync** — `timestamp` must be within 300 seconds of hub server time
+4. **Check `x25519_public_key`** — if null, your registration didn't include the encryption key. Re-register with both keys
+5. **Run `curl /health`** — `connected_nodes` is the ground truth, not registry `availability`
 
 ### Common Mistakes
 
@@ -389,6 +413,8 @@ async function submitResult(taskId, payload) {
 - ❌ **Signing WebSocket auth with the wrong payload** — WS signature must be over `nodeId + ts` (string concatenation), matching the Hub's `verify_signature(pub_pem, node_id, timestamp, signature)` call
 - ❌ **Calling `/register` on every startup** — registration sets availability to `"offline"` and can reset your alias. Register **once** after generating your key, then only make WebSocket connections on subsequent restarts. The WS `accept()` call handles marking you online
 - ❌ **Starting WebSocket before `/register` completes** — if your public key isn't in the database yet, the WS will fail with code 4001 "Unknown Node ID". Always register (once) before connecting WebSocket
+- ❌ **Sending manual `{"event": "pong"}` over WebSocket** — the hub doesn't use JSON-level ping/pong. Use the ws library's `pingInterval` option for keepalive instead
+- ❌ **Ignoring WS close codes** — always log `ws.on('close', (code, reason))`. The code tells you exactly why the hub rejected your connection (4001=unknown node, 4002=bad signature, 4004=missing auth)
 
 ### Registry Update API Reference
 
