@@ -1,6 +1,7 @@
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect, Request, Header, Depends
 from fastapi.responses import HTMLResponse, PlainTextResponse, JSONResponse
 from fastapi.exceptions import RequestValidationError
+from pydantic import BaseModel
 from typing import Dict, List, Optional
 import asyncio
 import uuid
@@ -102,7 +103,33 @@ COMPLETED_TASK_CACHE_TTL_SECONDS = int(os.getenv("MEP_COMPLETED_TASK_CACHE_TTL_S
 COMPLETED_TASK_CACHE_MAX_ITEMS = int(os.getenv("MEP_COMPLETED_TASK_CACHE_MAX_ITEMS", "1000"))
 IDEMPOTENCY_TTL_SECONDS = int(os.getenv("MEP_IDEMPOTENCY_TTL_SECONDS", "86400"))
 TIMEOUT_POLICY = os.getenv("MEP_TIMEOUT_POLICY", "refund").lower()
-VALID_AVAILABILITY = {"online", "idle", "busy", "offline", "unknown"}
+VALID_AVAILABILITY = {"online", "idle", "busy", "offline", "degraded", "unknown"}
+
+# ---------------------------------------------------------------------------
+# Node Activity Tracking (for passive degraded detection)
+# ---------------------------------------------------------------------------
+node_activity_lock = asyncio.Lock()
+node_last_activity: Dict[str, float] = {}
+
+DEGRADED_THRESHOLD_SECONDS = float(os.getenv("MEP_DEGRADED_THRESHOLD_SECONDS", "600"))
+
+
+async def _track_node_activity(node_id: str):
+    async with node_activity_lock:
+        node_last_activity[node_id] = time.time()
+
+
+async def _sweep_node_activity():
+    now = time.time()
+    async with node_activity_lock:
+        for node_id, last_seen in list(node_last_activity.items()):
+            if node_id in connected_nodes:
+                continue
+            if (now - last_seen) > DEGRADED_THRESHOLD_SECONDS:
+                existing = db.get_registry(node_id)
+                if existing and existing.get("availability") not in ("offline", "degraded"):
+                    db.update_registry_availability(node_id, "degraded", now)
+                    log_event("node_degraded", f"Node {node_id} marked degraded due to inactivity", node_id=node_id)
 DEFAULT_REGISTRY_MAX_AGE_MINUTES = float(os.getenv("MEP_REGISTRY_MAX_AGE_MINUTES", "0") or "0")
 ASSIGNMENT_REPUTATION_WEIGHT = float(os.getenv("MEP_ASSIGNMENT_REPUTATION_WEIGHT", "0.55"))
 ASSIGNMENT_AVAILABILITY_WEIGHT = float(os.getenv("MEP_ASSIGNMENT_AVAILABILITY_WEIGHT", "0.25"))
@@ -699,6 +726,7 @@ async def _maintenance_worker():
         try:
             await _evict_completed_tasks_cache()
             _sweep_idempotency_records()
+            await _sweep_node_activity()
         except Exception as exc:
             log_event("maintenance_sweep_failed", f"Maintenance sweep failed: {exc}")
         await asyncio.sleep(max(1, MAINTENANCE_SWEEP_INTERVAL_SECONDS))
@@ -817,6 +845,7 @@ async def update_registry(payload: RegistryUpdate, authenticated_node: str = Dep
 async def update_availability(payload: AvailabilityUpdate, authenticated_node: str = Depends(verify_request)):
     availability = _normalize_availability(payload.availability)
     db.update_registry_availability(authenticated_node, availability, time.time())
+    await _track_node_activity(authenticated_node)
     return {"status": "success", "node_id": authenticated_node, "availability": availability}
 
 @app.post("/registry/heartbeat")
@@ -826,6 +855,7 @@ async def registry_heartbeat(payload: RegistryHeartbeat, request: Request, authe
         existing = db.get_registry(authenticated_node)
         availability = existing.get("availability") if existing else "unknown"
     db.update_registry_availability(authenticated_node, availability, time.time())
+    await _track_node_activity(authenticated_node)
     hub_url, ws_url = get_hub_urls(request)
     return {"status": "success", "node_id": authenticated_node, "availability": availability, "hub_url": hub_url, "ws_url": ws_url}
 
@@ -1402,6 +1432,88 @@ async def health_check():
         }
     }
 
+
+# ---------------------------------------------------------------------------
+# Diagnostic Endpoint — tiered approach (per Hermes DM discussion)
+# ---------------------------------------------------------------------------
+class DiagnosticResponse(BaseModel):
+    node_id: Optional[str] = None
+    registered: bool = False
+    availability: Optional[str] = None
+    last_heartbeat: Optional[float] = None
+    ws_connected: bool = False
+    connected_since: Optional[float] = None
+    last_ws_activity: Optional[float] = None
+    auth_ok: Optional[bool] = None
+    error: Optional[str] = None
+
+
+@app.get("/diagnostic")
+async def diagnostic(
+    node_id: Optional[str] = None,
+    x_mep_nodeid: Optional[str] = Header(default=None),
+    x_mep_timestamp: Optional[str] = Header(default=None),
+    x_mep_signature: Optional[str] = Header(default=None),
+) -> DiagnosticResponse:
+    """
+    Tiered diagnostic endpoint.
+
+    Tier 1 (public, no auth) — specify node_id as query param:
+        GET /diagnostic?node_id=node_xxx
+        Returns: {node_id, registered, availability, last_heartbeat}
+
+    Tier 2 (authenticated) — no query param, uses auth headers:
+        GET /diagnostic (with X-MEP-NodeID, X-MEP-Timestamp, X-MEP-Signature)
+        Returns: full health report including ws_connected, last_ws_activity, auth_ok
+
+    No node_id + no auth -> returns error="usage"
+    """
+    requesting_node = x_mep_nodeid
+
+    # Tier 1: Public diagnostic with node_id query param
+    if node_id:
+        registry = db.get_registry(node_id)
+        if not registry:
+            return DiagnosticResponse(error="node_not_found", node_id=node_id)
+        return DiagnosticResponse(
+            node_id=node_id,
+            registered=True,
+            availability=registry.get("availability"),
+            last_heartbeat=registry.get("updated_at"),
+        )
+
+    # Tier 2: Authenticated full diagnostic
+    if requesting_node:
+        authenticated_node = None
+        try:
+            ts = x_mep_timestamp or ""
+            sig = x_mep_signature or ""
+            pub_pem = db.get_pub_pem(requesting_node)
+            if pub_pem and auth.verify_signature(pub_pem, requesting_node, ts, sig):
+                authenticated_node = requesting_node
+        except Exception:
+            pass
+
+        ws_connected = requesting_node in connected_nodes
+        async with node_activity_lock:
+            last_ws = node_last_activity.get(requesting_node)
+        registry = db.get_registry(requesting_node)
+
+        return DiagnosticResponse(
+            node_id=requesting_node,
+            registered=bool(registry),
+            availability=registry.get("availability") if registry else None,
+            last_heartbeat=registry.get("updated_at") if registry else None,
+            ws_connected=ws_connected,
+            connected_since=None,
+            last_ws_activity=last_ws,
+            auth_ok=authenticated_node is not None,
+        )
+
+    # No node_id, no auth -> usage error
+    return DiagnosticResponse(error="usage", node_id=None, registered=False, ws_connected=False)
+
+
 @app.get("/logs/ledger_audit.log", response_class=PlainTextResponse)
 async def ledger_audit_log():
     path = _resolve_log_path("ledger_audit.log")
@@ -1581,6 +1693,7 @@ async def websocket_endpoint(
     try:
         while True:
             await websocket.receive_text()
+            await _track_node_activity(node_id)
     except WebSocketDisconnect:
         async with node_lock:
             if connected_nodes.get(node_id) is websocket:
