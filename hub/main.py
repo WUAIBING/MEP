@@ -192,6 +192,13 @@ def _is_trusted_host(host_value: Optional[str]) -> bool:
     return any(normalized.endswith(f".{suffix}") for suffix in TRUSTED_HOSTS_WILDCARD_SUFFIXES)
 
 
+def _is_local_dev_host(host_value: Optional[str]) -> bool:
+    normalized = _normalize_host_header(host_value)
+    if not normalized:
+        return False
+    return normalized in {"localhost", "127.0.0.1", "::1", "testserver"}
+
+
 @app.middleware("http")
 async def add_security_headers(request: Request, call_next):
     if not _is_trusted_host(request.headers.get("host")):
@@ -200,7 +207,7 @@ async def add_security_headers(request: Request, call_next):
             content={"status": "error", "detail": "Untrusted Host header"},
         )
     proto = _request_proto(request)
-    if REQUIRE_TLS and proto != "https":
+    if REQUIRE_TLS and proto != "https" and not _is_local_dev_host(request.headers.get("host")):
         return JSONResponse(
             status_code=426,
             content={"status": "error", "detail": "TLS required. Use HTTPS/WSS via reverse proxy."},
@@ -341,18 +348,18 @@ def _normalize_hub_url(value: str) -> str:
     return normalized
 
 def _validate_registration_pubkey(pubkey: str) -> str:
-    normalized = (pubkey or "").strip()
-    if not normalized:
+    raw_value = pubkey or ""
+    if not raw_value.strip():
         raise HTTPException(status_code=400, detail="pubkey is required")
-    if len(normalized) > 8_192:
+    if len(raw_value) > 8_192:
         raise HTTPException(status_code=413, detail="pubkey too large")
     try:
-        public_key = serialization.load_pem_public_key(normalized.encode("utf-8"))
+        public_key = serialization.load_pem_public_key(raw_value.encode("utf-8"))
     except (ValueError, TypeError):
         raise HTTPException(status_code=400, detail="Invalid PEM public key")
     if not isinstance(public_key, ed25519.Ed25519PublicKey):
         raise HTTPException(status_code=400, detail="Unsupported key type; expected Ed25519 public key")
-    return normalized
+    return raw_value
 
 async def _list_federation_peers() -> list[str]:
     async with federation_peer_lock:
@@ -1541,7 +1548,7 @@ async def websocket_endpoint(
     ws_proto = websocket.url.scheme.lower()
     if TRUST_PROXY_PROTO and ws_forwarded_proto in ("http", "https"):
         ws_proto = "wss" if ws_forwarded_proto == "https" else "ws"
-    if REQUIRE_TLS and ws_proto != "wss":
+    if REQUIRE_TLS and ws_proto != "wss" and not _is_local_dev_host(websocket.headers.get("host")):
         await websocket.close(code=1008, reason="TLS required")
         return
 
