@@ -102,7 +102,7 @@ COMPLETED_TASK_CACHE_TTL_SECONDS = int(os.getenv("MEP_COMPLETED_TASK_CACHE_TTL_S
 COMPLETED_TASK_CACHE_MAX_ITEMS = int(os.getenv("MEP_COMPLETED_TASK_CACHE_MAX_ITEMS", "1000"))
 IDEMPOTENCY_TTL_SECONDS = int(os.getenv("MEP_IDEMPOTENCY_TTL_SECONDS", "86400"))
 TIMEOUT_POLICY = os.getenv("MEP_TIMEOUT_POLICY", "refund").lower()
-VALID_AVAILABILITY = {"online", "idle", "busy", "offline", "unknown"}
+VALID_AVAILABILITY = {"online", "idle", "busy", "offline", "degraded", "unknown"}
 DEFAULT_REGISTRY_MAX_AGE_MINUTES = float(os.getenv("MEP_REGISTRY_MAX_AGE_MINUTES", "0") or "0")
 ASSIGNMENT_REPUTATION_WEIGHT = float(os.getenv("MEP_ASSIGNMENT_REPUTATION_WEIGHT", "0.55"))
 ASSIGNMENT_AVAILABILITY_WEIGHT = float(os.getenv("MEP_ASSIGNMENT_AVAILABILITY_WEIGHT", "0.25"))
@@ -699,6 +699,7 @@ async def _maintenance_worker():
         try:
             await _evict_completed_tasks_cache()
             _sweep_idempotency_records()
+            await _sweep_node_activity()
         except Exception as exc:
             log_event("maintenance_sweep_failed", f"Maintenance sweep failed: {exc}")
         await asyncio.sleep(max(1, MAINTENANCE_SWEEP_INTERVAL_SECONDS))
@@ -826,6 +827,7 @@ async def registry_heartbeat(payload: RegistryHeartbeat, request: Request, authe
         existing = db.get_registry(authenticated_node)
         availability = existing.get("availability") if existing else "unknown"
     db.update_registry_availability(authenticated_node, availability, time.time())
+    await _track_node_activity(authenticated_node)
     hub_url, ws_url = get_hub_urls(request)
     return {"status": "success", "node_id": authenticated_node, "availability": availability, "hub_url": hub_url, "ws_url": ws_url}
 
@@ -1581,8 +1583,50 @@ async def websocket_endpoint(
     try:
         while True:
             await websocket.receive_text()
+            await _track_node_activity(node_id)
     except WebSocketDisconnect:
         async with node_lock:
             if connected_nodes.get(node_id) is websocket:
                 del connected_nodes[node_id]
         db.update_registry_availability(node_id, "offline", time.time())
+
+# ---------------------------------------------------------------------------
+# Node Activity Tracking (for passive degraded detection)
+# ---------------------------------------------------------------------------
+node_activity_lock = asyncio.Lock()
+node_last_activity: Dict[str, float] = {}
+
+DEGRADED_THRESHOLD_SECONDS = float(os.getenv("MEP_DEGRADED_THRESHOLD_SECONDS", "600"))
+
+
+async def _track_node_activity(node_id: str):
+    """Update last activity timestamp for a node. Called on heartbeat and WS activity."""
+    async with node_activity_lock:
+        node_last_activity[node_id] = time.time()
+
+
+def _get_node_degraded_nodes() -> list[str]:
+    """Return list of node_ids that are registered but haven't shown activity recently."""
+    now = time.time()
+    degraded = []
+    for node_id in node_last_activity:
+        # If node has no active WS and no recent activity
+        if node_id not in connected_nodes:
+            last = node_last_activity.get(node_id, 0)
+            if last > 0 and (now - last) > DEGRADED_THRESHOLD_SECONDS:
+                degraded.append(node_id)
+    return degraded
+
+
+async def _sweep_node_activity():
+    """Mark stale-but-registered nodes as degraded. Run in maintenance worker."""
+    now = time.time()
+    async with node_activity_lock:
+        for node_id, last_seen in list(node_last_activity.items()):
+            if node_id in connected_nodes:
+                continue  # actively connected, skip
+            if (now - last_seen) > DEGRADED_THRESHOLD_SECONDS:
+                existing = db.get_registry(node_id)
+                if existing and existing.get("availability") not in ("offline", "degraded"):
+                    db.update_registry_availability(node_id, "degraded", now)
+                    log_event("node_degraded", f"Node {node_id} marked degraded due to inactivity", node_id=node_id)
