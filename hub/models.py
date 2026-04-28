@@ -33,6 +33,7 @@ class NodeBalance(BaseModel):
 
 class RegistryUpdate(BaseModel):
     alias: Optional[str] = None
+    bio: Optional[str] = None
     skills: Optional[List[str]] = None
     models: Optional[List[str]] = None
     metadata: Optional[Dict[str, Any]] = None
