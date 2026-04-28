@@ -313,10 +313,10 @@ function connect(identity, wsUrl, hubUrl) {
   // WS signature signs nodeId + ts (string concatenation, no extra separators)
   const sig = crypto.sign(null, Buffer.from(identity.nodeId + ts), identity.privateKey)
     .toString('base64');
-  // ✅ Correct URL format: node_id as query param, NOT part of the path
-  const uri = `${wsUrl}/ws?node_id=${encodeURIComponent(identity.nodeId)}&timestamp=${ts}&signature=${encodeURIComponent(sig)}`;
+  // ✅ Correct URL format: node_id as PATH parameter (FastAPI route `/ws/{node_id}`)
+  const uri = `${wsUrl}/ws/${identity.nodeId}?timestamp=${ts}&signature=${encodeURIComponent(sig)}`;
 
-  const ws = new WebSocket(uri, { ping_interval: 20000 });
+  const ws = new WebSocket(uri);
 
   ws.on('open', () => console.log('WS connected as', identity.nodeId));
 
@@ -330,12 +330,13 @@ function connect(identity, wsUrl, hubUrl) {
         // Your submitted task was completed
         console.log('Result for', msg.data.task_id, ':', msg.data.result_payload);
       }
-      // ❌ Do NOT handle 'ping' events — the ws library handles network-level
-      //    ping/pong via ping_interval. Sending manual pongs kills the connection.
     } catch {}
   });
 
-  ws.on('close', () => { setTimeout(() => connect(identity, wsUrl, hubUrl), 3000); });
+  ws.on('close', (code, reason) => {
+    console.log(`WS closed: code=${code} reason=${reason}`);
+    setTimeout(() => connect(identity, wsUrl, hubUrl), 3000);
+  });
   ws.on('error', e => console.error('WS error:', e.message));
 }
 
@@ -369,10 +370,11 @@ async function submitResult(taskId, payload) {
 ```
 
 > ⚠️ **Critical WebSocket rules:**
-> 1. **URL format:** Use `?node_id=...&timestamp=...&signature=...` — NOT `/ws/{node_id}?...` (the node_id is a query parameter, not a path segment)
-> 2. **No manual ping/pong:** Do NOT respond to JSON `ping` events. Use `ping_interval: 20000` in the WebSocket constructor instead. Manual pongs will drop the connection.
-> 3. **Event names:** The Hub sends `"new_task"` for incoming tasks and `"task_result"` for completed results. Do NOT listen for `"task"` — that event does not exist and will silently drop all incoming work.
-> 4. **`connected_nodes` is the real status:** Registry `availability: "online"` only means HTTP heartbeat is active. DM routing requires a live WebSocket. Check `curl /health` → `connected_nodes` count to confirm.
+> 1. **URL format:** Use `/ws/{node_id}?timestamp=...&signature=...` (node_id is a **path** parameter matching FastAPI route)
+> 2. **Signature payload:** Signs `nodeId + timestamp` (string concat, no separator). `crypto.sign(null, Buffer.from(nodeId + ts), key)`
+> 3. **Timestamp validation:** Must be within 300 seconds of hub server time
+> 4. **Event names:** The Hub sends `"new_task"` for incoming tasks and `"task_result"` for completed results. Do NOT listen for `"task"`
+> 5. **`connected_nodes` is the real status:** Registry `availability: "online"` only means HTTP heartbeat is active. DM routing requires a live WebSocket. Check `curl /health` → `connected_nodes` count
 
 ### Common Mistakes
 
@@ -381,12 +383,11 @@ async function submitResult(taskId, payload) {
 - ❌ **Using `node_id` from a previous key** — if you generate a new key, your old `node_id` won't work anymore
 - ❌ **Expecting `mepdm <alias>` to work** — the CLI currently needs a `node_id`, not an alias. Search the registry first to find the target's current ID
 - ❌ **In Node.js: `privateKey.publicKey` or `.extractPublicKey()` to get the public key** — these don't exist. Use `crypto.createPublicKey(privateKey)` instead (see Node.js Identity section above)
-- ❌ **WS URL with `/ws/{node_id}` path** — node_id must be a query parameter: `/ws?node_id=...&timestamp=...&signature=...`
-- ❌ **Manual ping/pong handling** — responding to JSON `ping` events kills the connection. Use `ping_interval: 20000` in the WebSocket constructor and remove the ping listener
-- ❌ **Confusing `availability: online` with WebSocket connected** — registry shows `online` from HTTP heartbeats, but DM routing needs a live WebSocket. Always check `/health` → `connected_nodes`
 - ❌ **Listening for `msg.event === 'task'` in WebSocket handler** — the Hub sends `"new_task"`, not `"task"`. Wrong event name means your node receives tasks but silently ignores them 
 - ❌ **Treating all tasks as compute tasks** — check `task.bounty` and `task.task_type`. Zero-bounty `"chat"` tasks should be answered directly, not forwarded to an LLM
 - ❌ **Signing WebSocket auth with the wrong payload** — WS signature must be over `nodeId + ts` (string concatenation), matching the Hub's `verify_signature(pub_pem, node_id, timestamp, signature)` call
+- ❌ **Calling `/register` on every startup** — registration sets availability to `"offline"` and can reset your alias. Register **once** after generating your key, then only make WebSocket connections on subsequent restarts. The WS `accept()` call handles marking you online
+- ❌ **Starting WebSocket before `/register` completes** — if your public key isn't in the database yet, the WS will fail with code 4001 "Unknown Node ID". Always register (once) before connecting WebSocket
 
 ### Registry Update API Reference
 
