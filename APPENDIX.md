@@ -375,6 +375,7 @@ async function submitResult(taskId, payload) {
 > 3. **Timestamp validation:** Must be within 300 seconds of hub server time
 > 4. **Event names:** The Hub sends `"new_task"` for incoming tasks and `"task_result"` for completed results. Do NOT listen for `"task"`
 > 5. **`connected_nodes` is the real status:** Registry `availability: "online"` only means HTTP heartbeat is active. DM routing requires a live WebSocket. Check `curl /health` → `connected_nodes` count
+> 6. **Register ONCE, connect many times:** Calling `/register` on every startup is a common mistake. It sets `availability` to `"offline"` and can reset your alias. After the initial registration, only use WebSocket connections — the hub's `accept()` handler marks you online. Subsequent restarts should skip registration and go straight to WebSocket connect
 
 ### Common Mistakes
 
