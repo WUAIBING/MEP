@@ -17,6 +17,8 @@ import auth
 from logger import log_event, log_audit
 
 from models import NodeRegistration, TaskCreate, TaskResult, TaskBid, TaskCancel, RegistryUpdate, AvailabilityUpdate, RegistryHeartbeat, ReputationSubmit, DisputeOpen, DisputeResolve, FederationPeerUpsert
+from onboard_bot import OnboardBot
+from pydantic import BaseModel, Field
 
 app = FastAPI(title="MEP Hub", description="The Time Exchange Clearinghouse", version="0.1.2")
 
@@ -28,6 +30,8 @@ ws_last_seen: Dict[str, float] = {}
 rate_limits: Dict[str, List[float]] = {}
 task_lock = asyncio.Lock()
 node_lock = asyncio.Lock()
+# Onboard bot singleton — created on startup
+onboard_bot: OnboardBot = None
 MAX_BODY_BYTES = 200_000
 MAX_PAYLOAD_CHARS = 20_000
 RATE_LIMIT_WINDOW = 10.0
@@ -692,6 +696,13 @@ async def start_timeout_worker():
     await _load_active_tasks_from_db()
     asyncio.create_task(_assignment_timeout_worker())
     asyncio.create_task(_maintenance_worker())
+
+    # Start onboard bot (Ollama-powered help for new nodes)
+    global onboard_bot
+    base_url = os.getenv("MEP_HUB_PUBLIC_URL", str(app.title))  # placeholder; WS URL resolved by clients
+    onboard_bot = OnboardBot(hub_url=base_url)
+    asyncio.create_task(onboard_bot.start())
+
     if REQUIRE_TLS:
         log_event("transport_policy", "TLS enforcement enabled", require_tls=True, trust_proxy_proto=TRUST_PROXY_PROTO)
     else:
@@ -700,6 +711,10 @@ async def start_timeout_worker():
 
 @app.on_event("shutdown")
 async def shutdown_hub():
+    global onboard_bot
+    if onboard_bot:
+        await onboard_bot.stop()
+        onboard_bot = None
     async with node_lock:
         sockets = list(connected_nodes.values())
         connected_nodes.clear()
@@ -1397,6 +1412,45 @@ async def resolve_dispute(payload: DisputeResolve, x_mep_admin_key: Optional[str
         "escrow_status": latest_escrow.get("status") if latest_escrow else None
     }
 
+# ── Onboard Bot endpoints ───────────────────────────────────────────────
+class OnboardAskRequest(BaseModel):
+    question: str = Field(..., min_length=3, max_length=1000)
+    node_id: Optional[str] = None
+
+
+@app.post("/onboard/ask")
+async def onboard_ask(body: OnboardAskRequest):
+    """
+    Ask the onboard bot a question about MEP connection, registration, or troubleshooting.
+    Falls back to structured FAQ if Ollama is unavailable.
+    """
+    if onboard_bot is None:
+        raise HTTPException(status_code=503, detail="Onboard bot not initialised")
+    result = await onboard_bot.ask(body.question, node_id=body.node_id)
+    return result
+
+
+@app.get("/onboard/health")
+async def onboard_health():
+    """
+    Check onboard bot and Ollama status.
+    """
+    if onboard_bot is None:
+        raise HTTPException(status_code=503, detail="Onboard bot not initialised")
+    return await onboard_bot.health()
+
+
+@app.get("/onboard/faq")
+async def onboard_faq():
+    """
+    Return structured FAQ for MEP onboarding and troubleshooting.
+    """
+    if onboard_bot is None:
+        raise HTTPException(status_code=503, detail="Onboard bot not initialised")
+    return {"faq": OnboardBot.get_faq()}
+
+
+# ── Health endpoint ──────────────────────────────────────────────────
 @app.get("/health")
 async def health_check():
     db_health = db.check_database_health()

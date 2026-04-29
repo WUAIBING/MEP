@@ -1,6 +1,8 @@
 pytest
+pytest-asyncio
 pytest-cov
 httpx
+requests-mock
 ruff
 cryptography
 fastapi
