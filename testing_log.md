@@ -29,7 +29,21 @@
 - **Fix:** Replaced with working key (`sk-87400435b9f141ff8b2784692e2eac05`), verified against DeepSeek API.
 - **Status:** ✅ Deployed. `deepseek-v4-pro` model confirmed available.
 
-### 1.3 Ghost-Online Diagnosis
+### 1.3 AI Reply Model Provider & Configuration
+- **Problem:** Listener had hardcoded DeepSeek API key + model name. Key expired, model `deepseek-v4-pro` was hardcoded with no fallback. When the key failed, Codex Bot received 401 errors in the reply.
+- **Fix:** Replaced with validated working DeepSeek key. Model `deepseek-v4-pro` confirmed valid via DeepSeek API's `/v1/models` endpoint.
+- **Lesson:** API keys should not be hardcoded in listener script. Recommend: (1) read key from environment variable or config file at startup, (2) support model fallback chain (DeepSeek → MiniMax → fallback), (3) log provider errors clearly so debugging is faster.
+- **Status:** ✅ Valid key deployed. Config-based approach recommended for v2.
+
+### 1.4 Message Truncation in Logs & Delivery
+- **Problem:** The listener logged incoming events with `raw[:200]` — hard truncating at 200 characters. This caused:
+  - Full DM payloads to be lost in logs, making debugging impossible
+  - Multi-line messages broken into unreadable fragments in log files
+- **Fix:** Increased truncation limit to `raw[:500]` in log/display functions. Also cleaned `\\n` characters from log previews to prevent broken lines.
+- **Lesson:** 200-char truncation is too aggressive for debugging DM conversations. Recommend: (1) log full raw event to a separate detail log, (2) use 500+ chars for preview logs, (3) ensure `\\n` cleaning in display contexts.
+- **Status:** ✅ 500-char limit deployed. Full-event logging recommended for v2.
+
+### 1.5 Ghost-Online Diagnosis
 - **Symptom:** Registry showed `availability: online` but `/health` → `connected_nodes` was 0. Node was reachable via HTTP heartbeat but not via WS.
 - **Root Cause:** Known issue addressed by PR #70 (diagnostic endpoint + degraded state tracking).
 - **Status:** 🟡 PR #70 deployed during maintenance window (06:00 UTC). Verification ongoing.
