@@ -9,23 +9,35 @@ import requests
 import websockets
 
 from clients.shared.identity import MEPIdentity
-
-HUB_URL = os.getenv("HUB_URL", "https://mep-hub.silentcopilot.ai")
-WS_URL = os.getenv("WS_URL", "wss://mep-hub.silentcopilot.ai")
+from clients.shared.manifest import load_manifest
 
 
 class MEPClient:
-    def __init__(self, key_path: str):
+    def __init__(self, key_path: str, hub_url: Optional[str] = None, ws_url: Optional[str] = None):
         self.identity = MEPIdentity(key_path)
         self.node_id = self.identity.node_id
         self.session = requests.Session()
+        self.session.trust_env = False
         self.task_channels: dict[str, str] = {}
         self._stop = asyncio.Event()
+        manifest = load_manifest()
+        self.hub_url = (
+            hub_url
+            or os.getenv("HUB_URL")
+            or (manifest.hub_url if manifest else None)
+            or "https://mep-hub.silentcopilot.ai"
+        )
+        self.ws_url = (
+            ws_url
+            or os.getenv("WS_URL")
+            or (manifest.ws_url if manifest else None)
+            or "wss://mep-hub.silentcopilot.ai"
+        )
 
     async def register(self) -> dict:
         response = await asyncio.to_thread(
             self.session.post,
-            f"{HUB_URL}/register",
+            f"{self.hub_url}/register",
             json={"pubkey": self.identity.pub_pem},
             timeout=10,
         )
@@ -57,7 +69,7 @@ class MEPClient:
         headers = self._auth_headers(payload_str)
         response = await asyncio.to_thread(
             self.session.post,
-            f"{HUB_URL}/tasks/submit",
+            f"{self.hub_url}/tasks/submit",
             data=payload_str,
             headers=headers,
             timeout=20,
@@ -70,7 +82,7 @@ class MEPClient:
         headers = self._auth_headers(payload_str)
         response = await asyncio.to_thread(
             self.session.post,
-            f"{HUB_URL}/tasks/cancel",
+            f"{self.hub_url}/tasks/cancel",
             data=payload_str,
             headers=headers,
             timeout=20,
@@ -82,7 +94,7 @@ class MEPClient:
         headers = self._auth_headers(payload_str)
         response = await asyncio.to_thread(
             self.session.get,
-            f"{HUB_URL}/tasks/result/{task_id}",
+            f"{self.hub_url}/tasks/result/{task_id}",
             headers=headers,
             timeout=20,
         )
@@ -93,7 +105,7 @@ class MEPClient:
         headers = self._auth_headers(payload_str)
         response = await asyncio.to_thread(
             self.session.get,
-            f"{HUB_URL}/balance/{self.node_id}",
+            f"{self.hub_url}/balance/{self.node_id}",
             headers=headers,
             timeout=20,
         )
@@ -103,7 +115,7 @@ class MEPClient:
         while not self._stop.is_set():
             ts = str(int(time.time()))
             sig = urllib.parse.quote(self.identity.sign(self.node_id, ts))
-            uri = f"{WS_URL}/ws/{self.node_id}?timestamp={ts}&signature={sig}"
+            uri = f"{self.ws_url}/ws/{self.node_id}?timestamp={ts}&signature={sig}"
             try:
                 async with websockets.connect(uri) as ws:
                     while not self._stop.is_set():
