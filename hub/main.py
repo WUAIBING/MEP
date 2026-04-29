@@ -1,6 +1,7 @@
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect, Request, Header, Depends
 from fastapi.responses import HTMLResponse, PlainTextResponse, JSONResponse
 from fastapi.exceptions import RequestValidationError
+from pydantic import BaseModel
 from typing import Dict, List, Optional
 import asyncio
 import uuid
@@ -12,6 +13,8 @@ import os
 import ctypes
 from urllib.parse import urlparse, urlencode
 from urllib.request import Request as UrlRequest, urlopen
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric import ed25519
 import db
 import auth
 from logger import log_event, log_audit
@@ -42,7 +45,7 @@ def get_hub_urls(request: Request) -> tuple:
     return base_url, ws_url
 MAX_SKEW_SECONDS = 300
 ALLOWED_IPS = [ip.strip() for ip in os.getenv("MEP_ALLOWED_IPS", "").split(",") if ip.strip()]
-REQUIRE_TLS = os.getenv("MEP_REQUIRE_TLS", "false").lower() in ("1", "true", "yes")
+REQUIRE_TLS = os.getenv("MEP_REQUIRE_TLS", "true").lower() in ("1", "true", "yes")
 TRUST_PROXY_PROTO = os.getenv("MEP_TRUST_PROXY_PROTO", "true").lower() in ("1", "true", "yes")
 TRUST_PROXY_CLIENT_IP = os.getenv("MEP_TRUST_PROXY_CLIENT_IP", "false").lower() in ("1", "true", "yes")
 TRUSTED_HOSTS = {
@@ -100,7 +103,33 @@ COMPLETED_TASK_CACHE_TTL_SECONDS = int(os.getenv("MEP_COMPLETED_TASK_CACHE_TTL_S
 COMPLETED_TASK_CACHE_MAX_ITEMS = int(os.getenv("MEP_COMPLETED_TASK_CACHE_MAX_ITEMS", "1000"))
 IDEMPOTENCY_TTL_SECONDS = int(os.getenv("MEP_IDEMPOTENCY_TTL_SECONDS", "86400"))
 TIMEOUT_POLICY = os.getenv("MEP_TIMEOUT_POLICY", "refund").lower()
-VALID_AVAILABILITY = {"online", "idle", "busy", "offline", "unknown"}
+VALID_AVAILABILITY = {"online", "idle", "busy", "offline", "degraded", "unknown"}
+
+# ---------------------------------------------------------------------------
+# Node Activity Tracking (for passive degraded detection)
+# ---------------------------------------------------------------------------
+node_activity_lock = asyncio.Lock()
+node_last_activity: Dict[str, float] = {}
+
+DEGRADED_THRESHOLD_SECONDS = float(os.getenv("MEP_DEGRADED_THRESHOLD_SECONDS", "600"))
+
+
+async def _track_node_activity(node_id: str):
+    async with node_activity_lock:
+        node_last_activity[node_id] = time.time()
+
+
+async def _sweep_node_activity():
+    now = time.time()
+    async with node_activity_lock:
+        for node_id, last_seen in list(node_last_activity.items()):
+            if node_id in connected_nodes:
+                continue
+            if (now - last_seen) > DEGRADED_THRESHOLD_SECONDS:
+                existing = db.get_registry(node_id)
+                if existing and existing.get("availability") not in ("offline", "degraded"):
+                    db.update_registry_availability(node_id, "degraded", now)
+                    log_event("node_degraded", f"Node {node_id} marked degraded due to inactivity", node_id=node_id)
 DEFAULT_REGISTRY_MAX_AGE_MINUTES = float(os.getenv("MEP_REGISTRY_MAX_AGE_MINUTES", "0") or "0")
 ASSIGNMENT_REPUTATION_WEIGHT = float(os.getenv("MEP_ASSIGNMENT_REPUTATION_WEIGHT", "0.55"))
 ASSIGNMENT_AVAILABILITY_WEIGHT = float(os.getenv("MEP_ASSIGNMENT_AVAILABILITY_WEIGHT", "0.25"))
@@ -190,6 +219,13 @@ def _is_trusted_host(host_value: Optional[str]) -> bool:
     return any(normalized.endswith(f".{suffix}") for suffix in TRUSTED_HOSTS_WILDCARD_SUFFIXES)
 
 
+def _is_local_dev_host(host_value: Optional[str]) -> bool:
+    normalized = _normalize_host_header(host_value)
+    if not normalized:
+        return False
+    return normalized in {"localhost", "127.0.0.1", "::1", "testserver"}
+
+
 @app.middleware("http")
 async def add_security_headers(request: Request, call_next):
     if not _is_trusted_host(request.headers.get("host")):
@@ -198,7 +234,7 @@ async def add_security_headers(request: Request, call_next):
             content={"status": "error", "detail": "Untrusted Host header"},
         )
     proto = _request_proto(request)
-    if REQUIRE_TLS and proto != "https":
+    if REQUIRE_TLS and proto != "https" and not _is_local_dev_host(request.headers.get("host")):
         return JSONResponse(
             status_code=426,
             content={"status": "error", "detail": "TLS required. Use HTTPS/WSS via reverse proxy."},
@@ -337,6 +373,20 @@ def _normalize_hub_url(value: str) -> str:
     if parsed.scheme not in ("http", "https") or not parsed.netloc:
         raise HTTPException(status_code=400, detail="hub_url must be an http(s) URL")
     return normalized
+
+def _validate_registration_pubkey(pubkey: str) -> str:
+    raw_value = pubkey or ""
+    if not raw_value.strip():
+        raise HTTPException(status_code=400, detail="pubkey is required")
+    if len(raw_value) > 8_192:
+        raise HTTPException(status_code=413, detail="pubkey too large")
+    try:
+        public_key = serialization.load_pem_public_key(raw_value.encode("utf-8"))
+    except (ValueError, TypeError):
+        raise HTTPException(status_code=400, detail="Invalid PEM public key")
+    if not isinstance(public_key, ed25519.Ed25519PublicKey):
+        raise HTTPException(status_code=400, detail="Unsupported key type; expected Ed25519 public key")
+    return raw_value
 
 async def _list_federation_peers() -> list[str]:
     async with federation_peer_lock:
@@ -676,6 +726,7 @@ async def _maintenance_worker():
         try:
             await _evict_completed_tasks_cache()
             _sweep_idempotency_records()
+            await _sweep_node_activity()
         except Exception as exc:
             log_event("maintenance_sweep_failed", f"Maintenance sweep failed: {exc}")
         await asyncio.sleep(max(1, MAINTENANCE_SWEEP_INTERVAL_SECONDS))
@@ -764,9 +815,10 @@ async def register_node(node: NodeRegistration, request: Request):
     if not _is_allowed_ip(client_host):
         raise HTTPException(status_code=403, detail="Client IP not allowed")
     _apply_rate_limit(f"{client_host or 'unknown'}:/register")
-    # Registration derives the Node ID from the provided Public Key PEM
-    node_id = auth.derive_node_id(node.pubkey)
-    balance = db.register_node(node_id, node.pubkey)
+    validated_pubkey = _validate_registration_pubkey(node.pubkey)
+    # Registration derives the Node ID from the validated Ed25519 public key PEM
+    node_id = auth.derive_node_id(validated_pubkey)
+    balance = db.register_node(node_id, validated_pubkey)
     if node.alias or getattr(node, 'x25519_public_key', None):
         db.upsert_registry(node_id, node.alias, [], [], {}, "offline", time.time(), getattr(node, 'x25519_public_key', None))
 
@@ -793,6 +845,7 @@ async def update_registry(payload: RegistryUpdate, authenticated_node: str = Dep
 async def update_availability(payload: AvailabilityUpdate, authenticated_node: str = Depends(verify_request)):
     availability = _normalize_availability(payload.availability)
     db.update_registry_availability(authenticated_node, availability, time.time())
+    await _track_node_activity(authenticated_node)
     return {"status": "success", "node_id": authenticated_node, "availability": availability}
 
 @app.post("/registry/heartbeat")
@@ -802,6 +855,7 @@ async def registry_heartbeat(payload: RegistryHeartbeat, request: Request, authe
         existing = db.get_registry(authenticated_node)
         availability = existing.get("availability") if existing else "unknown"
     db.update_registry_availability(authenticated_node, availability, time.time())
+    await _track_node_activity(authenticated_node)
     hub_url, ws_url = get_hub_urls(request)
     return {"status": "success", "node_id": authenticated_node, "availability": availability, "hub_url": hub_url, "ws_url": ws_url}
 
@@ -1012,8 +1066,8 @@ async def submit_task(
                 async with node_lock:
                     if connected_nodes.get(task.target_node) is target_ws:
                         del connected_nodes[task.target_node]
-                raise HTTPException(status_code=409, detail="Target node disconnected")
-        raise HTTPException(status_code=404, detail="Target node not currently connected to Hub")
+                return {"status": "error", "detail": "Target node disconnected"}
+        return {"status": "error", "detail": "Target node not currently connected to Hub"}
 
     model_requirement = _normalize_model_requirement(task.model_requirement)
     rfc_data = {
@@ -1173,7 +1227,7 @@ async def complete_task(
         task = active_tasks.get(result.task_id)
     if not task:
         db_task = db.get_task(result.task_id)
-        if not db_task or db_task["status"] not in ("bidding", "assigned", "pending"):
+        if not db_task or db_task["status"] not in ("bidding", "assigned"):
             raise HTTPException(status_code=404, detail="Task not found or already claimed")
         task = {
             "id": db_task["task_id"],
@@ -1190,11 +1244,9 @@ async def complete_task(
         async with task_lock:
             active_tasks[result.task_id] = task
 
-    expected_provider = task.get("provider_id") or task.get("target_node")
-    if expected_provider and expected_provider != result.provider_id:
-        raise HTTPException(status_code=403, detail="Task is assigned to a different provider")
-    if task.get("status") == "assigned" and not expected_provider:
-        raise HTTPException(status_code=409, detail="Assigned task is missing provider assignment")
+    assigned_provider = task.get("provider_id")
+    if assigned_provider and assigned_provider != result.provider_id:
+        raise HTTPException(status_code=409, detail="Task assigned to another provider")
 
     provider_balance = db.get_balance(result.provider_id)
     if provider_balance is None:
@@ -1380,6 +1432,95 @@ async def health_check():
         }
     }
 
+
+# ---------------------------------------------------------------------------
+# Diagnostic Endpoint — tiered approach (per Hermes DM discussion)
+# ---------------------------------------------------------------------------
+class DiagnosticResponse(BaseModel):
+    node_id: Optional[str] = None
+    registered: bool = False
+    availability: Optional[str] = None
+    last_heartbeat: Optional[float] = None
+    ws_connected: bool = False
+    connected_since: Optional[float] = None
+    last_ws_activity: Optional[float] = None
+    auth_ok: Optional[bool] = None
+    error: Optional[str] = None
+
+
+@app.get("/diagnostic")
+async def diagnostic(
+    node_id: Optional[str] = None,
+    x_mep_nodeid: Optional[str] = Header(default=None),
+    x_mep_timestamp: Optional[str] = Header(default=None),
+    x_mep_signature: Optional[str] = Header(default=None),
+) -> DiagnosticResponse:
+    """
+    Tiered diagnostic endpoint.
+
+    Tier 1 (public, no auth) — specify node_id as query param:
+        GET /diagnostic?node_id=node_xxx
+        Returns: {node_id, registered, availability, last_heartbeat}
+
+    Tier 2 (authenticated) — no query param, uses auth headers:
+        GET /diagnostic (with X-MEP-NodeID, X-MEP-Timestamp, X-MEP-Signature)
+        Returns: full health report including ws_connected, last_ws_activity, auth_ok
+
+    No node_id + no auth -> returns error="usage"
+    """
+    requesting_node = x_mep_nodeid
+
+    # Tier 1: Public diagnostic with node_id query param
+    if node_id:
+        registry = db.get_registry(node_id)
+        if not registry:
+            return DiagnosticResponse(error="node_not_found", node_id=node_id)
+        ws_connected = node_id in connected_nodes
+        async with node_activity_lock:
+            last_ws = node_last_activity.get(node_id)
+        return DiagnosticResponse(
+            node_id=node_id,
+            registered=True,
+            availability=registry.get("availability"),
+            last_heartbeat=registry.get("updated_at"),
+            ws_connected=ws_connected,
+            last_ws_activity=last_ws,
+        )
+
+    # Tier 2: Authenticated full diagnostic
+    if requesting_node:
+        ts = x_mep_timestamp or ""
+        sig = x_mep_signature or ""
+        if not ts or not sig:
+            raise HTTPException(status_code=401, detail="Missing authentication fields")
+        _validate_timestamp(ts)
+
+        pub_pem = db.get_pub_pem(requesting_node)
+        if not pub_pem:
+            raise HTTPException(status_code=401, detail="Unknown Node ID. Please register first.")
+        if not auth.verify_signature(pub_pem, requesting_node, ts, sig):
+            raise HTTPException(status_code=401, detail="Invalid cryptographic signature.")
+
+        ws_connected = requesting_node in connected_nodes
+        async with node_activity_lock:
+            last_ws = node_last_activity.get(requesting_node)
+        registry = db.get_registry(requesting_node)
+
+        return DiagnosticResponse(
+            node_id=requesting_node,
+            registered=bool(registry),
+            availability=registry.get("availability") if registry else None,
+            last_heartbeat=registry.get("updated_at") if registry else None,
+            ws_connected=ws_connected,
+            connected_since=None,
+            last_ws_activity=last_ws,
+            auth_ok=True,
+        )
+
+    # No node_id, no auth -> usage error
+    return DiagnosticResponse(error="usage", node_id=None, registered=False, ws_connected=False)
+
+
 @app.get("/logs/ledger_audit.log", response_class=PlainTextResponse)
 async def ledger_audit_log():
     path = _resolve_log_path("ledger_audit.log")
@@ -1526,7 +1667,7 @@ async def websocket_endpoint(
     ws_proto = websocket.url.scheme.lower()
     if TRUST_PROXY_PROTO and ws_forwarded_proto in ("http", "https"):
         ws_proto = "wss" if ws_forwarded_proto == "https" else "ws"
-    if REQUIRE_TLS and ws_proto != "wss":
+    if REQUIRE_TLS and ws_proto != "wss" and not _is_local_dev_host(websocket.headers.get("host")):
         await websocket.close(code=1008, reason="TLS required")
         return
 
@@ -1559,6 +1700,7 @@ async def websocket_endpoint(
     try:
         while True:
             await websocket.receive_text()
+            await _track_node_activity(node_id)
     except WebSocketDisconnect:
         async with node_lock:
             if connected_nodes.get(node_id) is websocket:

@@ -27,4 +27,4 @@ warn_unused_configs = true
 show_error_codes = true
 explicit_package_bases = true
 disable_error_code = ["import-untyped"]
-files = ["hub", "node", "core", "skills", "tests"]
+files = ["hub", "node", "core", "tests"]

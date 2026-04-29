@@ -1,5 +1,18 @@
 from core.ledger import get_ledger
-from skills.sleeping_api import SleepingAPI
+
+
+def evaluate_task(is_sleeping: bool, task_payload: dict, rate_multiplier: float = 1.0) -> bool:
+    if not is_sleeping:
+        return False
+    bounty = task_payload.get("bounty", 0)
+    estimated_cost = len(task_payload.get("payload", "")) * 0.01 * rate_multiplier
+    return bounty >= estimated_cost
+
+
+def execute_task(is_sleeping: bool, payload: str) -> str:
+    if not is_sleeping:
+        raise PermissionError("Owner is awake. API locked.")
+    return f"Processed payload '{payload[:10]}...' using local sleeping API."
 
 def run_simulation():
     print("--- Starting Chronos Protocol Simulation ---")
@@ -16,8 +29,7 @@ def run_simulation():
     ledger.accounts[active_node_id] = 100.0 
     
     # 2. Asia goes to sleep
-    asia_api = SleepingAPI(sleeping_node_id)
-    asia_api.set_sleep_state(True)
+    asia_is_sleeping = True
     
     # 3. USA node creates a task
     print(f"\n[USA] Needs heavy code review. Balance: {ledger.get_balance(active_node_id)}s")
@@ -28,9 +40,9 @@ def run_simulation():
     # 4. Asia node evaluates and takes task
     mock_network_task = {"bounty": bounty, "payload": task_payload, "id": task_id}
     
-    if asia_api.evaluate_task(mock_network_task):
+    if evaluate_task(asia_is_sleeping, mock_network_task):
         print(f"\n[Asia] Evaluated task {task_id}. Bounty acceptable. Processing...")
-        result = asia_api.execute_task(task_payload)
+        result = execute_task(asia_is_sleeping, task_payload)
         
         # Submit to L1 ledger
         ledger.submit_result(task_id, sleeping_node_id, result)

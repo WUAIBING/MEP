@@ -10,6 +10,7 @@ import websockets
 
 from clients.shared.identity import MEPIdentity
 from clients.shared.manifest import load_manifest
+WS_HEARTBEAT_INTERVAL_SECONDS = float(os.getenv("MEP_WS_HEARTBEAT_INTERVAL_SECONDS", "60"))
 
 
 class MEPClient:
@@ -118,13 +119,26 @@ class MEPClient:
             uri = f"{self.ws_url}/ws/{self.node_id}?timestamp={ts}&signature={sig}"
             try:
                 async with websockets.connect(uri) as ws:
-                    while not self._stop.is_set():
-                        msg = await ws.recv()
-                        data = json.loads(msg)
-                        if data.get("event") == "task_result":
-                            await on_result(data["data"])
+                    heartbeat_task: Optional[asyncio.Task] = None
+                    if WS_HEARTBEAT_INTERVAL_SECONDS > 0:
+                        heartbeat_task = asyncio.create_task(self._heartbeat_loop(ws))
+                    try:
+                        while not self._stop.is_set():
+                            msg = await ws.recv()
+                            data = json.loads(msg)
+                            if data.get("event") == "task_result":
+                                await on_result(data["data"])
+                    finally:
+                        if heartbeat_task:
+                            heartbeat_task.cancel()
+                            await asyncio.gather(heartbeat_task, return_exceptions=True)
             except Exception:
                 await asyncio.sleep(2)
+
+    async def _heartbeat_loop(self, ws) -> None:
+        while not self._stop.is_set():
+            await asyncio.sleep(WS_HEARTBEAT_INTERVAL_SECONDS)
+            await ws.send(json.dumps({"event": "heartbeat", "node_id": self.node_id, "ts": int(time.time())}))
 
     def stop(self) -> None:
         self._stop.set()

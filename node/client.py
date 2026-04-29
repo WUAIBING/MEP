@@ -8,6 +8,8 @@ import urllib.parse
 from reputation import ReputationManager
 from identity import MEPIdentity
 
+WS_HEARTBEAT_INTERVAL_SECONDS = 60
+
 class ChronosNode:
     """
     Simulated Clawdbot Client (Both Consumer & Provider)
@@ -81,14 +83,24 @@ class ChronosNode:
         uri = f"{self.ws_url}/ws/{self.node_id}?timestamp={ts}&signature={sig_safe}"
         async with websockets.connect(uri) as ws:
             print(f"[Node {self.node_id}] Connected to Hub via WebSocket.")
-            while True:
-                msg = await ws.recv()
-                data = json.loads(msg)
-                
-                if data["event"] == "new_task":
-                    asyncio.create_task(self._handle_new_task(data["data"]))
-                elif data["event"] == "task_result":
-                    asyncio.create_task(self._handle_task_result(data["data"]))
+            heartbeat_task = asyncio.create_task(self._heartbeat_loop(ws))
+            try:
+                while True:
+                    msg = await ws.recv()
+                    data = json.loads(msg)
+
+                    if data["event"] == "new_task":
+                        asyncio.create_task(self._handle_new_task(data["data"]))
+                    elif data["event"] == "task_result":
+                        asyncio.create_task(self._handle_task_result(data["data"]))
+            finally:
+                heartbeat_task.cancel()
+                await asyncio.gather(heartbeat_task, return_exceptions=True)
+
+    async def _heartbeat_loop(self, ws):
+        while True:
+            await asyncio.sleep(WS_HEARTBEAT_INTERVAL_SECONDS)
+            await ws.send(json.dumps({"event": "heartbeat", "node_id": self.node_id, "ts": int(time.time())}))
 
     async def submit_task(self, payload: str, bounty: float):
         """As a Consumer, create a task and lock SECONDS."""

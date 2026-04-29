@@ -1,4 +1,5 @@
 import base64
+import binascii
 import hashlib
 import time
 
@@ -23,5 +24,5 @@ def verify_signature(pub_pem: str, payload_str: str, timestamp: str, signature_b
         message = f"{payload_str}{timestamp}".encode("utf-8")
         public_key.verify(signature, message)
         return True
-    except (InvalidSignature, ValueError, Exception):
+    except (InvalidSignature, ValueError, TypeError, binascii.Error):
         return False

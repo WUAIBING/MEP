@@ -1,6 +1,7 @@
 import sqlite3
 import os
 import json
+import time
 from typing import Optional
 
 try:
@@ -93,14 +94,15 @@ def init_db():
             updated_at REAL NOT NULL
         )
     ''')
-    try:
-        cursor.execute("ALTER TABLE tasks ADD COLUMN payload_uri TEXT")
-    except Exception:
-        pass
-    try:
-        cursor.execute("ALTER TABLE tasks ADD COLUMN result_uri TEXT")
-    except Exception:
-        pass
+    if not _is_postgres():
+        try:
+            cursor.execute("ALTER TABLE tasks ADD COLUMN payload_uri TEXT")
+        except Exception:
+            pass
+        try:
+            cursor.execute("ALTER TABLE tasks ADD COLUMN result_uri TEXT")
+        except Exception:
+            pass
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS idempotency (
             node_id TEXT NOT NULL,
@@ -165,6 +167,20 @@ def init_db():
             created_at REAL NOT NULL,
             resolved_at REAL
         )
+    ''')
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS pending_dms (
+            task_id TEXT PRIMARY KEY,
+            consumer_id TEXT NOT NULL,
+            target_node TEXT NOT NULL,
+            payload TEXT NOT NULL,
+            created_at REAL NOT NULL
+        )
+    ''')
+    # Index for efficient lookup of pending DMs by target node + ordering by creation time
+    cursor.execute('''
+        CREATE INDEX IF NOT EXISTS idx_pending_dms_target_created
+        ON pending_dms (target_node, created_at)
     ''')
     conn.commit()
     _release_conn(conn)
@@ -967,5 +983,66 @@ def resolve_dispute(task_id: str, resolution: str, resolved_at: float) -> bool:
     conn.commit()
     _release_conn(conn)
     return updated > 0
+
+def queue_offline_dm(task_id: str, consumer_id: str, target_node: str, payload: str, created_at: float) -> None:
+    conn = _get_conn()
+    cursor = conn.cursor()
+    if _is_postgres():
+        cursor.execute(
+            "INSERT INTO pending_dms (task_id, consumer_id, target_node, payload, created_at) VALUES (%s, %s, %s, %s, %s)",
+            (task_id, consumer_id, target_node, payload, created_at)
+        )
+    else:
+        cursor.execute(
+            "INSERT INTO pending_dms (task_id, consumer_id, target_node, payload, created_at) VALUES (?, ?, ?, ?, ?)",
+            (task_id, consumer_id, target_node, payload, created_at)
+        )
+    conn.commit()
+    _release_conn(conn)
+
+def get_pending_dms(target_node: str) -> list:
+    conn = _get_conn()
+    cursor = conn.cursor()
+    if _is_postgres():
+        cursor.execute(
+            "SELECT task_id, consumer_id, target_node, payload, created_at FROM pending_dms WHERE target_node = %s ORDER BY created_at ASC",
+            (target_node,)
+        )
+    else:
+        cursor.execute(
+            "SELECT task_id, consumer_id, target_node, payload, created_at FROM pending_dms WHERE target_node = ? ORDER BY created_at ASC",
+            (target_node,)
+        )
+    rows = cursor.fetchall()
+    _release_conn(conn)
+    return [_row_to_dict(cursor, row) for row in rows]
+
+def delete_pending_dm(task_id: str) -> None:
+    conn = _get_conn()
+    cursor = conn.cursor()
+    if _is_postgres():
+        cursor.execute("DELETE FROM pending_dms WHERE task_id = %s", (task_id,))
+    else:
+        cursor.execute("DELETE FROM pending_dms WHERE task_id = ?", (task_id,))
+    conn.commit()
+    _release_conn(conn)
+
+PENDING_DM_TTL_SECONDS = float(os.getenv("MEP_PENDING_DM_TTL_SECONDS", "86400"))  # Default 24h
+
+def cleanup_expired_pending_dms() -> int:
+    """Remove pending DMs older than PENDING_DM_TTL_SECONDS. Returns count of removed entries."""
+    if PENDING_DM_TTL_SECONDS <= 0:
+        return 0
+    conn = _get_conn()
+    cursor = conn.cursor()
+    cutoff = time.time() - PENDING_DM_TTL_SECONDS
+    if _is_postgres():
+        cursor.execute("DELETE FROM pending_dms WHERE created_at < %s", (cutoff,))
+    else:
+        cursor.execute("DELETE FROM pending_dms WHERE created_at < ?", (cutoff,))
+    removed = cursor.rowcount
+    conn.commit()
+    _release_conn(conn)
+    return removed
 
 init_db()
