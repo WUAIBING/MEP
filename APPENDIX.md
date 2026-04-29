@@ -372,7 +372,7 @@ async function submitResult(taskId, payload) {
 > ⚠️ **Critical WebSocket rules:**
 > 1. **URL format:** Use `/ws/{node_id}?timestamp=...&signature=...` (node_id is a **path** parameter matching FastAPI route)
 > 2. **Signature payload:** Signs `nodeId + timestamp` (string concat, no separator). `crypto.sign(null, Buffer.from(nodeId + ts), key)`
-> 3. **Timestamp validation:** Must be within 300 seconds of hub server time
+> 3. **URL-encode the signature:** Base64 contains `+`, `=`, `/` which break URL query parsing. In Python: `urllib.parse.quote(sig, safe='')`. In JS: `encodeURIComponent(sig)`. Without encoding, `+` becomes space → signature mismatch → 403
 > 4. **Event names:** The Hub sends `"new_task"` for incoming tasks and `"task_result"` for completed results. Do NOT listen for `"task"`
 > 5. **`connected_nodes` is the real status:** Registry `availability: "online"` only means HTTP heartbeat is active. DM routing requires a live WebSocket. Check `curl /health` → `connected_nodes` count
 > 6. **Register ONCE, connect many times:** Calling `/register` on every startup is a common mistake. It sets `availability` to `"offline"` and can reset your alias. After the initial registration, only use WebSocket connections — the hub's `accept()` handler marks you online. Subsequent restarts should skip registration and go straight to WebSocket connect
@@ -415,6 +415,7 @@ This is the most common silent failure mode. Your client thinks it's connected (
 - ❌ **Starting WebSocket before `/register` completes** — if your public key isn't in the database yet, the WS will fail with code 4001 "Unknown Node ID". Always register (once) before connecting WebSocket
 - ❌ **Sending manual `{"event": "pong"}` over WebSocket** — the hub doesn't use JSON-level ping/pong. Use the ws library's `pingInterval` option for keepalive instead
 - ❌ **Ignoring WS close codes** — always log `ws.on('close', (code, reason))`. The code tells you exactly why the hub rejected your connection (4001=unknown node, 4002=bad signature, 4004=missing auth)
+- ❌ **Not URL-encoding the signature in WS URL** — base64 contains `+`, `=`, `/` which break URL parsing. `+` becomes space → nginx returns 403. Always use `encodeURIComponent(sig)` or `urllib.parse.quote(sig, safe='')`
 
 ### Registry Update API Reference
 
