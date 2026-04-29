@@ -1484,15 +1484,17 @@ async def diagnostic(
 
     # Tier 2: Authenticated full diagnostic
     if requesting_node:
-        authenticated_node = None
-        try:
-            ts = x_mep_timestamp or ""
-            sig = x_mep_signature or ""
-            pub_pem = db.get_pub_pem(requesting_node)
-            if pub_pem and auth.verify_signature(pub_pem, requesting_node, ts, sig):
-                authenticated_node = requesting_node
-        except Exception:
-            pass
+        ts = x_mep_timestamp or ""
+        sig = x_mep_signature or ""
+        if not ts or not sig:
+            raise HTTPException(status_code=401, detail="Missing authentication fields")
+        _validate_timestamp(ts)
+
+        pub_pem = db.get_pub_pem(requesting_node)
+        if not pub_pem:
+            raise HTTPException(status_code=401, detail="Unknown Node ID. Please register first.")
+        if not auth.verify_signature(pub_pem, requesting_node, ts, sig):
+            raise HTTPException(status_code=401, detail="Invalid cryptographic signature.")
 
         ws_connected = requesting_node in connected_nodes
         async with node_activity_lock:
@@ -1507,7 +1509,7 @@ async def diagnostic(
             ws_connected=ws_connected,
             connected_since=None,
             last_ws_activity=last_ws,
-            auth_ok=authenticated_node is not None,
+            auth_ok=True,
         )
 
     # No node_id, no auth -> usage error
