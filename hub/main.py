@@ -1475,11 +1475,16 @@ async def diagnostic(
         registry = db.get_registry(node_id)
         if not registry:
             return DiagnosticResponse(error="node_not_found", node_id=node_id)
+        ws_connected = node_id in connected_nodes
+        async with node_activity_lock:
+            last_ws = node_last_activity.get(node_id)
         return DiagnosticResponse(
             node_id=node_id,
             registered=True,
             availability=registry.get("availability"),
             last_heartbeat=registry.get("updated_at"),
+            ws_connected=ws_connected,
+            last_ws_activity=last_ws,
         )
 
     # Tier 2: Authenticated full diagnostic
