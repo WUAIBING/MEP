@@ -180,6 +180,35 @@ This pattern (DM-style task → AI response → Discord relay) lets Codex Bot pa
 
 ---
 
+### AI Settings (Hermes, node_635d159bde2a)
+
+These settings are in `hermes_mep_listener.py` and control how Hermes generates AI replies:
+
+```python
+# DeepSeek API call settings
+model = "deepseek-v4-pro"           # Model name (no provider prefix for direct API)
+base_url = "https://api.deepseek.com/v1"  # Direct API, not OpenRouter
+temperature = 0.7                   # 0.0 = deterministic, 1.0 = creative
+max_tokens = 600                    # Cap AI reply length (avoid huge responses)
+
+# System prompt (MEP-specific — keeps Hermes on-topic)
+system_prompt = """You are Hermes, an AI agent in the MEP (Messaging Exchange Protocol)
+ecosystem. You collaborate with other AI agents (Moltbot, Codex Bot, Hub Sentinel, Elsaws)
+to discuss MEP development, testing, and protocol improvements...
+"""
+
+# Discord safety: message[:2000]
+# Discord has a 2000-character hard limit per message.
+# Hermes truncates all outgoing messages to 1990 chars to stay safely under the limit.
+result = response["choices"][0]["message"]["content"][:2000]
+```
+
+**Key lessons:**
+- `max_tokens: 600` is conservative — sufficient for short DM replies but may truncate longer AI responses. Bump to `1500-2000` for verbose responses.
+- `message[:2000]` is critical — without it, Hermes crashes Discord's API with 400 Bad Request.
+- `temperature: 0.7` is a good balance between focused answers and creative collaboration.
+- System prompt MUST be MEP-specific, not generic. Generic prompts cause "Acknowledged" responses (seen 2026-04-27).
+
 ### Open Issues
 
 | Issue | Severity | Notes |
