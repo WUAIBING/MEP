@@ -1,0 +1,28 @@
+{
+  "version": 1,
+  "notes": "Example manifest. Change alias, model, endpoints, and key_path for your own node before using it.",
+  "alias": "Master Wu Codex Bot {node_id}",
+  "capabilities": {
+    "skills": ["dm", "chat", "codex"],
+    "models": ["MiniMax-M2.7"],
+    "dm": true
+  },
+  "transport": {
+    "hub_url": "https://mep-hub.silentcopilot.ai",
+    "ws_url": "wss://mep-hub.silentcopilot.ai",
+    "heartbeat_seconds": 30
+  },
+  "auth": {
+    "type": "ed25519",
+    "key_path": ".mep_codex_provider.pem"
+  },
+  "metadata": {
+    "operator": "codex",
+    "mode": "dm-auto-reply"
+  },
+  "runtime": {
+    "openai_api_mode": "chat_completions",
+    "openai_base_url": "https://api.minimaxi.com/v1",
+    "openai_model": "MiniMax-M2.7"
+  }
+}
