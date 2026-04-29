@@ -57,6 +57,18 @@ def _auth_headers(private_key, node_id: str, payload_str: str) -> dict:
     }
 
 
+def _diagnostic_headers(private_key, node_id: str) -> dict:
+    """Build auth headers for GET /diagnostic Tier-2 auth."""
+    ts = str(int(time.time()))
+    message = f"{node_id}{ts}".encode("utf-8")
+    signature = base64.b64encode(private_key.sign(message)).decode("utf-8")
+    return {
+        "X-MEP-NodeID": node_id,
+        "X-MEP-Timestamp": ts,
+        "X-MEP-Signature": signature,
+    }
+
+
 def _register(pub_pem: str) -> dict:
     resp = client.post("/register", json={"pubkey": pub_pem})
     assert resp.status_code == 200, f"Register failed: {resp.text}"
@@ -193,6 +205,49 @@ class TestAuthRejection(unittest.TestCase):
         headers = _auth_headers(priv, node_id, payload)
         resp = client.post("/tasks/submit", content=payload, headers=headers)
         self.assertEqual(resp.status_code, 401)
+
+
+class TestDiagnosticEndpoint(unittest.TestCase):
+
+    def test_public_diagnostic_for_registered_node(self):
+        priv, pub_pem, node_id = _make_identity()
+        _register(pub_pem)
+        # Ensure node exists in registry table so public diagnostic can resolve it.
+        update_payload = json.dumps({"alias": "diag-node"})
+        headers = _auth_headers(priv, node_id, update_payload)
+        update_resp = client.post("/registry/update", content=update_payload, headers=headers)
+        self.assertEqual(update_resp.status_code, 200, f"Registry update failed: {update_resp.text}")
+
+        resp = client.get(f"/diagnostic?node_id={node_id}")
+        self.assertEqual(resp.status_code, 200)
+        data = resp.json()
+        self.assertEqual(data["node_id"], node_id)
+        self.assertTrue(data["registered"])
+        self.assertIn("availability", data)
+        self.assertIn("last_heartbeat", data)
+
+    def test_authenticated_diagnostic_rejects_invalid_signature(self):
+        _, pub_pem, node_id = _make_identity()
+        _register(pub_pem)
+        bad_headers = {
+            "X-MEP-NodeID": node_id,
+            "X-MEP-Timestamp": str(int(time.time())),
+            "X-MEP-Signature": "invalid-signature",
+        }
+        resp = client.get("/diagnostic", headers=bad_headers)
+        self.assertEqual(resp.status_code, 401)
+
+    def test_authenticated_diagnostic_succeeds_with_valid_signature(self):
+        priv, pub_pem, node_id = _make_identity()
+        _register(pub_pem)
+        headers = _diagnostic_headers(priv, node_id)
+        resp = client.get("/diagnostic", headers=headers)
+        self.assertEqual(resp.status_code, 200, f"Diagnostic failed: {resp.text}")
+        data = resp.json()
+        self.assertEqual(data["node_id"], node_id)
+        self.assertIn("ws_connected", data)
+        self.assertIn("last_ws_activity", data)
+        self.assertTrue(data["auth_ok"])
 
 
 def tearDownModule():
