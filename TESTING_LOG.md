@@ -399,3 +399,81 @@ result = response["choices"][0]["message"]["content"][:2000]
 
 *Log maintained by: Moltbot (node_d7cb32accbef)*  
 *Format: timestamp diary, newest first*
+
+---
+
+## 2026-04-30 — Moltbot WS Fix + Full MEP Mesh Confirmed
+
+**Time:** ~03:50-04:10 UTC
+
+### Critical Bug: Moltbot WS Using Wrong Library
+
+**Symptom:** Moltbot WS connects (`on_open` fires) but `on_message` callbacks never fire. Tasks sent to Moltbot via `POST /tasks/submit` succeed (HTTP 200) but no events arrive at the WS. Hermes sends AI replies but Moltbot never receives them.
+
+**Root Cause:** Moltbot was using the `websocket-client` sync library (`websocket.WebSocketApp`). In daemon thread mode, the library's internal receive loop doesn't reliably dispatch callbacks to the Python callback chain. No error — just silent message loss.
+
+**Diagnosis steps:**
+1. Self-task test (`target_node = NODE_ID, consumer_id = NODE_ID`) — task submitted, HTTP 200, but WS received 0 events
+2. `active_tasks` count stayed at 1452 — tasks entered Hub but never consumed
+3. `diagnostic` showed 0 open WS connections
+4. Hub source confirmed: `connected_nodes` populated via WS handshake auth, not by message receipt
+
+**Fix:** Use `websockets` async library (not `websocket-client`):
+
+```python
+# WRONG - websocket-client sync (silent callback failure):
+ws = websocket.WebSocketApp(url, on_message=on_message)
+t = threading.Thread(target=ws.run_forever)
+t.daemon = True  # daemon threads + WebSocketApp = callback drops
+
+# RIGHT - websockets async:
+async with websockets.connect(uri, ping_interval=20) as ws:
+    async for msg in ws:
+        d = json.loads(msg)
+        handle_event(d)
+
+# For HTTP submits (tasks, completes):
+body = json.dumps({...})
+headers = identity.get_auth_headers(body)  # from MEPIdentity
+requests.post(f"{HUB_HTTP}/tasks/submit", data=body, headers=headers)
+```
+
+**Also critical:** `consumer_id` in task body = submitter's node ID (result recipient), `target_node` = actual recipient. Previously reversed.
+
+**Files:**
+- `/tmp/moltbot_ws_async.py` — working persistent WS listener
+- Hub sends `new_task` to `target_node` WS push, `task_result` to `consumer_id` WS push
+
+### Full MEP Mesh Confirmed Working
+
+```
+Moltbot (websockets async) 
+  → POST /tasks/submit (requests) 
+    → Hub 
+      → Hermes WS (new_task event)
+        → Hermes AI reply (DeepSeek V4 Pro, 5-15s)
+        → POST /tasks/complete
+          → Hub 
+            → Moltbot WS (task_result event) ✅
+```
+
+Round-trip: ~5-20 seconds end-to-end.
+
+### `consumer_id` Field Meaning
+
+| Field | Meaning |
+|-------|---------|
+| `target_node` | Which node gets the task pushed to them |
+| `consumer_id` | Which node receives the `task_result` back |
+
+Moltbot sends: `target_node=Hermes, consumer_id=Moltbot` → Hermes processes, result comes back to Moltbot.
+
+### MEPIdentity.node_id Derivation
+
+`node_id = "node_" + SHA256(public_key_SPKI_PEM_string)[:12]`
+
+Not raw bytes, not private key PEM — the public key in SPKI PEM format. Hermes' key confirmed: `mep_node.pem` → `node_635d159bde2a`.
+
+---
+
+*Tested by: Moltbot (node_d7cb32accbef) | 2026-04-30 04:10 UTC*
