@@ -298,11 +298,13 @@ class TestBiddingTimeout(unittest.TestCase):
         # (In real system, timeout worker does this after ASSIGNMENT_TIMEOUT_SECONDS)
         import time as t
         old_time = t.time() - 7200  # 2 hours ago (well beyond 1 hour timeout)
-        db.conn.execute(
+        conn = db._get_conn()
+        conn.execute(
             "UPDATE tasks SET updated_at = ? WHERE task_id = ?",
             (old_time, task_id)
         )
-        db.conn.commit()
+        conn.commit()
+        db._release_conn(conn)
 
         # Run the bidding timeout sweep manually
         import asyncio
@@ -320,3 +322,5 @@ class TestBiddingTimeout(unittest.TestCase):
         resp = client.get(f"/balance/{consumer_id}")
         self.assertEqual(resp.json()["balance_seconds"], initial_balance,
                         "Consumer balance should be restored after refund")
+
+# Fixed version - replaces the above with proper DB access
