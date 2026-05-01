@@ -458,6 +458,43 @@ def expire_task_if_assigned(task_id: str, updated_at: float) -> bool:
     _release_conn(conn)
     return updated > 0
 
+def expire_task_if_bidding(task_id: str, updated_at: float) -> bool:
+    """Expire a bidding task (no provider accepted)"""
+    conn = _get_conn()
+    cursor = conn.cursor()
+    if _is_postgres():
+        cursor.execute(
+            "UPDATE tasks SET status = 'expired', provider_id = NULL, updated_at = %s WHERE task_id = %s AND status = 'bidding'",
+            (updated_at, task_id)
+        )
+    else:
+        cursor.execute(
+            "UPDATE tasks SET status = 'expired', provider_id = NULL, updated_at = ? WHERE task_id = ? AND status = 'bidding'",
+            (updated_at, task_id)
+        )
+    updated = cursor.rowcount
+    conn.commit()
+    _release_conn(conn)
+    return updated > 0
+
+def get_bidding_tasks_before(cutoff_ts: float) -> list:
+    """Get bidding tasks older than cutoff - for timeout sweep"""
+    conn = _get_conn()
+    if not _is_postgres():
+        conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+    if _is_postgres():
+        cursor.execute("SELECT task_id, consumer_id, payload, bounty, updated_at FROM tasks WHERE status = 'bidding' AND updated_at < %s", (cutoff_ts,))
+    else:
+        cursor.execute("SELECT task_id, consumer_id, payload, bounty, updated_at FROM tasks WHERE status = 'bidding' AND updated_at < ?", (cutoff_ts,))
+    rows = cursor.fetchall()
+    if _is_postgres():
+        result = [_row_to_dict(cursor, row) for row in rows]
+    else:
+        result = [dict(row) for row in rows]
+    _release_conn(conn)
+    return result
+
 def requeue_task_if_assigned(task_id: str, updated_at: float) -> bool:
     conn = _get_conn()
     cursor = conn.cursor()
