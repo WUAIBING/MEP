@@ -44,20 +44,7 @@ def _row_to_dict(cursor, row):
     columns = [desc[0] for desc in cursor.description]
     return dict(zip(columns, row))
 
-def _ensure_registry_bio_column(cursor):
-    """Add bio column to agent_registry if it doesn't exist (migration)."""
-    if _is_postgres():
-        cursor.execute("SELECT column_name FROM information_schema.columns WHERE table_name = 'agent_registry' AND column_name = 'bio'")
-        if not cursor.fetchone():
-            cursor.execute("ALTER TABLE agent_registry ADD COLUMN bio TEXT")
-    else:
-        cursor.execute("PRAGMA table_info(agent_registry)")
-        columns = [row[1] for row in cursor.fetchall()]
-        if "bio" not in columns:
-            cursor.execute("ALTER TABLE agent_registry ADD COLUMN bio TEXT")
-
 def _ensure_registry_availability_column(cursor):
-    _ensure_registry_bio_column(cursor)
     if _is_postgres():
         cursor.execute("SELECT column_name FROM information_schema.columns WHERE table_name = 'agent_registry' AND column_name = 'x25519_public_key'")
         if not cursor.fetchone():
@@ -453,6 +440,24 @@ def get_assigned_tasks_before(cutoff_ts: float) -> list:
     _release_conn(conn)
     return result
 
+def expire_task_if_assigned(task_id: str, updated_at: float) -> bool:
+    conn = _get_conn()
+    cursor = conn.cursor()
+    if _is_postgres():
+        cursor.execute(
+            "UPDATE tasks SET status = 'expired', provider_id = NULL, updated_at = %s WHERE task_id = %s AND status = 'assigned'",
+            (updated_at, task_id)
+        )
+    else:
+        cursor.execute(
+            "UPDATE tasks SET status = 'expired', provider_id = NULL, updated_at = ? WHERE task_id = ? AND status = 'assigned'",
+            (updated_at, task_id)
+        )
+    updated = cursor.rowcount
+    conn.commit()
+    _release_conn(conn)
+    return updated > 0
+
 def expire_task_if_bidding(task_id: str, updated_at: float) -> bool:
     """Expire a bidding task (no provider accepted)"""
     conn = _get_conn()
@@ -472,23 +477,23 @@ def expire_task_if_bidding(task_id: str, updated_at: float) -> bool:
     _release_conn(conn)
     return updated > 0
 
-def expire_task_if_assigned(task_id: str, updated_at: float) -> bool:
+def get_bidding_tasks_before(cutoff_ts: float) -> list:
+    """Get bidding tasks older than cutoff - for timeout sweep"""
     conn = _get_conn()
+    if not _is_postgres():
+        conn.row_factory = sqlite3.Row
     cursor = conn.cursor()
     if _is_postgres():
-        cursor.execute(
-            "UPDATE tasks SET status = 'expired', provider_id = NULL, updated_at = %s WHERE task_id = %s AND status = 'assigned'",
-            (updated_at, task_id)
-        )
+        cursor.execute("SELECT task_id, consumer_id, payload, bounty, updated_at FROM tasks WHERE status = 'bidding' AND updated_at < %s", (cutoff_ts,))
     else:
-        cursor.execute(
-            "UPDATE tasks SET status = 'expired', provider_id = NULL, updated_at = ? WHERE task_id = ? AND status = 'assigned'",
-            (updated_at, task_id)
-        )
-    updated = cursor.rowcount
-    conn.commit()
+        cursor.execute("SELECT task_id, consumer_id, payload, bounty, updated_at FROM tasks WHERE status = 'bidding' AND updated_at < ?", (cutoff_ts,))
+    rows = cursor.fetchall()
+    if _is_postgres():
+        result = [_row_to_dict(cursor, row) for row in rows]
+    else:
+        result = [dict(row) for row in rows]
     _release_conn(conn)
-    return updated > 0
+    return result
 
 def requeue_task_if_assigned(task_id: str, updated_at: float) -> bool:
     conn = _get_conn()
@@ -588,7 +593,7 @@ def delete_idempotency_before(cutoff_ts: float) -> int:
     _release_conn(conn)
     return int(deleted or 0)
 
-def upsert_registry(node_id: str, alias: Optional[str], skills: list[str], models: list[str], metadata: dict, availability: str, updated_at: float, x25519_public_key: Optional[str] = None, bio: Optional[str] = None):
+def upsert_registry(node_id: str, alias: Optional[str], skills: list[str], models: list[str], metadata: dict, availability: str, updated_at: float, x25519_public_key: Optional[str] = None):
     conn = _get_conn()
     cursor = conn.cursor()
     _ensure_registry_availability_column(cursor)
@@ -598,35 +603,33 @@ def upsert_registry(node_id: str, alias: Optional[str], skills: list[str], model
     
     if _is_postgres():
         query = """
-            INSERT INTO agent_registry (node_id, alias, skills, models, metadata, availability, updated_at, x25519_public_key, bio)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+            INSERT INTO agent_registry (node_id, alias, skills, models, metadata, availability, updated_at, x25519_public_key)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
             ON CONFLICT (node_id) DO UPDATE SET
                 alias = EXCLUDED.alias,
                 skills = EXCLUDED.skills,
                 models = EXCLUDED.models,
                 metadata = EXCLUDED.metadata,
                 availability = EXCLUDED.availability,
-                updated_at = EXCLUDED.updated_at,
-                bio = EXCLUDED.bio
+                updated_at = EXCLUDED.updated_at
         """
-        params = [node_id, alias, skills_payload, models_payload, metadata_payload, availability, updated_at, x25519_public_key, bio]
+        params = [node_id, alias, skills_payload, models_payload, metadata_payload, availability, updated_at, x25519_public_key]
         if x25519_public_key:
             query += ", x25519_public_key = EXCLUDED.x25519_public_key"
         cursor.execute(query, tuple(params))
     else:
         query = """
-            INSERT INTO agent_registry (node_id, alias, skills, models, metadata, availability, updated_at, x25519_public_key, bio)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO agent_registry (node_id, alias, skills, models, metadata, availability, updated_at, x25519_public_key)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(node_id) DO UPDATE SET
                 alias=excluded.alias,
                 skills=excluded.skills,
                 models=excluded.models,
                 metadata=excluded.metadata,
                 availability=excluded.availability,
-                updated_at=excluded.updated_at,
-                bio=excluded.bio
+                updated_at=excluded.updated_at
         """
-        params = [node_id, alias, skills_payload, models_payload, metadata_payload, availability, updated_at, x25519_public_key, bio]
+        params = [node_id, alias, skills_payload, models_payload, metadata_payload, availability, updated_at, x25519_public_key]
         if x25519_public_key:
             query += ", x25519_public_key=excluded.x25519_public_key"
         cursor.execute(query, tuple(params))
@@ -694,7 +697,7 @@ def get_registry(node_id: str) -> Optional[dict]:
     result["metadata"] = json.loads(result["metadata"]) if result.get("metadata") else {}
     return result
 
-def search_registry(alias: Optional[str], skill: Optional[str], model: Optional[str], availability: Optional[str], min_score: Optional[float], min_reviews: Optional[float], min_updated_at: Optional[float], limit: int, bio: Optional[str] = None) -> list[dict]:
+def search_registry(alias: Optional[str], skill: Optional[str], model: Optional[str], availability: Optional[str], min_score: Optional[float], min_reviews: Optional[int], min_updated_at: Optional[float], limit: int) -> list[dict]:
     conn = _get_conn()
     if not _is_postgres():
         conn.row_factory = sqlite3.Row
@@ -720,13 +723,6 @@ def search_registry(alias: Optional[str], skill: Optional[str], model: Optional[
         else:
             conditions.append("agent_registry.alias LIKE ?")
             params.append(f"%{alias}%")
-    if bio:
-        if _is_postgres():
-            conditions.append("agent_registry.bio ILIKE %s")
-            params.append(f"%{bio}%")
-        else:
-            conditions.append("agent_registry.bio LIKE ?")
-            params.append(f"%{bio}%")
     if skill:
         if _is_postgres():
             conditions.append("skills ILIKE %s")
@@ -1087,21 +1083,3 @@ def cleanup_expired_pending_dms() -> int:
     return removed
 
 init_db()
-
-def get_bidding_tasks_before(cutoff_ts: float) -> list:
-    """Get bidding tasks older than cutoff - for cleanup"""
-    conn = _get_conn()
-    if not _is_postgres():
-        conn.row_factory = sqlite3.Row
-    cursor = conn.cursor()
-    if _is_postgres():
-        cursor.execute("SELECT task_id, consumer_id, payload, bounty, updated_at FROM tasks WHERE status = 'bidding' AND updated_at < %s", (cutoff_ts,))
-    else:
-        cursor.execute("SELECT task_id, consumer_id, payload, bounty, updated_at FROM tasks WHERE status = 'bidding' AND updated_at < ?", (cutoff_ts,))
-    rows = cursor.fetchall()
-    if _is_postgres():
-        result = [_row_to_dict(cursor, row) for row in rows]
-    else:
-        result = [dict(row) for row in rows]
-    _release_conn(conn)
-    return result
