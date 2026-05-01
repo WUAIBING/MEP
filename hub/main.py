@@ -350,11 +350,12 @@ async def _list_federation_peers() -> list[str]:
 
 def _build_registry_query(
     alias: Optional[str],
+    bio: Optional[str],
     skill: Optional[str],
     model: Optional[str],
     availability: Optional[str],
     min_score: Optional[float],
-    min_reviews: Optional[int],
+    min_reviews: Optional[float],
     max_age_minutes: Optional[float],
     limit: int
 ) -> dict:
@@ -367,6 +368,7 @@ def _build_registry_query(
         safe_max_age = max(0.0, max_age_minutes)
     min_updated_at = None if safe_max_age is None else time.time() - safe_max_age * 60.0
     normalized_alias = alias.strip().lower() if alias else None
+    normalized_bio = bio.strip().lower() if bio else None
     normalized_skill = skill.strip().lower() if skill else None
     normalized_model = model.strip().lower() if model else None
     normalized_availability = _normalize_availability(availability) if availability else None
@@ -376,6 +378,7 @@ def _build_registry_query(
         "safe_min_reviews": safe_min_reviews,
         "min_updated_at": min_updated_at,
         "normalized_alias": normalized_alias,
+        "normalized_bio": normalized_bio,
         "normalized_skill": normalized_skill,
         "normalized_model": normalized_model,
         "normalized_availability": normalized_availability
@@ -667,10 +670,38 @@ async def _sweep_assigned_timeouts():
                 del active_tasks[task["task_id"]]
         log_event("task_expired", f"Task {task['task_id'][:8]} expired after timeout", task_id=task["task_id"], consumer_id=task["consumer_id"], provider_id=task["provider_id"], bounty=task["bounty"])
 
+# NEW: Sweep bidding tasks that were never picked up
+async def _sweep_bidding_timeouts():
+    """Expire bidding tasks that never got a provider and refund bounty"""
+    if ASSIGNMENT_TIMEOUT_SECONDS <= 0:
+        return
+    cutoff = time.time() - ASSIGNMENT_TIMEOUT_SECONDS
+    expired_bidding = db.get_bidding_tasks_before(cutoff)
+    if not expired_bidding:
+        return
+    now = time.time()
+    for task in expired_bidding:
+        if not db.expire_task_if_bidding(task["task_id"], now):
+            continue
+        # Refund escrow to consumer for unassigned bidding tasks
+        if task.get("bounty", 0) > 0:
+            refunded = db.refund_escrow(task["task_id"], now)
+            if refunded is None:
+                # If no escrow, add balance directly
+                db.add_balance(task["consumer_id"], task["bounty"])
+            new_balance = db.get_balance(task["consumer_id"])
+            log_audit("BIDDING_TIMEOUT_REFUND", task["consumer_id"], task["bounty"], new_balance, task["task_id"])
+        async with task_lock:
+            if task["task_id"] in active_tasks:
+                del active_tasks[task["task_id"]]
+        log_event("task_expired_bidding", f"Task {task['task_id'][:8]} expired, refunded {task.get('bounty', 0)}", task_id=task["task_id"], consumer_id=task["consumer_id"], bounty=task.get("bounty", 0))
+    return result
+
 async def _assignment_timeout_worker():
     while True:
         try:
             await _sweep_assigned_timeouts()
+            await _sweep_bidding_timeouts()  # Add bidding sweep
         except Exception as exc:
             log_event("timeout_sweep_failed", f"Timeout sweep failed: {exc}")
         await asyncio.sleep(ASSIGNMENT_SWEEP_INTERVAL_SECONDS)
@@ -774,8 +805,8 @@ async def register_node(node: NodeRegistration, request: Request):
     # Registration derives the Node ID from the provided Public Key PEM
     node_id = auth.derive_node_id(node.pubkey)
     balance = db.register_node(node_id, node.pubkey)
-    if node.alias or getattr(node, 'x25519_public_key', None):
-        db.upsert_registry(node_id, node.alias, [], [], {}, "offline", time.time(), getattr(node, 'x25519_public_key', None))
+    if node.alias or getattr(node, 'x25519_public_key', None) or getattr(node, 'bio', None):
+        db.upsert_registry(node_id, node.alias, [], [], {}, "offline", time.time(), getattr(node, 'x25519_public_key', None), getattr(node, 'bio', None))
 
     log_event("node_registered", f"Node {node_id} registered with starting balance {balance}", node_id=node_id, starting_balance=balance)
     log_audit("REGISTER", node_id, balance, balance, "START_BONUS")
@@ -793,7 +824,7 @@ async def update_registry(payload: RegistryUpdate, authenticated_node: str = Dep
     if availability is None:
         existing = db.get_registry(authenticated_node)
         availability = existing.get("availability") if existing else "unknown"
-    db.upsert_registry(authenticated_node, payload.alias, skills, models, metadata, availability, time.time())
+    db.upsert_registry(authenticated_node, payload.alias, skills, models, metadata, availability, time.time(), bio=getattr(payload, 'bio', None))
     return {"status": "success", "node_id": authenticated_node}
 
 @app.post("/registry/availability")
@@ -838,6 +869,7 @@ async def registry_heartbeat(payload: RegistryHeartbeat, request: Request, authe
 @app.get("/registry/search")
 async def search_registry(
     alias: Optional[str] = None,
+    bio: Optional[str] = None,
     skill: Optional[str] = None,
     model: Optional[str] = None,
     availability: Optional[str] = None,
@@ -846,7 +878,7 @@ async def search_registry(
     max_age_minutes: Optional[float] = None,
     limit: int = 20
 ):
-    query = _build_registry_query(alias, skill, model, availability, min_score, min_reviews, max_age_minutes, limit)
+    query = _build_registry_query(alias, bio, skill, model, availability, min_score, min_reviews, max_age_minutes, limit)
     results = _search_registry_local(query)
     return {"count": len(results), "results": results}
 
@@ -878,6 +910,7 @@ async def remove_federation_peer(hub_url: str, x_mep_admin_key: Optional[str] = 
 @app.get("/federation/discovery")
 async def federation_discovery(
     alias: Optional[str] = None,
+    bio: Optional[str] = None,
     skill: Optional[str] = None,
     model: Optional[str] = None,
     availability: Optional[str] = None,
@@ -887,7 +920,7 @@ async def federation_discovery(
     limit: int = 20,
     include_local: bool = True
 ):
-    query = _build_registry_query(alias, skill, model, availability, min_score, min_reviews, max_age_minutes, min(limit, FEDERATION_REMOTE_LIMIT))
+    query = _build_registry_query(alias, bio, skill, model, availability, min_score, min_reviews, max_age_minutes, min(limit, FEDERATION_REMOTE_LIMIT))
     local_results = _search_registry_local(query) if include_local else []
     for item in local_results:
         item["source_hub"] = HUB_ID
