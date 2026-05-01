@@ -21,6 +21,7 @@ class MEPClient:
         self.session.trust_env = False
         self.task_channels: dict[str, str] = {}
         self._stop = asyncio.Event()
+        self._heartbeat_task: asyncio.Task | None = None
         manifest = load_manifest()
         self.hub_url = (
             hub_url
@@ -33,6 +34,11 @@ class MEPClient:
             or os.getenv("WS_URL")
             or (manifest.ws_url if manifest else None)
             or "wss://mep-hub.silentcopilot.ai"
+        )
+        self.heartbeat_seconds = int(
+            os.getenv("MEP_HEARTBEAT_SECONDS")
+            or (manifest.heartbeat_seconds if manifest else 30)
+            or 30
         )
 
     async def register(self) -> dict:
@@ -49,6 +55,30 @@ class MEPClient:
         headers = self.identity.get_auth_headers(payload_str)
         headers["Content-Type"] = "application/json"
         return headers
+
+    async def heartbeat_loop(self, availability: str = "online") -> None:
+        while not self._stop.is_set():
+            body = {"availability": availability}
+            payload_str = json.dumps(body)
+            try:
+                response = await asyncio.to_thread(
+                    self.session.post,
+                    f"{self.hub_url}/registry/heartbeat",
+                    data=payload_str,
+                    headers=self._auth_headers(payload_str),
+                    timeout=15,
+                )
+                response.raise_for_status()
+            except Exception:
+                # Best-effort keepalive; receiver/reconnect loop handles hard failures.
+                pass
+            await asyncio.sleep(max(1, self.heartbeat_seconds))
+
+    def start_heartbeat(self, availability: str = "online") -> asyncio.Task:
+        if self._heartbeat_task and not self._heartbeat_task.done():
+            return self._heartbeat_task
+        self._heartbeat_task = asyncio.create_task(self.heartbeat_loop(availability=availability))
+        return self._heartbeat_task
 
     async def submit_task(
         self,
@@ -142,3 +172,5 @@ class MEPClient:
 
     def stop(self) -> None:
         self._stop.set()
+        if self._heartbeat_task and not self._heartbeat_task.done():
+            self._heartbeat_task.cancel()
