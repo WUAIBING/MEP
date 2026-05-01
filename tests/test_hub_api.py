@@ -322,5 +322,3 @@ class TestBiddingTimeout(unittest.TestCase):
         resp = client.get(f"/balance/{consumer_id}")
         self.assertEqual(resp.json()["balance_seconds"], initial_balance,
                         "Consumer balance should be restored after refund")
-
-# Fixed version - replaces the above with proper DB access
