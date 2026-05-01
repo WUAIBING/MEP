@@ -4,6 +4,7 @@ from typing import Optional, List, Dict, Any
 class NodeRegistration(BaseModel):
     pubkey: str = Field(..., description="Node's public key or UUID")
     alias: Optional[str] = None
+    bio: Optional[str] = Field(default=None, description="Short biography / description of this node (max 280 chars)")
 
 class TaskCreate(BaseModel):
     consumer_id: str
@@ -33,6 +34,7 @@ class NodeBalance(BaseModel):
 
 class RegistryUpdate(BaseModel):
     alias: Optional[str] = None
+    bio: Optional[str] = Field(default=None, description="Short biography / description (max 280 chars)")
     skills: Optional[List[str]] = None
     models: Optional[List[str]] = None
     metadata: Optional[Dict[str, Any]] = None
