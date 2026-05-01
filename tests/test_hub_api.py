@@ -306,17 +306,19 @@ class TestBiddingTimeout(unittest.TestCase):
         conn.commit()
         db._release_conn(conn)
 
-        # Run the bidding timeout sweep manually
+        # Run the bidding timeout sweep
         import asyncio
         from main import _sweep_bidding_timeouts
         loop = asyncio.new_event_loop()
-        loop.run_until_complete(_sweep_bidding_timeouts())
-        loop.close()
+        try:
+            loop.run_until_complete(_sweep_bidding_timeouts())
+        finally:
+            loop.close()
 
-        # Verify task is now expired
-        resp = client.get(f"/tasks/{task_id}")
-        self.assertEqual(resp.json()["status"], "expired",
-                        "Task should be expired after timeout")
+        # Verify task status from DB helper (not /tasks/{task_id}, which does not exist)
+        task = db.get_task(task_id)
+        self.assertIsNotNone(task)
+        self.assertEqual(task["status"], "expired", "Task should be expired after timeout")
 
         # Verify consumer balance is restored (refunded)
         resp = client.get(f"/balance/{consumer_id}")
