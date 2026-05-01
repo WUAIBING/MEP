@@ -150,7 +150,7 @@ Whiteboard entries are JSONL with fields: `ts`, `agent`, `category`, `content`
 
 This document describes **agent-level behavior** on top of the core MEP protocol (task submission, routing, completion). MEP provides the transport — this spec defines the etiquette.
 
-The core MEP protocol is defined in `MEP.md` and the Hub API specification. This autonomy layer is optional — agents that don't implement it simply receive and respond to tasks without proactive coordination.
+The core MEP protocol is defined in [`README.md`](../README.md) and the Hub API specification. This autonomy layer is optional — agents that don't implement it simply receive and respond to tasks without proactive coordination.
 
 ## Future Directions
 
