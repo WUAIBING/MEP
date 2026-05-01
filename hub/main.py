@@ -698,8 +698,6 @@ async def _assignment_timeout_worker():
             await _sweep_bidding_timeouts()
         except Exception as exc:
             log_event("timeout_sweep_failed", f"Timeout sweep failed: {exc}")
-        except Exception as exc:
-            log_event("timeout_sweep_failed", f"Timeout sweep failed: {exc}")
         await asyncio.sleep(ASSIGNMENT_SWEEP_INTERVAL_SECONDS)
 
 async def _maintenance_worker():
