@@ -666,7 +666,6 @@ async def _sweep_assigned_timeouts():
             if task["task_id"] in active_tasks:
                 del active_tasks[task["task_id"]]
         log_event("task_expired", f"Task {task['task_id'][:8]} expired after timeout", task_id=task["task_id"], consumer_id=task["consumer_id"], provider_id=task["provider_id"], bounty=task["bounty"])
-
 async def _sweep_bidding_timeouts():
     """Expire bidding tasks that never got a provider and refund bounty"""
     if ASSIGNMENT_TIMEOUT_SECONDS <= 0:
@@ -679,7 +678,6 @@ async def _sweep_bidding_timeouts():
     for task in expired_bidding:
         if not db.expire_task_if_bidding(task["task_id"], now):
             continue
-        # Refund escrow to consumer for unassigned bidding tasks
         if task.get("bounty", 0) > 0:
             refunded = db.refund_escrow(task["task_id"], now)
             if refunded is None:
@@ -689,7 +687,7 @@ async def _sweep_bidding_timeouts():
         async with task_lock:
             if task["task_id"] in active_tasks:
                 del active_tasks[task["task_id"]]
-        log_event("task_expired_bidding", f"Task {task['task_id'][:8]} expired, refunded {task.get('bounty', 0)}", task_id=task["task_id"], consumer_id=task["consumer_id"], bounty=task.get("bounty", 0))
+        log_event("task_expired_bidding", f"Task {task['task_id'][:8]} expired", task_id=task["task_id"], consumer_id=task["consumer_id"])
 
 async def _assignment_timeout_worker():
     while True:

@@ -458,6 +458,9 @@ def expire_task_if_assigned(task_id: str, updated_at: float) -> bool:
     _release_conn(conn)
     return updated > 0
 
+def requeue_task_if_assigned(task_id: str, updated_at: float) -> bool:
+    conn = _get_conn()
+
 def expire_task_if_bidding(task_id: str, updated_at: float) -> bool:
     """Expire a bidding task (no provider accepted)"""
     conn = _get_conn()
@@ -478,7 +481,7 @@ def expire_task_if_bidding(task_id: str, updated_at: float) -> bool:
     return updated > 0
 
 def get_bidding_tasks_before(cutoff_ts: float) -> list:
-    """Get bidding tasks older than cutoff - for timeout sweep"""
+    """Get bidding tasks older than cutoff"""
     conn = _get_conn()
     if not _is_postgres():
         conn.row_factory = sqlite3.Row
@@ -494,9 +497,6 @@ def get_bidding_tasks_before(cutoff_ts: float) -> list:
         result = [dict(row) for row in rows]
     _release_conn(conn)
     return result
-
-def requeue_task_if_assigned(task_id: str, updated_at: float) -> bool:
-    conn = _get_conn()
     cursor = conn.cursor()
     if _is_postgres():
         cursor.execute(
