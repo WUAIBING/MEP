@@ -72,6 +72,14 @@ class CodexProvider:
         self._stop = asyncio.Event()
         self._llm_api_key = os.getenv("OPENAI_API_KEY")
 
+    def _log(self, message: str) -> None:
+        try:
+            print(message)
+        except UnicodeEncodeError:
+            # Keep provider alive on Windows consoles that cannot emit some Unicode.
+            fallback = message.encode("utf-8", errors="replace").decode("utf-8", errors="replace")
+            print(fallback)
+
     def _auth_headers(self, payload_str: str) -> dict:
         return self.client._auth_headers(payload_str)
 
@@ -204,7 +212,7 @@ class CodexProvider:
                 )
                 response.raise_for_status()
             except Exception as exc:
-                print(f"[codex-provider] heartbeat failed: {exc}")
+                self._log(f"[codex-provider] heartbeat failed: {exc}")
             await asyncio.sleep(self.heartbeat_seconds)
 
     async def complete_task(self, task: dict) -> None:
@@ -226,7 +234,7 @@ class CodexProvider:
             timeout=20,
         )
         response.raise_for_status()
-        print(f"[codex-provider] completed task {task_id} for {consumer_id}")
+        self._log(f"[codex-provider] completed task {task_id} for {consumer_id}")
 
     async def ws_loop(self) -> None:
         import websockets
@@ -237,7 +245,7 @@ class CodexProvider:
             uri = f"{self.client.ws_url}/ws/{self.client.node_id}?timestamp={ts}&signature={sig}"
             try:
                 async with websockets.connect(uri) as ws:
-                    print(f"[codex-provider] websocket connected: {self.client.node_id}")
+                    self._log(f"[codex-provider] websocket connected: {self.client.node_id}")
                     while not self._stop.is_set():
                         try:
                             raw = await asyncio.wait_for(ws.recv(), timeout=20)
@@ -250,16 +258,16 @@ class CodexProvider:
                         if event == "new_task":
                             await self.complete_task(task)
                         elif event == "task_result":
-                            print(f"[codex-provider] task_result: {task}")
+                            self._log(f"[codex-provider] task_result: {task}")
                         elif event == "rfc":
-                            print(f"[codex-provider] rfc ignored: {task.get('id')}")
+                            self._log(f"[codex-provider] rfc ignored: {task.get('id')}")
             except Exception as exc:
-                print(f"[codex-provider] websocket disconnected: {exc}")
+                self._log(f"[codex-provider] websocket disconnected: {exc}")
                 await asyncio.sleep(3)
 
     async def run(self) -> None:
         registration = await self.register()
-        print(
+        self._log(
             f"[codex-provider] registered {registration.get('node_id')} alias='{self.alias}' "
             f"balance={registration.get('balance')}"
         )

@@ -113,6 +113,7 @@ class StdioAdapter:
 
     async def run(self) -> None:
         await self.client.register()
+        heartbeat = self.client.start_heartbeat(availability="online")
         listener = asyncio.create_task(self.client.listen_results(self._handle_result))
         print(f"[{self.platform_name}] connected as {self.client.node_id}")
         print(f"[{self.platform_name}] commands: mep, mepdm, mepdata, mepcancel, mepresult, mepbalance, exit")
@@ -124,6 +125,7 @@ class StdioAdapter:
                 keep_going = await self._dispatch_line(line)
         finally:
             self.client.stop()
+            heartbeat.cancel()
             listener.cancel()
 
 

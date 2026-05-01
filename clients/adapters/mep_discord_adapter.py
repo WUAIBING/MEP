@@ -33,6 +33,7 @@ async def on_ready():
     if DISCORD_TOKEN is None:
         return
     await client.register()
+    client.start_heartbeat(availability="online")
 
     async def on_result(data: dict):
         task_id = data.get("task_id")
@@ -124,4 +125,7 @@ async def mepbalance(ctx):
 
 
 if DISCORD_TOKEN:
-    bot.run(DISCORD_TOKEN)
+    try:
+        bot.run(DISCORD_TOKEN)
+    finally:
+        client.stop()
