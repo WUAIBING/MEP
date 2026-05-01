@@ -260,3 +260,67 @@ def tearDownModule():
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestBiddingTimeout(unittest.TestCase):
+    """Test bidding task timeout + refund flow"""
+
+    def test_stale_bidding_task_expired_and_refunded(self):
+        """Verify stale bidding tasks are expired and bounty refunded to consumer"""
+        # Setup: consumer and provider
+        consumer_priv, consumer_pub, consumer_id = _make_identity()
+        provider_priv, provider_pub, provider_id = _make_identity()
+        _register(consumer_pub)
+        _register(provider_pub)
+
+        # Get initial balance
+        resp = client.get(f"/balance/{consumer_id}")
+        initial_balance = resp.json()["balance_seconds"]
+
+        # Submit task with bounty (escrow created)
+        bounty = 1.0
+        task_payload = json.dumps({
+            "consumer_id": consumer_id,
+            "payload": "Stale task that will timeout",
+            "bounty": bounty,
+        })
+        headers = _auth_headers(consumer_priv, consumer_id, task_payload)
+        resp = client.post("/tasks/submit", content=task_payload, headers=headers)
+        self.assertEqual(resp.status_code, 200, f"Submit failed: {resp.text}")
+        task_id = resp.json()["task_id"]
+
+        # Verify balance is escrowed (reduced by bounty)
+        resp = client.get(f"/balance/{consumer_id}")
+        self.assertLess(resp.json()["balance_seconds"], initial_balance,
+                       "Consumer balance should decrease by bounty")
+
+        # Simulate task aging: directly update task's updated_at in DB to be old
+        # (In real system, timeout worker does this after ASSIGNMENT_TIMEOUT_SECONDS)
+        import time as t
+        old_time = t.time() - 7200  # 2 hours ago (well beyond 1 hour timeout)
+        conn = db._get_conn()
+        conn.execute(
+            "UPDATE tasks SET updated_at = ? WHERE task_id = ?",
+            (old_time, task_id)
+        )
+        conn.commit()
+        db._release_conn(conn)
+
+        # Run the bidding timeout sweep
+        import asyncio
+        from main import _sweep_bidding_timeouts
+        loop = asyncio.new_event_loop()
+        try:
+            loop.run_until_complete(_sweep_bidding_timeouts())
+        finally:
+            loop.close()
+
+        # Verify task status from DB helper (not /tasks/{task_id}, which does not exist)
+        task = db.get_task(task_id)
+        self.assertIsNotNone(task)
+        self.assertEqual(task["status"], "expired", "Task should be expired after timeout")
+
+        # Verify consumer balance is restored (refunded)
+        resp = client.get(f"/balance/{consumer_id}")
+        self.assertEqual(resp.json()["balance_seconds"], initial_balance,
+                        "Consumer balance should be restored after refund")
