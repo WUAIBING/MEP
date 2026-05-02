@@ -12,8 +12,13 @@ import unittest
 
 # Point hub DB at a temp file so tests don't pollute anything
 _test_db = os.path.join(tempfile.gettempdir(), "mep_test_hub.db")
+try:
+    os.remove(_test_db)
+except OSError:
+    pass
 os.environ["MEP_SQLITE_PATH"] = _test_db
 os.environ.setdefault("MEP_DATABASE_URL", "")  # force SQLite
+os.environ.setdefault("MEP_START_BONUS_SECONDS", "0.0")
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(__file__)), "hub"))
 
@@ -95,7 +100,8 @@ class TestRegistration(unittest.TestCase):
         data = _register(pub_pem)
         self.assertEqual(data["status"], "success")
         self.assertTrue(data["node_id"].startswith("node_"))
-        self.assertGreater(data["balance"], 0)
+        self.assertEqual(data["balance"], 0.0)
+        self.assertTrue(data["was_created"])
 
     def test_duplicate_registration_preserves_balance(self):
         _, pub_pem, _ = _make_identity()
@@ -103,6 +109,23 @@ class TestRegistration(unittest.TestCase):
         data2 = _register(pub_pem)
         self.assertEqual(data1["node_id"], data2["node_id"])
         self.assertEqual(data1["balance"], data2["balance"])
+        self.assertTrue(data1["was_created"])
+        self.assertFalse(data2["was_created"])
+
+    def test_configured_start_bonus_for_new_node(self):
+        _, pub_pem, node_id = _make_identity()
+        balance, was_created = db.register_node(node_id, pub_pem, 10.0)
+        self.assertTrue(was_created)
+        self.assertEqual(balance, 10.0)
+
+    def test_duplicate_registration_ignores_later_start_bonus(self):
+        _, pub_pem, node_id = _make_identity()
+        balance1, was_created1 = db.register_node(node_id, pub_pem, 0.0)
+        balance2, was_created2 = db.register_node(node_id, pub_pem, 10.0)
+        self.assertTrue(was_created1)
+        self.assertFalse(was_created2)
+        self.assertEqual(balance1, 0.0)
+        self.assertEqual(balance2, 0.0)
 
 
 class TestBalance(unittest.TestCase):
@@ -112,7 +135,7 @@ class TestBalance(unittest.TestCase):
         _register(pub_pem)
         resp = client.get(f"/balance/{node_id}")
         self.assertEqual(resp.status_code, 200)
-        self.assertGreater(resp.json()["balance_seconds"], 0)
+        self.assertEqual(resp.json()["balance_seconds"], 0.0)
 
     def test_unknown_node_404(self):
         resp = client.get("/balance/node_doesnotexist")
@@ -128,6 +151,7 @@ class TestTaskLifecycle(unittest.TestCase):
         provider_priv, provider_pub, provider_id = _make_identity()
         _register(consumer_pub)
         _register(provider_pub)
+        db.set_balance(consumer_id, 10.0)
 
         # Submit task
         bounty = 1.0
@@ -163,9 +187,9 @@ class TestTaskLifecycle(unittest.TestCase):
         self.assertEqual(resp.json()["status"], "success")
         self.assertEqual(resp.json()["earned"], bounty)
 
-        # Verify provider balance increased
+        # Verify provider earned the bounty from a zero default starting balance.
         resp = client.get(f"/balance/{provider_id}")
-        self.assertGreater(resp.json()["balance_seconds"], 10.0)  # 10 starting + 1 earned
+        self.assertEqual(resp.json()["balance_seconds"], bounty)
 
     def test_insufficient_balance_rejected(self):
         consumer_priv, consumer_pub, consumer_id = _make_identity()
@@ -272,6 +296,7 @@ class TestBiddingTimeout(unittest.TestCase):
         provider_priv, provider_pub, provider_id = _make_identity()
         _register(consumer_pub)
         _register(provider_pub)
+        db.set_balance(consumer_id, 10.0)
 
         # Get initial balance
         resp = client.get(f"/balance/{consumer_id}")

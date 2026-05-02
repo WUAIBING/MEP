@@ -104,6 +104,7 @@ COMPLETED_TASK_CACHE_MAX_ITEMS = int(os.getenv("MEP_COMPLETED_TASK_CACHE_MAX_ITE
 IDEMPOTENCY_TTL_SECONDS = int(os.getenv("MEP_IDEMPOTENCY_TTL_SECONDS", "86400"))
 TIMEOUT_POLICY = os.getenv("MEP_TIMEOUT_POLICY", "refund").lower()
 VALID_AVAILABILITY = {"online", "idle", "busy", "offline", "degraded", "unknown"}
+START_BONUS_SECONDS = float(os.getenv("MEP_START_BONUS_SECONDS", "0.0"))
 
 # ---------------------------------------------------------------------------
 # Node Activity Tracking (for passive degraded detection)
@@ -842,16 +843,19 @@ async def register_node(node: NodeRegistration, request: Request):
     validated_pubkey = _validate_registration_pubkey(node.pubkey)
     # Registration derives the Node ID from the validated Ed25519 public key PEM
     node_id = auth.derive_node_id(validated_pubkey)
-    balance = db.register_node(node_id, validated_pubkey)
+    balance, was_created = db.register_node(node_id, validated_pubkey, START_BONUS_SECONDS)
     if node.alias or getattr(node, 'x25519_public_key', None):
         db.upsert_registry(node_id, node.alias, [], [], {}, "offline", time.time(), getattr(node, 'x25519_public_key', None))
 
-    log_event("node_registered", f"Node {node_id} registered with starting balance {balance}", node_id=node_id, starting_balance=balance)
-    log_audit("REGISTER", node_id, balance, balance, "START_BONUS")
+    log_event("node_registered", f"Node {node_id} registered with balance {balance}", node_id=node_id, balance=balance, was_created=was_created, start_bonus_seconds=START_BONUS_SECONDS)
+    if was_created and START_BONUS_SECONDS > 0:
+        log_audit("REGISTER", node_id, START_BONUS_SECONDS, balance, "START_BONUS")
+    else:
+        log_audit("REGISTER", node_id, 0.0, balance, "REGISTER")
 
     hub_url, ws_url = get_hub_urls(request)
 
-    return {"status": "success", "node_id": node_id, "balance": balance, "hub_url": hub_url, "ws_url": ws_url}
+    return {"status": "success", "node_id": node_id, "balance": balance, "was_created": was_created, "hub_url": hub_url, "ws_url": ws_url}
 
 @app.post("/registry/update")
 async def update_registry(payload: RegistryUpdate, authenticated_node: str = Depends(verify_request)):
