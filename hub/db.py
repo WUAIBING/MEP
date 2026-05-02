@@ -197,10 +197,40 @@ def init_db():
         CREATE INDEX IF NOT EXISTS idx_pending_dms_target_created
         ON pending_dms (target_node, created_at)
     ''')
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS registration_audit (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            node_id TEXT NOT NULL,
+            pubkey_fingerprint TEXT NOT NULL,
+            client_ip TEXT,
+            registered_at REAL NOT NULL,
+            start_bonus_enabled INTEGER NOT NULL DEFAULT 0
+        )
+    ''')
+    if _is_postgres():
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS registration_audit (
+                id SERIAL PRIMARY KEY,
+                node_id TEXT NOT NULL,
+                pubkey_fingerprint TEXT NOT NULL,
+                client_ip TEXT,
+                registered_at DOUBLE PRECISION NOT NULL,
+                start_bonus_enabled BOOLEAN NOT NULL DEFAULT FALSE
+            )
+        ''')
+    cursor.execute('''
+        CREATE INDEX IF NOT EXISTS idx_registration_audit_node_id
+        ON registration_audit (node_id)
+    ''')
+    cursor.execute('''
+        CREATE INDEX IF NOT EXISTS idx_registration_audit_registered_at
+        ON registration_audit (registered_at)
+    ''')
     conn.commit()
     _release_conn(conn)
 
-def register_node(node_id: str, pub_pem: str) -> float:
+def register_node(node_id: str, pub_pem: str, start_bonus_enabled: bool = False, client_ip: str = None) -> float:
+    import hashlib
     conn = _get_conn()
     cursor = conn.cursor()
     if _is_postgres():
@@ -208,25 +238,40 @@ def register_node(node_id: str, pub_pem: str) -> float:
     else:
         cursor.execute("SELECT balance FROM ledger WHERE node_id = ?", (node_id,))
     row = cursor.fetchone()
+    initial_balance = 10.0 if start_bonus_enabled else 0.0
     if not row:
         if _is_postgres():
             cursor.execute(
                 "INSERT INTO ledger (node_id, pub_pem, balance) VALUES (%s, %s, %s) ON CONFLICT (node_id) DO NOTHING",
-                (node_id, pub_pem, 10.0)
+                (node_id, pub_pem, initial_balance)
             )
         else:
             cursor.execute(
                 "INSERT OR IGNORE INTO ledger (node_id, pub_pem, balance) VALUES (?, ?, ?)",
-                (node_id, pub_pem, 10.0)
+                (node_id, pub_pem, initial_balance)
             )
         conn.commit()
+    # Registration audit log
+    pubkey_fingerprint = hashlib.sha256(pub_pem.encode()).hexdigest()[:16]
+    now = time.time()
+    if _is_postgres():
+        cursor.execute(
+            "INSERT INTO registration_audit (node_id, pubkey_fingerprint, client_ip, registered_at, start_bonus_enabled) VALUES (%s, %s, %s, %s, %s)",
+            (node_id, pubkey_fingerprint, client_ip, now, start_bonus_enabled)
+        )
+    else:
+        cursor.execute(
+            "INSERT INTO registration_audit (node_id, pubkey_fingerprint, client_ip, registered_at, start_bonus_enabled) VALUES (?, ?, ?, ?, ?)",
+            (node_id, pubkey_fingerprint, client_ip, now, 1 if start_bonus_enabled else 0)
+        )
+    conn.commit()
     if _is_postgres():
         cursor.execute("SELECT balance FROM ledger WHERE node_id = %s", (node_id,))
     else:
         cursor.execute("SELECT balance FROM ledger WHERE node_id = ?", (node_id,))
     row = cursor.fetchone()
     _release_conn(conn)
-    return row[0] if row else 10.0
+    return row[0] if row else 0.0
 
 def get_pub_pem(node_id: str) -> Optional[str]:
     conn = _get_conn()
@@ -257,6 +302,41 @@ def get_node_count() -> int:
         cursor.execute("SELECT COUNT(*) FROM ledger")
     else:
         cursor.execute("SELECT COUNT(*) FROM ledger")
+    row = cursor.fetchone()
+    _release_conn(conn)
+    return int(row[0]) if row else 0
+
+
+def get_completed_tasks_count(node_id: str) -> int:
+    """Return count of tasks completed by this node as provider."""
+    conn = _get_conn()
+    cursor = conn.cursor()
+    if _is_postgres():
+        cursor.execute(
+            "SELECT COUNT(*) FROM tasks WHERE provider_id = %s AND status = 'completed'",
+            (node_id,)
+        )
+    else:
+        cursor.execute(
+            "SELECT COUNT(*) FROM tasks WHERE provider_id = ? AND status = 'completed'",
+            (node_id,)
+        )
+    row = cursor.fetchone()
+    _release_conn(conn)
+    return int(row[0]) if row else 0
+
+
+def get_registration_audit_count(client_ip: str = None) -> int:
+    """Return count of registrations, optionally filtered by IP."""
+    conn = _get_conn()
+    cursor = conn.cursor()
+    if client_ip:
+        if _is_postgres():
+            cursor.execute("SELECT COUNT(*) FROM registration_audit WHERE client_ip = %s", (client_ip,))
+        else:
+            cursor.execute("SELECT COUNT(*) FROM registration_audit WHERE client_ip = ?", (client_ip,))
+    else:
+        cursor.execute("SELECT COUNT(*) FROM registration_audit")
     row = cursor.fetchone()
     _release_conn(conn)
     return int(row[0]) if row else 0
