@@ -67,6 +67,19 @@ def _ensure_registry_availability_column(cursor):
         if "availability" not in columns:
             cursor.execute("ALTER TABLE agent_registry ADD COLUMN availability TEXT NOT NULL DEFAULT 'unknown'")
 
+def _ensure_tasks_expires_in_seconds_column(cursor):
+    if _is_postgres():
+        cursor.execute(
+            "SELECT column_name FROM information_schema.columns WHERE table_name = 'tasks' AND column_name = 'expires_in_seconds'"
+        )
+        if not cursor.fetchone():
+            cursor.execute("ALTER TABLE tasks ADD COLUMN expires_in_seconds INTEGER")
+    else:
+        cursor.execute("PRAGMA table_info(tasks)")
+        columns = [row[1] for row in cursor.fetchall()]
+        if "expires_in_seconds" not in columns:
+            cursor.execute("ALTER TABLE tasks ADD COLUMN expires_in_seconds INTEGER")
+
 def init_db():
     conn = _get_conn()
     cursor = conn.cursor()
@@ -87,6 +100,7 @@ def init_db():
             status TEXT NOT NULL,
             target_node TEXT,
             model_requirement TEXT,
+            expires_in_seconds INTEGER,
             result_payload TEXT,
             payload_uri TEXT,
             result_uri TEXT,
@@ -94,6 +108,7 @@ def init_db():
             updated_at REAL NOT NULL
         )
     ''')
+    _ensure_tasks_expires_in_seconds_column(cursor)
     if not _is_postgres():
         try:
             cursor.execute("ALTER TABLE tasks ADD COLUMN payload_uri TEXT")
@@ -286,18 +301,30 @@ def deduct_balance(node_id: str, amount: float) -> bool:
     _release_conn(conn)
     return updated > 0
 
-def create_task(task_id: str, consumer_id: str, payload: str, bounty: float, status: str, target_node: Optional[str], model_requirement: Optional[str], created_at: float, result_payload: Optional[str] = None, payload_uri: Optional[str] = None):
+def create_task(
+    task_id: str,
+    consumer_id: str,
+    payload: str,
+    bounty: float,
+    status: str,
+    target_node: Optional[str],
+    model_requirement: Optional[str],
+    created_at: float,
+    result_payload: Optional[str] = None,
+    payload_uri: Optional[str] = None,
+    expires_in_seconds: Optional[int] = None,
+):
     conn = _get_conn()
     cursor = conn.cursor()
     if _is_postgres():
         cursor.execute(
-            "INSERT INTO tasks (task_id, consumer_id, provider_id, payload, bounty, status, target_node, model_requirement, result_payload, payload_uri, created_at, updated_at) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
-            (task_id, consumer_id, None, payload, bounty, status, target_node, model_requirement, result_payload, payload_uri, created_at, created_at)
+            "INSERT INTO tasks (task_id, consumer_id, provider_id, payload, bounty, status, target_node, model_requirement, expires_in_seconds, result_payload, payload_uri, created_at, updated_at) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
+            (task_id, consumer_id, None, payload, bounty, status, target_node, model_requirement, expires_in_seconds, result_payload, payload_uri, created_at, created_at)
         )
     else:
         cursor.execute(
-            "INSERT INTO tasks (task_id, consumer_id, provider_id, payload, bounty, status, target_node, model_requirement, result_payload, payload_uri, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (task_id, consumer_id, None, payload, bounty, status, target_node, model_requirement, result_payload, payload_uri, created_at, created_at)
+            "INSERT INTO tasks (task_id, consumer_id, provider_id, payload, bounty, status, target_node, model_requirement, expires_in_seconds, result_payload, payload_uri, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (task_id, consumer_id, None, payload, bounty, status, target_node, model_requirement, expires_in_seconds, result_payload, payload_uri, created_at, created_at)
         )
     conn.commit()
     _release_conn(conn)
@@ -489,6 +516,80 @@ def get_bidding_tasks_before(cutoff_ts: float) -> list:
         cursor.execute("SELECT task_id, consumer_id, payload, bounty, updated_at FROM tasks WHERE status = 'bidding' AND updated_at < %s", (cutoff_ts,))
     else:
         cursor.execute("SELECT task_id, consumer_id, payload, bounty, updated_at FROM tasks WHERE status = 'bidding' AND updated_at < ?", (cutoff_ts,))
+    rows = cursor.fetchall()
+    if _is_postgres():
+        result = [_row_to_dict(cursor, row) for row in rows]
+    else:
+        result = [dict(row) for row in rows]
+    _release_conn(conn)
+    return result
+
+def get_assigned_tasks_for_timeout(now_ts: float, default_timeout: int, min_timeout: int, max_timeout: int) -> list:
+    conn = _get_conn()
+    if not _is_postgres():
+        conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+    if _is_postgres():
+        cursor.execute(
+            """
+            SELECT *
+            FROM tasks
+            WHERE status = 'assigned'
+              AND updated_at < (
+                %s - LEAST(GREATEST(COALESCE(expires_in_seconds, %s), %s), %s)
+              )
+            """,
+            (now_ts, default_timeout, min_timeout, max_timeout),
+        )
+    else:
+        cursor.execute(
+            """
+            SELECT *
+            FROM tasks
+            WHERE status = 'assigned'
+              AND updated_at < (
+                ? - MIN(MAX(COALESCE(expires_in_seconds, ?), ?), ?)
+              )
+            """,
+            (now_ts, default_timeout, min_timeout, max_timeout),
+        )
+    rows = cursor.fetchall()
+    if _is_postgres():
+        result = [_row_to_dict(cursor, row) for row in rows]
+    else:
+        result = [dict(row) for row in rows]
+    _release_conn(conn)
+    return result
+
+def get_bidding_tasks_for_timeout(now_ts: float, default_timeout: int, min_timeout: int, max_timeout: int) -> list:
+    conn = _get_conn()
+    if not _is_postgres():
+        conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+    if _is_postgres():
+        cursor.execute(
+            """
+            SELECT task_id, consumer_id, payload, bounty, updated_at, expires_in_seconds
+            FROM tasks
+            WHERE status = 'bidding'
+              AND updated_at < (
+                %s - LEAST(GREATEST(COALESCE(expires_in_seconds, %s), %s), %s)
+              )
+            """,
+            (now_ts, default_timeout, min_timeout, max_timeout),
+        )
+    else:
+        cursor.execute(
+            """
+            SELECT task_id, consumer_id, payload, bounty, updated_at, expires_in_seconds
+            FROM tasks
+            WHERE status = 'bidding'
+              AND updated_at < (
+                ? - MIN(MAX(COALESCE(expires_in_seconds, ?), ?), ?)
+              )
+            """,
+            (now_ts, default_timeout, min_timeout, max_timeout),
+        )
     rows = cursor.fetchall()
     if _is_postgres():
         result = [_row_to_dict(cursor, row) for row in rows]

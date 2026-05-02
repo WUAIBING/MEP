@@ -281,11 +281,6 @@ def tearDownModule():
     except OSError:
         pass
 
-
-if __name__ == "__main__":
-    unittest.main()
-
-
 class TestBiddingTimeout(unittest.TestCase):
     """Test bidding task timeout + refund flow"""
 
@@ -349,3 +344,55 @@ class TestBiddingTimeout(unittest.TestCase):
         resp = client.get(f"/balance/{consumer_id}")
         self.assertEqual(resp.json()["balance_seconds"], initial_balance,
                         "Consumer balance should be restored after refund")
+
+
+class TestConsumerDefinedTimeout(unittest.TestCase):
+    """Per-task consumer timeout should override global default within bounds."""
+
+    def test_consumer_timeout_expires_task_earlier(self):
+        consumer_priv, consumer_pub, consumer_id = _make_identity()
+        _register(consumer_pub)
+
+        resp = client.get(f"/balance/{consumer_id}")
+        initial_balance = resp.json()["balance_seconds"]
+
+        bounty = 1.0
+        task_payload = json.dumps({
+            "consumer_id": consumer_id,
+            "payload": "Expire me quickly",
+            "bounty": bounty,
+            "expires_in_seconds": 60,
+        })
+        headers = _auth_headers(consumer_priv, consumer_id, task_payload)
+        resp = client.post("/tasks/submit", content=task_payload, headers=headers)
+        self.assertEqual(resp.status_code, 200, f"Submit failed: {resp.text}")
+        task_id = resp.json()["task_id"]
+
+        # This is older than the consumer timeout (60s) but younger than global default (3600s).
+        old_time = time.time() - 120
+        conn = db._get_conn()
+        conn.execute(
+            "UPDATE tasks SET updated_at = ? WHERE task_id = ?",
+            (old_time, task_id)
+        )
+        conn.commit()
+        db._release_conn(conn)
+
+        import asyncio
+        from main import _sweep_bidding_timeouts
+        loop = asyncio.new_event_loop()
+        try:
+            loop.run_until_complete(_sweep_bidding_timeouts())
+        finally:
+            loop.close()
+
+        task = db.get_task(task_id)
+        self.assertIsNotNone(task)
+        self.assertEqual(task["status"], "expired")
+
+        resp = client.get(f"/balance/{consumer_id}")
+        self.assertEqual(resp.json()["balance_seconds"], initial_balance)
+
+
+if __name__ == "__main__":
+    unittest.main()
