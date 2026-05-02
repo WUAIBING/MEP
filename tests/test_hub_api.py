@@ -352,6 +352,7 @@ class TestConsumerDefinedTimeout(unittest.TestCase):
     def test_consumer_timeout_expires_task_earlier(self):
         consumer_priv, consumer_pub, consumer_id = _make_identity()
         _register(consumer_pub)
+        db.set_balance(consumer_id, 10.0)
 
         resp = client.get(f"/balance/{consumer_id}")
         initial_balance = resp.json()["balance_seconds"]
