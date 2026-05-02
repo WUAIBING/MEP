@@ -48,6 +48,7 @@ ALLOWED_IPS = [ip.strip() for ip in os.getenv("MEP_ALLOWED_IPS", "").split(",") 
 REQUIRE_TLS = os.getenv("MEP_REQUIRE_TLS", "true").lower() in ("1", "true", "yes")
 TRUST_PROXY_PROTO = os.getenv("MEP_TRUST_PROXY_PROTO", "true").lower() in ("1", "true", "yes")
 TRUST_PROXY_CLIENT_IP = os.getenv("MEP_TRUST_PROXY_CLIENT_IP", "false").lower() in ("1", "true", "yes")
+MEP_START_BONUS_ENABLED = os.getenv("MEP_START_BONUS_ENABLED", "false").lower() in ("1", "true", "yes")
 TRUSTED_HOSTS = {
     item.strip().lower()
     for item in os.getenv("MEP_TRUSTED_HOSTS", "").split(",")
@@ -859,7 +860,7 @@ async def register_node(node: NodeRegistration, request: Request):
     validated_pubkey = _validate_registration_pubkey(node.pubkey)
     # Registration derives the Node ID from the validated Ed25519 public key PEM
     node_id = auth.derive_node_id(validated_pubkey)
-    balance = db.register_node(node_id, validated_pubkey)
+    balance = db.register_node(node_id, validated_pubkey, start_bonus_enabled=MEP_START_BONUS_ENABLED, client_ip=client_host)
     if node.alias or getattr(node, 'x25519_public_key', None):
         db.upsert_registry(node_id, node.alias, [], [], {}, "offline", time.time(), getattr(node, 'x25519_public_key', None))
 
@@ -1240,6 +1241,10 @@ async def place_bid(bid: TaskBid, authenticated_node: str = Depends(verify_reque
         if assignment_profile["risk_reasons"]:
             risk_reasons = ", ".join(assignment_profile["risk_reasons"])
             return {"status": "rejected", "detail": f"Provider rejected by risk control: {risk_reasons}"}
+        # PR #92: Penalize providers with 0 completed tasks (Sybil defense)
+        completed_count = db.get_completed_tasks_count(bid.provider_id)
+        if completed_count == 0:
+            log_event("bid_zero_tasks", f"Provider {bid.provider_id} bidding with 0 completed tasks", provider_id=bid.provider_id, task_id=bid.task_id)
         if not db.assign_task_if_open(bid.task_id, bid.provider_id, time.time()):
             return {"status": "rejected", "detail": "Task already assigned to another node"}
         task["status"] = "assigned"
