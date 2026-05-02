@@ -11,6 +11,7 @@ class TaskCreate(BaseModel):
     bounty: float
     target_node: Optional[str] = None  # Direct messaging / specific bot targeting
     model_requirement: Optional[str] = None
+    expires_in_seconds: Optional[int] = Field(default=None, ge=1)
     secret_data: Optional[str] = None
     payload_uri: Optional[str] = None  # IPFS or HTTP link to payload
 

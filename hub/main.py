@@ -97,6 +97,9 @@ DISPUTE_WINDOW_SECONDS = int(os.getenv("MEP_DISPUTE_WINDOW_SECONDS", "86400"))
 DISPUTE_REASON_MIN_CHARS = int(os.getenv("MEP_DISPUTE_REASON_MIN_CHARS", "10"))
 DISPUTE_REASON_MAX_CHARS = int(os.getenv("MEP_DISPUTE_REASON_MAX_CHARS", "500"))
 ASSIGNMENT_TIMEOUT_SECONDS = int(os.getenv("MEP_ASSIGNMENT_TIMEOUT_SECONDS", "3600"))
+TASK_TIMEOUT_DEFAULT_SECONDS = int(os.getenv("MEP_TASK_TIMEOUT_DEFAULT_SECONDS", str(ASSIGNMENT_TIMEOUT_SECONDS)))
+TASK_TIMEOUT_MIN_SECONDS = int(os.getenv("MEP_TASK_TIMEOUT_MIN_SECONDS", "60"))
+TASK_TIMEOUT_MAX_SECONDS = int(os.getenv("MEP_TASK_TIMEOUT_MAX_SECONDS", "86400"))
 ASSIGNMENT_SWEEP_INTERVAL_SECONDS = int(os.getenv("MEP_ASSIGNMENT_SWEEP_INTERVAL_SECONDS", "60"))
 MAINTENANCE_SWEEP_INTERVAL_SECONDS = int(os.getenv("MEP_MAINTENANCE_SWEEP_INTERVAL_SECONDS", "60"))
 COMPLETED_TASK_CACHE_TTL_SECONDS = int(os.getenv("MEP_COMPLETED_TASK_CACHE_TTL_SECONDS", "3600"))
@@ -104,6 +107,10 @@ COMPLETED_TASK_CACHE_MAX_ITEMS = int(os.getenv("MEP_COMPLETED_TASK_CACHE_MAX_ITE
 IDEMPOTENCY_TTL_SECONDS = int(os.getenv("MEP_IDEMPOTENCY_TTL_SECONDS", "86400"))
 TIMEOUT_POLICY = os.getenv("MEP_TIMEOUT_POLICY", "refund").lower()
 VALID_AVAILABILITY = {"online", "idle", "busy", "offline", "degraded", "unknown"}
+
+if TASK_TIMEOUT_MIN_SECONDS > TASK_TIMEOUT_MAX_SECONDS:
+    TASK_TIMEOUT_MIN_SECONDS, TASK_TIMEOUT_MAX_SECONDS = TASK_TIMEOUT_MAX_SECONDS, TASK_TIMEOUT_MIN_SECONDS
+TASK_TIMEOUT_DEFAULT_SECONDS = max(TASK_TIMEOUT_MIN_SECONDS, min(TASK_TIMEOUT_DEFAULT_SECONDS, TASK_TIMEOUT_MAX_SECONDS))
 
 # ---------------------------------------------------------------------------
 # Node Activity Tracking (for passive degraded detection)
@@ -292,6 +299,7 @@ async def _load_active_tasks_from_db():
             "status": task["status"],
             "target_node": task["target_node"],
             "model_requirement": task["model_requirement"],
+            "expires_in_seconds": task.get("expires_in_seconds"),
             "provider_id": task["provider_id"],
             "payload_uri": task.get("payload_uri"),
             "secret_data": task.get("result_payload")
@@ -655,13 +663,17 @@ def _sweep_idempotency_records():
         log_event("idempotency_cleaned", f"Removed {removed} expired idempotency records", removed=removed)
 
 async def _sweep_assigned_timeouts():
-    if ASSIGNMENT_TIMEOUT_SECONDS <= 0:
-        return
-    cutoff = time.time() - ASSIGNMENT_TIMEOUT_SECONDS
-    expired_tasks = db.get_assigned_tasks_before(cutoff)
-    if not expired_tasks:
+    if TASK_TIMEOUT_DEFAULT_SECONDS <= 0:
         return
     now = time.time()
+    expired_tasks = db.get_assigned_tasks_for_timeout(
+        now,
+        TASK_TIMEOUT_DEFAULT_SECONDS,
+        TASK_TIMEOUT_MIN_SECONDS,
+        TASK_TIMEOUT_MAX_SECONDS,
+    )
+    if not expired_tasks:
+        return
     for task in expired_tasks:
         if TIMEOUT_POLICY == "rebroadcast" and not task["target_node"]:
             if not db.requeue_task_if_assigned(task["task_id"], now):
@@ -674,6 +686,7 @@ async def _sweep_assigned_timeouts():
                 "status": "bidding",
                 "target_node": task["target_node"],
                 "model_requirement": task["model_requirement"],
+                "expires_in_seconds": task.get("expires_in_seconds"),
                 "payload_uri": task.get("payload_uri"),
                 "secret_data": task.get("result_payload")
             }
@@ -715,13 +728,17 @@ async def _sweep_assigned_timeouts():
 
 async def _sweep_bidding_timeouts():
     """Expire bidding tasks that never got a provider and refund bounty"""
-    if ASSIGNMENT_TIMEOUT_SECONDS <= 0:
-        return
-    cutoff = time.time() - ASSIGNMENT_TIMEOUT_SECONDS
-    expired_bidding = db.get_bidding_tasks_before(cutoff)
-    if not expired_bidding:
+    if TASK_TIMEOUT_DEFAULT_SECONDS <= 0:
         return
     now = time.time()
+    expired_bidding = db.get_bidding_tasks_for_timeout(
+        now,
+        TASK_TIMEOUT_DEFAULT_SECONDS,
+        TASK_TIMEOUT_MIN_SECONDS,
+        TASK_TIMEOUT_MAX_SECONDS,
+    )
+    if not expired_bidding:
+        return
     for task in expired_bidding:
         if not db.expire_task_if_bidding(task["task_id"], now):
             continue
@@ -1032,6 +1049,11 @@ async def submit_task(
         raise HTTPException(status_code=400, detail="Insufficient SECONDS balance to pay for task")
     if task.bounty < 0 and not task.secret_data:
         raise HTTPException(status_code=400, detail="Data market tasks (bounty < 0) require secret_data")
+    if task.expires_in_seconds is not None:
+        task.expires_in_seconds = max(
+            TASK_TIMEOUT_MIN_SECONDS,
+            min(int(task.expires_in_seconds), TASK_TIMEOUT_MAX_SECONDS),
+        )
 
     task_id = str(uuid.uuid4())
     now = time.time()
@@ -1058,10 +1080,23 @@ async def submit_task(
         "status": "bidding",
         "target_node": task.target_node,
         "model_requirement": task.model_requirement,
+        "expires_in_seconds": task.expires_in_seconds,
         "payload_uri": normalized_payload_uri,
         "secret_data": task.secret_data
     }
-    db.create_task(task_id, task.consumer_id, payload, task.bounty, "bidding", task.target_node, task.model_requirement, now, result_payload=task.secret_data, payload_uri=normalized_payload_uri)
+    db.create_task(
+        task_id,
+        task.consumer_id,
+        payload,
+        task.bounty,
+        "bidding",
+        task.target_node,
+        task.model_requirement,
+        now,
+        result_payload=task.secret_data,
+        payload_uri=normalized_payload_uri,
+        expires_in_seconds=task.expires_in_seconds,
+    )
     async with task_lock:
         active_tasks[task_id] = task_data
 
@@ -1158,6 +1193,7 @@ async def cancel_task(
             "status": db_task["status"],
             "target_node": db_task["target_node"],
             "model_requirement": db_task["model_requirement"],
+            "expires_in_seconds": db_task.get("expires_in_seconds"),
             "provider_id": db_task["provider_id"],
             "payload_uri": db_task.get("payload_uri"),
             "secret_data": db_task.get("result_payload")
