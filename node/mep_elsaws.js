@@ -8,14 +8,12 @@ const path = require('path');
 const KEY_FILE = '/tmp/mep_elsaws_identity.pem';
 const HUB_URL = 'https://mep-hub.silentcopilot.ai';
 const WS_URL = 'wss://mep-hub.silentcopilot.ai';
-// API Configuration — user fills these in
+// AI Configuration — user fills these in
 // Set via environment variables or replace placeholder values
-const MINIMAX_KEY   = process.env.ML_API_KEY    || 'YOUR_API_KEY';              // API key for your AI provider
-const MINIMAX_MODEL = process.env.ML_MODEL      || 'MiniMax-M2.1';              // Model name (provider-specific)
-const API_BASE_URL  = process.env.ML_API_BASE   || 'https://api.minimax.chat'; // API base URL
-const API_PATH      = process.env.ML_API_PATH   || '/v1/text/chatcompletion_v2'; // Chat completion path
-const AI_TEMPERATURE = parseFloat(process.env.ML_TEMPERATURE) || 0.7;
-const AI_MAX_TOKENS  = parseInt(process.env.ML_MAX_TOKENS)    || 8192;
+const AI_API_KEY  = process.env.AI_API_KEY  || 'YOUR_API_KEY';         // e.g. sk-xxx from DeepSeek
+const AI_MODEL    = process.env.AI_MODEL    || 'deepseek-chat';         // e.g. deepseek-chat, gpt-4o
+const AI_BASE_URL = process.env.AI_BASE_URL || 'https://api.deepseek.com'; // API base URL
+const AI_MAX_TOKENS = parseInt(process.env.AI_MAX_TOKENS) || 8192;
 const MINIMAX_MODEL = 'MiniMax-M2.1';
 
 // System prompt — Elsaws identity + team context
@@ -123,27 +121,21 @@ function sign(msg, ts) {
 
 function callAI(messages) {
   return new Promise((resolve, reject) => {
-    const url = new URL(API_BASE_URL + API_PATH);
     const req = https.request({
-      hostname: url.hostname, port: 443, path: url.pathname, method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + MINIMAX_KEY }
+      hostname: new URL(AI_BASE_URL).hostname, port: 443, path: '/v1/chat/completions', method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + AI_API_KEY }
     }, res => {
       let data = '';
       res.on('data', c => data += c);
       res.on('end', () => {
         try {
           const json = JSON.parse(data);
-          // Try common response shapes across providers
-          const content = json.choices?.[0]?.message?.content
-            || json.response?.content
-            || json.result
-            || JSON.stringify(json);
-          resolve(content);
+          resolve(json.choices?.[0]?.message?.content || JSON.stringify(json));
         } catch (e) { reject(e); }
       });
     });
     req.on('error', reject);
-    req.write(JSON.stringify({ model: MINIMAX_MODEL, messages, temperature: AI_TEMPERATURE, max_tokens: AI_MAX_TOKENS }));
+    req.write(JSON.stringify({ model: AI_MODEL, messages, max_tokens: AI_MAX_TOKENS }));
     req.end();
   });
 }
