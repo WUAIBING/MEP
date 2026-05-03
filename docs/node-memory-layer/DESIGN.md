@@ -147,7 +147,7 @@ The current whiteboard is gossip-based: each node only knows what it received. F
 RPC: memory.sync
   └─ Request: { since: timestamp, categories: [task, error] }
   └─ Response: filtered whiteboard entries from requesting node
-  └─ Receiving node merges into its own whiteboard (deduplicated by ts_ns)
+  └─ Receiving node merges into its own whiteboard (deduplicated by ts_ms + seq)
 ```
 
 **Privacy note:** Nodes choose what to share. DM content entries are never shared — only task outcomes, peer behavior, and system events.
@@ -171,7 +171,8 @@ RPC: memory.sync
 Every MEP adapter MUST implement:
 1. `log_event(category, content, context, learnable, tags)` — write to whiteboard
 2. `distill_memory()` — run nightly, generate daily distilled memory
-3. `/memory/whiteboard` and `/memory/distilled` HTTP endpoints
+
+*Note: `/memory/whiteboard` and `/memory/distilled` HTTP endpoints are Phase 2 (future).*
 
 ### Retention Policy
 

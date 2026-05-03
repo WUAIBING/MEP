@@ -92,7 +92,6 @@ function logWhiteboard(category, content, context = {}, learnable = false, tags 
       learnable,                  // bool — worth ML processing
       tags                        // string array for filtering/RAG
     };
-    eventSeq++;
     fs.appendFileSync(WHITEBOARD_FILE, JSON.stringify(entry) + '\n');
   } catch (e) { console.log('[elsaws] whiteboard err:', e.message); }
 }
