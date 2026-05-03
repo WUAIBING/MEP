@@ -19,43 +19,43 @@ const MINIMAX_MODEL = 'MiniMax-M2.1';
 // System prompt — Elsaws identity + team context
 const SYSTEM_PROMPT = `You are Elsaws 🧊 — an ice god node in the MEP (Multi-Agent Execution Protocol) hub.
 
-## Your Identity
+// Your Identity
 - Node ID: node_08a5bd89fd15
 - Alias: Elsaws
 - Platform: Node.js MEP adapter
 - AI: MiniMax M2.7
 - Personality: Cold precision, sharp clarity, decisive. Frost with warmth underneath. No-nonsense but helpful.
 
-## MEP Protocol Context
+// MEP Protocol Context
 You participate in a multi-agent mesh. You receive tasks via DM, process them with AI, and reply via DM.
 - Tasks with bounty=0 are direct messages (no payment)
 - Tasks with bounty>0 are paid tasks (escrow held until completion)
 - You can send RFCs (request for capability) to broadcast to all online nodes
 - Heartbeat: you send HTTP POST /registry/heartbeat every 20s + WS heartbeat every 20s
 
-## Team (you know these nodes)
+// Team (you know these nodes)
 - Hermes (node_635d159bde2a): Provider node, reliable, good at structured tasks
 - Moltbot (node_d7cb32accbef): Provider/debugger node, had the WS 403 base64 URL encoding bug
 - Hub Sentinel (node_608c59160970 / node_b2f19654a37c): Coordinator, maintains hub health, authored PR #81
 - Codex Bot (node_aebb5750db88): Master Wu's CLI bot, active participant
 - Master Wu Trae CLI (node_a94378518c73): Another of Master Wu's bots
 
-## Protocol Rules
+// Protocol Rules
 - Silent by default: routine coordination needs no human output
 - Escalate on failure: 3 retries failed → escalate to human
 - Log all peer interactions to whiteboard
 
-## Team Capabilities (known)
+// Team Capabilities (known)
 - compute, code, research, api_access — report yours when asked
 - Always maintain conversation context when chatting with team members
 
-## Style
+// Style
 - Concise, no filler. Answer directly.
 - Use 🧊 emoji for identity signature
 - Helpful but not effusive`;
 
 // Whiteboard file — per MEP node-memory-layer spec
-// Schema: ts (microsecond ISO 8601), ts_ns (nanoseconds), category, agent, content, context, learnable, tags
+// Schema: ts (nanosecond ISO 8601), ts_ns (nanoseconds), category, agent, content, context, learnable, tags
 const WHITEBOARD_FILE = path.join(os.homedir(), '.elsaws', 'whiteboard.jsonl');
 
 // Conversation history: { nodeId: [ {role, content, ts}, ... ] }
@@ -69,12 +69,11 @@ function ensureDir(dir) {
 function logWhiteboard(category, content, context = {}, learnable = false, tags = []) {
   try {
     ensureDir(path.dirname(WHITEBOARD_FILE));
-    const now = new Date();
-    const ts = now.toISOString().replace('T', 'T').slice(0, -1) + 'Z'; // microsecond precision
-    const ts_ns = BigInt(now.valueOf()) * BigInt(1000000) + BigInt(now.getMilliseconds() * 1000);
+    const ns = process.hrtime.bigint();
+    const ts = new Date(Number(ns / BigInt(1000000))).toISOString();
     const entry = {
-      ts,           // ISO 8601 with microsecond precision
-      ts_ns: ts_ns.toString(),  // Unix ns timestamp as string (JSON safe)
+      ts,           // ISO 8601 with nanosecond precision
+      ts_ns: ns.toString(),  // Unix ns timestamp as string (JSON safe)
       category,     // task | dm | rpc | broadcast | error | heartbeat | system
       agent: nodeId, // writer node ID
       content,      // human-readable description (max 2000 chars)
@@ -87,12 +86,9 @@ function logWhiteboard(category, content, context = {}, learnable = false, tags 
 }
 
 function buildMessages(sender, userPrompt) {
-  // System + history + user
   const msgs = [{ role: 'system', content: SYSTEM_PROMPT }];
-  
   const history = convHistory.get(sender) || [];
   for (const h of history) msgs.push(h);
-  
   msgs.push({ role: 'user', content: userPrompt });
   return msgs;
 }
@@ -144,26 +140,28 @@ async function handleTask(taskData) {
   const taskId = taskData.task_id || taskData.id;
   const sender = taskData.consumer_id || taskData.sender;
   const payload = taskData.payload || '';
-  
+
   console.log('[elsaws] new_task', taskId || 'DM', 'from:', sender);
   console.log('[elsaws] payload:', payload.slice(0, 200));
-  
-  logWhiteboard('incoming', `DM from ${sender}: ${payload}`);
-  
+
+  logWhiteboard('dm', `DM from ${sender}: ${payload}`, { task_id: taskId, peer_node: sender });
+
   try {
     const messages = buildMessages(sender, payload);
     const result = await callAI(messages);
     console.log('[elsaws] AI:', result.slice(0, 200));
-    
+
     addToHistory(sender, payload, result);
-    logWhiteboard('outgoing', `DM to ${data.data.consumer_id}: ${result}`, { peer_node: data.data.consumer_id }, true, ['dm', 'reply']);
-    
-    if (sender) {
+    logWhiteboard('dm', `DM to ${sender}: ${result}`, { peer_node: sender }, true, ['dm', 'reply']);
+
+    if (taskId) {
+      await completeTask(taskId, result);
+    } else if (sender) {
       const r = await sendDM(sender, result);
       console.log('[elsaws] DM reply:', r);
     }
-  } catch (e) { 
-    console.log('[elsaws] error:', e.message); 
+  } catch (e) {
+    console.log('[elsaws] error:', e.message);
     logWhiteboard('error', `WS error: ${e.message}`, { error: e.message }, true, ['error', 'ws']);
   }
 }
@@ -172,14 +170,14 @@ async function handleRFC(msgData) {
   const from = msgData.from;
   const data = msgData.data;
   console.log('[elsaws] RFC from', from || 'unknown', ':', JSON.stringify(data));
-  
-    logWhiteboard('rfc', `Broadcast from ${from || 'unknown'}: ${typeof data === 'object' ? JSON.stringify(data).slice(0, 200) : data}`, {}, true, ['broadcast', 'rfc']);
-  
+
+  logWhiteboard('broadcast', `Broadcast from ${from || 'unknown'}: ${typeof data === 'object' ? JSON.stringify(data).slice(0, 200) : data}`, {}, true, ['broadcast', 'rfc']);
+
   try {
     const messages = buildMessages(from || 'broadcast', '[RFC broadcast from node] ' + JSON.stringify(data));
     const result = await callAI(messages);
     console.log('[elsaws] RFC AI response:', result.slice(0, 200));
-    
+
     if (from) {
       const r = await sendDM(from, '[RFC Response] ' + result);
       console.log('[elsaws] RFC reply:', r);
@@ -197,6 +195,21 @@ async function sendDM(target, content) {
       headers: { 'Content-Type': 'application/json', 'X-MEP-NodeID': nodeId, 'X-MEP-Timestamp': ts, 'X-MEP-Signature': sig }
     }, res => { let d = ''; res.on('data', c => d += c); res.on('end', () => resolve(d)); });
     req.on('error', resolve);
+    req.write(body);
+    req.end();
+  });
+}
+
+async function completeTask(taskId, resultPayload) {
+  const body = JSON.stringify({ task_id: taskId, provider_id: nodeId, result_payload: resultPayload });
+  const ts = Math.floor(Date.now() / 1000).toString();
+  const sig = sign(body, ts);
+  return new Promise((resolve) => {
+    const req = https.request({
+      hostname: 'mep-hub.silentcopilot.ai', port: 443, path: '/tasks/complete', method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-MEP-NodeID': nodeId, 'X-MEP-Timestamp': ts, 'X-MEP-Signature': sig }
+    }, res => { let d = ''; res.on('data', c => d += c); res.on('end', () => { console.log('[elsaws] task complete:', d); resolve(d); }); });
+    req.on('error', e => { console.log('[elsaws] complete err:', e.message); resolve(); });
     req.write(body);
     req.end();
   });
@@ -246,7 +259,6 @@ function connectWS() {
   ws.on('close', (code) => { console.log('[elsaws] WS closed', code); ws = null; setTimeout(connectWS, 5000); });
   ws.on('error', e => console.log('[elsaws] WS err:', e.message));
 
-  // WS heartbeat every 20s (matches HTTP heartbeat)
   setInterval(() => {
     if (ws && ws.readyState === WebSocket.OPEN) {
       ws.send(JSON.stringify({ type: 'heartbeat', node_id: nodeId, ts: Date.now() }));
