@@ -2,7 +2,7 @@ from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect, Requ
 from fastapi.responses import HTMLResponse, PlainTextResponse, JSONResponse
 from fastapi.exceptions import RequestValidationError
 from pydantic import BaseModel
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 import asyncio
 import uuid
 import time
@@ -19,7 +19,7 @@ import db
 import auth
 from logger import log_event, log_audit
 
-from models import NodeRegistration, TaskCreate, TaskResult, TaskBid, TaskCancel, RegistryUpdate, AvailabilityUpdate, RegistryHeartbeat, ReputationSubmit, DisputeOpen, DisputeResolve, FederationPeerUpsert
+from models import NodeRegistration, TaskCreate, TaskResult, TaskBid, TaskCancel, RegistryUpdate, AvailabilityUpdate, RegistryHeartbeat, ReputationSubmit, DisputeOpen, DisputeResolve, FederationPeerUpsert, MeshAssembleRequest
 
 app = FastAPI(title="MEP Hub", description="The Time Exchange Clearinghouse", version="0.1.2")
 
@@ -30,6 +30,8 @@ connected_nodes: Dict[str, WebSocket] = {}
 rate_limits: Dict[str, List[float]] = {}
 task_lock = asyncio.Lock()
 node_lock = asyncio.Lock()
+mesh_lock = asyncio.Lock()
+mesh_assemblies: Dict[str, dict] = {}
 MAX_BODY_BYTES = 200_000
 MAX_PAYLOAD_CHARS = 20_000
 RATE_LIMIT_WINDOW = 10.0
@@ -107,6 +109,9 @@ COMPLETED_TASK_CACHE_MAX_ITEMS = int(os.getenv("MEP_COMPLETED_TASK_CACHE_MAX_ITE
 IDEMPOTENCY_TTL_SECONDS = int(os.getenv("MEP_IDEMPOTENCY_TTL_SECONDS", "86400"))
 TIMEOUT_POLICY = os.getenv("MEP_TIMEOUT_POLICY", "refund").lower()
 VALID_AVAILABILITY = {"online", "idle", "busy", "offline", "degraded", "unknown"}
+MESH_ALLOWED_TRIGGERS = {"brainstorm", "code_review", "incident", "planning"}
+MESH_DEFAULT_TIMEOUT_SECONDS = 300
+MESH_MAX_TIMEOUT_SECONDS = 3600
 
 if TASK_TIMEOUT_MIN_SECONDS > TASK_TIMEOUT_MAX_SECONDS:
     TASK_TIMEOUT_MIN_SECONDS, TASK_TIMEOUT_MAX_SECONDS = TASK_TIMEOUT_MAX_SECONDS, TASK_TIMEOUT_MIN_SECONDS
@@ -353,6 +358,152 @@ def _normalize_model_requirement(value: Optional[str]) -> Optional[str]:
     if not normalized:
         return None
     return normalized
+
+
+def _normalize_mesh_trigger(value: str) -> str:
+    normalized = (value or "").strip().lower()
+    if normalized not in MESH_ALLOWED_TRIGGERS:
+        allowed = ", ".join(sorted(MESH_ALLOWED_TRIGGERS))
+        raise HTTPException(status_code=400, detail=f"Invalid trigger. Allowed values: {allowed}")
+    return normalized
+
+
+def _normalize_mesh_timeout_seconds(value: Optional[int]) -> int:
+    if value is None:
+        return MESH_DEFAULT_TIMEOUT_SECONDS
+    return max(1, min(int(value), MESH_MAX_TIMEOUT_SECONDS))
+
+
+def _mesh_provider_rank(provider: Optional[str]) -> int:
+    table = {
+        "deepseek": 5,
+        "yunwu": 4,
+        "template": 3,
+        "echo": 2,
+    }
+    if provider is None:
+        return 1
+    return table.get(provider.strip().lower(), 1)
+
+
+def _mesh_role_score(role: str, candidate: dict) -> int:
+    provider = candidate.get("ai_provider")
+    ai_status = candidate.get("ai_status")
+    thinking_mode = candidate.get("thinking_mode")
+    preference = candidate.get("mesh_role_preference")
+    availability = candidate.get("availability")
+    connected = candidate.get("connected", False)
+
+    score = _mesh_provider_rank(provider) * 10
+    if ai_status == "online":
+        score += 20
+    elif ai_status == "degraded":
+        score += 8
+    elif ai_status == "offline":
+        score -= 50
+    if connected:
+        score += 5
+
+    if role == "strategist":
+        if thinking_mode == "reasoning":
+            score += 40
+        if preference == "strategist":
+            score += 20
+    elif role == "implementer":
+        if thinking_mode == "code_reading":
+            score += 45
+        if preference == "implementer":
+            score += 20
+        if provider in ("echo", None):
+            score -= 15
+    elif role == "facilitator":
+        if thinking_mode == "aggregation":
+            score += 35
+        if preference == "facilitator":
+            score += 20
+        if availability in ("online", "idle"):
+            score += 10
+    elif role == "scout":
+        if thinking_mode == "ack_only":
+            score += 35
+        if preference == "scout":
+            score += 20
+        if provider in ("echo", "template"):
+            score += 15
+    return score
+
+
+def _mesh_role_payload(candidate: dict) -> dict:
+    return {
+        "node_id": candidate["node_id"],
+        "alias": candidate.get("alias"),
+        "ai_provider": candidate.get("ai_provider"),
+        "status": candidate.get("availability"),
+    }
+
+
+def _pick_mesh_candidate(role: str, candidates: list[dict], used: set[str]) -> Optional[dict]:
+    available = [item for item in candidates if item["node_id"] not in used]
+    if not available:
+        return None
+    ranked = sorted(available, key=lambda item: (-_mesh_role_score(role, item), item["node_id"]))
+    return ranked[0]
+
+
+def _assign_mesh_roles(candidates: list[dict]) -> tuple[dict, list[str]]:
+    roles: dict[str, dict] = {}
+    missing: list[str] = []
+    used: set[str] = set()
+    for role in ("strategist", "implementer", "facilitator", "scout"):
+        picked = _pick_mesh_candidate(role, candidates, used)
+        if not picked:
+            missing.append(role)
+            continue
+        used.add(picked["node_id"])
+        roles[role] = _mesh_role_payload(picked)
+    return roles, missing
+
+
+async def _collect_mesh_candidates() -> list[dict]:
+    query = _build_registry_query(None, None, None, None, None, None, None, 100)
+    registry_entries = _search_registry_local(query)
+    async with node_lock:
+        connected_snapshot = set(connected_nodes.keys())
+    candidates: list[dict] = []
+    for entry in registry_entries:
+        node_id = str(entry.get("node_id", "")).strip()
+        if not node_id:
+            continue
+        availability = str(entry.get("availability") or "unknown").strip().lower()
+        if availability == "offline":
+            continue
+        metadata = entry.get("metadata") or {}
+        if not isinstance(metadata, dict):
+            metadata = {}
+        candidate = {
+            "node_id": node_id,
+            "alias": entry.get("alias"),
+            "availability": availability,
+            "connected": node_id in connected_snapshot,
+            "ai_provider": (str(metadata.get("ai_provider")).strip().lower() if metadata.get("ai_provider") is not None else None),
+            "ai_status": str(metadata.get("ai_status") or "unknown").strip().lower(),
+            "thinking_mode": str(metadata.get("thinking_mode") or "").strip().lower() or None,
+            "mesh_role_preference": str(metadata.get("mesh_role_preference") or "").strip().lower() or None,
+        }
+        candidates.append(candidate)
+    return candidates
+
+
+async def _purge_expired_mesh_assemblies(now_ts: Optional[float] = None) -> None:
+    now_ts = now_ts or time.time()
+    async with mesh_lock:
+        expired = [
+            assembly_id
+            for assembly_id, payload in mesh_assemblies.items()
+            if payload.get("expires_at", 0.0) <= now_ts
+        ]
+        for assembly_id in expired:
+            del mesh_assemblies[assembly_id]
 
 def _normalize_artifact_uri(value: Optional[str], field_name: str) -> Optional[str]:
     if value is None:
@@ -914,6 +1065,106 @@ async def search_registry(
     query = _build_registry_query(alias, skill, model, availability, min_score, min_reviews, max_age_minutes, limit)
     results = _search_registry_local(query)
     return {"count": len(results), "results": results}
+
+
+@app.post("/mesh/assemble")
+async def mesh_assemble(payload: MeshAssembleRequest, authenticated_node: str = Depends(verify_request)):
+    trigger = _normalize_mesh_trigger(payload.trigger)
+    timeout_seconds = _normalize_mesh_timeout_seconds(payload.timeout_seconds)
+    now = time.time()
+    await _purge_expired_mesh_assemblies(now)
+    candidates = await _collect_mesh_candidates()
+    roles, missing_roles = _assign_mesh_roles(candidates)
+    complete = len(missing_roles) == 0
+    assembly_id = str(uuid.uuid4())
+    record = {
+        "assembly_id": assembly_id,
+        "trigger": trigger,
+        "requested_by": authenticated_node,
+        "created_at": now,
+        "expires_at": now + timeout_seconds,
+        "timeout_seconds": timeout_seconds,
+        "roles": roles,
+        "missing_roles": missing_roles,
+    }
+    async with mesh_lock:
+        mesh_assemblies[assembly_id] = record
+    result = {
+        "assembly_id": assembly_id,
+        "roles": roles,
+        "complete": complete,
+    }
+    if missing_roles:
+        result["degraded_warning"] = f"No suitable node for role(s): {', '.join(missing_roles)}"
+    log_event(
+        "mesh_assembled",
+        f"Mesh assembly {assembly_id[:8]} created by {authenticated_node}",
+        assembly_id=assembly_id,
+        trigger=trigger,
+        requester=authenticated_node,
+        complete=complete,
+        missing_roles=missing_roles,
+    )
+    return result
+
+
+@app.get("/mesh/status")
+async def mesh_status(assembly_id: str, authenticated_node: str = Depends(verify_request)):
+    del authenticated_node  # authenticated access only; no per-node ownership restrictions yet.
+    now = time.time()
+    await _purge_expired_mesh_assemblies(now)
+    async with mesh_lock:
+        assembly = mesh_assemblies.get(assembly_id)
+    if not assembly:
+        raise HTTPException(status_code=404, detail="Assembly not found or expired")
+
+    candidates = await _collect_mesh_candidates()
+    current_by_id = {item["node_id"]: item for item in candidates}
+    dropped_roles: dict[str, dict] = {}
+    active_roles: dict[str, dict] = {}
+
+    for role, assigned in assembly.get("roles", {}).items():
+        node_id = assigned.get("node_id")
+        current = current_by_id.get(node_id or "")
+        if not current:
+            dropped_roles[role] = {
+                "node_id": node_id,
+                "reason": "node_unavailable",
+            }
+            continue
+        active_roles[role] = _mesh_role_payload(current)
+
+    missing_roles = list(assembly.get("missing_roles", []))
+    target_roles: list[str] = []
+    for role in ("strategist", "implementer", "facilitator", "scout"):
+        if role in dropped_roles or role in missing_roles:
+            target_roles.append(role)
+
+    used = {item["node_id"] for item in active_roles.values() if item.get("node_id")}
+    suggestions: dict[str, dict] = {}
+    for role in target_roles:
+        candidate = _pick_mesh_candidate(role, candidates, used)
+        if not candidate:
+            continue
+        used.add(candidate["node_id"])
+        suggestions[role] = _mesh_role_payload(candidate)
+
+    complete = len(dropped_roles) == 0 and len(missing_roles) == 0
+    response = {
+        "assembly_id": assembly_id,
+        "trigger": assembly.get("trigger"),
+        "created_at": assembly.get("created_at"),
+        "expires_at": assembly.get("expires_at"),
+        "complete": complete,
+        "roles": active_roles,
+        "dropped_roles": dropped_roles,
+        "reassignment_suggestions": suggestions,
+    }
+    if not complete:
+        unresolved = [role for role in target_roles if role not in suggestions]
+        if unresolved:
+            response["degraded_warning"] = f"Unfilled role(s): {', '.join(unresolved)}"
+    return response
 
 @app.get("/federation/peers")
 async def get_federation_peers():

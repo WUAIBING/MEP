@@ -60,3 +60,8 @@ class DisputeResolve(BaseModel):
 
 class FederationPeerUpsert(BaseModel):
     hub_url: str
+
+
+class MeshAssembleRequest(BaseModel):
+    trigger: str
+    timeout_seconds: Optional[int] = Field(default=300, ge=1, le=3600)
