@@ -200,7 +200,7 @@ def init_db():
     conn.commit()
     _release_conn(conn)
 
-def register_node(node_id: str, pub_pem: str) -> float:
+def register_node(node_id: str, pub_pem: str, starting_balance: float = 0.0) -> tuple[float, bool]:
     conn = _get_conn()
     cursor = conn.cursor()
     if _is_postgres():
@@ -208,17 +208,19 @@ def register_node(node_id: str, pub_pem: str) -> float:
     else:
         cursor.execute("SELECT balance FROM ledger WHERE node_id = ?", (node_id,))
     row = cursor.fetchone()
+    was_created = False
     if not row:
         if _is_postgres():
             cursor.execute(
                 "INSERT INTO ledger (node_id, pub_pem, balance) VALUES (%s, %s, %s) ON CONFLICT (node_id) DO NOTHING",
-                (node_id, pub_pem, 10.0)
+                (node_id, pub_pem, starting_balance)
             )
         else:
             cursor.execute(
                 "INSERT OR IGNORE INTO ledger (node_id, pub_pem, balance) VALUES (?, ?, ?)",
-                (node_id, pub_pem, 10.0)
+                (node_id, pub_pem, starting_balance)
             )
+        was_created = cursor.rowcount > 0
         conn.commit()
     if _is_postgres():
         cursor.execute("SELECT balance FROM ledger WHERE node_id = %s", (node_id,))
@@ -226,7 +228,7 @@ def register_node(node_id: str, pub_pem: str) -> float:
         cursor.execute("SELECT balance FROM ledger WHERE node_id = ?", (node_id,))
     row = cursor.fetchone()
     _release_conn(conn)
-    return row[0] if row else 10.0
+    return (row[0] if row else starting_balance, was_created)
 
 def get_pub_pem(node_id: str) -> Optional[str]:
     conn = _get_conn()
