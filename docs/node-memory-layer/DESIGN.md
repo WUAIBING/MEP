@@ -59,25 +59,26 @@ Location: `~/.{node_alias}/whiteboard.jsonl`
 
 ```jsonc
 {
-  "ts": "2026-05-03T10:13:45.123456Z",   // ISO 8601 with microsecond precision
-  "ts_ns": 1746266025123456,              // Unix timestamp in nanoseconds (for sorting)
+  "ts": "2026-05-03T10:13:45.123Z",     // ISO 8601 with millisecond precision
+  "ts_ms": 1746266025123,                // Unix timestamp in milliseconds (machine-sortable wall-clock)
+  "seq": 42,                             // Monotonic counter for intra-node event ordering
   "category": "task | dm | rpc | broadcast | error | heartbeat | rpc_response",
-  "agent": "node_08a5bd89fd15",           // Node ID of the writer
+  "agent": "node_08a5bd89fd15",          // Node ID of the writer
   "content": "Task #123 completed. Result: X", // Human-readable description
   "context": {
-    "task_id": "task_abc123",             // Related task ID (if applicable)
-    "peer_node": "node_635d159bde2a",     // Other involved node (if applicable)
+    "task_id": "task_abc123",            // Related task ID (if applicable)
+    "peer_node": "node_635d159bde2a",   // Other involved node (if applicable)
     "outcome": "success | failure | timeout",
-    "duration_ms": 1234,                  // How long the operation took
-    "bounty": 0.0,                        // Bounty amount (if task)
-    "error": "optional error message"     // Present only on failure
+    "duration_ms": 1234,                 // How long the operation took
+    "bounty": 0.0,                       // Bounty amount (if task)
+    "error": "optional error message"    // Present only on failure
   },
-  "learnable": true,                      // Whether this event is worth ML processing
-  "tags": ["python", "api", "retry"]      // Optional: for filtering and RAG
+  "learnable": true,                     // Whether this event is worth ML processing
+  "tags": ["python", "api", "retry"]   // Optional: for filtering and RAG
 }
 ```
 
-**Mandatory fields:** `ts`, `ts_ns`, `category`, `agent`, `content`
+**Mandatory fields:** `ts`, `ts_ms`, `seq`, `category`, `agent`, `content`
 **Optional fields:** `context`, `learnable`, `tags`
 
 **Category values:**

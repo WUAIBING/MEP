@@ -60,7 +60,7 @@ You participate in a multi-agent mesh. You receive tasks via DM, process them wi
 - Helpful but not effusive`;
 
 // Whiteboard file — per MEP node-memory-layer spec
-// Schema: ts (Unix ms ISO 8601), ts_ns (Unix ns), seq (monotonic counter), category, agent, content, context, learnable, tags
+// Schema: ts (ISO 8601 ms), ts_ms (Unix ms), seq (monotonic counter), category, agent, content, context, learnable, tags
 const WHITEBOARD_FILE = path.join(os.homedir(), '.elsaws', 'whiteboard.jsonl');
 
 // Conversation history: { nodeId: [ {role, content, ts}, ... ] }
@@ -78,9 +78,9 @@ function ensureDir(dir) {
 function logWhiteboard(category, content, context = {}, learnable = false, tags = []) {
   try {
     ensureDir(path.dirname(WHITEBOARD_FILE));
-    const wallclock_ms = Date.now();                          // Unix ms (honest wall-clock)
-    const seq_ns = Number(process.hrtime.bigint() - SEQ_ORIGIN); // monotonic ns since process start
-    const ts = new Date(wallclock_ms).toISOString();           // ISO 8601 wall-clock
+    const wallclock_ms = Date.now();
+    const seq = eventSeq++;        // monotonic counter for intra-node ordering
+    const ts = new Date(wallclock_ms).toISOString();
     const entry = {
       ts,                         // ISO 8601 with millisecond precision (honest — JS Date only gives ms)
       ts_ms: wallclock_ms,        // Unix ms timestamp
