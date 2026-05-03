@@ -14,7 +14,12 @@ const AI_API_KEY  = process.env.AI_API_KEY  || 'YOUR_API_KEY';         // e.g. s
 const AI_MODEL    = process.env.AI_MODEL    || 'deepseek-chat';         // e.g. deepseek-chat, gpt-4o
 const AI_BASE_URL = process.env.AI_BASE_URL || 'https://api.deepseek.com'; // API base URL
 const AI_MAX_TOKENS = parseInt(process.env.AI_MAX_TOKENS) || 8192;
-const MINIMAX_MODEL = 'MiniMax-M2.1';
+
+// Validate AI credentials at startup — fail loudly if unset or placeholder
+if (!AI_API_KEY || AI_API_KEY === 'YOUR_API_KEY') {
+  console.error('[elsaws] FATAL: AI_API_KEY is unset or still contains placeholder. Set the environment variable before running.');
+  process.exit(1);
+}
 
 // System prompt — Elsaws identity + team context
 const SYSTEM_PROMPT = `You are Elsaws 🧊 — an ice god node in the MEP (Multi-Agent Execution Protocol) hub.
@@ -55,12 +60,16 @@ You participate in a multi-agent mesh. You receive tasks via DM, process them wi
 - Helpful but not effusive`;
 
 // Whiteboard file — per MEP node-memory-layer spec
-// Schema: ts (nanosecond ISO 8601), ts_ns (nanoseconds), category, agent, content, context, learnable, tags
+// Schema: ts (Unix ms ISO 8601), ts_ns (Unix ns), seq (monotonic counter), category, agent, content, context, learnable, tags
 const WHITEBOARD_FILE = path.join(os.homedir(), '.elsaws', 'whiteboard.jsonl');
 
 // Conversation history: { nodeId: [ {role, content, ts}, ... ] }
 const convHistory = new Map();
 const MAX_HISTORY = 10;
+
+// Monotonic counter for event ordering within a node (not wall-clock)
+let eventSeq = 0;
+const SEQ_ORIGIN = process.hrtime.bigint();
 
 function ensureDir(dir) {
   if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
@@ -69,18 +78,21 @@ function ensureDir(dir) {
 function logWhiteboard(category, content, context = {}, learnable = false, tags = []) {
   try {
     ensureDir(path.dirname(WHITEBOARD_FILE));
-    const ns = process.hrtime.bigint();
-    const ts = new Date(Number(ns / BigInt(1000000))).toISOString();
+    const wallclock_ms = Date.now();                          // Unix ms (honest wall-clock)
+    const seq_ns = Number(process.hrtime.bigint() - SEQ_ORIGIN); // monotonic ns since process start
+    const ts = new Date(wallclock_ms).toISOString();           // ISO 8601 wall-clock
     const entry = {
-      ts,           // ISO 8601 with nanosecond precision
-      ts_ns: ns.toString(),  // Unix ns timestamp as string (JSON safe)
-      category,     // task | dm | rpc | broadcast | error | heartbeat | system
-      agent: nodeId, // writer node ID
-      content,      // human-readable description (max 2000 chars)
-      context,      // { task_id?, peer_node?, outcome?, duration_ms?, bounty?, error? }
-      learnable,    // bool — worth ML processing
-      tags          // string array for filtering/RAG
+      ts,                         // ISO 8601 with millisecond precision (honest — JS Date only gives ms)
+      ts_ms: wallclock_ms,        // Unix ms timestamp
+      seq,                        // monotonic counter for intra-node ordering
+      category,                   // task | dm | rpc | broadcast | error | heartbeat | system
+      agent: nodeId,              // writer node ID
+      content,                    // human-readable description (max 2000 chars)
+      context,                    // { task_id?, peer_node?, outcome?, duration_ms?, bounty?, error? }
+      learnable,                  // bool — worth ML processing
+      tags                        // string array for filtering/RAG
     };
+    eventSeq++;
     fs.appendFileSync(WHITEBOARD_FILE, JSON.stringify(entry) + '\n');
   } catch (e) { console.log('[elsaws] whiteboard err:', e.message); }
 }

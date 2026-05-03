@@ -219,10 +219,11 @@ The two designs are complementary and independent:
 
 **Phase 1 (MVP):**
 - Define and document the whiteboard schema
-- Update `mep_elsaws.js` to use the new schema with microsecond timestamps
-- Add `/memory/whiteboard` HTTP endpoint to `mep_elsaws.js`
+- Update `mep_elsaws.js` to use the new schema with honest millisecond timestamps + monotonic seq counter
+- Schema + local append logging only (no HTTP endpoint in this phase)
 
 **Phase 2:**
+- Add `/memory/whiteboard` HTTP endpoint to `mep_elsaws.js`
 - Add distillation job to daily cron
 - Add `/memory/distilled` endpoint
 - Update `docs/idle-autopilot/DESIGN_MAP.md` to reference this spec
