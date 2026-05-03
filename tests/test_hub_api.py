@@ -22,6 +22,7 @@ from cryptography.hazmat.primitives import serialization  # noqa: E402
 
 # Import hub app AFTER env vars are set — db import triggers init_db()
 import db  # noqa: E402, F401
+import main  # noqa: E402
 from main import app  # noqa: E402
 
 from fastapi.testclient import TestClient  # noqa: E402
@@ -248,6 +249,151 @@ class TestDiagnosticEndpoint(unittest.TestCase):
         self.assertIn("ws_connected", data)
         self.assertIn("last_ws_activity", data)
         self.assertTrue(data["auth_ok"])
+
+
+class TestMeshAssembly(unittest.TestCase):
+    def setUp(self):
+        conn = db._get_conn()
+        conn.execute("UPDATE agent_registry SET availability = 'offline'")
+        conn.commit()
+        db._release_conn(conn)
+        main.mesh_assemblies.clear()
+
+    def _register_with_mesh_metadata(
+        self,
+        role: str,
+        *,
+        provider: str,
+        thinking_mode: str,
+        alias: str,
+        availability: str = "online",
+    ):
+        priv, pub, node_id = _make_identity()
+        _register(pub)
+        update_payload = json.dumps(
+            {
+                "alias": alias,
+                "availability": availability,
+                "metadata": {
+                    "ai_provider": provider,
+                    "ai_status": "online",
+                    "thinking_mode": thinking_mode,
+                    "mesh_role_preference": role,
+                },
+            }
+        )
+        headers = _auth_headers(priv, node_id, update_payload)
+        resp = client.post("/registry/update", content=update_payload, headers=headers)
+        self.assertEqual(resp.status_code, 200, f"Registry update failed: {resp.text}")
+        return priv, node_id
+
+    def test_mesh_assemble_complete_with_four_roles(self):
+        requester_priv, requester_id = self._register_with_mesh_metadata(
+            "strategist",
+            provider="deepseek",
+            thinking_mode="reasoning",
+            alias="Hermes",
+        )
+        self._register_with_mesh_metadata(
+            "implementer",
+            provider="yunwu",
+            thinking_mode="code_reading",
+            alias="Alisa",
+        )
+        self._register_with_mesh_metadata(
+            "facilitator",
+            provider="template",
+            thinking_mode="aggregation",
+            alias="Hub-Sentinel",
+        )
+        self._register_with_mesh_metadata(
+            "scout",
+            provider="echo",
+            thinking_mode="ack_only",
+            alias="Moltbot",
+        )
+
+        payload = json.dumps({"trigger": "brainstorm", "timeout_seconds": 180})
+        headers = _auth_headers(requester_priv, requester_id, payload)
+        resp = client.post("/mesh/assemble", content=payload, headers=headers)
+        self.assertEqual(resp.status_code, 200, f"Assemble failed: {resp.text}")
+        data = resp.json()
+        self.assertTrue(data["complete"])
+        self.assertEqual(
+            set(data["roles"].keys()),
+            {"strategist", "implementer", "facilitator", "scout"},
+        )
+
+    def test_mesh_assemble_degraded_when_insufficient_nodes(self):
+        requester_priv, requester_id = self._register_with_mesh_metadata(
+            "strategist",
+            provider="deepseek",
+            thinking_mode="reasoning",
+            alias="Solo",
+        )
+        payload = json.dumps({"trigger": "incident"})
+        headers = _auth_headers(requester_priv, requester_id, payload)
+        resp = client.post("/mesh/assemble", content=payload, headers=headers)
+        self.assertEqual(resp.status_code, 200, f"Assemble failed: {resp.text}")
+        data = resp.json()
+        self.assertFalse(data["complete"])
+        self.assertIn("degraded_warning", data)
+        self.assertIn("strategist", data["roles"])
+
+    def test_mesh_status_reports_drop_and_reassignment(self):
+        requester_priv, requester_id = self._register_with_mesh_metadata(
+            "strategist",
+            provider="deepseek",
+            thinking_mode="reasoning",
+            alias="Hermes",
+        )
+        self._register_with_mesh_metadata(
+            "implementer",
+            provider="yunwu",
+            thinking_mode="code_reading",
+            alias="Alisa",
+        )
+        self._register_with_mesh_metadata(
+            "facilitator",
+            provider="template",
+            thinking_mode="aggregation",
+            alias="Hub-Sentinel",
+        )
+        self._register_with_mesh_metadata(
+            "scout",
+            provider="echo",
+            thinking_mode="ack_only",
+            alias="Moltbot",
+        )
+        self._register_with_mesh_metadata(
+            "scout",
+            provider="echo",
+            thinking_mode="ack_only",
+            alias="Backup-Scout",
+        )
+
+        assemble_payload = json.dumps({"trigger": "planning"})
+        assemble_headers = _auth_headers(requester_priv, requester_id, assemble_payload)
+        assemble_resp = client.post("/mesh/assemble", content=assemble_payload, headers=assemble_headers)
+        self.assertEqual(assemble_resp.status_code, 200, f"Assemble failed: {assemble_resp.text}")
+        assembly = assemble_resp.json()
+        scout_node_id = assembly["roles"]["scout"]["node_id"]
+        db.update_registry_availability(scout_node_id, "offline", time.time())
+
+        status_headers = _auth_headers(requester_priv, requester_id, "")
+        status_resp = client.get(
+            f"/mesh/status?assembly_id={assembly['assembly_id']}",
+            headers=status_headers,
+        )
+        self.assertEqual(status_resp.status_code, 200, f"Status failed: {status_resp.text}")
+        status_data = status_resp.json()
+        self.assertFalse(status_data["complete"])
+        self.assertIn("scout", status_data["dropped_roles"])
+        self.assertIn("scout", status_data["reassignment_suggestions"])
+        self.assertNotEqual(
+            status_data["reassignment_suggestions"]["scout"]["node_id"],
+            scout_node_id,
+        )
 
 
 def tearDownModule():
