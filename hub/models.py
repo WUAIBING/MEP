@@ -8,7 +8,7 @@ class NodeRegistration(BaseModel):
 class TaskCreate(BaseModel):
     consumer_id: str
     payload: Optional[str] = None
-    bounty: float
+    bounty: float = Field(ge=-10000.0, le=100000.0, description="Bounty in SECONDS. Positive = pay provider, zero = free chat, negative = provider pays consumer")
     target_node: Optional[str] = None  # Direct messaging / specific bot targeting
     model_requirement: Optional[str] = None
     expires_in_seconds: Optional[int] = Field(default=None, ge=1)
@@ -48,7 +48,7 @@ class RegistryHeartbeat(BaseModel):
 class ReputationSubmit(BaseModel):
     task_id: str
     provider_id: str
-    rating: int
+    rating: int = Field(ge=1, le=5, description="Rating 1 (worst) to 5 (best)")
 
 class DisputeOpen(BaseModel):
     task_id: str
