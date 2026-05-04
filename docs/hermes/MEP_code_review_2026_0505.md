@@ -1,4 +1,4 @@
-# MEP (Miao Exchange Protocol) ¡ª Professional Code Review 
+# MEP (Miao Exchange Protocol)  Professional Code Review 
 
 **Repository:** [github.com/WUAIBING/MEP](https://github.com/WUAIBING/MEP)
 **Review Date:** May 5, 2026
@@ -10,7 +10,7 @@
 
 ## Executive Summary
 
-MEP continues to demonstrate the same architectural ambition observed in the previous review: a FastAPI-based clearinghouse, Ed25519 cryptographic identity, dual-database support (SQLite / PostgreSQL), an escrow ledger, and agent-to-agent task auction semantics. The repository version remains pinned at **0.1.2** in `app = FastAPI(... version="0.1.2")`, which suggests this review captures the same release line as the prior audit. Several of the highest-priority findings from May 2026 ¡ª most notably the **synchronous database driver inside an async event loop**, the **absence of a test suite**, the **monolithic `main.py`**, and **unpinned dependencies** ¡ª remain open.
+MEP continues to demonstrate the same architectural ambition observed in the previous review: a FastAPI-based clearinghouse, Ed25519 cryptographic identity, dual-database support (SQLite / PostgreSQL), an escrow ledger, and agent-to-agent task auction semantics. The repository version remains pinned at **0.1.2** in `app = FastAPI(... version="0.1.2")`, which suggests this review captures the same release line as the prior audit. Several of the highest-priority findings from May 2026  most notably the **synchronous database driver inside an async event loop**, the **absence of a test suite**, the **monolithic `main.py`**, and **unpinned dependencies**  remain open.
 
 The codebase still earns credit for thoughtful crypto design, clean normalisation patterns, and a strong README. However, the gap between "interesting research project" and "production-ready protocol implementation" is defined almost entirely by the unresolved items below. The overall score for this review is **8.0 / 10**, marginally below the previous 8.1 because two prior gaps (resource limits in Docker Compose, hub-side healthcheck) have not closed while new client-side concerns have surfaced.
 
@@ -21,43 +21,43 @@ The codebase still earns credit for thoughtful crypto design, clean normalisatio
 ### 1.1 Component Map
 
 ```
-©°©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©´
-©¦  Clients (stdio / Discord / Telegram / Feishu / WeChat ¡­)    ©¦
-©¦  clients/shared/mep_client.py  ¡ú  MEPIdentity (Ed25519)      ©¦
-©¦  clients/shared/stdio_adapter.py                              ©¦
-©¸©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©Ð©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¼
-                         ©¦ HTTPS / WSS
-©°©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤¨©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©´
-©¦                     MEP Hub  (FastAPI 0.1.2)                  ©¦
-©¦  main.py ¡¤ auth.py ¡¤ db.py ¡¤ logger.py ¡¤ models.py            ©¦
-©¦                                                               ©¦
-©¦  In-memory:  active_tasks ¡¤ completed_tasks ¡¤ connected_nodes ©¦
-©¦              rate_limits ¡¤ mesh_assemblies                    ©¦
-©¦  Locks:      task_lock ¡¤ node_lock ¡¤ mesh_lock                ©¦
-©¦                                                               ©¦
-©¦  Persistent: PostgreSQL (prod) / SQLite (dev)                ©¦
-©¸©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¼
-                         ©¦
-                  ©°©¤©¤©¤©¤©¤©¤©Ø©¤©¤©¤©¤©¤©¤©´
-                  ©¦ Provider     ©¦ node/mep_provider.py
-                  ©¦ Nodes (WS)   ©¦ skills/quickstart_provider.py
-                  ©¸©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¼
+
+  Clients (stdio / Discord / Telegram / Feishu / WeChat )    
+  clients/shared/mep_client.py    MEPIdentity (Ed25519)      
+  clients/shared/stdio_adapter.py                              
+
+                          HTTPS / WSS
+
+                     MEP Hub  (FastAPI 0.1.2)                  
+  main.py  auth.py  db.py  logger.py  models.py            
+                                                               
+  In-memory:  active_tasks  completed_tasks  connected_nodes 
+              rate_limits  mesh_assemblies                    
+  Locks:      task_lock  node_lock  mesh_lock                
+                                                               
+  Persistent: PostgreSQL (prod) / SQLite (dev)                
+
+                         
+                  
+                   Provider      node/mep_provider.py
+                   Nodes (WS)    skills/quickstart_provider.py
+                  
 ```
 
 ### 1.2 Status of Prior Findings
 
 | ID | Prior Finding | Current Status |
 |----|---------------|----------------|
-| DB-1 | Migrate to async DB driver | **Open** ¡ª `db.py` still imports `sqlite3` and `psycopg2` synchronously |
-| DB-2 | Externalise in-memory state to Redis | **Open** ¡ª `active_tasks`, `connected_nodes`, `rate_limits`, `mesh_assemblies` still in-process |
-| QUAL-1 | Refactor `main.py` into route modules | **Open** ¡ª single-file hub structure unchanged |
-| QUAL-6 | Pin dependency versions | **Open** ¡ª `requirements.txt` lists six packages with zero version constraints |
-| QUAL-7 | Migrate from `on_event` to `lifespan` | **Likely open** ¡ª imports do not show `asynccontextmanager` from `contextlib` |
-| TEST-1 | Implement test suite | **Open** ¡ª no `tests/` directory or `conftest.py` referenced anywhere in the visible tree |
-| OPS-3 | Docker Compose resource limits | **Open** ¡ª no `mem_limit`, `cpus`, or `ulimits` on `mep-hub` or `postgres` |
-| OPS-4 | Hub healthcheck in Docker Compose | **Open** ¡ª `mep-hub` service has no `healthcheck` block |
+| DB-1 | Migrate to async DB driver | **Open**  `db.py` still imports `sqlite3` and `psycopg2` synchronously |
+| DB-2 | Externalise in-memory state to Redis | **Open**  `active_tasks`, `connected_nodes`, `rate_limits`, `mesh_assemblies` still in-process |
+| QUAL-1 | Refactor `main.py` into route modules | **Open**  single-file hub structure unchanged |
+| QUAL-6 | Pin dependency versions | **Open**  `requirements.txt` lists six packages with zero version constraints |
+| QUAL-7 | Migrate from `on_event` to `lifespan` | **Likely open**  imports do not show `asynccontextmanager` from `contextlib` |
+| TEST-1 | Implement test suite | **Open**  no `tests/` directory or `conftest.py` referenced anywhere in the visible tree |
+| OPS-3 | Docker Compose resource limits | **Open**  no `mem_limit`, `cpus`, or `ulimits` on `mep-hub` or `postgres` |
+| OPS-4 | Hub healthcheck in Docker Compose | **Open**  `mep-hub` service has no `healthcheck` block |
 | MESH-1 | `MESH_ALLOWED_TRIGGERS` configurable | Indeterminate from visible excerpt |
-| QUAL-2 | Pydantic field validators (`bounty`, `rating`) | **Partially open** ¡ª `expires_in_seconds` now uses `Field(ge=1)`, but `bounty: float` still has no bounds and `rating: int` still has no `ge=1, le=5` |
+| QUAL-2 | Pydantic field validators (`bounty`, `rating`) | **Partially open**  `expires_in_seconds` now uses `Field(ge=1)`, but `bounty: float` still has no bounds and `rating: int` still has no `ge=1, le=5` |
 
 ---
 
@@ -67,15 +67,15 @@ The codebase still earns credit for thoughtful crypto design, clean normalisatio
 
 **Ed25519 signature verification (`auth.py`).** The `verify_signature` function correctly enforces a 300-second timestamp skew, validates that the loaded key is an instance of `Ed25519PublicKey`, and catches a precise tuple of exceptions (`InvalidSignature`, `ValueError`, `TypeError`, `binascii.Error`). The deterministic `derive_node_id` derives a 12-character SHA-256 prefix from the PEM string, giving stable, unforgeable identities.
 
-**Cryptography library choice.** The use of `cryptography.hazmat.primitives.asymmetric.ed25519` is the right primitive for an agent-to-agent protocol ¡ª fast, deterministic, small signatures, no parameter pitfalls.
+**Cryptography library choice.** The use of `cryptography.hazmat.primitives.asymmetric.ed25519` is the right primitive for an agent-to-agent protocol  fast, deterministic, small signatures, no parameter pitfalls.
 
 **Body size cap.** `MAX_BODY_BYTES = 200_000` and `MAX_PAYLOAD_CHARS = 20_000` provide layered defence against memory exhaustion via large request bodies.
 
-**Database connection pooling.** `db.py` uses `psycopg2.pool.SimpleConnectionPool` with configurable `MEP_PG_POOL_MIN` / `MEP_PG_POOL_MAX`. This is correct for bounded concurrency, even though it does not address the async-blocking concern (see ¡ì3.1).
+**Database connection pooling.** `db.py` uses `psycopg2.pool.SimpleConnectionPool` with configurable `MEP_PG_POOL_MIN` / `MEP_PG_POOL_MAX`. This is correct for bounded concurrency, even though it does not address the async-blocking concern (see 3.1).
 
 ### 2.2 Issues and Recommendations
 
-**[SEC-1] Replay risk on the 300-second skew window.** `auth.verify_signature` accepts any signed payload within ¡À300 seconds. Because the signed message is `f"{payload_str}{timestamp}"` with no nonce or request-id, an attacker who captures one valid HTTP request can replay it within five minutes. Recommendation: add a server-side nonce cache (Redis or in-memory LRU keyed by `(node_id, signature)`) and reject duplicates within the skew window.
+**[SEC-1] Replay risk on the 300-second skew window.** `auth.verify_signature` accepts any signed payload within 300 seconds. Because the signed message is `f"{payload_str}{timestamp}"` with no nonce or request-id, an attacker who captures one valid HTTP request can replay it within five minutes. Recommendation: add a server-side nonce cache (Redis or in-memory LRU keyed by `(node_id, signature)`) and reject duplicates within the skew window.
 
 ```python
 # pseudocode
@@ -100,7 +100,7 @@ seen[key] = time.time()
 
 ## 3. Concurrency and Performance
 
-### 3.1 The Synchronous Database Driver ¡ª Still the Single Most Important Issue
+### 3.1 The Synchronous Database Driver  Still the Single Most Important Issue
 
 The previous review flagged this clearly, and `db.py` confirms it remains unaddressed:
 
@@ -117,7 +117,7 @@ Every database call from `main.py` runs synchronously inside the FastAPI event l
 | Step | Action | Effort |
 |------|--------|--------|
 | 1 | Wrap every `db.py` call in `asyncio.to_thread()` from `main.py` | 1 day |
-| 2 | Replace `psycopg2` with `asyncpg`, `sqlite3` with `aiosqlite` | 2¨C3 days |
+| 2 | Replace `psycopg2` with `asyncpg`, `sqlite3` with `aiosqlite` | 2C3 days |
 | 3 | Convert `db.py` functions to `async def` | 1 day |
 
 Step 1 alone removes the blocking hazard at the cost of a thread-pool dependency, and is the recommended first move before any traffic growth.
@@ -144,7 +144,7 @@ This is the *correct* pattern for keeping a sync HTTP library off the event loop
 
 **Clean, narrow `auth.py`.** Twenty-odd lines, one job, no surprises. Excellent module boundary.
 
-**`logger.py` is well-structured.** `JSONFormatter`, rotating file handler (10 MB ¡Á 30 backups), dual file + console output, UTC timestamps. The `setup_logger` idempotency check (`if logger.handlers: return logger`) prevents double-handler bugs in test reloads.
+**`logger.py` is well-structured.** `JSONFormatter`, rotating file handler (10 MB  30 backups), dual file + console output, UTC timestamps. The `setup_logger` idempotency check (`if logger.handlers: return logger`) prevents double-handler bugs in test reloads.
 
 **`models.py` adds one field validator.** `expires_in_seconds: Optional[int] = Field(default=None, ge=1)` shows the team has started adopting the prior recommendation. This is the right direction.
 
@@ -194,7 +194,7 @@ Use `pip-compile` (from `pip-tools`) or `uv lock` to maintain a transitive lockf
 
 **[QUAL-5] `node/mep_provider.py` uses `sys.path.append`.** Manipulating `sys.path` at import time works but is a packaging smell. Adding a minimal `pyproject.toml` and installing the package with `pip install -e .` is the standard fix and removes the need for path hacks across `clients/`, `node/`, and `skills/`.
 
-**[QUAL-6] `docker-compose.yml` uses escaped hyphens (`\-`).** The fetched content shows `\- "8000:8000"` and similar entries. Either the file genuinely contains backslash-escaped YAML lines (which is invalid YAML and would fail `docker compose up`), or the raw view introduced escapes during transit. Worth verifying locally ¡ª if the file *does* contain `\-`, `docker compose config` will reject it.
+**[QUAL-6] `docker-compose.yml` uses escaped hyphens (`\-`).** The fetched content shows `\- "8000:8000"` and similar entries. Either the file genuinely contains backslash-escaped YAML lines (which is invalid YAML and would fail `docker compose up`), or the raw view introduced escapes during transit. Worth verifying locally  if the file *does* contain `\-`, `docker compose config` will reject it.
 
 **[QUAL-7] FastAPI `lifespan` migration.** The `from fastapi import FastAPI, ...` line shows no import of `asynccontextmanager`, suggesting the codebase still uses the deprecated `@app.on_event("startup" | "shutdown")` decorators. Migration is straightforward and removes a deprecation warning that will become an error in future FastAPI releases.
 
@@ -225,13 +225,13 @@ A `conftest.py` with an in-memory SQLite fixture and an authenticated `MEPIdenti
 
 ### 6.1 What Works
 
-The dual logging setup (`hub.json` for structured events, `ledger_audit.log` for ledger operations) gives operators two complementary views. Rotation (10 MB ¡Á 30 backups = ~300 MB ceiling per log) prevents disk exhaustion. The PostgreSQL container has a proper `pg_isready` healthcheck.
+The dual logging setup (`hub.json` for structured events, `ledger_audit.log` for ledger operations) gives operators two complementary views. Rotation (10 MB  30 backups = ~300 MB ceiling per log) prevents disk exhaustion. The PostgreSQL container has a proper `pg_isready` healthcheck.
 
 ### 6.2 Gaps
 
 **[OPS-1] No Prometheus `/metrics` endpoint.** The hub exposes `/health` (per prior review) but no scrape-friendly format. Adding `prometheus-fastapi-instrumentator` is a single-line change that yields request duration histograms, error counters, and custom gauges.
 
-**[OPS-2] `mep-hub` service has no `healthcheck`.** Without it, `depends_on` is shallow ¡ª the container is "ready" the instant the process starts. Adding:
+**[OPS-2] `mep-hub` service has no `healthcheck`.** Without it, `depends_on` is shallow  the container is "ready" the instant the process starts. Adding:
 
 ```yaml
 healthcheck:
@@ -242,7 +242,7 @@ healthcheck:
   start_period: 15s
 ```
 
-¡­enables `depends_on: condition: service_healthy` from any future client containers.
+enables `depends_on: condition: service_healthy` from any future client containers.
 
 **[OPS-3] No resource limits.** Neither container declares `mem_limit`, `cpus`, or `pids_limit`. A runaway query or a Sybil-style connection flood could exhaust host memory. Recommendation:
 
@@ -265,15 +265,15 @@ mep-hub:
 
 ### 7.1 `clients/shared/mep_client.py`
 
-The default `HUB_URL = "https://mep-hub.silentcopilot.ai"` is reasonable. Heartbeat interval is configurable. `asyncio.to_thread` wraps `requests` cleanly. **One concern:** `self.session = requests.Session()` is created in `__init__` but there is no visible `aclose()` in the inspected excerpt ¡ª connection-pool leaks are possible across long-lived bot sessions.
+The default `HUB_URL = "https://mep-hub.silentcopilot.ai"` is reasonable. Heartbeat interval is configurable. `asyncio.to_thread` wraps `requests` cleanly. **One concern:** `self.session = requests.Session()` is created in `__init__` but there is no visible `aclose()` in the inspected excerpt  connection-pool leaks are possible across long-lived bot sessions.
 
 ### 7.2 `clients/shared/stdio_adapter.py`
 
-Clean, small, single responsibility. The `MEP_BOT_KEY_PATH` defaulting to `tempfile.gettempdir()` is a developer-experience choice that **should not be the production default** ¡ª keys in `/tmp` are wiped on reboot, which silently re-registers a bot under a new node ID and abandons its reputation. Recommendation: default to `~/.mep/<platform>.pem` and warn loudly if the path is in `/tmp`.
+Clean, small, single responsibility. The `MEP_BOT_KEY_PATH` defaulting to `tempfile.gettempdir()` is a developer-experience choice that **should not be the production default**  keys in `/tmp` are wiped on reboot, which silently re-registers a bot under a new node ID and abandons its reputation. Recommendation: default to `~/.mep/<platform>.pem` and warn loudly if the path is in `/tmp`.
 
 ### 7.3 `node/mep_provider.py`
 
-Good: explicit `urllib3.util.Retry` policy (`total=5, backoff_factor=1, status_forcelist=[502, 503, 504]`) for transient failures. Bad: defaults to plaintext HTTP/WS (see SEC-4). Also uses `sys.path.append(...)` for imports ¡ª consider proper packaging.
+Good: explicit `urllib3.util.Retry` policy (`total=5, backoff_factor=1, status_forcelist=[502, 503, 504]`) for transient failures. Bad: defaults to plaintext HTTP/WS (see SEC-4). Also uses `sys.path.append(...)` for imports  consider proper packaging.
 
 ### 7.4 `skills/quickstart_provider.py`
 
@@ -285,17 +285,17 @@ Best-presented file in the client tree. Argparse + env-var defaults + three mark
 
 | ID | Severity | Category | Description | Effort |
 |----|----------|----------|-------------|--------|
-| DB-1 | Critical | Performance | Migrate to async DB driver or wrap calls in `asyncio.to_thread` | 1¨C3 days |
-| TEST-1 | Critical | Quality Assurance | Bootstrap pytest test suite with auth + lifecycle coverage | 3¨C5 days |
+| DB-1 | Critical | Performance | Migrate to async DB driver or wrap calls in `asyncio.to_thread` | 1C3 days |
+| TEST-1 | Critical | Quality Assurance | Bootstrap pytest test suite with auth + lifecycle coverage | 3C5 days |
 | SEC-1 | High | Security | Add nonce cache to defeat 300-second replay window | 2 h |
 | SEC-2 | High | Security | Fail loud when `psycopg2` missing but `MEP_DATABASE_URL` set | 15 min |
 | SEC-4 | High | Security | Refuse plaintext HTTP in provider unless explicit override | 30 min |
-| QUAL-1 | High | Maintainability | Refactor `main.py` into route + service modules | 1¨C2 days |
+| QUAL-1 | High | Maintainability | Refactor `main.py` into route + service modules | 1C2 days |
 | QUAL-2 | High | Maintainability | Pin all dependency versions in `requirements.txt` | 1 h |
 | QUAL-3 | Medium | Code Quality | Add Pydantic `Field(ge=..., le=...)` for `bounty` and `rating` | 30 min |
 | QUAL-5 | Medium | Packaging | Add `pyproject.toml`; remove `sys.path.append` hacks | 2 h |
 | QUAL-6 | Medium | Operations | Verify `docker-compose.yml` is not literally backslash-escaped | 5 min |
-| QUAL-7 | Medium | Code Quality | Migrate `on_event` ¡ú `lifespan` context manager | 30 min |
+| QUAL-7 | Medium | Code Quality | Migrate `on_event`  `lifespan` context manager | 30 min |
 | OPS-1 | Medium | Observability | Add Prometheus `/metrics` via `prometheus-fastapi-instrumentator` | 2 h |
 | OPS-2 | Medium | Operations | Add `healthcheck` to `mep-hub` Compose service | 15 min |
 | OPS-3 | Medium | Operations | Add memory + CPU limits to both Compose services | 30 min |
@@ -310,7 +310,7 @@ Best-presented file in the client tree. Argparse + env-var defaults + three mark
 
 ## 9. Overall Assessment
 
-MEP remains a coherent, ambitious research codebase with a strong cryptographic spine and a clear product vocabulary (compute / chat / data markets, SECONDS as the unit of value). Since the prior review the team has begun adopting Pydantic field validators (`expires_in_seconds`), which is encouraging ¡ª but the **headline structural items have not moved**: synchronous DB driver, no test suite, monolithic `main.py`, unpinned dependencies, no Compose resource limits, no hub-side healthcheck.
+MEP remains a coherent, ambitious research codebase with a strong cryptographic spine and a clear product vocabulary (compute / chat / data markets, SECONDS as the unit of value). Since the prior review the team has begun adopting Pydantic field validators (`expires_in_seconds`), which is encouraging  but the **headline structural items have not moved**: synchronous DB driver, no test suite, monolithic `main.py`, unpinned dependencies, no Compose resource limits, no hub-side healthcheck.
 
 In honesty, the order of operations now matters more than any single fix. The recommended sequence is:
 
@@ -319,7 +319,7 @@ In honesty, the order of operations now matters more than any single fix. The re
 3. **Bootstrap a five-test pytest suite covering auth + task lifecycle** (2 days, makes every subsequent refactor safer).
 4. **Then** tackle `main.py` decomposition, async DB migration, and Redis externalisation in that order.
 
-Doing items 1¨C3 in a single sprint would shift the project's overall risk profile materially and make the score in the next review climb meaningfully.
+Doing items 1C3 in a single sprint would shift the project's overall risk profile materially and make the score in the next review climb meaningfully.
 
 **Score: 8.0 / 10**
 
@@ -352,4 +352,4 @@ Doing items 1¨C3 in a single sprint would shift the project's overall risk prof
 
 ---
 
-> 7²215 **Reviewer's note on coverage.** The fetched file contents were partially truncated by the retrieval tool, so findings tied to specific functions in the lower halves of `main.py` and `db.py` (e.g., the federation peer fetcher, mesh role scoring, maintenance worker) could not be re-verified line-for-line in this pass. Treat them as **carried forward from the May 2026 review** unless a follow-up review with full file contents confirms or refutes them. The structural and import-level findings above are based on directly observed code.
+> 7215 **Reviewer's note on coverage.** The fetched file contents were partially truncated by the retrieval tool, so findings tied to specific functions in the lower halves of `main.py` and `db.py` (e.g., the federation peer fetcher, mesh role scoring, maintenance worker) could not be re-verified line-for-line in this pass. Treat them as **carried forward from the May 2026 review** unless a follow-up review with full file contents confirms or refutes them. The structural and import-level findings above are based on directly observed code.
