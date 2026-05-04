@@ -129,8 +129,10 @@ function sign(msg, ts) {
 function callAI(messages) {
   return new Promise((resolve, reject) => {
     const url = new URL(AI_BASE_URL);
+    const basePath = url.pathname.replace(/\/$/, ''); // strip trailing slash
     const req = https.request({
-      hostname: url.hostname, port: url.port || 443, path: '/v1/chat/completions', method: 'POST',
+      hostname: url.hostname, port: url.port || 443,
+      path: basePath + '/chat/completions', method: 'POST',
       headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + AI_API_KEY }
     }, res => {
       let data = '';
