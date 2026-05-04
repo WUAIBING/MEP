@@ -1,6 +1,6 @@
-fastapi
-uvicorn
-pydantic
-websockets
-cryptography
-psycopg2-binary
+fastapi==0.115.0
+uvicorn[standard]==0.32.0
+pydantic==2.9.2
+websockets==13.1
+cryptography==43.0.3
+psycopg2-binary==2.9.10

@@ -17,6 +17,11 @@ PG_POOL_MAX = int(os.getenv("MEP_PG_POOL_MAX", "5"))
 _pg_pool: Optional["pool.SimpleConnectionPool"] = None
 
 def _is_postgres() -> bool:
+    if DB_URL and psycopg2 is None:
+        raise SystemExit(
+            "MEP_DATABASE_URL is set but psycopg2 is not installed. "
+            "Install it with: pip install psycopg2-binary"
+        )
     return bool(DB_URL)
 
 def _get_pg_pool():
