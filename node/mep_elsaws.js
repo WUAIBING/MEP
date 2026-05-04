@@ -6,8 +6,8 @@ const os = require('os');
 const path = require('path');
 
 const KEY_FILE = '/tmp/mep_elsaws_identity.pem';
-const HUB_URL = 'https://mep-hub.silentcopilot.ai';
-const WS_URL = 'wss://mep-hub.silentcopilot.ai';
+const HUB_URL = process.env.HUB_URL || 'https://mep-hub.silentcopilot.ai';
+const WS_URL = process.env.WS_URL || 'wss://mep-hub.silentcopilot.ai';
 // AI Configuration — user fills these in
 // Set via environment variables or replace placeholder values
 const AI_API_KEY  = process.env.AI_API_KEY  || 'YOUR_API_KEY';         // e.g. sk-xxx from DeepSeek
@@ -128,8 +128,9 @@ function sign(msg, ts) {
 
 function callAI(messages) {
   return new Promise((resolve, reject) => {
+    const url = new URL(AI_BASE_URL);
     const req = https.request({
-      hostname: new URL(AI_BASE_URL).hostname, port: 443, path: '/v1/chat/completions', method: 'POST',
+      hostname: url.hostname, port: url.port || 443, path: '/v1/chat/completions', method: 'POST',
       headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + AI_API_KEY }
     }, res => {
       let data = '';
@@ -200,9 +201,10 @@ async function sendDM(target, content) {
   const body = JSON.stringify({ consumer_id: nodeId, payload: content, bounty: 0, target_node: target });
   const ts = Math.floor(Date.now() / 1000).toString();
   const sig = sign(body, ts);
+  const hubUrl = new URL(HUB_URL);
   return new Promise((resolve) => {
     const req = https.request({
-      hostname: 'mep-hub.silentcopilot.ai', port: 443, path: '/tasks/submit', method: 'POST',
+      hostname: hubUrl.hostname, port: hubUrl.port || 443, path: '/tasks/submit', method: 'POST',
       headers: { 'Content-Type': 'application/json', 'X-MEP-NodeID': nodeId, 'X-MEP-Timestamp': ts, 'X-MEP-Signature': sig }
     }, res => { let d = ''; res.on('data', c => d += c); res.on('end', () => resolve(d)); });
     req.on('error', resolve);
@@ -215,9 +217,10 @@ async function completeTask(taskId, resultPayload) {
   const body = JSON.stringify({ task_id: taskId, provider_id: nodeId, result_payload: resultPayload });
   const ts = Math.floor(Date.now() / 1000).toString();
   const sig = sign(body, ts);
+  const hubUrl = new URL(HUB_URL);
   return new Promise((resolve) => {
     const req = https.request({
-      hostname: 'mep-hub.silentcopilot.ai', port: 443, path: '/tasks/complete', method: 'POST',
+      hostname: hubUrl.hostname, port: hubUrl.port || 443, path: '/tasks/complete', method: 'POST',
       headers: { 'Content-Type': 'application/json', 'X-MEP-NodeID': nodeId, 'X-MEP-Timestamp': ts, 'X-MEP-Signature': sig }
     }, res => { let d = ''; res.on('data', c => d += c); res.on('end', () => { console.log('[elsaws] task complete:', d); resolve(d); }); });
     req.on('error', e => { console.log('[elsaws] complete err:', e.message); resolve(); });
@@ -227,9 +230,10 @@ async function completeTask(taskId, resultPayload) {
 }
 
 function register() {
+  const hubUrl = new URL(HUB_URL);
   return new Promise((resolve) => {
     const regReq = https.request({
-      hostname: 'mep-hub.silentcopilot.ai', port: 443, path: '/register', method: 'POST',
+      hostname: hubUrl.hostname, port: hubUrl.port || 443, path: '/register', method: 'POST',
       headers: { 'Content-Type': 'application/json' }
     }, res => { let d = ''; res.on('data', c => d += c); res.on('end', () => { console.log('[elsaws] reg:', d); resolve(); }); });
     regReq.on('error', e => console.log('err:', e.message));
@@ -242,8 +246,9 @@ function updateRegistry() {
     const body = JSON.stringify({ availability: 'online', alias: 'Elsaws' });
     const ts = Math.floor(Date.now() / 1000).toString();
     const sig = sign(body, ts);
+    const hubUrl = new URL(HUB_URL);
     const req = https.request({
-      hostname: 'mep-hub.silentcopilot.ai', port: 443, path: '/registry/update', method: 'POST',
+      hostname: hubUrl.hostname, port: hubUrl.port || 443, path: '/registry/update', method: 'POST',
       headers: { 'Content-Type': 'application/json', 'X-MEP-NodeID': nodeId, 'X-MEP-Timestamp': ts, 'X-MEP-Signature': sig }
     }, res => { let d = ''; res.on('data', c => d += c); res.on('end', () => { console.log('[elsaws] update:', d); resolve(); }); });
     req.on('error', e => console.log('err:', e.message));
@@ -281,8 +286,9 @@ function httpHeartbeat() {
   const body = JSON.stringify({ availability: 'online' });
   const ts = Math.floor(Date.now() / 1000).toString();
   const sig = sign(body, ts);
+  const hubUrl = new URL(HUB_URL);
   const req = https.request({
-    hostname: 'mep-hub.silentcopilot.ai', port: 443, path: '/registry/heartbeat', method: 'POST',
+    hostname: hubUrl.hostname, port: hubUrl.port || 443, path: '/registry/heartbeat', method: 'POST',
     headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body),
                'X-MEP-NodeID': nodeId, 'X-MEP-Timestamp': ts, 'X-MEP-Signature': sig }
   }, res => { let d = ''; res.on('data', c => d += c); res.on('end', () => console.log('[elsaws] heartbeat:', d)); });
