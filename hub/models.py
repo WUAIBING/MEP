@@ -69,7 +69,7 @@ class MeshAssembleRequest(BaseModel):
 
 class BrainstormSessionCreate(BaseModel):
     owner_id: str
-    participants: List[str] = Field(..., min_length=2)
+    participants: List[str] = Field(..., min_length=1)
     topic: Optional[str] = None
     max_messages: Optional[int] = Field(default=200, ge=10, le=2000)
 
