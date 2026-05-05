@@ -31,7 +31,9 @@ rate_limits: Dict[str, List[float]] = {}
 task_lock = asyncio.Lock()
 node_lock = asyncio.Lock()
 mesh_lock = asyncio.Lock()
+anti_loop_lock = asyncio.Lock()
 mesh_assemblies: Dict[str, dict] = {}
+anti_loop_channels: Dict[str, dict] = {}
 MAX_BODY_BYTES = 200_000
 MAX_PAYLOAD_CHARS = 20_000
 RATE_LIMIT_WINDOW = 10.0
@@ -112,6 +114,11 @@ VALID_AVAILABILITY = {"online", "idle", "busy", "offline", "degraded", "unknown"
 MESH_ALLOWED_TRIGGERS = {"brainstorm", "code_review", "incident", "planning"}
 MESH_DEFAULT_TIMEOUT_SECONDS = 300
 MESH_MAX_TIMEOUT_SECONDS = 3600
+ANTI_LOOP_ENABLED = os.getenv("MEP_ANTI_LOOP_ENABLED", "true").lower() in ("1", "true", "yes")
+ANTI_LOOP_WINDOW_SECONDS = float(os.getenv("MEP_ANTI_LOOP_WINDOW_SECONDS", "90"))
+ANTI_LOOP_MAX_MESSAGES = int(os.getenv("MEP_ANTI_LOOP_MAX_MESSAGES", "6"))
+ANTI_LOOP_COOLDOWN_SECONDS = int(os.getenv("MEP_ANTI_LOOP_COOLDOWN_SECONDS", "60"))
+ANTI_LOOP_TERMINATION_TOKENS = ("[end]", "[no_relay]", "[ack_only]")
 
 if TASK_TIMEOUT_MIN_SECONDS > TASK_TIMEOUT_MAX_SECONDS:
     TASK_TIMEOUT_MIN_SECONDS, TASK_TIMEOUT_MAX_SECONDS = TASK_TIMEOUT_MAX_SECONDS, TASK_TIMEOUT_MIN_SECONDS
@@ -358,6 +365,84 @@ def _normalize_model_requirement(value: Optional[str]) -> Optional[str]:
     if not normalized:
         return None
     return normalized
+
+
+def _direct_dm_channel(a: str, b: str) -> str:
+    left, right = sorted([a, b])
+    return f"dm:{left}:{right}"
+
+
+def _contains_anti_loop_termination(payload: str) -> bool:
+    lowered = (payload or "").lower()
+    return any(token in lowered for token in ANTI_LOOP_TERMINATION_TOKENS)
+
+
+async def _anti_loop_check_and_record(consumer_id: str, target_node: str, payload: str) -> None:
+    if not ANTI_LOOP_ENABLED:
+        return
+    if not consumer_id or not target_node:
+        return
+    channel = _direct_dm_channel(consumer_id, target_node)
+    now = time.time()
+    async with anti_loop_lock:
+        state = anti_loop_channels.setdefault(
+            channel,
+            {
+                "events": [],
+                "cooldown_until": 0.0,
+                "circuit_break_count": 0,
+                "last_reason": None,
+                "last_break_at": None,
+                "last_nodes": [],
+            },
+        )
+        cooldown_until = float(state.get("cooldown_until", 0.0) or 0.0)
+        if now < cooldown_until:
+            remaining = int(max(1, cooldown_until - now))
+            raise HTTPException(
+                status_code=429,
+                detail=f"Anti-loop cooldown active for {channel}; retry in {remaining}s",
+            )
+
+        state["events"].append(
+            {
+                "ts": now,
+                "sender": consumer_id,
+                "termination": _contains_anti_loop_termination(payload),
+            }
+        )
+        cutoff = now - ANTI_LOOP_WINDOW_SECONDS
+        state["events"] = [event for event in state["events"] if float(event.get("ts", 0)) >= cutoff]
+
+        non_terminal_events = [event for event in state["events"] if not event.get("termination")]
+        senders = [str(event.get("sender", "")) for event in non_terminal_events if event.get("sender")]
+        unique_senders = sorted(set(senders))
+        alternating = False
+        if len(senders) >= 4:
+            last4 = senders[-4:]
+            alternating = (
+                last4[0] == last4[2]
+                and last4[1] == last4[3]
+                and last4[0] != last4[1]
+            )
+
+        if len(non_terminal_events) >= ANTI_LOOP_MAX_MESSAGES and (alternating or len(unique_senders) <= 2):
+            state["cooldown_until"] = now + ANTI_LOOP_COOLDOWN_SECONDS
+            state["circuit_break_count"] = int(state.get("circuit_break_count", 0)) + 1
+            state["last_reason"] = "bot_loop_detected"
+            state["last_break_at"] = now
+            state["last_nodes"] = unique_senders
+            log_event(
+                "anti_loop_circuit_break",
+                f"Circuit break triggered for {channel}",
+                channel=channel,
+                nodes=unique_senders,
+                cooldown_seconds=ANTI_LOOP_COOLDOWN_SECONDS,
+            )
+            raise HTTPException(
+                status_code=429,
+                detail=f"Anti-loop circuit break triggered for {channel}; cooldown {ANTI_LOOP_COOLDOWN_SECONDS}s",
+            )
 
 
 def _normalize_mesh_trigger(value: str) -> str:
@@ -1285,6 +1370,8 @@ async def submit_task(
         raise HTTPException(status_code=400, detail="Task requires payload or payload_uri")
     if len(payload) > MAX_PAYLOAD_CHARS:
         raise HTTPException(status_code=413, detail="Task payload too large")
+    if task.target_node and float(task.bounty) == 0.0:
+        await _anti_loop_check_and_record(task.consumer_id, task.target_node, payload)
     
     if x_mep_idempotency_key:
         existing = db.get_idempotency(authenticated_node, "/tasks/submit", x_mep_idempotency_key)
@@ -1745,7 +1832,7 @@ async def health_check():
 
 
 # ---------------------------------------------------------------------------
-# Diagnostic Endpoint — tiered approach (per Hermes DM discussion)
+# Diagnostic Endpoint 鈥?tiered approach (per Hermes DM discussion)
 # ---------------------------------------------------------------------------
 class DiagnosticResponse(BaseModel):
     node_id: Optional[str] = None
@@ -1769,11 +1856,11 @@ async def diagnostic(
     """
     Tiered diagnostic endpoint.
 
-    Tier 1 (public, no auth) — specify node_id as query param:
+    Tier 1 (public, no auth) 鈥?specify node_id as query param:
         GET /diagnostic?node_id=node_xxx
         Returns: {node_id, registered, availability, last_heartbeat}
 
-    Tier 2 (authenticated) — no query param, uses auth headers:
+    Tier 2 (authenticated) 鈥?no query param, uses auth headers:
         GET /diagnostic (with X-MEP-NodeID, X-MEP-Timestamp, X-MEP-Signature)
         Returns: full health report including ws_connected, last_ws_activity, auth_ok
 
@@ -1853,6 +1940,65 @@ async def recent_events(limit: int = 50, x_mep_admin_key: Optional[str] = Header
     events = _read_recent_events(safe_limit)
     return {"count": len(events), "events": events}
 
+
+@app.get("/anti-loop/status")
+async def anti_loop_status(channel: Optional[str] = None):
+    now = time.time()
+
+    def _serialize(channel_id: str, state: dict) -> dict:
+        events = list(state.get("events", []))
+        cutoff = now - ANTI_LOOP_WINDOW_SECONDS
+        recent = [event for event in events if float(event.get("ts", 0)) >= cutoff]
+        cooldown_until = float(state.get("cooldown_until", 0.0) or 0.0)
+        return {
+            "channel": channel_id,
+            "state": "cooldown" if cooldown_until > now else "normal",
+            "consecutive_bot_messages": len([event for event in recent if not event.get("termination")]),
+            "circuit_break_active": cooldown_until > now,
+            "cooldown_remaining_seconds": max(0, int(cooldown_until - now)),
+            "circuit_break_count": int(state.get("circuit_break_count", 0)),
+            "last_reason": state.get("last_reason"),
+            "last_break_at": state.get("last_break_at"),
+            "nodes_involved": state.get("last_nodes", []),
+        }
+
+    async with anti_loop_lock:
+        if channel:
+            state = anti_loop_channels.get(channel)
+            if not state:
+                return {
+                    "channel": channel,
+                    "state": "normal",
+                    "consecutive_bot_messages": 0,
+                    "circuit_break_active": False,
+                    "cooldown_remaining_seconds": 0,
+                    "circuit_break_count": 0,
+                    "last_reason": None,
+                    "last_break_at": None,
+                    "nodes_involved": [],
+                }
+            return _serialize(channel, state)
+        items = [_serialize(channel_id, state) for channel_id, state in anti_loop_channels.items()]
+    return {"channels": items, "count": len(items)}
+
+
+@app.post("/anti-loop/reset")
+async def anti_loop_reset(channel: Optional[str] = None, x_mep_admin_key: Optional[str] = Header(default=None)):
+    _require_admin(x_mep_admin_key)
+    async with anti_loop_lock:
+        if channel:
+            state = anti_loop_channels.get(channel)
+            if not state:
+                return {"status": "ok", "reset_channels": 0}
+            state["cooldown_until"] = 0.0
+            state["events"] = []
+            state["last_reason"] = "manual_reset"
+            state["last_break_at"] = time.time()
+            state["last_nodes"] = []
+            return {"status": "ok", "reset_channels": 1, "channel": channel}
+        anti_loop_channels.clear()
+        return {"status": "ok", "reset_channels": "all"}
+
 @app.get("/", response_class=HTMLResponse)
 async def hub_landing(request: Request):
     async with node_lock:
@@ -1870,7 +2016,7 @@ async def hub_landing(request: Request):
     ws_url = base_url.replace("https://", "wss://").replace("http://", "ws://")
     total_nodes = db.get_node_count()
     last_completed_ts = db.get_last_completed_task_time()
-    last_completed = datetime.utcfromtimestamp(last_completed_ts).strftime("%Y-%m-%d %H:%M:%S UTC") if last_completed_ts else "—"
+    last_completed = datetime.utcfromtimestamp(last_completed_ts).strftime("%Y-%m-%d %H:%M:%S UTC") if last_completed_ts else "-"
     html = f"""<!doctype html>
 <html lang="en">
 <head>
@@ -1898,7 +2044,7 @@ async def hub_landing(request: Request):
 <body>
   <div class="card">
     <div class="label">Welcome to MEP Hub 0</div>
-    <div>Version {app.version} • Uptime {uptime} • Status {status}</div>
+    <div>Version {app.version} 鈥?Uptime {uptime} 鈥?Status {status}</div>
     <div class="row">
       <div>
         <div class="kpi">{online_count}</div>
