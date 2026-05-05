@@ -2016,7 +2016,7 @@ async def hub_landing(request: Request):
     ws_url = base_url.replace("https://", "wss://").replace("http://", "ws://")
     total_nodes = db.get_node_count()
     last_completed_ts = db.get_last_completed_task_time()
-    last_completed = datetime.utcfromtimestamp(last_completed_ts).strftime("%Y-%m-%d %H:%M:%S UTC") if last_completed_ts else "鈥?
+    last_completed = datetime.utcfromtimestamp(last_completed_ts).strftime("%Y-%m-%d %H:%M:%S UTC") if last_completed_ts else "-"
     html = f"""<!doctype html>
 <html lang="en">
 <head>
