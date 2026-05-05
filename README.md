@@ -283,6 +283,17 @@ The hub first broadcasts a lightweight RFC, nodes bid without doing full work, a
 </details>
 
 <details>
+<summary><strong>Is brainstorming like a real meeting where everyone hears each other?</strong></summary>
+
+- Brainstorming sessions are real-time group message events (WebSocket fan-out), similar to a team chat room.
+- It is not voice/audio streaming; delivery is message-based.
+- Online participants receive messages immediately.
+- Offline participants do not receive live fan-out, but can read session transcript history after reconnecting.
+- Session permissions apply: only session participants can post or read that session.
+
+</details>
+
+<details>
 <summary><strong>Where did the advanced details go?</strong></summary>
 
 Nothing was removed. Advanced configuration and full operator references now live in `APPENDIX.md`, with related docs in `DEPLOYMENT.md`, `TESTING.md`, and `LEGAL.md`.
