@@ -19,7 +19,23 @@ import db
 import auth
 from logger import log_event, log_audit
 
-from models import NodeRegistration, TaskCreate, TaskResult, TaskBid, TaskCancel, RegistryUpdate, AvailabilityUpdate, RegistryHeartbeat, ReputationSubmit, DisputeOpen, DisputeResolve, FederationPeerUpsert, MeshAssembleRequest
+from models import (
+    NodeRegistration,
+    TaskCreate,
+    TaskResult,
+    TaskBid,
+    TaskCancel,
+    RegistryUpdate,
+    AvailabilityUpdate,
+    RegistryHeartbeat,
+    ReputationSubmit,
+    DisputeOpen,
+    DisputeResolve,
+    FederationPeerUpsert,
+    MeshAssembleRequest,
+    BrainstormSessionCreate,
+    BrainstormSessionPost,
+)
 
 app = FastAPI(title="MEP Hub", description="The Time Exchange Clearinghouse", version="0.1.2")
 
@@ -32,8 +48,10 @@ task_lock = asyncio.Lock()
 node_lock = asyncio.Lock()
 mesh_lock = asyncio.Lock()
 anti_loop_lock = asyncio.Lock()
+brainstorm_lock = asyncio.Lock()
 mesh_assemblies: Dict[str, dict] = {}
 anti_loop_channels: Dict[str, dict] = {}
+brainstorm_sessions: Dict[str, dict] = {}
 MAX_BODY_BYTES = 200_000
 MAX_PAYLOAD_CHARS = 20_000
 RATE_LIMIT_WINDOW = 10.0
@@ -443,6 +461,22 @@ async def _anti_loop_check_and_record(consumer_id: str, target_node: str, payloa
                 status_code=429,
                 detail=f"Anti-loop circuit break triggered for {channel}; cooldown {ANTI_LOOP_COOLDOWN_SECONDS}s",
             )
+
+
+def _normalize_brainstorm_participants(owner_id: str, participants: list[str]) -> list[str]:
+    cleaned: list[str] = []
+    seen: set[str] = set()
+    for raw in participants:
+        node_id = str(raw or "").strip()
+        if not node_id:
+            continue
+        if node_id not in seen:
+            cleaned.append(node_id)
+            seen.add(node_id)
+    if owner_id not in seen:
+        cleaned.append(owner_id)
+        seen.add(owner_id)
+    return cleaned
 
 
 def _normalize_mesh_trigger(value: str) -> str:
@@ -1250,6 +1284,156 @@ async def mesh_status(assembly_id: str, authenticated_node: str = Depends(verify
         if unresolved:
             response["degraded_warning"] = f"Unfilled role(s): {', '.join(unresolved)}"
     return response
+
+
+@app.post("/brainstorm/sessions/create")
+async def brainstorm_create(
+    payload: BrainstormSessionCreate,
+    authenticated_node: str = Depends(verify_request),
+):
+    if authenticated_node != payload.owner_id:
+        raise HTTPException(status_code=403, detail="Cannot create session for another node")
+    participants = _normalize_brainstorm_participants(payload.owner_id, payload.participants)
+    if len(participants) < 2:
+        raise HTTPException(status_code=400, detail="Brainstorm session requires at least 2 participants")
+    now = time.time()
+    session_id = str(uuid.uuid4())
+    session = {
+        "session_id": session_id,
+        "owner_id": payload.owner_id,
+        "participants": participants,
+        "topic": (payload.topic or "").strip(),
+        "created_at": now,
+        "updated_at": now,
+        "status": "active",
+        "max_messages": int(payload.max_messages or 200),
+        "messages": [],
+        "message_seq": 0,
+    }
+    async with brainstorm_lock:
+        brainstorm_sessions[session_id] = session
+    log_event(
+        "brainstorm_session_created",
+        f"Brainstorm session {session_id[:8]} created by {payload.owner_id}",
+        session_id=session_id,
+        owner_id=payload.owner_id,
+        participant_count=len(participants),
+    )
+    return {
+        "status": "success",
+        "session_id": session_id,
+        "owner_id": payload.owner_id,
+        "participants": participants,
+        "topic": session["topic"],
+    }
+
+
+@app.post("/brainstorm/sessions/post")
+async def brainstorm_post(
+    payload: BrainstormSessionPost,
+    authenticated_node: str = Depends(verify_request),
+):
+    async with brainstorm_lock:
+        session = brainstorm_sessions.get(payload.session_id)
+        if not session or session.get("status") != "active":
+            raise HTTPException(status_code=404, detail="Brainstorm session not found or inactive")
+        participants = list(session.get("participants", []))
+        if authenticated_node not in participants:
+            raise HTTPException(status_code=403, detail="Node is not a participant of this session")
+        max_messages = int(session.get("max_messages", 200))
+        if len(session["messages"]) >= max_messages:
+            raise HTTPException(status_code=400, detail="Brainstorm session reached max messages")
+        message_id = f"{payload.session_id}:{int(session.get('message_seq', 0)) + 1}"
+        message = {
+            "message_id": message_id,
+            "session_id": payload.session_id,
+            "sender_id": authenticated_node,
+            "content": payload.message.strip(),
+            "reply_to_message_id": payload.reply_to_message_id,
+            "created_at": time.time(),
+        }
+        session["message_seq"] = int(session.get("message_seq", 0)) + 1
+        session["messages"].append(message)
+        session["updated_at"] = message["created_at"]
+
+    fanout_payload = {
+        "event": "brainstorm_message",
+        "data": {
+            "session_id": payload.session_id,
+            "topic": session.get("topic"),
+            "message": message,
+            "participants": participants,
+        },
+    }
+    delivered_to: list[str] = []
+    async with node_lock:
+        participant_sockets = [(node_id, connected_nodes.get(node_id)) for node_id in participants]
+    for node_id, ws in participant_sockets:
+        if not ws:
+            continue
+        try:
+            await ws.send_json(fanout_payload)
+            delivered_to.append(node_id)
+        except Exception as exc:
+            log_event(
+                "brainstorm_fanout_failed",
+                f"Failed fanout for session {payload.session_id[:8]} to {node_id}: {exc}",
+                session_id=payload.session_id,
+                node_id=node_id,
+            )
+            async with node_lock:
+                if connected_nodes.get(node_id) is ws:
+                    del connected_nodes[node_id]
+    return {"status": "success", "message_id": message_id, "delivered_to": delivered_to}
+
+
+@app.get("/brainstorm/sessions/{session_id}")
+async def brainstorm_get_session(
+    session_id: str,
+    limit: int = 100,
+    authenticated_node: str = Depends(verify_request),
+):
+    safe_limit = max(1, min(limit, 500))
+    async with brainstorm_lock:
+        session = brainstorm_sessions.get(session_id)
+        if not session:
+            raise HTTPException(status_code=404, detail="Brainstorm session not found")
+        if authenticated_node not in session.get("participants", []):
+            raise HTTPException(status_code=403, detail="Node is not a participant of this session")
+        messages = list(session.get("messages", []))
+        payload = {
+            "session_id": session["session_id"],
+            "owner_id": session["owner_id"],
+            "participants": list(session.get("participants", [])),
+            "topic": session.get("topic"),
+            "status": session.get("status"),
+            "created_at": session.get("created_at"),
+            "updated_at": session.get("updated_at"),
+            "message_count": len(messages),
+            "messages": messages[-safe_limit:],
+        }
+    return payload
+
+
+@app.get("/brainstorm/sessions")
+async def brainstorm_list_sessions(authenticated_node: str = Depends(verify_request)):
+    now = time.time()
+    async with brainstorm_lock:
+        sessions = [
+            {
+                "session_id": session["session_id"],
+                "owner_id": session["owner_id"],
+                "participants": list(session.get("participants", [])),
+                "topic": session.get("topic"),
+                "status": session.get("status"),
+                "updated_at": session.get("updated_at"),
+                "message_count": len(session.get("messages", [])),
+            }
+            for session in brainstorm_sessions.values()
+            if authenticated_node in session.get("participants", [])
+        ]
+    sessions.sort(key=lambda item: float(item.get("updated_at") or now), reverse=True)
+    return {"count": len(sessions), "sessions": sessions}
 
 @app.get("/federation/peers")
 async def get_federation_peers():

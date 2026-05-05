@@ -396,6 +396,68 @@ class TestMeshAssembly(unittest.TestCase):
         )
 
 
+class TestBrainstormSessions(unittest.TestCase):
+    def setUp(self):
+        main.brainstorm_sessions.clear()
+
+    def test_create_post_and_read_session(self):
+        owner_priv, owner_pub, owner_id = _make_identity()
+        p1_priv, p1_pub, p1_id = _make_identity()
+        p2_priv, p2_pub, p2_id = _make_identity()
+        _register(owner_pub)
+        _register(p1_pub)
+        _register(p2_pub)
+
+        create_payload = json.dumps(
+            {
+                "owner_id": owner_id,
+                "participants": [p1_id, p2_id],
+                "topic": "Loop-free architecture",
+            }
+        )
+        create_headers = _auth_headers(owner_priv, owner_id, create_payload)
+        create_resp = client.post("/brainstorm/sessions/create", content=create_payload, headers=create_headers)
+        self.assertEqual(create_resp.status_code, 200, f"Create failed: {create_resp.text}")
+        session_id = create_resp.json()["session_id"]
+
+        post_payload = json.dumps(
+            {
+                "session_id": session_id,
+                "message": "I suggest we add a shared session timeline.",
+            }
+        )
+        post_headers = _auth_headers(p1_priv, p1_id, post_payload)
+        post_resp = client.post("/brainstorm/sessions/post", content=post_payload, headers=post_headers)
+        self.assertEqual(post_resp.status_code, 200, f"Post failed: {post_resp.text}")
+
+        get_headers = _auth_headers(p2_priv, p2_id, "")
+        get_resp = client.get(f"/brainstorm/sessions/{session_id}", headers=get_headers)
+        self.assertEqual(get_resp.status_code, 200, f"Get failed: {get_resp.text}")
+        data = get_resp.json()
+        self.assertEqual(data["topic"], "Loop-free architecture")
+        self.assertEqual(data["message_count"], 1)
+        self.assertEqual(data["messages"][0]["sender_id"], p1_id)
+
+    def test_non_participant_cannot_post(self):
+        owner_priv, owner_pub, owner_id = _make_identity()
+        p1_priv, p1_pub, p1_id = _make_identity()
+        outsider_priv, outsider_pub, outsider_id = _make_identity()
+        _register(owner_pub)
+        _register(p1_pub)
+        _register(outsider_pub)
+
+        create_payload = json.dumps({"owner_id": owner_id, "participants": [p1_id]})
+        create_headers = _auth_headers(owner_priv, owner_id, create_payload)
+        create_resp = client.post("/brainstorm/sessions/create", content=create_payload, headers=create_headers)
+        self.assertEqual(create_resp.status_code, 200)
+        session_id = create_resp.json()["session_id"]
+
+        post_payload = json.dumps({"session_id": session_id, "message": "Intruding message"})
+        post_headers = _auth_headers(outsider_priv, outsider_id, post_payload)
+        post_resp = client.post("/brainstorm/sessions/post", content=post_payload, headers=post_headers)
+        self.assertEqual(post_resp.status_code, 403)
+
+
 def tearDownModule():
     """Clean up test database."""
     try:
