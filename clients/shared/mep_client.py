@@ -100,7 +100,70 @@ class MEPClient:
         )
         return {"status_code": response.status_code, "json": response.json()}
 
-    async def listen_results(self, on_result: Callable[[dict], Awaitable[None]]) -> None:
+    async def create_brainstorm_session(
+        self,
+        participants: list[str],
+        topic: Optional[str] = None,
+        max_messages: int = 200,
+    ) -> dict:
+        body: dict = {
+            "owner_id": self.node_id,
+            "participants": participants,
+            "max_messages": max_messages,
+        }
+        if topic:
+            body["topic"] = topic
+        payload_str = json.dumps(body)
+        headers = self._auth_headers(payload_str)
+        response = await asyncio.to_thread(
+            self.session.post,
+            f"{HUB_URL}/brainstorm/sessions/create",
+            data=payload_str,
+            headers=headers,
+            timeout=20,
+        )
+        return {"status_code": response.status_code, "json": response.json()}
+
+    async def post_brainstorm_message(
+        self,
+        session_id: str,
+        message: str,
+        reply_to_message_id: Optional[str] = None,
+    ) -> dict:
+        body: dict = {
+            "session_id": session_id,
+            "message": message,
+        }
+        if reply_to_message_id:
+            body["reply_to_message_id"] = reply_to_message_id
+        payload_str = json.dumps(body)
+        headers = self._auth_headers(payload_str)
+        response = await asyncio.to_thread(
+            self.session.post,
+            f"{HUB_URL}/brainstorm/sessions/post",
+            data=payload_str,
+            headers=headers,
+            timeout=20,
+        )
+        return {"status_code": response.status_code, "json": response.json()}
+
+    async def get_brainstorm_session(self, session_id: str, limit: int = 100) -> dict:
+        payload_str = ""
+        headers = self._auth_headers(payload_str)
+        response = await asyncio.to_thread(
+            self.session.get,
+            f"{HUB_URL}/brainstorm/sessions/{session_id}",
+            params={"limit": limit},
+            headers=headers,
+            timeout=20,
+        )
+        return {"status_code": response.status_code, "json": response.json()}
+
+    async def listen_results(
+        self,
+        on_result: Callable[[dict], Awaitable[None]],
+        on_event: Optional[Callable[[dict], Awaitable[None]]] = None,
+    ) -> None:
         while not self._stop.is_set():
             ts = str(int(time.time()))
             sig = urllib.parse.quote(self.identity.sign(self.node_id, ts))
@@ -116,6 +179,8 @@ class MEPClient:
                             data = json.loads(msg)
                             if data.get("event") == "task_result":
                                 await on_result(data["data"])
+                            elif on_event is not None:
+                                await on_event(data)
                     finally:
                         if heartbeat_task:
                             heartbeat_task.cancel()
