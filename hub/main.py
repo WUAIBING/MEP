@@ -19,7 +19,7 @@ import db
 import auth
 from logger import log_event, log_audit
 
-from models import NodeRegistration, TaskCreate, TaskResult, TaskBid, TaskCancel, RegistryUpdate, AvailabilityUpdate, RegistryHeartbeat, ReputationSubmit, DisputeOpen, DisputeResolve, FederationPeerUpsert
+from models import NodeRegistration, TaskCreate, TaskResult, TaskBid, TaskCancel, RegistryUpdate, AvailabilityUpdate, RegistryHeartbeat, ReputationSubmit, DisputeOpen, DisputeResolve, FederationPeerUpsert, MeshAssembleRequest
 
 app = FastAPI(title="MEP Hub", description="The Time Exchange Clearinghouse", version="0.1.2")
 
@@ -30,6 +30,10 @@ connected_nodes: Dict[str, WebSocket] = {}
 rate_limits: Dict[str, List[float]] = {}
 task_lock = asyncio.Lock()
 node_lock = asyncio.Lock()
+mesh_lock = asyncio.Lock()
+anti_loop_lock = asyncio.Lock()
+mesh_assemblies: Dict[str, dict] = {}
+anti_loop_channels: Dict[str, dict] = {}
 MAX_BODY_BYTES = 200_000
 MAX_PAYLOAD_CHARS = 20_000
 RATE_LIMIT_WINDOW = 10.0
@@ -97,6 +101,9 @@ DISPUTE_WINDOW_SECONDS = int(os.getenv("MEP_DISPUTE_WINDOW_SECONDS", "86400"))
 DISPUTE_REASON_MIN_CHARS = int(os.getenv("MEP_DISPUTE_REASON_MIN_CHARS", "10"))
 DISPUTE_REASON_MAX_CHARS = int(os.getenv("MEP_DISPUTE_REASON_MAX_CHARS", "500"))
 ASSIGNMENT_TIMEOUT_SECONDS = int(os.getenv("MEP_ASSIGNMENT_TIMEOUT_SECONDS", "3600"))
+TASK_TIMEOUT_DEFAULT_SECONDS = int(os.getenv("MEP_TASK_TIMEOUT_DEFAULT_SECONDS", str(ASSIGNMENT_TIMEOUT_SECONDS)))
+TASK_TIMEOUT_MIN_SECONDS = int(os.getenv("MEP_TASK_TIMEOUT_MIN_SECONDS", "60"))
+TASK_TIMEOUT_MAX_SECONDS = int(os.getenv("MEP_TASK_TIMEOUT_MAX_SECONDS", "86400"))
 ASSIGNMENT_SWEEP_INTERVAL_SECONDS = int(os.getenv("MEP_ASSIGNMENT_SWEEP_INTERVAL_SECONDS", "60"))
 MAINTENANCE_SWEEP_INTERVAL_SECONDS = int(os.getenv("MEP_MAINTENANCE_SWEEP_INTERVAL_SECONDS", "60"))
 COMPLETED_TASK_CACHE_TTL_SECONDS = int(os.getenv("MEP_COMPLETED_TASK_CACHE_TTL_SECONDS", "3600"))
@@ -104,6 +111,18 @@ COMPLETED_TASK_CACHE_MAX_ITEMS = int(os.getenv("MEP_COMPLETED_TASK_CACHE_MAX_ITE
 IDEMPOTENCY_TTL_SECONDS = int(os.getenv("MEP_IDEMPOTENCY_TTL_SECONDS", "86400"))
 TIMEOUT_POLICY = os.getenv("MEP_TIMEOUT_POLICY", "refund").lower()
 VALID_AVAILABILITY = {"online", "idle", "busy", "offline", "degraded", "unknown"}
+MESH_ALLOWED_TRIGGERS = {"brainstorm", "code_review", "incident", "planning"}
+MESH_DEFAULT_TIMEOUT_SECONDS = 300
+MESH_MAX_TIMEOUT_SECONDS = 3600
+ANTI_LOOP_ENABLED = os.getenv("MEP_ANTI_LOOP_ENABLED", "true").lower() in ("1", "true", "yes")
+ANTI_LOOP_WINDOW_SECONDS = float(os.getenv("MEP_ANTI_LOOP_WINDOW_SECONDS", "90"))
+ANTI_LOOP_MAX_MESSAGES = int(os.getenv("MEP_ANTI_LOOP_MAX_MESSAGES", "6"))
+ANTI_LOOP_COOLDOWN_SECONDS = int(os.getenv("MEP_ANTI_LOOP_COOLDOWN_SECONDS", "60"))
+ANTI_LOOP_TERMINATION_TOKENS = ("[end]", "[no_relay]", "[ack_only]")
+
+if TASK_TIMEOUT_MIN_SECONDS > TASK_TIMEOUT_MAX_SECONDS:
+    TASK_TIMEOUT_MIN_SECONDS, TASK_TIMEOUT_MAX_SECONDS = TASK_TIMEOUT_MAX_SECONDS, TASK_TIMEOUT_MIN_SECONDS
+TASK_TIMEOUT_DEFAULT_SECONDS = max(TASK_TIMEOUT_MIN_SECONDS, min(TASK_TIMEOUT_DEFAULT_SECONDS, TASK_TIMEOUT_MAX_SECONDS))
 
 # ---------------------------------------------------------------------------
 # Node Activity Tracking (for passive degraded detection)
@@ -292,6 +311,7 @@ async def _load_active_tasks_from_db():
             "status": task["status"],
             "target_node": task["target_node"],
             "model_requirement": task["model_requirement"],
+            "expires_in_seconds": task.get("expires_in_seconds"),
             "provider_id": task["provider_id"],
             "payload_uri": task.get("payload_uri"),
             "secret_data": task.get("result_payload")
@@ -345,6 +365,230 @@ def _normalize_model_requirement(value: Optional[str]) -> Optional[str]:
     if not normalized:
         return None
     return normalized
+
+
+def _direct_dm_channel(a: str, b: str) -> str:
+    left, right = sorted([a, b])
+    return f"dm:{left}:{right}"
+
+
+def _contains_anti_loop_termination(payload: str) -> bool:
+    lowered = (payload or "").lower()
+    return any(token in lowered for token in ANTI_LOOP_TERMINATION_TOKENS)
+
+
+async def _anti_loop_check_and_record(consumer_id: str, target_node: str, payload: str) -> None:
+    if not ANTI_LOOP_ENABLED:
+        return
+    if not consumer_id or not target_node:
+        return
+    channel = _direct_dm_channel(consumer_id, target_node)
+    now = time.time()
+    async with anti_loop_lock:
+        state = anti_loop_channels.setdefault(
+            channel,
+            {
+                "events": [],
+                "cooldown_until": 0.0,
+                "circuit_break_count": 0,
+                "last_reason": None,
+                "last_break_at": None,
+                "last_nodes": [],
+            },
+        )
+        cooldown_until = float(state.get("cooldown_until", 0.0) or 0.0)
+        if now < cooldown_until:
+            remaining = int(max(1, cooldown_until - now))
+            raise HTTPException(
+                status_code=429,
+                detail=f"Anti-loop cooldown active for {channel}; retry in {remaining}s",
+            )
+
+        state["events"].append(
+            {
+                "ts": now,
+                "sender": consumer_id,
+                "termination": _contains_anti_loop_termination(payload),
+            }
+        )
+        cutoff = now - ANTI_LOOP_WINDOW_SECONDS
+        state["events"] = [event for event in state["events"] if float(event.get("ts", 0)) >= cutoff]
+
+        non_terminal_events = [event for event in state["events"] if not event.get("termination")]
+        senders = [str(event.get("sender", "")) for event in non_terminal_events if event.get("sender")]
+        unique_senders = sorted(set(senders))
+        alternating = False
+        if len(senders) >= 4:
+            last4 = senders[-4:]
+            alternating = (
+                last4[0] == last4[2]
+                and last4[1] == last4[3]
+                and last4[0] != last4[1]
+            )
+
+        if len(non_terminal_events) >= ANTI_LOOP_MAX_MESSAGES and (alternating or len(unique_senders) <= 2):
+            state["cooldown_until"] = now + ANTI_LOOP_COOLDOWN_SECONDS
+            state["circuit_break_count"] = int(state.get("circuit_break_count", 0)) + 1
+            state["last_reason"] = "bot_loop_detected"
+            state["last_break_at"] = now
+            state["last_nodes"] = unique_senders
+            log_event(
+                "anti_loop_circuit_break",
+                f"Circuit break triggered for {channel}",
+                channel=channel,
+                nodes=unique_senders,
+                cooldown_seconds=ANTI_LOOP_COOLDOWN_SECONDS,
+            )
+            raise HTTPException(
+                status_code=429,
+                detail=f"Anti-loop circuit break triggered for {channel}; cooldown {ANTI_LOOP_COOLDOWN_SECONDS}s",
+            )
+
+
+def _normalize_mesh_trigger(value: str) -> str:
+    normalized = (value or "").strip().lower()
+    if normalized not in MESH_ALLOWED_TRIGGERS:
+        allowed = ", ".join(sorted(MESH_ALLOWED_TRIGGERS))
+        raise HTTPException(status_code=400, detail=f"Invalid trigger. Allowed values: {allowed}")
+    return normalized
+
+
+def _normalize_mesh_timeout_seconds(value: Optional[int]) -> int:
+    if value is None:
+        return MESH_DEFAULT_TIMEOUT_SECONDS
+    return max(1, min(int(value), MESH_MAX_TIMEOUT_SECONDS))
+
+
+def _mesh_provider_rank(provider: Optional[str]) -> int:
+    table = {
+        "deepseek": 5,
+        "yunwu": 4,
+        "template": 3,
+        "echo": 2,
+    }
+    if provider is None:
+        return 1
+    return table.get(provider.strip().lower(), 1)
+
+
+def _mesh_role_score(role: str, candidate: dict) -> int:
+    provider = candidate.get("ai_provider")
+    ai_status = candidate.get("ai_status")
+    thinking_mode = candidate.get("thinking_mode")
+    preference = candidate.get("mesh_role_preference")
+    availability = candidate.get("availability")
+    connected = candidate.get("connected", False)
+
+    score = _mesh_provider_rank(provider) * 10
+    if ai_status == "online":
+        score += 20
+    elif ai_status == "degraded":
+        score += 8
+    elif ai_status == "offline":
+        score -= 50
+    if connected:
+        score += 5
+
+    if role == "strategist":
+        if thinking_mode == "reasoning":
+            score += 40
+        if preference == "strategist":
+            score += 20
+    elif role == "implementer":
+        if thinking_mode == "code_reading":
+            score += 45
+        if preference == "implementer":
+            score += 20
+        if provider in ("echo", None):
+            score -= 15
+    elif role == "facilitator":
+        if thinking_mode == "aggregation":
+            score += 35
+        if preference == "facilitator":
+            score += 20
+        if availability in ("online", "idle"):
+            score += 10
+    elif role == "scout":
+        if thinking_mode == "ack_only":
+            score += 35
+        if preference == "scout":
+            score += 20
+        if provider in ("echo", "template"):
+            score += 15
+    return score
+
+
+def _mesh_role_payload(candidate: dict) -> dict:
+    return {
+        "node_id": candidate["node_id"],
+        "alias": candidate.get("alias"),
+        "ai_provider": candidate.get("ai_provider"),
+        "status": candidate.get("availability"),
+    }
+
+
+def _pick_mesh_candidate(role: str, candidates: list[dict], used: set[str]) -> Optional[dict]:
+    available = [item for item in candidates if item["node_id"] not in used]
+    if not available:
+        return None
+    ranked = sorted(available, key=lambda item: (-_mesh_role_score(role, item), item["node_id"]))
+    return ranked[0]
+
+
+def _assign_mesh_roles(candidates: list[dict]) -> tuple[dict, list[str]]:
+    roles: dict[str, dict] = {}
+    missing: list[str] = []
+    used: set[str] = set()
+    for role in ("strategist", "implementer", "facilitator", "scout"):
+        picked = _pick_mesh_candidate(role, candidates, used)
+        if not picked:
+            missing.append(role)
+            continue
+        used.add(picked["node_id"])
+        roles[role] = _mesh_role_payload(picked)
+    return roles, missing
+
+
+async def _collect_mesh_candidates() -> list[dict]:
+    query = _build_registry_query(None, None, None, None, None, None, None, 100)
+    registry_entries = _search_registry_local(query)
+    async with node_lock:
+        connected_snapshot = set(connected_nodes.keys())
+    candidates: list[dict] = []
+    for entry in registry_entries:
+        node_id = str(entry.get("node_id", "")).strip()
+        if not node_id:
+            continue
+        availability = str(entry.get("availability") or "unknown").strip().lower()
+        if availability == "offline":
+            continue
+        metadata = entry.get("metadata") or {}
+        if not isinstance(metadata, dict):
+            metadata = {}
+        candidate = {
+            "node_id": node_id,
+            "alias": entry.get("alias"),
+            "availability": availability,
+            "connected": node_id in connected_snapshot,
+            "ai_provider": (str(metadata.get("ai_provider")).strip().lower() if metadata.get("ai_provider") is not None else None),
+            "ai_status": str(metadata.get("ai_status") or "unknown").strip().lower(),
+            "thinking_mode": str(metadata.get("thinking_mode") or "").strip().lower() or None,
+            "mesh_role_preference": str(metadata.get("mesh_role_preference") or "").strip().lower() or None,
+        }
+        candidates.append(candidate)
+    return candidates
+
+
+async def _purge_expired_mesh_assemblies(now_ts: Optional[float] = None) -> None:
+    now_ts = now_ts or time.time()
+    async with mesh_lock:
+        expired = [
+            assembly_id
+            for assembly_id, payload in mesh_assemblies.items()
+            if payload.get("expires_at", 0.0) <= now_ts
+        ]
+        for assembly_id in expired:
+            del mesh_assemblies[assembly_id]
 
 def _normalize_artifact_uri(value: Optional[str], field_name: str) -> Optional[str]:
     if value is None:
@@ -655,13 +899,17 @@ def _sweep_idempotency_records():
         log_event("idempotency_cleaned", f"Removed {removed} expired idempotency records", removed=removed)
 
 async def _sweep_assigned_timeouts():
-    if ASSIGNMENT_TIMEOUT_SECONDS <= 0:
-        return
-    cutoff = time.time() - ASSIGNMENT_TIMEOUT_SECONDS
-    expired_tasks = db.get_assigned_tasks_before(cutoff)
-    if not expired_tasks:
+    if TASK_TIMEOUT_DEFAULT_SECONDS <= 0:
         return
     now = time.time()
+    expired_tasks = db.get_assigned_tasks_for_timeout(
+        now,
+        TASK_TIMEOUT_DEFAULT_SECONDS,
+        TASK_TIMEOUT_MIN_SECONDS,
+        TASK_TIMEOUT_MAX_SECONDS,
+    )
+    if not expired_tasks:
+        return
     for task in expired_tasks:
         if TIMEOUT_POLICY == "rebroadcast" and not task["target_node"]:
             if not db.requeue_task_if_assigned(task["task_id"], now):
@@ -674,6 +922,7 @@ async def _sweep_assigned_timeouts():
                 "status": "bidding",
                 "target_node": task["target_node"],
                 "model_requirement": task["model_requirement"],
+                "expires_in_seconds": task.get("expires_in_seconds"),
                 "payload_uri": task.get("payload_uri"),
                 "secret_data": task.get("result_payload")
             }
@@ -715,13 +964,17 @@ async def _sweep_assigned_timeouts():
 
 async def _sweep_bidding_timeouts():
     """Expire bidding tasks that never got a provider and refund bounty"""
-    if ASSIGNMENT_TIMEOUT_SECONDS <= 0:
-        return
-    cutoff = time.time() - ASSIGNMENT_TIMEOUT_SECONDS
-    expired_bidding = db.get_bidding_tasks_before(cutoff)
-    if not expired_bidding:
+    if TASK_TIMEOUT_DEFAULT_SECONDS <= 0:
         return
     now = time.time()
+    expired_bidding = db.get_bidding_tasks_for_timeout(
+        now,
+        TASK_TIMEOUT_DEFAULT_SECONDS,
+        TASK_TIMEOUT_MIN_SECONDS,
+        TASK_TIMEOUT_MAX_SECONDS,
+    )
+    if not expired_bidding:
+        return
     for task in expired_bidding:
         if not db.expire_task_if_bidding(task["task_id"], now):
             continue
@@ -898,6 +1151,106 @@ async def search_registry(
     results = _search_registry_local(query)
     return {"count": len(results), "results": results}
 
+
+@app.post("/mesh/assemble")
+async def mesh_assemble(payload: MeshAssembleRequest, authenticated_node: str = Depends(verify_request)):
+    trigger = _normalize_mesh_trigger(payload.trigger)
+    timeout_seconds = _normalize_mesh_timeout_seconds(payload.timeout_seconds)
+    now = time.time()
+    await _purge_expired_mesh_assemblies(now)
+    candidates = await _collect_mesh_candidates()
+    roles, missing_roles = _assign_mesh_roles(candidates)
+    complete = len(missing_roles) == 0
+    assembly_id = str(uuid.uuid4())
+    record = {
+        "assembly_id": assembly_id,
+        "trigger": trigger,
+        "requested_by": authenticated_node,
+        "created_at": now,
+        "expires_at": now + timeout_seconds,
+        "timeout_seconds": timeout_seconds,
+        "roles": roles,
+        "missing_roles": missing_roles,
+    }
+    async with mesh_lock:
+        mesh_assemblies[assembly_id] = record
+    result = {
+        "assembly_id": assembly_id,
+        "roles": roles,
+        "complete": complete,
+    }
+    if missing_roles:
+        result["degraded_warning"] = f"No suitable node for role(s): {', '.join(missing_roles)}"
+    log_event(
+        "mesh_assembled",
+        f"Mesh assembly {assembly_id[:8]} created by {authenticated_node}",
+        assembly_id=assembly_id,
+        trigger=trigger,
+        requester=authenticated_node,
+        complete=complete,
+        missing_roles=missing_roles,
+    )
+    return result
+
+
+@app.get("/mesh/status")
+async def mesh_status(assembly_id: str, authenticated_node: str = Depends(verify_request)):
+    del authenticated_node  # authenticated access only; no per-node ownership restrictions yet.
+    now = time.time()
+    await _purge_expired_mesh_assemblies(now)
+    async with mesh_lock:
+        assembly = mesh_assemblies.get(assembly_id)
+    if not assembly:
+        raise HTTPException(status_code=404, detail="Assembly not found or expired")
+
+    candidates = await _collect_mesh_candidates()
+    current_by_id = {item["node_id"]: item for item in candidates}
+    dropped_roles: dict[str, dict] = {}
+    active_roles: dict[str, dict] = {}
+
+    for role, assigned in assembly.get("roles", {}).items():
+        node_id = assigned.get("node_id")
+        current = current_by_id.get(node_id or "")
+        if not current:
+            dropped_roles[role] = {
+                "node_id": node_id,
+                "reason": "node_unavailable",
+            }
+            continue
+        active_roles[role] = _mesh_role_payload(current)
+
+    missing_roles = list(assembly.get("missing_roles", []))
+    target_roles: list[str] = []
+    for role in ("strategist", "implementer", "facilitator", "scout"):
+        if role in dropped_roles or role in missing_roles:
+            target_roles.append(role)
+
+    used = {item["node_id"] for item in active_roles.values() if item.get("node_id")}
+    suggestions: dict[str, dict] = {}
+    for role in target_roles:
+        candidate = _pick_mesh_candidate(role, candidates, used)
+        if not candidate:
+            continue
+        used.add(candidate["node_id"])
+        suggestions[role] = _mesh_role_payload(candidate)
+
+    complete = len(dropped_roles) == 0 and len(missing_roles) == 0
+    response = {
+        "assembly_id": assembly_id,
+        "trigger": assembly.get("trigger"),
+        "created_at": assembly.get("created_at"),
+        "expires_at": assembly.get("expires_at"),
+        "complete": complete,
+        "roles": active_roles,
+        "dropped_roles": dropped_roles,
+        "reassignment_suggestions": suggestions,
+    }
+    if not complete:
+        unresolved = [role for role in target_roles if role not in suggestions]
+        if unresolved:
+            response["degraded_warning"] = f"Unfilled role(s): {', '.join(unresolved)}"
+    return response
+
 @app.get("/federation/peers")
 async def get_federation_peers():
     peers = await _list_federation_peers()
@@ -1017,6 +1370,8 @@ async def submit_task(
         raise HTTPException(status_code=400, detail="Task requires payload or payload_uri")
     if len(payload) > MAX_PAYLOAD_CHARS:
         raise HTTPException(status_code=413, detail="Task payload too large")
+    if task.target_node and float(task.bounty) == 0.0:
+        await _anti_loop_check_and_record(task.consumer_id, task.target_node, payload)
     
     if x_mep_idempotency_key:
         existing = db.get_idempotency(authenticated_node, "/tasks/submit", x_mep_idempotency_key)
@@ -1032,6 +1387,11 @@ async def submit_task(
         raise HTTPException(status_code=400, detail="Insufficient SECONDS balance to pay for task")
     if task.bounty < 0 and not task.secret_data:
         raise HTTPException(status_code=400, detail="Data market tasks (bounty < 0) require secret_data")
+    if task.expires_in_seconds is not None:
+        task.expires_in_seconds = max(
+            TASK_TIMEOUT_MIN_SECONDS,
+            min(int(task.expires_in_seconds), TASK_TIMEOUT_MAX_SECONDS),
+        )
 
     task_id = str(uuid.uuid4())
     now = time.time()
@@ -1058,10 +1418,23 @@ async def submit_task(
         "status": "bidding",
         "target_node": task.target_node,
         "model_requirement": task.model_requirement,
+        "expires_in_seconds": task.expires_in_seconds,
         "payload_uri": normalized_payload_uri,
         "secret_data": task.secret_data
     }
-    db.create_task(task_id, task.consumer_id, payload, task.bounty, "bidding", task.target_node, task.model_requirement, now, result_payload=task.secret_data, payload_uri=normalized_payload_uri)
+    db.create_task(
+        task_id,
+        task.consumer_id,
+        payload,
+        task.bounty,
+        "bidding",
+        task.target_node,
+        task.model_requirement,
+        now,
+        result_payload=task.secret_data,
+        payload_uri=normalized_payload_uri,
+        expires_in_seconds=task.expires_in_seconds,
+    )
     async with task_lock:
         active_tasks[task_id] = task_data
 
@@ -1158,6 +1531,7 @@ async def cancel_task(
             "status": db_task["status"],
             "target_node": db_task["target_node"],
             "model_requirement": db_task["model_requirement"],
+            "expires_in_seconds": db_task.get("expires_in_seconds"),
             "provider_id": db_task["provider_id"],
             "payload_uri": db_task.get("payload_uri"),
             "secret_data": db_task.get("result_payload")
@@ -1458,7 +1832,7 @@ async def health_check():
 
 
 # ---------------------------------------------------------------------------
-# Diagnostic Endpoint — tiered approach (per Hermes DM discussion)
+# Diagnostic Endpoint 鈥?tiered approach (per Hermes DM discussion)
 # ---------------------------------------------------------------------------
 class DiagnosticResponse(BaseModel):
     node_id: Optional[str] = None
@@ -1482,11 +1856,11 @@ async def diagnostic(
     """
     Tiered diagnostic endpoint.
 
-    Tier 1 (public, no auth) — specify node_id as query param:
+    Tier 1 (public, no auth) 鈥?specify node_id as query param:
         GET /diagnostic?node_id=node_xxx
         Returns: {node_id, registered, availability, last_heartbeat}
 
-    Tier 2 (authenticated) — no query param, uses auth headers:
+    Tier 2 (authenticated) 鈥?no query param, uses auth headers:
         GET /diagnostic (with X-MEP-NodeID, X-MEP-Timestamp, X-MEP-Signature)
         Returns: full health report including ws_connected, last_ws_activity, auth_ok
 
@@ -1566,6 +1940,65 @@ async def recent_events(limit: int = 50, x_mep_admin_key: Optional[str] = Header
     events = _read_recent_events(safe_limit)
     return {"count": len(events), "events": events}
 
+
+@app.get("/anti-loop/status")
+async def anti_loop_status(channel: Optional[str] = None):
+    now = time.time()
+
+    def _serialize(channel_id: str, state: dict) -> dict:
+        events = list(state.get("events", []))
+        cutoff = now - ANTI_LOOP_WINDOW_SECONDS
+        recent = [event for event in events if float(event.get("ts", 0)) >= cutoff]
+        cooldown_until = float(state.get("cooldown_until", 0.0) or 0.0)
+        return {
+            "channel": channel_id,
+            "state": "cooldown" if cooldown_until > now else "normal",
+            "consecutive_bot_messages": len([event for event in recent if not event.get("termination")]),
+            "circuit_break_active": cooldown_until > now,
+            "cooldown_remaining_seconds": max(0, int(cooldown_until - now)),
+            "circuit_break_count": int(state.get("circuit_break_count", 0)),
+            "last_reason": state.get("last_reason"),
+            "last_break_at": state.get("last_break_at"),
+            "nodes_involved": state.get("last_nodes", []),
+        }
+
+    async with anti_loop_lock:
+        if channel:
+            state = anti_loop_channels.get(channel)
+            if not state:
+                return {
+                    "channel": channel,
+                    "state": "normal",
+                    "consecutive_bot_messages": 0,
+                    "circuit_break_active": False,
+                    "cooldown_remaining_seconds": 0,
+                    "circuit_break_count": 0,
+                    "last_reason": None,
+                    "last_break_at": None,
+                    "nodes_involved": [],
+                }
+            return _serialize(channel, state)
+        items = [_serialize(channel_id, state) for channel_id, state in anti_loop_channels.items()]
+    return {"channels": items, "count": len(items)}
+
+
+@app.post("/anti-loop/reset")
+async def anti_loop_reset(channel: Optional[str] = None, x_mep_admin_key: Optional[str] = Header(default=None)):
+    _require_admin(x_mep_admin_key)
+    async with anti_loop_lock:
+        if channel:
+            state = anti_loop_channels.get(channel)
+            if not state:
+                return {"status": "ok", "reset_channels": 0}
+            state["cooldown_until"] = 0.0
+            state["events"] = []
+            state["last_reason"] = "manual_reset"
+            state["last_break_at"] = time.time()
+            state["last_nodes"] = []
+            return {"status": "ok", "reset_channels": 1, "channel": channel}
+        anti_loop_channels.clear()
+        return {"status": "ok", "reset_channels": "all"}
+
 @app.get("/", response_class=HTMLResponse)
 async def hub_landing(request: Request):
     async with node_lock:
@@ -1583,7 +2016,7 @@ async def hub_landing(request: Request):
     ws_url = base_url.replace("https://", "wss://").replace("http://", "ws://")
     total_nodes = db.get_node_count()
     last_completed_ts = db.get_last_completed_task_time()
-    last_completed = datetime.utcfromtimestamp(last_completed_ts).strftime("%Y-%m-%d %H:%M:%S UTC") if last_completed_ts else "—"
+    last_completed = datetime.utcfromtimestamp(last_completed_ts).strftime("%Y-%m-%d %H:%M:%S UTC") if last_completed_ts else "-"
     html = f"""<!doctype html>
 <html lang="en">
 <head>
@@ -1611,7 +2044,7 @@ async def hub_landing(request: Request):
 <body>
   <div class="card">
     <div class="label">Welcome to MEP Hub 0</div>
-    <div>Version {app.version} • Uptime {uptime} • Status {status}</div>
+    <div>Version {app.version} 鈥?Uptime {uptime} 鈥?Status {status}</div>
     <div class="row">
       <div>
         <div class="kpi">{online_count}</div>

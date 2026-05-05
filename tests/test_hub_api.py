@@ -22,6 +22,7 @@ from cryptography.hazmat.primitives import serialization  # noqa: E402
 
 # Import hub app AFTER env vars are set — db import triggers init_db()
 import db  # noqa: E402, F401
+import main  # noqa: E402
 from main import app  # noqa: E402
 
 from fastapi.testclient import TestClient  # noqa: E402
@@ -250,17 +251,157 @@ class TestDiagnosticEndpoint(unittest.TestCase):
         self.assertTrue(data["auth_ok"])
 
 
+class TestMeshAssembly(unittest.TestCase):
+    def setUp(self):
+        conn = db._get_conn()
+        conn.execute("UPDATE agent_registry SET availability = 'offline'")
+        conn.commit()
+        db._release_conn(conn)
+        main.mesh_assemblies.clear()
+
+    def _register_with_mesh_metadata(
+        self,
+        role: str,
+        *,
+        provider: str,
+        thinking_mode: str,
+        alias: str,
+        availability: str = "online",
+    ):
+        priv, pub, node_id = _make_identity()
+        _register(pub)
+        update_payload = json.dumps(
+            {
+                "alias": alias,
+                "availability": availability,
+                "metadata": {
+                    "ai_provider": provider,
+                    "ai_status": "online",
+                    "thinking_mode": thinking_mode,
+                    "mesh_role_preference": role,
+                },
+            }
+        )
+        headers = _auth_headers(priv, node_id, update_payload)
+        resp = client.post("/registry/update", content=update_payload, headers=headers)
+        self.assertEqual(resp.status_code, 200, f"Registry update failed: {resp.text}")
+        return priv, node_id
+
+    def test_mesh_assemble_complete_with_four_roles(self):
+        requester_priv, requester_id = self._register_with_mesh_metadata(
+            "strategist",
+            provider="deepseek",
+            thinking_mode="reasoning",
+            alias="Hermes",
+        )
+        self._register_with_mesh_metadata(
+            "implementer",
+            provider="yunwu",
+            thinking_mode="code_reading",
+            alias="Alisa",
+        )
+        self._register_with_mesh_metadata(
+            "facilitator",
+            provider="template",
+            thinking_mode="aggregation",
+            alias="Hub-Sentinel",
+        )
+        self._register_with_mesh_metadata(
+            "scout",
+            provider="echo",
+            thinking_mode="ack_only",
+            alias="Moltbot",
+        )
+
+        payload = json.dumps({"trigger": "brainstorm", "timeout_seconds": 180})
+        headers = _auth_headers(requester_priv, requester_id, payload)
+        resp = client.post("/mesh/assemble", content=payload, headers=headers)
+        self.assertEqual(resp.status_code, 200, f"Assemble failed: {resp.text}")
+        data = resp.json()
+        self.assertTrue(data["complete"])
+        self.assertEqual(
+            set(data["roles"].keys()),
+            {"strategist", "implementer", "facilitator", "scout"},
+        )
+
+    def test_mesh_assemble_degraded_when_insufficient_nodes(self):
+        requester_priv, requester_id = self._register_with_mesh_metadata(
+            "strategist",
+            provider="deepseek",
+            thinking_mode="reasoning",
+            alias="Solo",
+        )
+        payload = json.dumps({"trigger": "incident"})
+        headers = _auth_headers(requester_priv, requester_id, payload)
+        resp = client.post("/mesh/assemble", content=payload, headers=headers)
+        self.assertEqual(resp.status_code, 200, f"Assemble failed: {resp.text}")
+        data = resp.json()
+        self.assertFalse(data["complete"])
+        self.assertIn("degraded_warning", data)
+        self.assertIn("strategist", data["roles"])
+
+    def test_mesh_status_reports_drop_and_reassignment(self):
+        requester_priv, requester_id = self._register_with_mesh_metadata(
+            "strategist",
+            provider="deepseek",
+            thinking_mode="reasoning",
+            alias="Hermes",
+        )
+        self._register_with_mesh_metadata(
+            "implementer",
+            provider="yunwu",
+            thinking_mode="code_reading",
+            alias="Alisa",
+        )
+        self._register_with_mesh_metadata(
+            "facilitator",
+            provider="template",
+            thinking_mode="aggregation",
+            alias="Hub-Sentinel",
+        )
+        self._register_with_mesh_metadata(
+            "scout",
+            provider="echo",
+            thinking_mode="ack_only",
+            alias="Moltbot",
+        )
+        self._register_with_mesh_metadata(
+            "scout",
+            provider="echo",
+            thinking_mode="ack_only",
+            alias="Backup-Scout",
+        )
+
+        assemble_payload = json.dumps({"trigger": "planning"})
+        assemble_headers = _auth_headers(requester_priv, requester_id, assemble_payload)
+        assemble_resp = client.post("/mesh/assemble", content=assemble_payload, headers=assemble_headers)
+        self.assertEqual(assemble_resp.status_code, 200, f"Assemble failed: {assemble_resp.text}")
+        assembly = assemble_resp.json()
+        scout_node_id = assembly["roles"]["scout"]["node_id"]
+        db.update_registry_availability(scout_node_id, "offline", time.time())
+
+        status_headers = _auth_headers(requester_priv, requester_id, "")
+        status_resp = client.get(
+            f"/mesh/status?assembly_id={assembly['assembly_id']}",
+            headers=status_headers,
+        )
+        self.assertEqual(status_resp.status_code, 200, f"Status failed: {status_resp.text}")
+        status_data = status_resp.json()
+        self.assertFalse(status_data["complete"])
+        self.assertIn("scout", status_data["dropped_roles"])
+        self.assertIn("scout", status_data["reassignment_suggestions"])
+        self.assertNotEqual(
+            status_data["reassignment_suggestions"]["scout"]["node_id"],
+            scout_node_id,
+        )
+
+
 def tearDownModule():
     """Clean up test database."""
     try:
         os.remove(_test_db)
     except OSError:
         pass
-
-
-if __name__ == "__main__":
-    unittest.main()
-
 
 class TestBiddingTimeout(unittest.TestCase):
     """Test bidding task timeout + refund flow"""
@@ -324,3 +465,55 @@ class TestBiddingTimeout(unittest.TestCase):
         resp = client.get(f"/balance/{consumer_id}")
         self.assertEqual(resp.json()["balance_seconds"], initial_balance,
                         "Consumer balance should be restored after refund")
+
+
+class TestConsumerDefinedTimeout(unittest.TestCase):
+    """Per-task consumer timeout should override global default within bounds."""
+
+    def test_consumer_timeout_expires_task_earlier(self):
+        consumer_priv, consumer_pub, consumer_id = _make_identity()
+        _register(consumer_pub)
+
+        resp = client.get(f"/balance/{consumer_id}")
+        initial_balance = resp.json()["balance_seconds"]
+
+        bounty = 1.0
+        task_payload = json.dumps({
+            "consumer_id": consumer_id,
+            "payload": "Expire me quickly",
+            "bounty": bounty,
+            "expires_in_seconds": 60,
+        })
+        headers = _auth_headers(consumer_priv, consumer_id, task_payload)
+        resp = client.post("/tasks/submit", content=task_payload, headers=headers)
+        self.assertEqual(resp.status_code, 200, f"Submit failed: {resp.text}")
+        task_id = resp.json()["task_id"]
+
+        # This is older than the consumer timeout (60s) but younger than global default (3600s).
+        old_time = time.time() - 120
+        conn = db._get_conn()
+        conn.execute(
+            "UPDATE tasks SET updated_at = ? WHERE task_id = ?",
+            (old_time, task_id)
+        )
+        conn.commit()
+        db._release_conn(conn)
+
+        import asyncio
+        from main import _sweep_bidding_timeouts
+        loop = asyncio.new_event_loop()
+        try:
+            loop.run_until_complete(_sweep_bidding_timeouts())
+        finally:
+            loop.close()
+
+        task = db.get_task(task_id)
+        self.assertIsNotNone(task)
+        self.assertEqual(task["status"], "expired")
+
+        resp = client.get(f"/balance/{consumer_id}")
+        self.assertEqual(resp.json()["balance_seconds"], initial_balance)
+
+
+if __name__ == "__main__":
+    unittest.main()
