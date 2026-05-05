@@ -1,4 +1,10 @@
-# MEP Mesh Assembly Protocol v1
+# MEP Mesh Assembly Protocol v1 (Legacy)
+
+> Status: Deprecated / Removed from active Hub API.
+>
+> As of PR #98, Hub no longer exposes `/mesh/assemble` and `/mesh/status`.
+> This document is a historical design reference and does not describe
+> currently available Hub endpoints.
 
 ## Problem Statement
 
@@ -17,9 +23,9 @@ Each node reports the following fields in its registry `metadata`:
 | `thinking_mode` | `"reasoning"`, `"code_reading"`, `"aggregation"`, `"ack_only"` | What type of thinking the node does best |
 | `mesh_role_preference` | `"strategist"`, `"implementer"`, `"facilitator"`, `"scout"` | Which role the node prefers |
 
-### Layer 2: `/mesh/assemble` Endpoint
+### Layer 2 (Legacy): `/mesh/assemble` Endpoint (Removed)
 
-**POST /mesh/assemble**
+**POST /mesh/assemble (removed)**
 
 Request body fields:
 
@@ -98,9 +104,9 @@ Valid JSON response:
 - **scout** → echo or template nodes best for heartbeat monitoring and acknowledgement delivery
 - If no suitable node is available for a role, the response includes a `degraded_warning` field explaining the gap
 
-### Layer 3: `/mesh/status` Endpoint
+### Layer 3 (Legacy): `/mesh/status` Endpoint (Removed)
 
-**GET /mesh/status?assembly_id=<uuid>**
+**GET /mesh/status?assembly_id=<uuid> (removed)**
 
 Returns whether the assembled team is still intact, which nodes have dropped, and re-assignment suggestions.
 
@@ -113,7 +119,7 @@ Returns whether the assembled team is still intact, which nodes have dropped, an
 | `/mesh/assemble` response | `assembly_id`, `roles`, `complete` | `degraded_warning` |
 | Role entry | `node_id`, `ai_provider`, `status` | `alias` |
 
-## Assembly Flow (from node perspective)
+## Historical Assembly Flow (legacy reference)
 
 1. Master Wu (or any node with auth) calls `POST /mesh/assemble`
 2. Hub reads registry metadata for all connected nodes
@@ -139,13 +145,10 @@ POST /registry/update
 }
 ```
 
-### Step 2: Master Wu assembles the team
+### Step 2 (Legacy): Master Wu assembled the team
 
-```json
-POST /mesh/assemble
-{
-  "trigger": "brainstorm"
-}
+```text
+Endpoint removed in current Hub releases.
 ```
 
 ### Step 3: Response

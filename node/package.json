@@ -1,0 +1,13 @@
+{
+  "name": "mep-node-elsaws",
+  "version": "1.0.0",
+  "description": "Elsaws node adapter for MEP (Multi-Agent Execution Protocol)",
+  "main": "mep_elsaws.js",
+  "scripts": {
+    "start": "node mep_elsaws.js",
+    "check": "node --check mep_elsaws.js"
+  },
+  "dependencies": {
+    "ws": "^8.16.0"
+  }
+}
