@@ -65,3 +65,16 @@ class FederationPeerUpsert(BaseModel):
 class MeshAssembleRequest(BaseModel):
     trigger: str
     timeout_seconds: Optional[int] = Field(default=300, ge=1, le=3600)
+
+
+class BrainstormSessionCreate(BaseModel):
+    owner_id: str
+    participants: List[str] = Field(..., min_length=2)
+    topic: Optional[str] = None
+    max_messages: Optional[int] = Field(default=200, ge=10, le=2000)
+
+
+class BrainstormSessionPost(BaseModel):
+    session_id: str
+    message: str = Field(..., min_length=1, max_length=5000)
+    reply_to_message_id: Optional[str] = None
