@@ -2228,7 +2228,7 @@ async def hub_landing(request: Request):
 <body>
   <div class="card">
     <div class="label">Welcome to MEP Hub 0</div>
-    <div>Version {app.version} | Uptime {uptime} | Status {status}</div>
+    <div>Version {app.version} Uptime {uptime} Status {status}</div>
     <div class="row">
       <div>
         <div class="kpi">{online_count}</div>
