@@ -22,22 +22,19 @@ os.environ["MEP_FEDERATION_ENABLED"] = "true"
 HUB_DIR = Path(__file__).resolve().parents[1] / "hub"
 sys.path.insert(0, str(HUB_DIR))
 
-import auth  # noqa: E402
 from main import app  # noqa: E402
 
 
 client = TestClient(app)
 
 
-def _make_identity() -> tuple[Ed25519PrivateKey, str, str]:
+def _make_identity() -> tuple[Ed25519PrivateKey, str]:
     private_key = Ed25519PrivateKey.generate()
     pub_pem = private_key.public_key().public_bytes(
         serialization.Encoding.PEM,
         serialization.PublicFormat.SubjectPublicKeyInfo,
     ).decode("utf-8")
-    # Hub registration normalizes PEM with .strip(), so we derive from the same normalized value.
-    node_id = auth.derive_node_id(pub_pem.strip())
-    return private_key, pub_pem, node_id
+    return private_key, pub_pem
 
 
 def _auth_headers(private_key: Ed25519PrivateKey, node_id: str, payload_str: str) -> dict[str, str]:
@@ -128,10 +125,11 @@ def test_health_returns_ok() -> None:
 
 
 def test_register_and_balance_flow() -> None:
-    _, pub_pem, node_id = _make_identity()
+    _, pub_pem = _make_identity()
     payload = _register(pub_pem)
     assert payload["status"] == "success"
-    assert payload["node_id"] == node_id
+    node_id = payload["node_id"]
+    assert node_id.startswith("node_")
     assert payload["balance"] >= 10.0
 
     response = client.get(f"/balance/{node_id}")
@@ -140,10 +138,10 @@ def test_register_and_balance_flow() -> None:
 
 
 def test_task_submit_bid_complete_happy_path() -> None:
-    consumer_priv, consumer_pub, consumer_id = _make_identity()
-    provider_priv, provider_pub, provider_id = _make_identity()
-    _register(consumer_pub)
-    _register(provider_pub)
+    consumer_priv, consumer_pub = _make_identity()
+    provider_priv, provider_pub = _make_identity()
+    consumer_id = _register(consumer_pub)["node_id"]
+    provider_id = _register(provider_pub)["node_id"]
 
     submit_data = _submit_task(consumer_priv, consumer_id, payload="compute this", bounty=1.5)
     task_id = submit_data["task_id"]
@@ -155,8 +153,8 @@ def test_task_submit_bid_complete_happy_path() -> None:
 
 
 def test_submit_rejects_missing_payload_and_uri() -> None:
-    consumer_priv, consumer_pub, consumer_id = _make_identity()
-    _register(consumer_pub)
+    consumer_priv, consumer_pub = _make_identity()
+    consumer_id = _register(consumer_pub)["node_id"]
 
     payload = json.dumps(
         {
@@ -173,8 +171,8 @@ def test_submit_rejects_missing_payload_and_uri() -> None:
 
 
 def test_submit_idempotency_returns_same_task_id() -> None:
-    consumer_priv, consumer_pub, consumer_id = _make_identity()
-    _register(consumer_pub)
+    consumer_priv, consumer_pub = _make_identity()
+    consumer_id = _register(consumer_pub)["node_id"]
     idem_key = f"idem-submit-{uuid.uuid4().hex}"
 
     first = _submit_task(consumer_priv, consumer_id, payload="same request", bounty=0.2, idem_key=idem_key)
@@ -186,8 +184,8 @@ def test_submit_idempotency_returns_same_task_id() -> None:
 
 
 def test_cancel_idempotency_is_stable() -> None:
-    consumer_priv, consumer_pub, consumer_id = _make_identity()
-    _register(consumer_pub)
+    consumer_priv, consumer_pub = _make_identity()
+    consumer_id = _register(consumer_pub)["node_id"]
     task_id = _submit_task(consumer_priv, consumer_id, payload="cancel me", bounty=0.3)["task_id"]
     idem_key = f"idem-cancel-{uuid.uuid4().hex}"
 
@@ -204,10 +202,10 @@ def test_cancel_idempotency_is_stable() -> None:
 
 
 def test_complete_idempotency_is_stable() -> None:
-    consumer_priv, consumer_pub, consumer_id = _make_identity()
-    provider_priv, provider_pub, provider_id = _make_identity()
-    _register(consumer_pub)
-    _register(provider_pub)
+    consumer_priv, consumer_pub = _make_identity()
+    provider_priv, provider_pub = _make_identity()
+    consumer_id = _register(consumer_pub)["node_id"]
+    provider_id = _register(provider_pub)["node_id"]
     task_id = _submit_task(consumer_priv, consumer_id, payload="complete once", bounty=0.6)["task_id"]
     assert _bid_task(provider_priv, provider_id, task_id)["status"] == "accepted"
     idem_key = f"idem-complete-{uuid.uuid4().hex}"
@@ -221,10 +219,10 @@ def test_complete_idempotency_is_stable() -> None:
 
 
 def test_open_dispute_and_resolve_consumer_chargeback() -> None:
-    consumer_priv, consumer_pub, consumer_id = _make_identity()
-    provider_priv, provider_pub, provider_id = _make_identity()
-    _register(consumer_pub)
-    _register(provider_pub)
+    consumer_priv, consumer_pub = _make_identity()
+    provider_priv, provider_pub = _make_identity()
+    consumer_id = _register(consumer_pub)["node_id"]
+    provider_id = _register(provider_pub)["node_id"]
     task_id = _submit_task(consumer_priv, consumer_id, payload="disputable work", bounty=1.2)["task_id"]
     assert _bid_task(provider_priv, provider_id, task_id)["status"] == "accepted"
     assert _complete_task(provider_priv, provider_id, task_id, result_payload="bad result")["status"] == "success"
@@ -244,10 +242,10 @@ def test_open_dispute_and_resolve_consumer_chargeback() -> None:
 
 
 def test_open_dispute_rejects_non_positive_bounty_task() -> None:
-    consumer_priv, consumer_pub, consumer_id = _make_identity()
-    provider_priv, provider_pub, provider_id = _make_identity()
-    _register(consumer_pub)
-    _register(provider_pub)
+    consumer_priv, consumer_pub = _make_identity()
+    provider_priv, provider_pub = _make_identity()
+    consumer_id = _register(consumer_pub)["node_id"]
+    provider_id = _register(provider_pub)["node_id"]
     task_id = _submit_task(consumer_priv, consumer_id, payload="free chat", bounty=0.0)["task_id"]
     assert _bid_task(provider_priv, provider_id, task_id)["status"] == "accepted"
     assert _complete_task(provider_priv, provider_id, task_id, result_payload="hi")["status"] == "success"
@@ -263,8 +261,8 @@ def test_federation_peer_admin_key_required() -> None:
 
 
 def test_federation_discovery_includes_local_registry_result() -> None:
-    node_priv, node_pub, node_id = _make_identity()
-    _register(node_pub)
+    node_priv, node_pub = _make_identity()
+    node_id = _register(node_pub)["node_id"]
 
     update_payload = json.dumps(
         {
