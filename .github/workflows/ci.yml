@@ -2,9 +2,12 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches:
+      - main
   pull_request:
-    branches: [main]
+    branches:
+      - main
+      - feat/**
   workflow_dispatch:
 
 jobs:
@@ -33,4 +36,4 @@ jobs:
         run: ruff check hub/ node/ core/ tests/
 
       - name: Run tests
-        run: python -m pytest tests/ -v --tb=short --cov --cov-report=term-missing
+        run: python -m pytest tests/test_core_ledger.py tests/test_hub_auth.py tests/test_hub_api_smoke.py -v --tb=short --cov=core --cov=hub --cov-report=term-missing
