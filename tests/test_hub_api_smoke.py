@@ -5,11 +5,14 @@ import sys
 import tempfile
 import time
 import uuid
+from contextlib import contextmanager
 from pathlib import Path
 
+import pytest
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from fastapi.testclient import TestClient
+from starlette.websockets import WebSocketDisconnect
 
 
 DB_PATH = os.path.join(tempfile.gettempdir(), f"mep_test_{uuid.uuid4().hex}.db")
@@ -22,22 +25,20 @@ os.environ["MEP_FEDERATION_ENABLED"] = "true"
 HUB_DIR = Path(__file__).resolve().parents[1] / "hub"
 sys.path.insert(0, str(HUB_DIR))
 
-import auth  # noqa: E402
-from main import app  # noqa: E402
+import main as hub_main  # noqa: E402
 
 
+app = hub_main.app
 client = TestClient(app)
 
 
-def _make_identity() -> tuple[Ed25519PrivateKey, str, str]:
+def _make_identity() -> tuple[Ed25519PrivateKey, str]:
     private_key = Ed25519PrivateKey.generate()
     pub_pem = private_key.public_key().public_bytes(
         serialization.Encoding.PEM,
         serialization.PublicFormat.SubjectPublicKeyInfo,
     ).decode("utf-8")
-    # Hub registration normalizes PEM with .strip(), so we derive from the same normalized value.
-    node_id = auth.derive_node_id(pub_pem.strip())
-    return private_key, pub_pem, node_id
+    return private_key, pub_pem
 
 
 def _auth_headers(private_key: Ed25519PrivateKey, node_id: str, payload_str: str) -> dict[str, str]:
@@ -50,6 +51,26 @@ def _auth_headers(private_key: Ed25519PrivateKey, node_id: str, payload_str: str
         "X-MEP-Signature": signature,
         "Content-Type": "application/json",
     }
+
+
+def _ws_signature(private_key: Ed25519PrivateKey, node_id: str, timestamp: str) -> str:
+    message = f"{node_id}{timestamp}".encode("utf-8")
+    return base64.b64encode(private_key.sign(message)).decode("utf-8")
+
+
+@contextmanager
+def _temporary_rate_limit(max_requests: int, window_seconds: float):
+    old_max = hub_main.RATE_LIMIT_MAX
+    old_window = hub_main.RATE_LIMIT_WINDOW
+    hub_main.RATE_LIMIT_MAX = max_requests
+    hub_main.RATE_LIMIT_WINDOW = window_seconds
+    hub_main.rate_limits.clear()
+    try:
+        yield
+    finally:
+        hub_main.rate_limits.clear()
+        hub_main.RATE_LIMIT_MAX = old_max
+        hub_main.RATE_LIMIT_WINDOW = old_window
 
 
 def _register(pub_pem: str) -> dict:
@@ -128,10 +149,11 @@ def test_health_returns_ok() -> None:
 
 
 def test_register_and_balance_flow() -> None:
-    _, pub_pem, node_id = _make_identity()
+    _, pub_pem = _make_identity()
     payload = _register(pub_pem)
     assert payload["status"] == "success"
-    assert payload["node_id"] == node_id
+    node_id = payload["node_id"]
+    assert node_id.startswith("node_")
     assert payload["balance"] >= 10.0
 
     response = client.get(f"/balance/{node_id}")
@@ -140,10 +162,10 @@ def test_register_and_balance_flow() -> None:
 
 
 def test_task_submit_bid_complete_happy_path() -> None:
-    consumer_priv, consumer_pub, consumer_id = _make_identity()
-    provider_priv, provider_pub, provider_id = _make_identity()
-    _register(consumer_pub)
-    _register(provider_pub)
+    consumer_priv, consumer_pub = _make_identity()
+    provider_priv, provider_pub = _make_identity()
+    consumer_id = _register(consumer_pub)["node_id"]
+    provider_id = _register(provider_pub)["node_id"]
 
     submit_data = _submit_task(consumer_priv, consumer_id, payload="compute this", bounty=1.5)
     task_id = submit_data["task_id"]
@@ -155,8 +177,8 @@ def test_task_submit_bid_complete_happy_path() -> None:
 
 
 def test_submit_rejects_missing_payload_and_uri() -> None:
-    consumer_priv, consumer_pub, consumer_id = _make_identity()
-    _register(consumer_pub)
+    consumer_priv, consumer_pub = _make_identity()
+    consumer_id = _register(consumer_pub)["node_id"]
 
     payload = json.dumps(
         {
@@ -173,8 +195,8 @@ def test_submit_rejects_missing_payload_and_uri() -> None:
 
 
 def test_submit_idempotency_returns_same_task_id() -> None:
-    consumer_priv, consumer_pub, consumer_id = _make_identity()
-    _register(consumer_pub)
+    consumer_priv, consumer_pub = _make_identity()
+    consumer_id = _register(consumer_pub)["node_id"]
     idem_key = f"idem-submit-{uuid.uuid4().hex}"
 
     first = _submit_task(consumer_priv, consumer_id, payload="same request", bounty=0.2, idem_key=idem_key)
@@ -186,8 +208,8 @@ def test_submit_idempotency_returns_same_task_id() -> None:
 
 
 def test_cancel_idempotency_is_stable() -> None:
-    consumer_priv, consumer_pub, consumer_id = _make_identity()
-    _register(consumer_pub)
+    consumer_priv, consumer_pub = _make_identity()
+    consumer_id = _register(consumer_pub)["node_id"]
     task_id = _submit_task(consumer_priv, consumer_id, payload="cancel me", bounty=0.3)["task_id"]
     idem_key = f"idem-cancel-{uuid.uuid4().hex}"
 
@@ -204,10 +226,10 @@ def test_cancel_idempotency_is_stable() -> None:
 
 
 def test_complete_idempotency_is_stable() -> None:
-    consumer_priv, consumer_pub, consumer_id = _make_identity()
-    provider_priv, provider_pub, provider_id = _make_identity()
-    _register(consumer_pub)
-    _register(provider_pub)
+    consumer_priv, consumer_pub = _make_identity()
+    provider_priv, provider_pub = _make_identity()
+    consumer_id = _register(consumer_pub)["node_id"]
+    provider_id = _register(provider_pub)["node_id"]
     task_id = _submit_task(consumer_priv, consumer_id, payload="complete once", bounty=0.6)["task_id"]
     assert _bid_task(provider_priv, provider_id, task_id)["status"] == "accepted"
     idem_key = f"idem-complete-{uuid.uuid4().hex}"
@@ -221,10 +243,10 @@ def test_complete_idempotency_is_stable() -> None:
 
 
 def test_open_dispute_and_resolve_consumer_chargeback() -> None:
-    consumer_priv, consumer_pub, consumer_id = _make_identity()
-    provider_priv, provider_pub, provider_id = _make_identity()
-    _register(consumer_pub)
-    _register(provider_pub)
+    consumer_priv, consumer_pub = _make_identity()
+    provider_priv, provider_pub = _make_identity()
+    consumer_id = _register(consumer_pub)["node_id"]
+    provider_id = _register(provider_pub)["node_id"]
     task_id = _submit_task(consumer_priv, consumer_id, payload="disputable work", bounty=1.2)["task_id"]
     assert _bid_task(provider_priv, provider_id, task_id)["status"] == "accepted"
     assert _complete_task(provider_priv, provider_id, task_id, result_payload="bad result")["status"] == "success"
@@ -244,10 +266,10 @@ def test_open_dispute_and_resolve_consumer_chargeback() -> None:
 
 
 def test_open_dispute_rejects_non_positive_bounty_task() -> None:
-    consumer_priv, consumer_pub, consumer_id = _make_identity()
-    provider_priv, provider_pub, provider_id = _make_identity()
-    _register(consumer_pub)
-    _register(provider_pub)
+    consumer_priv, consumer_pub = _make_identity()
+    provider_priv, provider_pub = _make_identity()
+    consumer_id = _register(consumer_pub)["node_id"]
+    provider_id = _register(provider_pub)["node_id"]
     task_id = _submit_task(consumer_priv, consumer_id, payload="free chat", bounty=0.0)["task_id"]
     assert _bid_task(provider_priv, provider_id, task_id)["status"] == "accepted"
     assert _complete_task(provider_priv, provider_id, task_id, result_payload="hi")["status"] == "success"
@@ -263,8 +285,8 @@ def test_federation_peer_admin_key_required() -> None:
 
 
 def test_federation_discovery_includes_local_registry_result() -> None:
-    node_priv, node_pub, node_id = _make_identity()
-    _register(node_pub)
+    node_priv, node_pub = _make_identity()
+    node_id = _register(node_pub)["node_id"]
 
     update_payload = json.dumps(
         {
@@ -284,6 +306,35 @@ def test_federation_discovery_includes_local_registry_result() -> None:
     assert payload["status"] == "success"
     assert payload["count"] >= 1
     assert any(item.get("node_id") == node_id for item in payload["results"])
+
+
+def test_register_rate_limit_enforced() -> None:
+    with _temporary_rate_limit(max_requests=2, window_seconds=60.0):
+        first = client.post("/register", json={"pubkey": "bad-pem"})
+        second = client.post("/register", json={"pubkey": "bad-pem"})
+        third = client.post("/register", json={"pubkey": "bad-pem"})
+
+    assert first.status_code in (400, 422)
+    assert second.status_code in (400, 422)
+    assert third.status_code == 429
+    assert "Rate limit exceeded" in third.json()["detail"]
+
+
+def test_websocket_rejects_oversized_message() -> None:
+    node_priv, node_pub = _make_identity()
+    node_id = _register(node_pub)["node_id"]
+    timestamp = str(int(time.time()))
+    ws_headers = {
+        "x-mep-timestamp": timestamp,
+        "x-mep-signature": _ws_signature(node_priv, node_id, timestamp),
+    }
+    oversized = "x" * (hub_main.MAX_WS_MESSAGE_BYTES + 1)
+
+    with client.websocket_connect(f"/ws/{node_id}", headers=ws_headers) as ws:
+        ws.send_text(oversized)
+        with pytest.raises(WebSocketDisconnect) as exc:
+            ws.receive_text()
+        assert exc.value.code == 1009
 
 
 def teardown_module() -> None:

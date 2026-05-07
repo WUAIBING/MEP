@@ -17,7 +17,16 @@ Usage:
   python3 mep_brainstorm_listener.py
 """
 
-import asyncio, websockets, urllib.parse, time, json, requests, os, re, sys
+import asyncio
+import json
+import os
+import re
+import sys
+import time
+import urllib.parse
+
+import requests
+import websockets
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 try:
