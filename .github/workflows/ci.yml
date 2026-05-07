@@ -4,8 +4,6 @@ on:
   push:
     branches:
       - main
-      - feat/**
-      - security/**
   pull_request:
     branches:
       - main
