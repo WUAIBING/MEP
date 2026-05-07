@@ -1,4 +1,5 @@
 import asyncio
+import json
 import os
 import tempfile
 from typing import Optional
@@ -15,6 +16,29 @@ class StdioAdapter:
         self.platform_name = platform_name
         self.default_model = default_model
         self.client = MEPClient(key_path)
+        self.alias = os.getenv("MEP_ALIAS", platform_name)
+
+    async def _announce_registry(self) -> None:
+        body = {
+            "alias": self.alias,
+            "skills": ["dm", "chat", self.platform_name.lower()],
+            "models": [self.default_model],
+            "metadata": {
+                "platform": self.platform_name.lower(),
+                **self.client.get_privacy_registry_metadata(),
+            },
+            "availability": "online",
+        }
+        payload = json.dumps(body)
+        response = await asyncio.to_thread(
+            self.client.session.post,
+            f"{self.client.hub_url.rstrip('/')}/registry/update",
+            data=payload,
+            headers=self.client._auth_headers(payload),
+            timeout=15,
+        )
+        if response.status_code != 200:
+            raise RuntimeError(f"registry update failed: {response.text}")
 
     async def _handle_result(self, data: dict) -> None:
         task_id = data.get("task_id")
@@ -113,6 +137,10 @@ class StdioAdapter:
 
     async def run(self) -> None:
         await self.client.register()
+        try:
+            await self._announce_registry()
+        except Exception as exc:
+            print(f"[{self.platform_name}] registry announce warning: {exc}")
         listener = asyncio.create_task(self.client.listen_results(self._handle_result))
         print(f"[{self.platform_name}] connected as {self.client.node_id}")
         print(f"[{self.platform_name}] commands: mep, mepdm, mepdata, mepcancel, mepresult, mepbalance, exit")

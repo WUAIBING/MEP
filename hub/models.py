@@ -4,6 +4,7 @@ from typing import Optional, List, Dict, Any
 class NodeRegistration(BaseModel):
     pubkey: str = Field(..., description="Node's public key or UUID")
     alias: Optional[str] = None
+    x25519_public_key: Optional[str] = None
 
 class TaskCreate(BaseModel):
     consumer_id: str

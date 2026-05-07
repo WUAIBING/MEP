@@ -70,8 +70,11 @@ def _diagnostic_headers(private_key, node_id: str) -> dict:
     }
 
 
-def _register(pub_pem: str) -> dict:
-    resp = client.post("/register", json={"pubkey": pub_pem})
+def _register(pub_pem: str, x25519_public_key: str | None = None) -> dict:
+    payload = {"pubkey": pub_pem}
+    if x25519_public_key is not None:
+        payload["x25519_public_key"] = x25519_public_key
+    resp = client.post("/register", json=payload)
     assert resp.status_code == 200, f"Register failed: {resp.text}"
     return resp.json()
 
@@ -181,6 +184,36 @@ class TestTaskLifecycle(unittest.TestCase):
         resp = client.post("/tasks/submit", content=task_payload, headers=headers)
         self.assertEqual(resp.status_code, 400)
         self.assertIn("Insufficient", resp.json()["detail"])
+
+    def test_target_require_encrypted_rejects_plaintext_dm(self):
+        consumer_priv, consumer_pub, consumer_id = _make_identity()
+        target_priv, target_pub, target_id = _make_identity()
+        _register(consumer_pub)
+        _register(target_pub, x25519_public_key="dGVzdC14MjU1MTkta2V5")
+
+        update_payload = json.dumps(
+            {
+                "alias": "target-secure",
+                "metadata": {"privacy_mode": "require_encrypted"},
+                "availability": "online",
+            }
+        )
+        target_headers = _auth_headers(target_priv, target_id, update_payload)
+        update_resp = client.post("/registry/update", content=update_payload, headers=target_headers)
+        self.assertEqual(update_resp.status_code, 200, f"Registry update failed: {update_resp.text}")
+
+        submit_payload = json.dumps(
+            {
+                "consumer_id": consumer_id,
+                "payload": "hello plaintext dm",
+                "bounty": 0.0,
+                "target_node": target_id,
+            }
+        )
+        consumer_headers = _auth_headers(consumer_priv, consumer_id, submit_payload)
+        submit_resp = client.post("/tasks/submit", content=submit_payload, headers=consumer_headers)
+        self.assertEqual(submit_resp.status_code, 400)
+        self.assertIn("Target requires encrypted DM payload", str(submit_resp.json().get("detail")))
 
 
 class TestAuthRejection(unittest.TestCase):
