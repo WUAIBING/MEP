@@ -114,6 +114,15 @@ Want a guided first run that registers a node and submits starter tasks?
 python -m skills.quickstart_provider
 ```
 
+Need the fastest "fresh node" path (about 2 minutes)?
+
+```bash
+python -m node.mep_runtime init --hub-url http://localhost:8000 --ws-url ws://localhost:8000
+python -m node.mep_runtime status --hub-url http://localhost:8000
+python -m node.mep_runtime doctor --hub-url http://localhost:8000
+python -m node.mep_runtime run --hub-url http://localhost:8000 --ws-url ws://localhost:8000
+```
+
 </details>
 
 <a id="option-2-use-client-adapters"></a>
