@@ -129,6 +129,7 @@ COMPLETED_TASK_CACHE_MAX_ITEMS = int(os.getenv("MEP_COMPLETED_TASK_CACHE_MAX_ITE
 IDEMPOTENCY_TTL_SECONDS = int(os.getenv("MEP_IDEMPOTENCY_TTL_SECONDS", "86400"))
 TIMEOUT_POLICY = os.getenv("MEP_TIMEOUT_POLICY", "refund").lower()
 VALID_AVAILABILITY = {"online", "idle", "busy", "offline", "degraded", "unknown"}
+LIVE_AVAILABILITY = {"online", "idle", "busy"}
 MESH_ALLOWED_TRIGGERS = {"brainstorm", "code_review", "incident", "planning"}
 MESH_DEFAULT_TIMEOUT_SECONDS = 300
 MESH_MAX_TIMEOUT_SECONDS = 3600
@@ -1165,6 +1166,10 @@ async def registry_heartbeat(payload: RegistryHeartbeat, request: Request, authe
     if availability is None:
         existing = db.get_registry(authenticated_node)
         availability = existing.get("availability") if existing else "unknown"
+    async with node_lock:
+        has_live_websocket = authenticated_node in connected_nodes
+    if availability in LIVE_AVAILABILITY and not has_live_websocket:
+        availability = "offline"
     db.update_registry_availability(authenticated_node, availability, time.time())
     await _track_node_activity(authenticated_node)
     hub_url, ws_url = get_hub_urls(request)

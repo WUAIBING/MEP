@@ -251,6 +251,21 @@ class TestDiagnosticEndpoint(unittest.TestCase):
         self.assertTrue(data["auth_ok"])
 
 
+class TestRegistryHeartbeatPresence(unittest.TestCase):
+    def test_heartbeat_online_without_websocket_forces_offline(self):
+        node_priv, node_pub, node_id = _make_identity()
+        _register(node_pub)
+        heartbeat_payload = json.dumps({"availability": "online"})
+        headers = _auth_headers(node_priv, node_id, heartbeat_payload)
+        heartbeat_response = client.post("/registry/heartbeat", content=heartbeat_payload, headers=headers)
+        self.assertEqual(heartbeat_response.status_code, 200, f"Heartbeat failed: {heartbeat_response.text}")
+        self.assertEqual(heartbeat_response.json()["availability"], "offline")
+
+        registry_response = client.get(f"/registry/{node_id}")
+        self.assertEqual(registry_response.status_code, 200, f"Registry read failed: {registry_response.text}")
+        self.assertEqual(registry_response.json()["availability"], "offline")
+
+
 class TestMeshAssembly(unittest.TestCase):
     def setUp(self):
         conn = db._get_conn()
