@@ -376,6 +376,80 @@ class TestOnboardDiagnose(unittest.TestCase):
         self.assertEqual(data["root_cause"], "healthy_or_insufficient_signal")
         self.assertEqual(data["severity"], "info")
 
+    def test_detects_auth_403_unregistered_or_policy(self):
+        payload = {
+            "node_id": "node_test",
+            "auth_status": "403",
+            "registered": False,
+        }
+        resp = client.post("/onboard/diagnose", json=payload)
+        self.assertEqual(resp.status_code, 200, f"Diagnose failed: {resp.text}")
+        data = resp.json()
+        self.assertEqual(data["root_cause"], "auth_403_unregistered_or_policy")
+        self.assertEqual(data["severity"], "high")
+
+    def test_detects_dm_pending_target_offline_or_route_issue(self):
+        payload = {
+            "node_id": "node_test",
+            "registered": True,
+            "ws_connected": True,
+            "auth_status": "ok",
+            "dm_status": "pending",
+        }
+        resp = client.post("/onboard/diagnose", json=payload)
+        self.assertEqual(resp.status_code, 200, f"Diagnose failed: {resp.text}")
+        data = resp.json()
+        self.assertEqual(data["root_cause"], "dm_pending_target_offline_or_route_issue")
+        self.assertEqual(data["severity"], "medium")
+
+    def test_detects_listener_payload_contract_mismatch(self):
+        payload = {
+            "node_id": "node_test",
+            "registered": True,
+            "ws_connected": True,
+            "auth_status": "ok",
+            "dm_status": "ok",
+            "listener_contract_ok": False,
+        }
+        resp = client.post("/onboard/diagnose", json=payload)
+        self.assertEqual(resp.status_code, 200, f"Diagnose failed: {resp.text}")
+        data = resp.json()
+        self.assertEqual(data["root_cause"], "listener_payload_contract_mismatch")
+        self.assertEqual(data["severity"], "medium")
+
+    def test_detects_heartbeat_interval_or_clock_drift(self):
+        payload = {
+            "node_id": "node_test",
+            "registered": True,
+            "ws_connected": True,
+            "auth_status": "ok",
+            "dm_status": "ok",
+            "listener_contract_ok": True,
+            "ai_configured": True,
+            "clock_skew_seconds": 400,
+        }
+        resp = client.post("/onboard/diagnose", json=payload)
+        self.assertEqual(resp.status_code, 200, f"Diagnose failed: {resp.text}")
+        data = resp.json()
+        self.assertEqual(data["root_cause"], "heartbeat_interval_or_clock_drift")
+        self.assertEqual(data["severity"], "medium")
+
+    def test_detects_ai_provider_config_invalid(self):
+        payload = {
+            "node_id": "node_test",
+            "registered": True,
+            "ws_connected": True,
+            "auth_status": "ok",
+            "dm_status": "ok",
+            "listener_contract_ok": True,
+            "ai_configured": False,
+        }
+        resp = client.post("/onboard/diagnose", json=payload)
+        self.assertEqual(resp.status_code, 200, f"Diagnose failed: {resp.text}")
+        data = resp.json()
+        self.assertEqual(data["root_cause"], "ai_provider_config_invalid")
+        self.assertEqual(data["severity"], "low")
+
 
 class TestRegistryHeartbeatPresence(unittest.TestCase):
     def test_heartbeat_online_without_websocket_forces_offline(self):
