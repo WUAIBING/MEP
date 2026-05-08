@@ -3,6 +3,7 @@ Hub API smoke tests — exercises the full task lifecycle using FastAPI TestClie
 No running server or Postgres needed; uses SQLite backend automatically.
 """
 import base64
+from contextlib import contextmanager
 import json
 import os
 import sys
@@ -74,6 +75,19 @@ def _register(pub_pem: str) -> dict:
     resp = client.post("/register", json={"pubkey": pub_pem})
     assert resp.status_code == 200, f"Register failed: {resp.text}"
     return resp.json()
+
+
+@contextmanager
+def _interbot_validation(enabled: bool, legacy_policy: str = "dm_only"):
+    old_enabled = main.INTERBOT_SPEC_VALIDATE_ENABLED
+    old_policy = main.INTERBOT_LEGACY_POLICY
+    main.INTERBOT_SPEC_VALIDATE_ENABLED = enabled
+    main.INTERBOT_LEGACY_POLICY = legacy_policy
+    try:
+        yield
+    finally:
+        main.INTERBOT_SPEC_VALIDATE_ENABLED = old_enabled
+        main.INTERBOT_LEGACY_POLICY = old_policy
 
 
 # ---------------------------------------------------------------------------
@@ -181,6 +195,69 @@ class TestTaskLifecycle(unittest.TestCase):
         resp = client.post("/tasks/submit", content=task_payload, headers=headers)
         self.assertEqual(resp.status_code, 400)
         self.assertIn("Insufficient", resp.json()["detail"])
+
+
+class TestInterBotSpecValidation(unittest.TestCase):
+    def test_rejects_invalid_structured_payload_when_enabled(self):
+        consumer_priv, consumer_pub, consumer_id = _make_identity()
+        _register(consumer_pub)
+        invalid_payload = json.dumps(
+            {
+                "consumer_id": consumer_id,
+                "payload": json.dumps({"spec_version": "mep.interbot.v1"}),
+                "bounty": 0.0,
+            }
+        )
+        headers = _auth_headers(consumer_priv, consumer_id, invalid_payload)
+        with _interbot_validation(True):
+            resp = client.post("/tasks/submit", content=invalid_payload, headers=headers)
+        self.assertEqual(resp.status_code, 400)
+        self.assertIn("Inter-bot payload", resp.json()["detail"])
+
+    def test_accepts_valid_structured_dm_payload_when_enabled(self):
+        consumer_priv, consumer_pub, consumer_id = _make_identity()
+        _, target_pub, target_id = _make_identity()
+        _register(consumer_pub)
+        _register(target_pub)
+        message = {
+            "spec_version": "mep.interbot.v1",
+            "message_id": "msg-123",
+            "timestamp_ms": int(time.time() * 1000),
+            "source": {"node_id": consumer_id, "alias": "consumer"},
+            "target": {"node_id": target_id, "alias": "target"},
+            "intent": {"type": "chat.request"},
+            "task": {"instructions": "hello", "expected_output": {"result_type": "text"}},
+            "economics": {"bounty_seconds": 0.0, "currency": "SECONDS"},
+        }
+        task_payload = json.dumps(
+            {
+                "consumer_id": consumer_id,
+                "payload": json.dumps(message),
+                "bounty": 0.0,
+                "target_node": target_id,
+            }
+        )
+        headers = _auth_headers(consumer_priv, consumer_id, task_payload)
+        with _interbot_validation(True):
+            resp = client.post("/tasks/submit", content=task_payload, headers=headers)
+        self.assertEqual(resp.status_code, 200)
+        self.assertIn(resp.json()["status"], ("success", "error"))
+
+    def test_rejects_legacy_plaintext_non_dm_when_enabled(self):
+        consumer_priv, consumer_pub, consumer_id = _make_identity()
+        _register(consumer_pub)
+        task_payload = json.dumps(
+            {
+                "consumer_id": consumer_id,
+                "payload": "legacy plaintext non-dm",
+                "bounty": 1.0,
+            }
+        )
+        headers = _auth_headers(consumer_priv, consumer_id, task_payload)
+        with _interbot_validation(True):
+            resp = client.post("/tasks/submit", content=task_payload, headers=headers)
+        self.assertEqual(resp.status_code, 400)
+        self.assertIn("Legacy plaintext payload", resp.json()["detail"])
 
 
 class TestAuthRejection(unittest.TestCase):
