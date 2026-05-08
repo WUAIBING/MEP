@@ -13,7 +13,6 @@ from dataclasses import dataclass
 from typing import Any, Optional
 
 import requests
-import websockets
 
 try:
     from node.identity import MEPIdentity
@@ -194,6 +193,13 @@ class RuntimeNode:
         return f"{self.ws_url}/ws/{self.node_id}?timestamp={ts}&signature={sig}"
 
     async def run_forever(self) -> int:
+        try:
+            import websockets  # type: ignore
+        except ImportError:
+            print("[mep run] missing optional dependency: websockets")
+            print("[mep run] install with: pip install websockets")
+            return 2
+
         ok, message = self.register(alias="mep-runtime")
         print(f"[mep run] {message}")
         if not ok:
