@@ -52,6 +52,8 @@ brainstorm_lock = asyncio.Lock()
 mesh_assemblies: Dict[str, dict] = {}
 anti_loop_channels: Dict[str, dict] = {}
 brainstorm_sessions: Dict[str, dict] = {}
+onboard_diagnosis_counts: Dict[str, int] = {}
+onboard_diagnosis_total = 0
 MAX_BODY_BYTES = 200_000
 MAX_PAYLOAD_CHARS = 20_000
 RATE_LIMIT_WINDOW = 10.0
@@ -2116,6 +2118,147 @@ class DiagnosticResponse(BaseModel):
     error: Optional[str] = None
 
 
+class OnboardDiagnoseRequest(BaseModel):
+    node_id: Optional[str] = None
+    registered: Optional[bool] = None
+    ws_connected: Optional[bool] = None
+    heartbeat_seconds_ago: Optional[float] = None
+    auth_status: Optional[str] = None
+    dm_status: Optional[str] = None
+    listener_contract_ok: Optional[bool] = None
+    ai_configured: Optional[bool] = None
+    clock_skew_seconds: Optional[float] = None
+
+
+def _onboard_diagnosis_result(
+    root_cause: str,
+    severity: str,
+    fix_steps: list[str],
+    copy_paste_commands: list[str],
+) -> dict:
+    return {
+        "root_cause": root_cause,
+        "severity": severity,
+        "fix_steps": fix_steps,
+        "copy_paste_commands": copy_paste_commands,
+    }
+
+
+def _diagnose_onboarding(payload: OnboardDiagnoseRequest) -> dict:
+    auth_status = (payload.auth_status or "").strip().lower()
+    dm_status = (payload.dm_status or "").strip().lower()
+
+    if auth_status in {"401", "invalid_signature", "signature_invalid", "timestamp_invalid"}:
+        return _onboard_diagnosis_result(
+            "auth_401_signature_or_timestamp",
+            "high",
+            [
+                "Regenerate signature using payload + current Unix timestamp.",
+                "Verify local clock drift is under 5 minutes.",
+                "Confirm Node ID and private key pair match registration public key.",
+            ],
+            [
+                "python -m node.test_crypto",
+                "curl -s http://localhost:8000/diagnostic?node_id=<your_node_id>",
+            ],
+        )
+
+    if auth_status in {"403", "unregistered"} or payload.registered is False:
+        return _onboard_diagnosis_result(
+            "auth_403_unregistered_or_policy",
+            "high",
+            [
+                "Register node before any signed endpoint usage.",
+                "Confirm allowlist and trusted host policy settings.",
+                "Retry after registration with fresh signature headers.",
+            ],
+            [
+                "curl -X POST http://localhost:8000/register -H \"Content-Type: application/json\" -d \"{\\\"pubkey\\\":\\\"<PEM>\\\"}\"",
+            ],
+        )
+
+    if payload.ws_connected is False and payload.heartbeat_seconds_ago is not None and payload.heartbeat_seconds_ago <= 120:
+        return _onboard_diagnosis_result(
+            "ghost_online_no_ws_presence",
+            "high",
+            [
+                "Restart listener and ensure websocket connection stays active.",
+                "Treat websocket connectivity as source of truth for live status.",
+                "Keep heartbeat interval steady and shorter than disconnect detection window.",
+            ],
+            [
+                "python -m node.mep_status",
+                "curl -s \"http://localhost:8000/diagnostic?node_id=<your_node_id>\"",
+            ],
+        )
+
+    if dm_status in {"pending", "target_offline", "route_error", "delivery_failed"}:
+        return _onboard_diagnosis_result(
+            "dm_pending_target_offline_or_route_issue",
+            "medium",
+            [
+                "Verify target node websocket is online before DM.",
+                "Check DM target node_id spelling and connectivity.",
+                "Retry DM after confirming both nodes are connected.",
+            ],
+            [
+                "python -m node.test_dm",
+            ],
+        )
+
+    if payload.listener_contract_ok is False:
+        return _onboard_diagnosis_result(
+            "listener_payload_contract_mismatch",
+            "medium",
+            [
+                "Use authoritative fields expected by Hub APIs (task_id/provider_id/result_payload).",
+                "Avoid stub payload responses for completed tasks.",
+                "Validate listener request/response schema with integration tests.",
+            ],
+            [
+                "python -m pytest tests/test_hub_api.py -q",
+            ],
+        )
+
+    if payload.clock_skew_seconds is not None and abs(payload.clock_skew_seconds) > MAX_SKEW_SECONDS:
+        return _onboard_diagnosis_result(
+            "heartbeat_interval_or_clock_drift",
+            "medium",
+            [
+                "Synchronize host clock with NTP before signing requests.",
+                "Keep heartbeat interval stable (for example 30-60s).",
+                "Re-run diagnostic checks after clock sync.",
+            ],
+            [
+                "python -m node.mep_status",
+            ],
+        )
+
+    if payload.ai_configured is False:
+        return _onboard_diagnosis_result(
+            "ai_provider_config_invalid",
+            "low",
+            [
+                "Configure provider credentials/model in runtime config.",
+                "Start with mock adapter to validate runtime before real AI adapter.",
+                "Switch to Ollama or OpenAI-compatible adapter after runtime passes doctor checks.",
+            ],
+            [
+                "python -m node.mep_ai_provider",
+            ],
+        )
+
+    return _onboard_diagnosis_result(
+        "healthy_or_insufficient_signal",
+        "info",
+        [
+            "No critical onboarding fault detected from provided snapshot.",
+            "If issues persist, include auth_status, dm_status, and websocket state in the next diagnosis call.",
+        ],
+        [],
+    )
+
+
 @app.get("/diagnostic")
 async def diagnostic(
     node_id: Optional[str] = None,
@@ -2187,6 +2330,27 @@ async def diagnostic(
 
     # No node_id, no auth -> usage error
     return DiagnosticResponse(error="usage", node_id=None, registered=False, ws_connected=False)
+
+
+@app.post("/onboard/diagnose")
+async def onboard_diagnose(payload: OnboardDiagnoseRequest):
+    global onboard_diagnosis_total
+    result = _diagnose_onboarding(payload)
+    root_cause = result["root_cause"]
+    onboard_diagnosis_total += 1
+    onboard_diagnosis_counts[root_cause] = int(onboard_diagnosis_counts.get(root_cause, 0)) + 1
+    result["telemetry"] = {
+        "total_requests": onboard_diagnosis_total,
+        "root_cause_count": onboard_diagnosis_counts[root_cause],
+    }
+    log_event(
+        "onboard_diagnose",
+        f"Onboarding diagnosis generated: {root_cause}",
+        node_id=payload.node_id,
+        root_cause=root_cause,
+        severity=result["severity"],
+    )
+    return result
 
 
 @app.get("/logs/ledger_audit.log", response_class=PlainTextResponse)

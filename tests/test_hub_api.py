@@ -328,6 +328,55 @@ class TestDiagnosticEndpoint(unittest.TestCase):
         self.assertTrue(data["auth_ok"])
 
 
+class TestOnboardDiagnose(unittest.TestCase):
+    def setUp(self):
+        main.onboard_diagnosis_counts.clear()
+        main.onboard_diagnosis_total = 0
+
+    def test_detects_auth_401_signature_or_timestamp(self):
+        payload = {
+            "node_id": "node_test",
+            "auth_status": "401",
+            "registered": True,
+        }
+        resp = client.post("/onboard/diagnose", json=payload)
+        self.assertEqual(resp.status_code, 200, f"Diagnose failed: {resp.text}")
+        data = resp.json()
+        self.assertEqual(data["root_cause"], "auth_401_signature_or_timestamp")
+        self.assertEqual(data["severity"], "high")
+        self.assertGreaterEqual(data["telemetry"]["total_requests"], 1)
+
+    def test_detects_ghost_online_without_ws(self):
+        payload = {
+            "node_id": "node_test",
+            "registered": True,
+            "ws_connected": False,
+            "heartbeat_seconds_ago": 15,
+            "auth_status": "ok",
+        }
+        resp = client.post("/onboard/diagnose", json=payload)
+        self.assertEqual(resp.status_code, 200, f"Diagnose failed: {resp.text}")
+        data = resp.json()
+        self.assertEqual(data["root_cause"], "ghost_online_no_ws_presence")
+        self.assertEqual(data["severity"], "high")
+
+    def test_returns_healthy_or_insufficient_signal_when_no_fault(self):
+        payload = {
+            "node_id": "node_test",
+            "registered": True,
+            "ws_connected": True,
+            "auth_status": "ok",
+            "dm_status": "ok",
+            "listener_contract_ok": True,
+            "ai_configured": True,
+        }
+        resp = client.post("/onboard/diagnose", json=payload)
+        self.assertEqual(resp.status_code, 200, f"Diagnose failed: {resp.text}")
+        data = resp.json()
+        self.assertEqual(data["root_cause"], "healthy_or_insufficient_signal")
+        self.assertEqual(data["severity"], "info")
+
+
 class TestMeshAssembly(unittest.TestCase):
     def setUp(self):
         conn = db._get_conn()
