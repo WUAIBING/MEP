@@ -15,9 +15,48 @@ from typing import Any, Optional
 import requests
 
 try:
+    import websockets  # type: ignore
+except ImportError:
+    websockets = None
+
+try:
     from node.identity import MEPIdentity
 except ImportError:  # pragma: no cover - supports direct file execution
     from identity import MEPIdentity
+
+
+REQUIRED_PACKAGES = ["requests", "cryptography", "websockets"]
+
+
+def _check_dependencies() -> None:
+    missing_required = []
+    missing_optional = []
+
+    for pkg in REQUIRED_PACKAGES:
+        try:
+            __import__(pkg)
+        except ImportError:
+            missing_required.append(pkg)
+
+    if websockets is None:
+        missing_optional.append("websockets")
+
+    if missing_required:
+        print("[mep runtime] Missing required packages:", file=__import__("sys").stderr)
+        for pkg in missing_required:
+            print(f"  - {pkg}", file=__import__("sys").stderr)
+        print(file=__import__("sys").stderr)
+        print("Install with: pip install" + " ".join(missing_required), file=__import__("sys").stderr)
+        raise SystemExit(1)
+
+    if missing_optional:
+        print("[mep runtime] Missing optional packages:", file=__import__("sys").stdout)
+        for pkg in missing_optional:
+            print(f"  - {pkg}", file=__import__("sys").stdout)
+        print("Install with: pip install" + " ".join(missing_optional), file=__import__("sys").stdout)
+
+
+_check_dependencies()
 
 
 DEFAULT_HUB_URL = os.getenv("HUB_URL", "http://localhost:8000")
@@ -193,10 +232,8 @@ class RuntimeNode:
         return f"{self.ws_url}/ws/{self.node_id}?timestamp={ts}&signature={sig}"
 
     async def run_forever(self) -> int:
-        try:
-            import websockets  # type: ignore
-        except ImportError:
-            print("[mep run] missing optional dependency: websockets")
+        if websockets is None:
+            print("[mep run] missing required dependency: websockets")
             print("[mep run] install with: pip install websockets")
             return 2
 
