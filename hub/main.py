@@ -2,7 +2,7 @@ from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect, Requ
 from fastapi.responses import HTMLResponse, PlainTextResponse, JSONResponse
 from fastapi.exceptions import RequestValidationError
 from pydantic import BaseModel
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 import asyncio
 import uuid
 import time
@@ -130,6 +130,19 @@ IDEMPOTENCY_TTL_SECONDS = int(os.getenv("MEP_IDEMPOTENCY_TTL_SECONDS", "86400"))
 TIMEOUT_POLICY = os.getenv("MEP_TIMEOUT_POLICY", "refund").lower()
 VALID_AVAILABILITY = {"online", "idle", "busy", "offline", "degraded", "unknown"}
 LIVE_AVAILABILITY = {"online", "idle", "busy"}
+INTERBOT_SPEC_VERSION = "mep.interbot.v1"
+INTERBOT_ALLOWED_INTENTS = {
+    "chat.request",
+    "coordination.request",
+    "deployment.request",
+    "analysis.request",
+    "code.review.request",
+    "incident.response",
+    "test.request",
+}
+INTERBOT_SPEC_VALIDATE_ENABLED = os.getenv("MEP_INTERBOT_SPEC_VALIDATE", "false").lower() in ("1", "true", "yes")
+INTERBOT_CLOCK_SKEW_MS = int(os.getenv("MEP_INTERBOT_CLOCK_SKEW_MS", "600000"))
+INTERBOT_LEGACY_POLICY = os.getenv("MEP_INTERBOT_LEGACY_POLICY", "dm_only").strip().lower() or "dm_only"
 MESH_ALLOWED_TRIGGERS = {"brainstorm", "code_review", "incident", "planning"}
 MESH_DEFAULT_TIMEOUT_SECONDS = 300
 MESH_MAX_TIMEOUT_SECONDS = 3600
@@ -384,6 +397,78 @@ def _normalize_model_requirement(value: Optional[str]) -> Optional[str]:
     if not normalized:
         return None
     return normalized
+
+
+def _interbot_require_object(data: Any, field_name: str) -> dict:
+    if not isinstance(data, dict):
+        raise HTTPException(status_code=400, detail=f"Inter-bot payload missing object: {field_name}")
+    return data
+
+
+def _interbot_require_string(data: dict, field_name: str) -> str:
+    value = data.get(field_name)
+    if not isinstance(value, str) or not value.strip():
+        raise HTTPException(status_code=400, detail=f"Inter-bot payload missing field: {field_name}")
+    return value.strip()
+
+
+def _validate_interbot_payload_if_enabled(task: TaskCreate, payload: str) -> None:
+    if not INTERBOT_SPEC_VALIDATE_ENABLED or not payload:
+        return
+    payload_text = payload.strip()
+    if not payload_text:
+        return
+
+    try:
+        message = json.loads(payload_text)
+    except json.JSONDecodeError:
+        if INTERBOT_LEGACY_POLICY == "dm_only" and not (task.target_node and float(task.bounty) == 0.0):
+            raise HTTPException(
+                status_code=400,
+                detail="Legacy plaintext payload allowed only for direct DM tasks when MEP_INTERBOT_SPEC_VALIDATE=true",
+            )
+        return
+
+    message_obj = _interbot_require_object(message, "root")
+    if message_obj.get("spec_version") != INTERBOT_SPEC_VERSION:
+        raise HTTPException(status_code=400, detail="Inter-bot payload spec_version must be mep.interbot.v1")
+    _interbot_require_string(message_obj, "message_id")
+    timestamp_ms = message_obj.get("timestamp_ms")
+    if not isinstance(timestamp_ms, (int, float)):
+        raise HTTPException(status_code=400, detail="Inter-bot payload missing field: timestamp_ms")
+    now_ms = int(time.time() * 1000)
+    if abs(now_ms - int(timestamp_ms)) > INTERBOT_CLOCK_SKEW_MS:
+        raise HTTPException(status_code=400, detail="Inter-bot payload timestamp_ms out of allowed window")
+
+    source_obj = _interbot_require_object(message_obj.get("source"), "source")
+    source_node_id = _interbot_require_string(source_obj, "node_id")
+    if source_node_id != task.consumer_id:
+        raise HTTPException(status_code=400, detail="Inter-bot payload source.node_id mismatch with consumer_id")
+
+    intent_obj = _interbot_require_object(message_obj.get("intent"), "intent")
+    intent_type = _interbot_require_string(intent_obj, "type")
+    if intent_type not in INTERBOT_ALLOWED_INTENTS and "." not in intent_type:
+        raise HTTPException(status_code=400, detail="Inter-bot payload intent.type must use known type or namespaced custom value")
+
+    task_obj = _interbot_require_object(message_obj.get("task"), "task")
+    instructions = _interbot_require_string(task_obj, "instructions")
+    if len(instructions) > 4000:
+        raise HTTPException(status_code=400, detail="Inter-bot payload task.instructions too long (max 4000)")
+    expected_output_obj = _interbot_require_object(task_obj.get("expected_output"), "task.expected_output")
+    _interbot_require_string(expected_output_obj, "result_type")
+
+    economics_obj = _interbot_require_object(message_obj.get("economics"), "economics")
+    bounty_seconds = economics_obj.get("bounty_seconds")
+    if not isinstance(bounty_seconds, (int, float)):
+        raise HTTPException(status_code=400, detail="Inter-bot payload missing field: economics.bounty_seconds")
+    if abs(float(bounty_seconds) - float(task.bounty)) > 1e-9:
+        raise HTTPException(status_code=400, detail="Inter-bot payload economics.bounty_seconds must match task bounty")
+
+    target_obj = message_obj.get("target")
+    if isinstance(target_obj, dict) and task.target_node:
+        target_node_id = target_obj.get("node_id")
+        if isinstance(target_node_id, str) and target_node_id.strip() and target_node_id.strip() != task.target_node:
+            raise HTTPException(status_code=400, detail="Inter-bot payload target.node_id must match target_node")
 
 
 def _direct_dm_channel(a: str, b: str) -> str:
@@ -1559,6 +1644,7 @@ async def submit_task(
         raise HTTPException(status_code=400, detail="Task requires payload or payload_uri")
     if len(payload) > MAX_PAYLOAD_CHARS:
         raise HTTPException(status_code=413, detail="Task payload too large")
+    _validate_interbot_payload_if_enabled(task, payload)
     if task.target_node and float(task.bounty) == 0.0:
         await _anti_loop_check_and_record(task.consumer_id, task.target_node, payload)
     
