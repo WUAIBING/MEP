@@ -127,6 +127,7 @@ TASK_TIMEOUT_MAX_SECONDS = int(os.getenv("MEP_TASK_TIMEOUT_MAX_SECONDS", "86400"
 ASSIGNMENT_SWEEP_INTERVAL_SECONDS = int(os.getenv("MEP_ASSIGNMENT_SWEEP_INTERVAL_SECONDS", "60"))
 MAINTENANCE_SWEEP_INTERVAL_SECONDS = int(os.getenv("MEP_MAINTENANCE_SWEEP_INTERVAL_SECONDS", "60"))
 REGISTRY_RECONCILE_LIMIT = int(os.getenv("MEP_REGISTRY_RECONCILE_LIMIT", "1000"))
+REGISTRY_RECONCILE_STALE_SECONDS = float(os.getenv("MEP_REGISTRY_RECONCILE_STALE_SECONDS", "180"))
 COMPLETED_TASK_CACHE_TTL_SECONDS = int(os.getenv("MEP_COMPLETED_TASK_CACHE_TTL_SECONDS", "3600"))
 COMPLETED_TASK_CACHE_MAX_ITEMS = int(os.getenv("MEP_COMPLETED_TASK_CACHE_MAX_ITEMS", "1000"))
 IDEMPOTENCY_TTL_SECONDS = int(os.getenv("MEP_IDEMPOTENCY_TTL_SECONDS", "86400"))
@@ -164,6 +165,18 @@ TASK_TIMEOUT_DEFAULT_SECONDS = max(TASK_TIMEOUT_MIN_SECONDS, min(TASK_TIMEOUT_DE
 # ---------------------------------------------------------------------------
 node_activity_lock = asyncio.Lock()
 node_last_activity: Dict[str, float] = {}
+registry_reconcile_lock = asyncio.Lock()
+registry_reconcile_metrics: Dict[str, Any] = {
+    "runs": 0,
+    "candidates_scanned": 0,
+    "reconciled_total": 0,
+    "skipped_recent_total": 0,
+    "last_run_at": None,
+    "last_run_candidates": 0,
+    "last_run_reconciled": 0,
+    "last_run_skipped_recent": 0,
+    "last_reconciled_at": None,
+}
 
 DEGRADED_THRESHOLD_SECONDS = float(os.getenv("MEP_DEGRADED_THRESHOLD_SECONDS", "600"))
 
@@ -206,10 +219,18 @@ async def _reconcile_live_registry_presence():
             stale_candidates.append((node_id, availability))
 
     if not stale_candidates:
+        now = time.time()
+        async with registry_reconcile_lock:
+            registry_reconcile_metrics["runs"] += 1
+            registry_reconcile_metrics["last_run_at"] = now
+            registry_reconcile_metrics["last_run_candidates"] = 0
+            registry_reconcile_metrics["last_run_reconciled"] = 0
+            registry_reconcile_metrics["last_run_skipped_recent"] = 0
         return
 
     now = time.time()
     reconciled = 0
+    skipped_recent = 0
     for node_id, seen_availability in stale_candidates:
         async with node_lock:
             if node_id in connected_nodes:
@@ -220,6 +241,15 @@ async def _reconcile_live_registry_presence():
         current_availability = str(existing.get("availability") or "unknown").strip().lower()
         if current_availability not in LIVE_AVAILABILITY:
             continue
+        last_updated = existing.get("updated_at")
+        if last_updated is not None:
+            try:
+                age_seconds = now - float(last_updated)
+                if age_seconds < REGISTRY_RECONCILE_STALE_SECONDS:
+                    skipped_recent += 1
+                    continue
+            except (TypeError, ValueError):
+                pass
         db.update_registry_availability(node_id, "offline", now)
         reconciled += 1
         log_event(
@@ -229,6 +259,17 @@ async def _reconcile_live_registry_presence():
             previous_availability=seen_availability,
             reconciled_availability="offline",
         )
+    async with registry_reconcile_lock:
+        registry_reconcile_metrics["runs"] += 1
+        registry_reconcile_metrics["candidates_scanned"] += len(stale_candidates)
+        registry_reconcile_metrics["reconciled_total"] += reconciled
+        registry_reconcile_metrics["skipped_recent_total"] += skipped_recent
+        registry_reconcile_metrics["last_run_at"] = now
+        registry_reconcile_metrics["last_run_candidates"] = len(stale_candidates)
+        registry_reconcile_metrics["last_run_reconciled"] = reconciled
+        registry_reconcile_metrics["last_run_skipped_recent"] = skipped_recent
+        if reconciled:
+            registry_reconcile_metrics["last_reconciled_at"] = now
     if reconciled:
         log_event("registry_reconcile_summary", f"Reconciled {reconciled} stale live registry entries", reconciled=reconciled)
 DEFAULT_REGISTRY_MAX_AGE_MINUTES = float(os.getenv("MEP_REGISTRY_MAX_AGE_MINUTES", "0") or "0")
@@ -2144,6 +2185,8 @@ async def health_check():
     db_health = db.check_database_health()
     async with node_lock:
         online_count = len(connected_nodes)
+    async with registry_reconcile_lock:
+        reconcile_snapshot = dict(registry_reconcile_metrics)
     async with task_lock:
         active_count = len(active_tasks)
         completed_count = len(completed_tasks)
@@ -2153,7 +2196,8 @@ async def health_check():
         "metrics": {
             "connected_nodes": online_count,
             "active_tasks": active_count,
-            "completed_task_cache": completed_count
+            "completed_task_cache": completed_count,
+            "registry_reconcile": reconcile_snapshot,
         }
     }
 
