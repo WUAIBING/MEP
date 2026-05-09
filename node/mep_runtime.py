@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Unified node runtime for fast onboarding (`init`, `run`, `status`, `doctor`)."""
+"""Unified node runtime for fast onboarding (`init`, `up`, `run`, `status`, `doctor`)."""
 
 from __future__ import annotations
 
@@ -235,6 +235,18 @@ def _print_badges(badges: dict[str, bool]) -> None:
     print("[mep status] " + " | ".join(parts))
 
 
+def _print_listener_hint(args: argparse.Namespace) -> None:
+    cmd = (
+        "python -m node.mep_runtime "
+        f"--hub-url {args.hub_url} "
+        f"--ws-url {args.ws_url} "
+        f"--key-path {args.key_path} run"
+    )
+    print("[mep status] node is registered, but listener is not running.")
+    print("[mep status] start live listener with:")
+    print(f"  $ {cmd}")
+
+
 def cmd_init(args: argparse.Namespace) -> int:
     _ensure_key_parent(args.key_path)
     identity = MEPIdentity(args.key_path)
@@ -249,6 +261,7 @@ def cmd_init(args: argparse.Namespace) -> int:
     print(f"[mep init] register ok balance={body.get('balance') if body else '?'}")
     status_args = argparse.Namespace(
         hub_url=args.hub_url,
+        ws_url=args.ws_url,
         key_path=args.key_path,
         adapter=args.adapter,
         require_online=False,
@@ -266,6 +279,8 @@ def cmd_status(args: argparse.Namespace) -> int:
         return 2
     badges = _status_badges(body, ai_ready=args.adapter == "mock")
     _print_badges(badges)
+    if badges["REGISTERED"] and not badges["WS_CONNECTED"]:
+        _print_listener_hint(args)
     if args.require_online:
         return 0 if all(badges.values()) else 1
     return 0
@@ -327,6 +342,35 @@ def cmd_run(args: argparse.Namespace) -> int:
         return 0
 
 
+def cmd_up(args: argparse.Namespace) -> int:
+    print("[mep up] bootstrapping node with init -> doctor -> run")
+    init_args = argparse.Namespace(
+        hub_url=args.hub_url,
+        ws_url=args.ws_url,
+        key_path=args.key_path,
+        adapter=args.adapter,
+        alias=args.alias,
+    )
+    init_code = cmd_init(init_args)
+    if init_code != 0:
+        return init_code
+
+    doctor_args = argparse.Namespace(
+        hub_url=args.hub_url,
+        key_path=args.key_path,
+        adapter=args.adapter,
+        auth_status="ok",
+        dm_status="ok",
+        listener_contract_ok=None,
+        clock_skew_seconds=None,
+    )
+    doctor_code = cmd_doctor(doctor_args)
+    if doctor_code != 0:
+        print("[mep up] doctor failed; continuing to run listener for live connectivity")
+
+    return cmd_run(args)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="MEP unified runtime for fast onboarding.")
     parser.add_argument("--hub-url", default=DEFAULT_HUB_URL, help="Hub base URL.")
@@ -339,6 +383,10 @@ def build_parser() -> argparse.ArgumentParser:
     init_p = sub.add_parser("init", help="Generate/load key and register node.")
     init_p.add_argument("--alias", default="mep-runtime", help="Node alias for registration.")
     init_p.set_defaults(func=cmd_init)
+
+    up_p = sub.add_parser("up", help="One-command bootstrap: init + doctor + run.")
+    up_p.add_argument("--alias", default="mep-runtime", help="Node alias for registration.")
+    up_p.set_defaults(func=cmd_up)
 
     run_p = sub.add_parser("run", help="Run standardized listener runtime.")
     run_p.set_defaults(func=cmd_run)

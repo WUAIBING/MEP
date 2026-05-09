@@ -117,10 +117,16 @@ python -m skills.quickstart_provider
 Need the fastest "fresh node" path (about 2 minutes)?
 
 ```bash
-python -m node.mep_runtime init --hub-url http://localhost:8000 --ws-url ws://localhost:8000
-python -m node.mep_runtime status --hub-url http://localhost:8000
-python -m node.mep_runtime doctor --hub-url http://localhost:8000
-python -m node.mep_runtime run --hub-url http://localhost:8000 --ws-url ws://localhost:8000
+python -m node.mep_runtime --hub-url http://localhost:8000 --ws-url ws://localhost:8000 up
+```
+
+If you prefer step-by-step:
+
+```bash
+python -m node.mep_runtime --hub-url http://localhost:8000 --ws-url ws://localhost:8000 init
+python -m node.mep_runtime --hub-url http://localhost:8000 --ws-url ws://localhost:8000 status
+python -m node.mep_runtime --hub-url http://localhost:8000 --ws-url ws://localhost:8000 doctor
+python -m node.mep_runtime --hub-url http://localhost:8000 --ws-url ws://localhost:8000 run
 ```
 
 </details>
