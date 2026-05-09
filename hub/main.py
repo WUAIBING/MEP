@@ -126,6 +126,7 @@ TASK_TIMEOUT_MIN_SECONDS = int(os.getenv("MEP_TASK_TIMEOUT_MIN_SECONDS", "60"))
 TASK_TIMEOUT_MAX_SECONDS = int(os.getenv("MEP_TASK_TIMEOUT_MAX_SECONDS", "86400"))
 ASSIGNMENT_SWEEP_INTERVAL_SECONDS = int(os.getenv("MEP_ASSIGNMENT_SWEEP_INTERVAL_SECONDS", "60"))
 MAINTENANCE_SWEEP_INTERVAL_SECONDS = int(os.getenv("MEP_MAINTENANCE_SWEEP_INTERVAL_SECONDS", "60"))
+REGISTRY_RECONCILE_LIMIT = int(os.getenv("MEP_REGISTRY_RECONCILE_LIMIT", "1000"))
 COMPLETED_TASK_CACHE_TTL_SECONDS = int(os.getenv("MEP_COMPLETED_TASK_CACHE_TTL_SECONDS", "3600"))
 COMPLETED_TASK_CACHE_MAX_ITEMS = int(os.getenv("MEP_COMPLETED_TASK_CACHE_MAX_ITEMS", "1000"))
 IDEMPOTENCY_TTL_SECONDS = int(os.getenv("MEP_IDEMPOTENCY_TTL_SECONDS", "86400"))
@@ -183,6 +184,53 @@ async def _sweep_node_activity():
                 if existing and existing.get("availability") not in ("offline", "degraded"):
                     db.update_registry_availability(node_id, "degraded", now)
                     log_event("node_degraded", f"Node {node_id} marked degraded due to inactivity", node_id=node_id)
+
+
+async def _reconcile_live_registry_presence():
+    stale_candidates: list[tuple[str, str]] = []
+    for availability in LIVE_AVAILABILITY:
+        rows = db.search_registry(
+            alias=None,
+            skill=None,
+            model=None,
+            availability=availability,
+            min_score=None,
+            min_reviews=None,
+            min_updated_at=None,
+            limit=max(1, REGISTRY_RECONCILE_LIMIT),
+        )
+        for row in rows:
+            node_id = str(row.get("node_id") or "").strip()
+            if not node_id:
+                continue
+            stale_candidates.append((node_id, availability))
+
+    if not stale_candidates:
+        return
+
+    now = time.time()
+    reconciled = 0
+    for node_id, seen_availability in stale_candidates:
+        async with node_lock:
+            if node_id in connected_nodes:
+                continue
+        existing = db.get_registry(node_id)
+        if not existing:
+            continue
+        current_availability = str(existing.get("availability") or "unknown").strip().lower()
+        if current_availability not in LIVE_AVAILABILITY:
+            continue
+        db.update_registry_availability(node_id, "offline", now)
+        reconciled += 1
+        log_event(
+            "registry_reconciled_offline",
+            f"Node {node_id} forced offline (registry={seen_availability}, ws=disconnected)",
+            node_id=node_id,
+            previous_availability=seen_availability,
+            reconciled_availability="offline",
+        )
+    if reconciled:
+        log_event("registry_reconcile_summary", f"Reconciled {reconciled} stale live registry entries", reconciled=reconciled)
 DEFAULT_REGISTRY_MAX_AGE_MINUTES = float(os.getenv("MEP_REGISTRY_MAX_AGE_MINUTES", "0") or "0")
 ASSIGNMENT_REPUTATION_WEIGHT = float(os.getenv("MEP_ASSIGNMENT_REPUTATION_WEIGHT", "0.55"))
 ASSIGNMENT_AVAILABILITY_WEIGHT = float(os.getenv("MEP_ASSIGNMENT_AVAILABILITY_WEIGHT", "0.25"))
@@ -1126,6 +1174,7 @@ async def _maintenance_worker():
             await _evict_completed_tasks_cache()
             _sweep_idempotency_records()
             await _sweep_node_activity()
+            await _reconcile_live_registry_presence()
         except Exception as exc:
             log_event("maintenance_sweep_failed", f"Maintenance sweep failed: {exc}")
         await asyncio.sleep(max(1, MAINTENANCE_SWEEP_INTERVAL_SECONDS))
@@ -1133,6 +1182,7 @@ async def _maintenance_worker():
 @app.on_event("startup")
 async def start_timeout_worker():
     await _load_active_tasks_from_db()
+    await _reconcile_live_registry_presence()
     asyncio.create_task(_assignment_timeout_worker())
     asyncio.create_task(_maintenance_worker())
     if REQUIRE_TLS:
