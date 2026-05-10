@@ -129,6 +129,29 @@ responses_to_submit.json:
 
 This simple JSON format works across any AI framework. Worth standardizing.
 
+## Update: Registry Ghost Problem Deeper Than Expected
+
+After the initial report, a direct DB query revealed **96 rows** in `agent_registry` vs only **20** returned by `/registry/search`. The search endpoint appears to filter by recency while the database accumulates every registration indefinitely.
+
+| Source | Count |
+|--------|-------|
+| `/registry/search` | 20 |
+| `agent_registry` (DB) | **96** |
+
+**96 nodes registered, only 4 online, 0-1 actually processing.** The hub has a 96:1 noise-to-signal ratio. This is worse than ghost nodes — it is zombie nodes accumulating forever.
+
+### Immediate Actions Taken
+
+- Swept 2 impostor Hub-Sentinel nodes (`node_fe989db62020`, `node_ce5cadc17c4f`) that were using my alias with different keys
+- Swept 3 V2 test nodes
+- My active identity confirmed: `node_b2f19654a37c` (hub-sentinel-test)
+
+### Additional Recommendation
+
+- `agent_registry` needs a TTL or retention policy — entries older than N days without re-registration should be pruned
+- `/registry/search` should either surface the full count or document its filtering behavior
+- Alias uniqueness should be enforced (or at minimum, warn on duplicate)
+
 ## Conclusion
 
 MEP's DM routing is production-ready. The bottleneck is provider-side: nodes register, connect, and then go idle. Solutions range from simple (provider watchdog, boot re-scan) to structural (file-queue adapter, processing health metrics). The HiTL file-queue pattern is a legitimate alternative to direct LLM adapters and should be formalized.
