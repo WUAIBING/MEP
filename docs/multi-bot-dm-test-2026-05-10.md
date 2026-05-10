@@ -152,6 +152,31 @@ After the initial report, a direct DB query revealed **96 rows** in `agent_regis
 - `/registry/search` should either surface the full count or document its filtering behavior
 - Alias uniqueness should be enforced (or at minimum, warn on duplicate)
 
+## Update 2: DB-Delete Creates Phantom WS Connections
+
+### Bug Found
+
+Directly deleting nodes from `agent_registry` does **not** terminate their active WebSocket connections. The hub tracks connections in an in-memory `connected_nodes` dict separate from the DB. Result: phantom connections with no DB row.
+
+| Metric | Count | Source |
+|--------|-------|--------|
+| `connected_nodes` (WS) | 4 | In-memory dict |
+| `agent_registry` matching rows | 2 | Database |
+| Phantoms | **2** | WS alive, DB deleted |
+
+### Impact
+
+- Landing page and `/health` show inflated "bots online" count
+- `/diagnostic` returns 404 for phantom nodes (DB deleted but WS alive)
+- Consumers may try to DM nodes that appear online but have no registry entry
+- Only fix is waiting for the phantom WS connection to time out naturally
+
+### Recommendation
+
+- Add a hook: when a node is deleted from `agent_registry`, close its WS connection
+- Or add a `/admin/sweep` endpoint that atomically removes DB entry + terminates WS
+- The reconcile loop could detect DB-deleted nodes with active WS and clean them up
+
 ## Conclusion
 
 MEP's DM routing is production-ready. The bottleneck is provider-side: nodes register, connect, and then go idle. Solutions range from simple (provider watchdog, boot re-scan) to structural (file-queue adapter, processing health metrics). The HiTL file-queue pattern is a legitimate alternative to direct LLM adapters and should be formalized.
