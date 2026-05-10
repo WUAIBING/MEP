@@ -1,197 +1,143 @@
-# MEP Onboarding Experience Report
+# MEP Onboarding Experience Report v2
 
-**Date:** May 8, 2026  
-**Reviewer:** Trae SOLO Bot (as AI code reviewer)  
-**Scope:** End-to-end test of 2-minute fresh node onboarding flow
+**Date:** May 10, 2026  
+**Reviewer:** Trae SOLO Bot  
+**Scope:** End-to-end test of improved 2-minute fresh node onboarding flow
 
 ---
 
 ## Executive Summary
 
-Tested the advertised "2-minute fresh node" onboarding path. The core flow works, but there are friction points that can trip up new users. Below is the detailed walkthrough, findings, and recommendations.
+Re-tested the onboarding after README improvements. The `--doctor` command is a great addition. Overall experience improved from 7/10 to 8/10.
+
+**Test Node:** `node_0f0717002561` (registered and fully online)
 
 ---
 
-## Test Environment
+## Test Results
 
-| Component | Version |
-|-----------|---------|
-| OS | Linux (sandbox) |
-| Python | 3.x |
-| MEP | Latest from `main` branch |
-| Hub | `https://mep-hub.silentcopilot.ai` |
-| WS | `wss://mep-hub.silentcopilot.ai` |
+| Step | Command | Result | Time |
+|------|---------|--------|------|
+| 1. Dependencies | `pip install requests websockets cryptography` | Required (not in README) | ~10 sec |
+| 2. Init | `python -m node.mep_runtime --hub-url https://mep-hub.silentcopilot.ai init` | Registered with 10.0 balance | ~2 sec |
+| 3. Status | `python -m node.mep_runtime --hub-url https://mep-hub.silentcopilot.ai status` | Shows 5 badges | ~1 sec |
+| 4. Doctor | `python -m node.mep_runtime --hub-url https://mep-hub.silentcopilot.ai doctor` | **NEW** - Actionable diagnosis | ~1 sec |
+| 5. Run | `python -m node.mep_runtime --hub-url https://mep-hub.silentcopilot.ai --ws-url wss://mep-hub.silentcopilot.ai run` | WebSocket connects | ~3 sec |
+| 6. Final Status | All badges check | **ALL GREEN** | - |
 
----
-
-## Step-by-Step Walkthrough
-
-### Step 1: Clone Repository
-
-```bash
-git clone https://github.com/WUAIBING/MEP.git && cd MEP
-```
-
-| Aspect | Result |
-|--------|--------|
-| Time | ~5 seconds |
-| Status | ✅ Success |
-| Notes | Standard git clone, no issues |
-
-### Step 2: Install Dependencies
-
-```bash
-pip install requests websockets cryptography
-```
-
-| Aspect | Result |
-|--------|--------|
-| Time | ~10-30 seconds |
-| Status | ⚠️ Not mentioned in README fast path |
-| Notes | The "2-minute" path in README (lines 119-125) shows `pip install` but doesn't remind users to do it first |
-
-**Issue #1:** README fast-path assumes dependencies exist. New users may try to run `mep_runtime.py` immediately and get:
+### Final Status Output
 
 ```
-ModuleNotFoundError: No module named 'requests'
+[mep status] REGISTERED=OK | WS_CONNECTED=OK | HEARTBEATING=OK | DM_READY=OK | AI_READY=OK
 ```
-
-**Recommendation:** Add a callout box before the fast-path commands:
-
-```markdown
-> **Prerequisites:** Python 3.8+ and pip. Install required packages first:
-> ```bash
-> pip install requests websockets cryptography
-> ```
-```
-
-### Step 3: Initialize Node
-
-```bash
-cd node && python mep_runtime.py init --hub-url https://mep-hub.silentcopilot.ai
-```
-
-| Aspect | Result |
-|--------|--------|
-| Time | ~2 seconds |
-| Status | ✅ Success |
-| Output | Clean identity generation, node ID displayed |
-
-**Issue #2:** The `cd node` step is not obvious from the top-level README. The main README shows:
-
-```bash
-python -m clients.adapters.mep_codex_adapter
-```
-
-but the fast-path uses:
-
-```bash
-cd node && python mep_runtime.py
-```
-
-These are different entry points with different path requirements.
-
-**Recommendation:** Clarify that `mep_runtime.py` is in the `node/` subdirectory, or add `cd node` to the context.
-
-### Step 4: Check Status
-
-```bash
-cd node && python mep_runtime.py status --hub-url https://mep-hub.silentcopilot.ai
-```
-
-| Aspect | Result |
-|--------|--------|
-| Time | ~1 second |
-| Status | ✅ Success |
-| Output | Shows 5 badges (registered, connected, auth, DM, listener) |
-
-**Issue #3:** Status badges are a great UX. However, when a badge is red, there's no built-in hint about what to do next. Example: if `registered: false`, user sees red badge but no guidance.
-
-**Recommendation:** Add a `--doctor` flag or inline hint:
-
-```
-cd node && python mep_runtime.py doctor --hub-url https://mep-hub.silentcopilot.ai
-```
-
-### Step 5: Connect Node
-
-```bash
-cd node && python mep_runtime.py run --hub-url https://mep-hub.silentcopilot.ai --ws-url wss://mep-hub.silentcopilot.ai
-```
-
-| Aspect | Result |
-|--------|--------|
-| Time | ~3-5 seconds |
-| Status | ✅ Success |
-| Output | WebSocket connects, heartbeats begin |
-
-**Issue #4:** The `run` command requires both `--hub-url` and `--ws-url`. These are often the same base URL with different protocols. This is redundant for simple setups.
-
-**Recommendation:** Allow `--hub-url` alone and derive `ws-url` from it (e.g., `wss://mep-hub.silentcopilot.ai` from `https://mep-hub.silentcopilot.ai`).
-
----
-
-## Summary of Issues Found
-
-| # | Severity | Issue | Status |
-|---|----------|-------|--------|
-| 1 | Medium | Missing `pip install` reminder in fast-path | Fixed in PR #123 |
-| 2 | Low | `cd node` path not obvious | Fixed in PR #123 |
-| 3 | Low | No diagnostic hints for red badges | Future work |
-| 4 | Low | Redundant `--ws-url` when same as `--hub-url` | Future work |
 
 ---
 
 ## What's Working Well
 
-1. **Speed:** The actual registration flow is genuinely fast (~2 seconds for init/status)
-2. **Badge System:** Visual status indicators are excellent for troubleshooting
-3. **Identity Generation:** Clean, automatic node ID creation
-4. **WebSocket Reconnect:** Automatic reconnection logic works well
-5. **Error Messages:** Most error cases have clear messages
+### 1. Module Path Fixed
+**Before:** `cd node && python mep_runtime.py`
+**After:** `python -m node.mep_runtime`
 
----
+Cleaner, works from repo root. ✅
 
-## Recommendations (Priority Order)
+### 2. The `--doctor` Command
+This is the biggest improvement. When WS was not connected:
 
-### High Priority
+```
+[mep doctor] root_cause=ghost_online_no_ws_presence severity=high
+  - Restart listener and ensure websocket connection stays active.
+  - Treat websocket connectivity as source of truth for live status.
+  - Keep heartbeat interval steady and shorter than disconnect detection window.
+  $ python -m node.mep_status
+  $ curl -s "http://localhost:8000/diagnostic?node_id=<your_node_id>"
+[mep doctor] telemetry total=2 root_cause_count=1
+```
 
-1. **Dependency validation at startup** (already in PR #123) - Prevents cryptic `ModuleNotFoundError`
+Actionable, clear severity, suggests specific commands. ✅
 
-### Medium Priority
+### 3. Badge System
+Clear visual status indicators:
+- `REGISTERED=OK` - Node registered with hub
+- `WS_CONNECTED=OK` - WebSocket live
+- `HEARTBEATING=OK` - Heartbeats being sent
+- `DM_READY=OK` - Direct messaging available
+- `AI_READY=OK` - AI provider configured
 
-2. **Add `--doctor` subcommand** - Runs full diagnostic and suggests fixes
-3. **Derive `ws-url` from `hub-url`** - Simplifies the common case
-
-### Low Priority
-
-4. **Badge-specific troubleshooting hints** - Inline guidance when status is not OK
-5. **Progress indicators** - Show "Connecting..." during async operations
-
----
-
-## Files Changed in This PR
-
-None - this is a documentation-only PR capturing feedback for future improvements.
-
----
-
-## Test Commands Used
-
-```bash
-# Full test sequence
-git clone https://github.com/WUAIBING/MEP.git && cd MEP
-pip install requests websockets cryptography
-cd node && python mep_runtime.py init --hub-url https://mep-hub.silentcopilot.ai
-cd node && python mep_runtime.py status --hub-url https://mep-hub.silentcopilot.ai
-cd node && python mep_runtime.py run --hub-url https://mep-hub.silentcopilot.ai --ws-url wss://mep-hub.silentcopilot.ai
+### 4. Init with Balance
+New nodes get 10.0 SECONDS to start:
+```
+[mep init] register ok balance=10.0
 ```
 
 ---
 
-## Conclusion
+## Remaining Issues
 
-The MEP onboarding is functional and fast. The fixes in PR #123 address the critical first-run issues. Future iterations should focus on diagnostic tooling (the `--doctor` command) to make troubleshooting self-service.
+### 1. Dependency Install Not in README
 
-**Overall Rating:** 7/10 for first-time user experience  
-**Potential:** 9/10 with diagnostic tooling improvements
+The README fast-path doesn't mention `pip install` until after showing `mep_runtime` commands.
+
+**Current README (lines 119-124):**
+```bash
+python -m node.mep_runtime init --hub-url http://localhost:8000 --ws-url ws://localhost:8000
+python -m node.mep_runtime status --hub-url http://localhost:8000
+python -m node.mep_runtime doctor --hub-url http://localhost:8000
+python -m node.mep_runtime run --hub-url http://localhost:8000 --ws-url ws://localhost:8000
+```
+
+**Issue:** User will hit `ModuleNotFoundError: No module named 'requests'` immediately.
+
+**Recommendation:** Add a prerequisite section:
+
+```markdown
+### Prerequisites
+
+```bash
+pip install requests websockets cryptography
+```
+
+### Quick Start
+
+```bash
+python -m node.mep_runtime init --hub-url https://mep-hub.silentcopilot.ai
+python -m node.mep_runtime status --hub-url https://mep-hub.silentcopilot.ai
+python -m node.mep_runtime doctor --hub-url https://mep-hub.silentcopilot.ai
+python -m node.mep_runtime run --hub-url https://mep-hub.silentcopilot.ai --ws-url wss://mep-hub.silentcopilot.ai
+```
+```
+
+---
+
+## Comparison: Before vs After
+
+| Aspect | v1 (May 8) | v2 (May 10) | Change |
+|--------|------------|-------------|--------|
+| Module path | `cd node && python` | `python -m node.mep_runtime` | ✅ Fixed |
+| Diagnostic tool | None | `--doctor` command | ✅ New |
+| Dependency error | Cryptic `ModuleNotFoundError` | Still needs manual fix | ⚠️ Same |
+| Overall score | 7/10 | 8/10 | +1 |
+
+---
+
+## Recommendations
+
+### High Priority
+1. **Add pip install to README** - Prevents first-run failure
+
+### Medium Priority
+2. **Self-installing dependencies** - `mep_runtime.py` could prompt/auto-install missing packages
+3. **Derive ws-url from hub-url** - If only `--hub-url` provided, assume `wss://` from `https://`
+
+### Low Priority
+4. **Interactive init** - `python -m node.mep_runtime` with no args guides through setup
+
+---
+
+## Files Changed
+
+This is a documentation-only PR capturing v2 feedback.
+
+---
+
+**Reviewed by: Trae SOLO Bot**
