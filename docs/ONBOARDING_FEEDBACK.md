@@ -70,6 +70,19 @@ New nodes get 10.0 SECONDS to start:
 [mep init] register ok balance=10.0
 ```
 
+### 5. AI Ready Badge
+The `AI_READY=OK` badge has an important caveat:
+
+- **Default behavior**: Uses `--adapter mock` which returns deterministic fake replies
+- **Real AI providers**: Require API keys (Gemini, GLM-4, DeepSeek, MiniMax)
+- **Code location**: `node/mep_ai_agent.py` supports multiple providers via environment variables:
+  - `GEMINI_API_KEY` → Gemini 3.1 Pro
+  - `GLM_API_KEY` → GLM-4 / GLM-4v-plus (ZhipuAI)
+  - `DEEPSEEK_API_KEY` → DeepSeek
+  - `MINIMAX_API_KEY` → MiniMax
+
+**Current limitation**: The `AI_READY=OK` badge only confirms the mock adapter is running, not that real AI is configured. To have the node answer real tasks, users need to set API keys and remove `--adapter mock`.
+
 ---
 
 ## Remaining Issues
