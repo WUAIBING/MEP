@@ -490,6 +490,16 @@ def _normalize_model_requirement(value: Optional[str]) -> Optional[str]:
     return normalized
 
 
+async def _coerce_live_availability(node_id: str, availability: Optional[str]) -> Optional[str]:
+    if availability is None or availability not in LIVE_AVAILABILITY:
+        return availability
+    async with node_lock:
+        has_live_websocket = node_id in connected_nodes
+    if has_live_websocket:
+        return availability
+    return "offline"
+
+
 def _interbot_require_object(data: Any, field_name: str) -> dict:
     if not isinstance(data, dict):
         raise HTTPException(status_code=400, detail=f"Inter-bot payload missing object: {field_name}")
@@ -1328,12 +1338,14 @@ async def update_registry(payload: RegistryUpdate, authenticated_node: str = Dep
     if availability is None:
         existing = db.get_registry(authenticated_node)
         availability = existing.get("availability") if existing else "unknown"
+    availability = await _coerce_live_availability(authenticated_node, availability)
     db.upsert_registry(authenticated_node, payload.alias, skills, models, metadata, availability, time.time())
     return {"status": "success", "node_id": authenticated_node}
 
 @app.post("/registry/availability")
 async def update_availability(payload: AvailabilityUpdate, authenticated_node: str = Depends(verify_request)):
     availability = _normalize_availability(payload.availability)
+    availability = await _coerce_live_availability(authenticated_node, availability)
     db.update_registry_availability(authenticated_node, availability, time.time())
     await _track_node_activity(authenticated_node)
     return {"status": "success", "node_id": authenticated_node, "availability": availability}
@@ -1344,10 +1356,7 @@ async def registry_heartbeat(payload: RegistryHeartbeat, request: Request, authe
     if availability is None:
         existing = db.get_registry(authenticated_node)
         availability = existing.get("availability") if existing else "unknown"
-    async with node_lock:
-        has_live_websocket = authenticated_node in connected_nodes
-    if availability in LIVE_AVAILABILITY and not has_live_websocket:
-        availability = "offline"
+    availability = await _coerce_live_availability(authenticated_node, availability)
     db.update_registry_availability(authenticated_node, availability, time.time())
     await _track_node_activity(authenticated_node)
     hub_url, ws_url = get_hub_urls(request)

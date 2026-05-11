@@ -473,6 +473,7 @@ class TestMeshAssembly(unittest.TestCase):
         conn.commit()
         db._release_conn(conn)
         main.mesh_assemblies.clear()
+        main.connected_nodes.clear()
 
     def _register_with_mesh_metadata(
         self,
@@ -485,6 +486,8 @@ class TestMeshAssembly(unittest.TestCase):
     ):
         priv, pub, node_id = _make_identity()
         _register(pub)
+        # Mesh role selection treats websocket presence as source of truth.
+        main.connected_nodes[node_id] = object()
         update_payload = json.dumps(
             {
                 "alias": alias,

@@ -113,6 +113,50 @@ class TestHubGhostReconcile(unittest.IsolatedAsyncioTestCase):
         self.assertIn("last_run_reconciled", metrics)
         self.assertIn("last_run_skipped_recent", metrics)
 
+    async def test_registry_update_coerces_live_status_to_offline_without_ws(self):
+        payload = hub_main.RegistryUpdate(
+            alias="ghosty",
+            skills=["chat"],
+            models=["deepseek-v4"],
+            metadata={"k": "v"},
+            availability="online",
+        )
+        with (
+            patch.object(hub_main.db, "upsert_registry") as upsert_mock,
+            patch("main.time.time", return_value=1000.0),
+        ):
+            await hub_main.update_registry(payload, authenticated_node="node_ghost")
+
+        upsert_mock.assert_called_once()
+        self.assertEqual(upsert_mock.call_args.args[0], "node_ghost")
+        self.assertEqual(upsert_mock.call_args.args[5], "offline")
+
+    async def test_registry_update_keeps_live_status_when_ws_connected(self):
+        payload = hub_main.RegistryUpdate(availability="online")
+        hub_main.connected_nodes["node_live"] = object()
+        with (
+            patch.object(hub_main.db, "upsert_registry") as upsert_mock,
+            patch("main.time.time", return_value=1000.0),
+        ):
+            await hub_main.update_registry(payload, authenticated_node="node_live")
+
+        upsert_mock.assert_called_once()
+        self.assertEqual(upsert_mock.call_args.args[5], "online")
+
+    async def test_registry_availability_coerces_live_status_to_offline_without_ws(self):
+        payload = hub_main.AvailabilityUpdate(availability="busy")
+        with (
+            patch.object(hub_main.db, "update_registry_availability") as update_mock,
+            patch.object(hub_main, "_track_node_activity"),
+            patch("main.time.time", return_value=1000.0),
+        ):
+            response = await hub_main.update_availability(payload, authenticated_node="node_ghost")
+
+        update_mock.assert_called_once()
+        self.assertEqual(update_mock.call_args.args[0], "node_ghost")
+        self.assertEqual(update_mock.call_args.args[1], "offline")
+        self.assertEqual(response["availability"], "offline")
+
 
 if __name__ == "__main__":
     unittest.main()
