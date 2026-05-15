@@ -532,13 +532,13 @@ def _task_economics(task: TaskCreate) -> dict:
         market = str(economics.get("market") or "").strip().lower() or None
         payment_direction = str(economics.get("payment_direction") or "").strip().lower() or None
 
+        if "bounty_quanta" in economics or currency == "MEP_QUANTA":
+            raise HTTPException(status_code=400, detail="Task economics must use bounty_ns with currency MEP_NS")
         bounty_ns_value = economics.get("bounty_ns")
-        if bounty_ns_value is None:
-            bounty_ns_value = economics.get("bounty_quanta")
         if bounty_ns_value is not None:
             if currency is None:
                 currency = "MEP_NS"
-            if currency not in {"MEP_NS", "MEP_QUANTA"}:
+            if currency != "MEP_NS":
                 raise HTTPException(status_code=400, detail="Task economics currency must be MEP_NS")
             if isinstance(bounty_ns_value, bool):
                 raise HTTPException(status_code=400, detail="Task economics bounty_ns must be an integer")
@@ -719,13 +719,11 @@ def _validate_interbot_payload_if_enabled(consumer_id: str, task_economics: dict
     economics_obj = _interbot_require_object(message_obj.get("economics"), "economics")
     currency = economics_obj.get("currency")
     bounty_ns_value = economics_obj.get("bounty_ns")
-    if bounty_ns_value is None:
-        bounty_ns_value = economics_obj.get("bounty_quanta")
     if bounty_ns_value is None and "bounty_seconds" in economics_obj:
         if currency not in {None, "SECONDS"}:
             raise HTTPException(status_code=400, detail="Inter-bot payload economics.currency must be MEP_NS")
         bounty_ns_value = int(abs(float(economics_obj.get("bounty_seconds") or 0.0)) * 1_000_000_000)
-    elif currency not in {"MEP_NS", "MEP_QUANTA"}:
+    elif currency != "MEP_NS":
         raise HTTPException(status_code=400, detail="Inter-bot payload economics.currency must be MEP_NS")
     if bounty_ns_value is None:
         raise HTTPException(status_code=400, detail="Inter-bot payload missing field: economics.bounty_ns")
