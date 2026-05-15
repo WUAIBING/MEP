@@ -555,6 +555,7 @@ def _task_economics(task: TaskCreate) -> dict:
             payment_direction = "sender_to_receiver"
         return {
             "bounty_seconds": bounty_seconds,
+            "bounty_ns": bounty_seconds,
             "market": market,
             "payment_direction": payment_direction,
             "currency": currency,
@@ -570,6 +571,7 @@ def _task_economics(task: TaskCreate) -> dict:
     payment_direction = "receiver_to_sender" if bounty_seconds < 0 else ("none" if bounty_seconds == 0 else "sender_to_receiver")
     return {
         "bounty_seconds": bounty_seconds,
+        "bounty_ns": bounty_seconds,
         "market": market,
         "payment_direction": payment_direction,
         "currency": "SECONDS",
