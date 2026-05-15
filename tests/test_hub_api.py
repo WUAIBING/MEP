@@ -295,6 +295,32 @@ class TestInterBotSpecValidation(unittest.TestCase):
         resp = client.get(f"/balance/{consumer_id}")
         self.assertEqual(resp.json()["balance_seconds"], initial_balance - 1.0)
 
+    def test_rejects_obsolete_bounty_quanta_name(self):
+        consumer_priv, consumer_pub, consumer_id = _make_identity()
+        _register(consumer_pub)
+
+        task_payload = json.dumps(
+            {
+                "source": {"node_id": consumer_id},
+                "task": {
+                    "instructions": "obsolete unit name",
+                    "expected_output": {"result_type": "text"},
+                },
+                "economics": {
+                    "bounty_quanta": 1_000_000_000,
+                    "currency": "MEP_QUANTA",
+                    "market": "compute",
+                    "payment_direction": "sender_to_receiver",
+                },
+            }
+        )
+        headers = _auth_headers(consumer_priv, consumer_id, task_payload)
+        with _interbot_validation(True):
+            resp = client.post("/tasks/submit", content=task_payload, headers=headers)
+
+        self.assertEqual(resp.status_code, 400)
+        self.assertIn("MEP_NS", resp.json()["detail"])
+
 
 class TestAuthRejection(unittest.TestCase):
 
