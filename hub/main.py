@@ -525,15 +525,27 @@ def _task_expected_output(task: TaskCreate) -> dict:
 def _task_economics(task: TaskCreate) -> dict:
     if isinstance(task.economics, dict):
         economics = dict(task.economics)
-        bounty_ns = economics.get("bounty_ns", economics.get("bounty", task.bounty or 0.0))
+        bounty_value = economics.get("bounty_seconds")
+        if bounty_value is None:
+            bounty_value = economics.get("bounty")
+        if bounty_value is None:
+            bounty_value = economics.get("bounty_ns")
+        if bounty_value is None:
+            bounty_value = task.bounty if task.bounty is not None else task.bounty_ns
+        if bounty_value is None:
+            bounty_value = 0.0
+        try:
+            bounty_seconds = float(bounty_value)
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=400, detail="Task economics bounty must be a number")
         market = str(economics.get("market") or "").strip().lower() or None
         payment_direction = str(economics.get("payment_direction") or "").strip().lower() or None
         currency = str(economics.get("currency") or "SECONDS").strip() or "SECONDS"
         if market is None:
-            if isinstance(bounty_ns, (int, float)) and float(bounty_ns) < 0:
+            if bounty_seconds < 0:
                 market = "data"
                 payment_direction = payment_direction or "receiver_to_sender"
-            elif float(bounty_ns or 0) == 0:
+            elif bounty_seconds == 0:
                 market = "chat"
                 payment_direction = payment_direction or "none"
             else:
@@ -542,16 +554,22 @@ def _task_economics(task: TaskCreate) -> dict:
         if payment_direction is None:
             payment_direction = "sender_to_receiver"
         return {
-            "bounty_ns": bounty_ns,
+            "bounty_seconds": bounty_seconds,
             "market": market,
             "payment_direction": payment_direction,
             "currency": currency,
         }
-    bounty = float(task.bounty or 0.0)
-    market = "data" if bounty < 0 else ("chat" if bounty == 0 else "compute")
-    payment_direction = "receiver_to_sender" if bounty < 0 else ("none" if bounty == 0 else "sender_to_receiver")
+    bounty_value = task.bounty if task.bounty is not None else task.bounty_ns
+    if bounty_value is None:
+        bounty_value = 0.0
+    try:
+        bounty_seconds = float(bounty_value)
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="Task bounty must be a number")
+    market = "data" if bounty_seconds < 0 else ("chat" if bounty_seconds == 0 else "compute")
+    payment_direction = "receiver_to_sender" if bounty_seconds < 0 else ("none" if bounty_seconds == 0 else "sender_to_receiver")
     return {
-        "bounty_ns": bounty,
+        "bounty_seconds": bounty_seconds,
         "market": market,
         "payment_direction": payment_direction,
         "currency": "SECONDS",
@@ -604,7 +622,7 @@ def _interbot_require_string(data: dict, field_name: str) -> str:
     return value.strip()
 
 
-def _validate_interbot_payload_if_enabled(task: TaskCreate, payload: str) -> None:
+def _validate_interbot_payload_if_enabled(consumer_id: str, bounty_seconds: float, target_node: Optional[str], payload: str) -> None:
     if not INTERBOT_SPEC_VALIDATE_ENABLED or not payload:
         return
     payload_text = payload.strip()
@@ -614,7 +632,7 @@ def _validate_interbot_payload_if_enabled(task: TaskCreate, payload: str) -> Non
     try:
         message = json.loads(payload_text)
     except json.JSONDecodeError:
-        if INTERBOT_LEGACY_POLICY == "dm_only" and not (task.target_node and float(task.bounty) == 0.0):
+        if INTERBOT_LEGACY_POLICY == "dm_only" and not (target_node and bounty_seconds == 0.0):
             raise HTTPException(
                 status_code=400,
                 detail="Legacy plaintext payload allowed only for direct DM tasks when MEP_INTERBOT_SPEC_VALIDATE=true",
@@ -634,7 +652,7 @@ def _validate_interbot_payload_if_enabled(task: TaskCreate, payload: str) -> Non
 
     source_obj = _interbot_require_object(message_obj.get("source"), "source")
     source_node_id = _interbot_require_string(source_obj, "node_id")
-    if source_node_id != task.consumer_id:
+    if source_node_id != consumer_id:
         raise HTTPException(status_code=400, detail="Inter-bot payload source.node_id mismatch with consumer_id")
 
     intent_obj = _interbot_require_object(message_obj.get("intent"), "intent")
@@ -650,16 +668,16 @@ def _validate_interbot_payload_if_enabled(task: TaskCreate, payload: str) -> Non
     _interbot_require_string(expected_output_obj, "result_type")
 
     economics_obj = _interbot_require_object(message_obj.get("economics"), "economics")
-    bounty_seconds = economics_obj.get("bounty_seconds")
-    if not isinstance(bounty_seconds, (int, float)):
+    message_bounty_seconds = economics_obj.get("bounty_seconds")
+    if not isinstance(message_bounty_seconds, (int, float)):
         raise HTTPException(status_code=400, detail="Inter-bot payload missing field: economics.bounty_seconds")
-    if abs(float(bounty_seconds) - float(task.bounty)) > 1e-9:
+    if abs(float(message_bounty_seconds) - float(bounty_seconds)) > 1e-9:
         raise HTTPException(status_code=400, detail="Inter-bot payload economics.bounty_seconds must match task bounty")
 
     target_obj = message_obj.get("target")
-    if isinstance(target_obj, dict) and task.target_node:
+    if isinstance(target_obj, dict) and target_node:
         target_node_id = target_obj.get("node_id")
-        if isinstance(target_node_id, str) and target_node_id.strip() and target_node_id.strip() != task.target_node:
+        if isinstance(target_node_id, str) and target_node_id.strip() and target_node_id.strip() != target_node:
             raise HTTPException(status_code=400, detail="Inter-bot payload target.node_id must match target_node")
 
 
@@ -1837,11 +1855,11 @@ async def submit_task(
         raise HTTPException(status_code=400, detail="Task requires payload or payload_uri")
     if len(payload) > MAX_PAYLOAD_CHARS:
         raise HTTPException(status_code=413, detail="Task payload too large")
-    _validate_interbot_payload_if_enabled(task, payload)
     target_node = _task_target_node(task)
     target_capability = _task_target_capability(task)
     economics = _task_economics(task)
-    bounty = float(economics["bounty_ns"] or 0.0)
+    bounty = float(economics["bounty_seconds"])
+    _validate_interbot_payload_if_enabled(consumer_id, bounty, target_node, payload)
     if target_node and bounty == 0.0:
         await _anti_loop_check_and_record(consumer_id, target_node, payload)
     
