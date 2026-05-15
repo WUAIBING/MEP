@@ -4,6 +4,7 @@ import json
 import requests
 import time
 from identity import MEPIdentity
+from task_envelope import build_task_envelope
 
 HUB_URL = os.getenv("HUB_URL", "https://mep-hub.silentcopilot.ai")
 MY_NODE_ID = "node_1c1a93dda148" # Hub Sentinel
@@ -36,16 +37,13 @@ def get_online_nodes():
         return []
 
 def send_dm(target_node, identity):
-    # TaskCreate schema
-    payload = {
-        "consumer_id": identity.node_id,
-        "payload": MSG_CONTENT.strip(),
-        "bounty": 0.0,
-        "model_requirement": "gemini-3.1-pro-preview",
-        "target_node": target_node,
-        "payload_uri": None,
-        "secret_data": None
-    }
+    payload = build_task_envelope(
+        identity.node_id,
+        MSG_CONTENT.strip(),
+        0.0,
+        target_node=target_node,
+        target_capability="gemini-3.1-pro-preview",
+    )
     
     payload_str = json.dumps(payload)
     headers = identity.get_auth_headers(payload_str)
