@@ -143,6 +143,10 @@ INTERBOT_ALLOWED_INTENTS = {
     "code.review.request",
     "incident.response",
     "test.request",
+    "human.approval.request",
+    "human.input.request",
+    "data.feed.offer",
+    "data.dataset.offer",
 }
 INTERBOT_SPEC_VALIDATE_ENABLED = os.getenv("MEP_INTERBOT_SPEC_VALIDATE", "false").lower() in ("1", "true", "yes")
 INTERBOT_CLOCK_SKEW_MS = int(os.getenv("MEP_INTERBOT_CLOCK_SKEW_MS", "600000"))
@@ -490,6 +494,159 @@ def _normalize_model_requirement(value: Optional[str]) -> Optional[str]:
     return normalized
 
 
+def _task_consumer_id(task: TaskCreate) -> str:
+    source = task.source if isinstance(task.source, dict) else {}
+    source_node_id = source.get("node_id") if isinstance(source, dict) else None
+    if task.consumer_id and isinstance(source_node_id, str) and source_node_id.strip() and source_node_id.strip() != task.consumer_id:
+        raise HTTPException(status_code=400, detail="Task source.node_id mismatch with consumer_id")
+    if task.consumer_id:
+        return task.consumer_id
+    if isinstance(source_node_id, str) and source_node_id.strip():
+        return source_node_id.strip()
+    raise HTTPException(status_code=400, detail="Task requires consumer_id or source.node_id")
+
+
+def _task_instructions(task: TaskCreate) -> str:
+    if isinstance(task.task, dict):
+        instructions = task.task.get("instructions")
+        if isinstance(instructions, str) and instructions.strip():
+            return instructions.strip()
+    if isinstance(task.payload, str) and task.payload.strip():
+        return task.payload.strip()
+    raise HTTPException(status_code=400, detail="Task requires payload or task.instructions")
+
+
+def _task_expected_output(task: TaskCreate) -> dict:
+    if isinstance(task.task, dict):
+        expected_output = task.task.get("expected_output")
+        if isinstance(expected_output, dict):
+            return expected_output
+    return {}
+
+
+def _task_economics(task: TaskCreate) -> dict:
+    if isinstance(task.economics, dict):
+        economics = dict(task.economics)
+        currency_raw = economics.get("currency")
+        currency = str(currency_raw or "").strip().upper() if currency_raw is not None else None
+        market = str(economics.get("market") or "").strip().lower() or None
+        payment_direction = str(economics.get("payment_direction") or "").strip().lower() or None
+
+        bounty_ns_value = economics.get("bounty_ns")
+        if bounty_ns_value is None:
+            bounty_ns_value = economics.get("bounty_quanta")
+        if bounty_ns_value is not None:
+            if currency is None:
+                currency = "MEP_NS"
+            if currency not in {"MEP_NS", "MEP_QUANTA"}:
+                raise HTTPException(status_code=400, detail="Task economics currency must be MEP_NS")
+            if isinstance(bounty_ns_value, bool):
+                raise HTTPException(status_code=400, detail="Task economics bounty_ns must be an integer")
+            if isinstance(bounty_ns_value, int):
+                bounty_ns = bounty_ns_value
+            elif isinstance(bounty_ns_value, str) and bounty_ns_value.strip().isdigit():
+                bounty_ns = int(bounty_ns_value.strip())
+            else:
+                raise HTTPException(status_code=400, detail="Task economics bounty_ns must be an integer or decimal string")
+            if bounty_ns < 0:
+                raise HTTPException(status_code=400, detail="Task economics bounty_ns must be non-negative")
+            bounty_seconds_unsigned = float(bounty_ns) / 1_000_000_000.0
+
+            if market is None:
+                market = "chat" if bounty_ns == 0 else "compute"
+            if payment_direction is None:
+                payment_direction = "none" if market == "chat" else ("receiver_to_sender" if market == "data" else "sender_to_receiver")
+
+            if market == "chat":
+                if bounty_ns != 0 or payment_direction != "none":
+                    raise HTTPException(status_code=400, detail="Task economics chat market requires bounty_ns=0 and payment_direction=none")
+                bounty_seconds = 0.0
+            elif market == "compute":
+                if bounty_ns <= 0 or payment_direction != "sender_to_receiver":
+                    raise HTTPException(status_code=400, detail="Task economics compute market requires bounty_ns>0 and payment_direction=sender_to_receiver")
+                bounty_seconds = bounty_seconds_unsigned
+            elif market == "data":
+                if bounty_ns <= 0 or payment_direction != "receiver_to_sender":
+                    raise HTTPException(status_code=400, detail="Task economics data market requires bounty_ns>0 and payment_direction=receiver_to_sender")
+                bounty_seconds = -bounty_seconds_unsigned
+            else:
+                raise HTTPException(status_code=400, detail="Task economics market must be compute, chat, or data")
+
+            return {
+                "bounty_ns": bounty_ns,
+                "bounty_seconds": bounty_seconds,
+                "market": market,
+                "payment_direction": payment_direction,
+                "currency": "SECONDS",
+                "wire_currency": "MEP_NS",
+            }
+
+        bounty_value = economics.get("bounty_seconds")
+        if bounty_value is None:
+            bounty_value = economics.get("bounty")
+        if bounty_value is None:
+            bounty_value = task.bounty if task.bounty is not None else task.bounty_ns
+        if bounty_value is None:
+            bounty_value = 0.0
+        try:
+            bounty_seconds = float(bounty_value)
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=400, detail="Task economics bounty must be a number")
+        if market is None:
+            market = "data" if bounty_seconds < 0 else ("chat" if bounty_seconds == 0 else "compute")
+            payment_direction = payment_direction or ("receiver_to_sender" if market == "data" else ("none" if market == "chat" else "sender_to_receiver"))
+        if payment_direction is None:
+            payment_direction = "sender_to_receiver"
+        return {
+            "bounty_seconds": bounty_seconds,
+            "bounty_ns": int(abs(bounty_seconds) * 1_000_000_000),
+            "market": market,
+            "payment_direction": payment_direction,
+            "currency": "SECONDS",
+            "wire_currency": (currency or "SECONDS"),
+        }
+    bounty_value = task.bounty if task.bounty is not None else task.bounty_ns
+    if bounty_value is None:
+        bounty_value = 0.0
+    try:
+        bounty_seconds = float(bounty_value)
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="Task bounty must be a number")
+    market = "data" if bounty_seconds < 0 else ("chat" if bounty_seconds == 0 else "compute")
+    payment_direction = "receiver_to_sender" if bounty_seconds < 0 else ("none" if bounty_seconds == 0 else "sender_to_receiver")
+    return {
+        "bounty_seconds": bounty_seconds,
+        "bounty_ns": int(abs(bounty_seconds) * 1_000_000_000),
+        "market": market,
+        "payment_direction": payment_direction,
+        "currency": "SECONDS",
+        "wire_currency": "SECONDS",
+    }
+
+
+def _task_target_node(task: TaskCreate) -> Optional[str]:
+    if isinstance(task.routing, dict):
+        target_node_id = task.routing.get("target_node_id")
+        if isinstance(target_node_id, str) and target_node_id.strip():
+            return target_node_id.strip()
+        legacy_target = task.routing.get("target_node")
+        if isinstance(legacy_target, str) and legacy_target.strip():
+            return legacy_target.strip()
+    if isinstance(task.target_node, str) and task.target_node.strip():
+        return task.target_node.strip()
+    return None
+
+
+def _task_target_capability(task: TaskCreate) -> Optional[str]:
+    if isinstance(task.routing, dict):
+        capability = task.routing.get("target_capability")
+        if isinstance(capability, str) and capability.strip():
+            return capability.strip()
+    if isinstance(task.model_requirement, str) and task.model_requirement.strip():
+        return task.model_requirement.strip()
+    return None
+
+
 async def _coerce_live_availability(node_id: str, availability: Optional[str]) -> Optional[str]:
     if availability is None or availability not in LIVE_AVAILABILITY:
         return availability
@@ -513,7 +670,7 @@ def _interbot_require_string(data: dict, field_name: str) -> str:
     return value.strip()
 
 
-def _validate_interbot_payload_if_enabled(task: TaskCreate, payload: str) -> None:
+def _validate_interbot_payload_if_enabled(consumer_id: str, task_economics: dict, target_node: Optional[str], payload: str) -> None:
     if not INTERBOT_SPEC_VALIDATE_ENABLED or not payload:
         return
     payload_text = payload.strip()
@@ -523,7 +680,8 @@ def _validate_interbot_payload_if_enabled(task: TaskCreate, payload: str) -> Non
     try:
         message = json.loads(payload_text)
     except json.JSONDecodeError:
-        if INTERBOT_LEGACY_POLICY == "dm_only" and not (task.target_node and float(task.bounty) == 0.0):
+        bounty_seconds = float(task_economics.get("bounty_seconds") or 0.0)
+        if INTERBOT_LEGACY_POLICY == "dm_only" and not (target_node and bounty_seconds == 0.0):
             raise HTTPException(
                 status_code=400,
                 detail="Legacy plaintext payload allowed only for direct DM tasks when MEP_INTERBOT_SPEC_VALIDATE=true",
@@ -543,7 +701,7 @@ def _validate_interbot_payload_if_enabled(task: TaskCreate, payload: str) -> Non
 
     source_obj = _interbot_require_object(message_obj.get("source"), "source")
     source_node_id = _interbot_require_string(source_obj, "node_id")
-    if source_node_id != task.consumer_id:
+    if source_node_id != consumer_id:
         raise HTTPException(status_code=400, detail="Inter-bot payload source.node_id mismatch with consumer_id")
 
     intent_obj = _interbot_require_object(message_obj.get("intent"), "intent")
@@ -559,17 +717,76 @@ def _validate_interbot_payload_if_enabled(task: TaskCreate, payload: str) -> Non
     _interbot_require_string(expected_output_obj, "result_type")
 
     economics_obj = _interbot_require_object(message_obj.get("economics"), "economics")
-    bounty_seconds = economics_obj.get("bounty_seconds")
-    if not isinstance(bounty_seconds, (int, float)):
-        raise HTTPException(status_code=400, detail="Inter-bot payload missing field: economics.bounty_seconds")
-    if abs(float(bounty_seconds) - float(task.bounty)) > 1e-9:
-        raise HTTPException(status_code=400, detail="Inter-bot payload economics.bounty_seconds must match task bounty")
+    currency = economics_obj.get("currency")
+    bounty_ns_value = economics_obj.get("bounty_ns")
+    if bounty_ns_value is None:
+        bounty_ns_value = economics_obj.get("bounty_quanta")
+    if bounty_ns_value is None and "bounty_seconds" in economics_obj:
+        if currency not in {None, "SECONDS"}:
+            raise HTTPException(status_code=400, detail="Inter-bot payload economics.currency must be MEP_NS")
+        bounty_ns_value = int(abs(float(economics_obj.get("bounty_seconds") or 0.0)) * 1_000_000_000)
+    elif currency not in {"MEP_NS", "MEP_QUANTA"}:
+        raise HTTPException(status_code=400, detail="Inter-bot payload economics.currency must be MEP_NS")
+    if bounty_ns_value is None:
+        raise HTTPException(status_code=400, detail="Inter-bot payload missing field: economics.bounty_ns")
+    if isinstance(bounty_ns_value, bool):
+        raise HTTPException(status_code=400, detail="Inter-bot payload economics.bounty_ns must be an integer")
+    if isinstance(bounty_ns_value, int):
+        bounty_ns = bounty_ns_value
+    elif isinstance(bounty_ns_value, str) and bounty_ns_value.strip().isdigit():
+        bounty_ns = int(bounty_ns_value.strip())
+    else:
+        raise HTTPException(status_code=400, detail="Inter-bot payload economics.bounty_ns must be an integer or decimal string")
+    if bounty_ns < 0:
+        raise HTTPException(status_code=400, detail="Inter-bot payload economics.bounty_ns must be non-negative")
 
+    market = economics_obj.get("market") or task_economics.get("market")
+    payment_direction = economics_obj.get("payment_direction") or task_economics.get("payment_direction")
+    if market not in ("compute", "chat", "data"):
+        raise HTTPException(status_code=400, detail="Inter-bot payload economics.market must be compute, chat, or data")
+    if payment_direction not in ("sender_to_receiver", "receiver_to_sender", "none"):
+        raise HTTPException(status_code=400, detail="Inter-bot payload economics.payment_direction invalid")
+    if market == "chat" and (bounty_ns != 0 or payment_direction != "none"):
+        raise HTTPException(status_code=400, detail="Inter-bot payload economics chat market requires bounty_ns=0 and payment_direction=none")
+    if market == "compute" and (bounty_ns <= 0 or payment_direction != "sender_to_receiver"):
+        raise HTTPException(status_code=400, detail="Inter-bot payload economics compute market requires bounty_ns>0 and payment_direction=sender_to_receiver")
+    if market == "data" and (bounty_ns <= 0 or payment_direction != "receiver_to_sender"):
+        raise HTTPException(status_code=400, detail="Inter-bot payload economics data market requires bounty_ns>0 and payment_direction=receiver_to_sender")
+
+    expected_bounty_ns = task_economics.get("bounty_ns")
+    if isinstance(expected_bounty_ns, int):
+        if bounty_ns != expected_bounty_ns:
+            raise HTTPException(status_code=400, detail="Inter-bot payload economics.bounty_ns must match task economics")
+    else:
+        bounty_seconds = float(task_economics.get("bounty_seconds") or 0.0)
+        message_seconds_unsigned = float(bounty_ns) / 1_000_000_000.0
+        message_seconds = 0.0 if market == "chat" else (-message_seconds_unsigned if market == "data" else message_seconds_unsigned)
+        if abs(float(message_seconds) - float(bounty_seconds)) > 1e-9:
+            raise HTTPException(status_code=400, detail="Inter-bot payload economics must match task bounty")
+
+    routing_obj = message_obj.get("routing")
+    if isinstance(routing_obj, dict) and target_node:
+        target_node_id = routing_obj.get("target_node_id")
+        if isinstance(target_node_id, str) and target_node_id.strip() and target_node_id.strip() != target_node:
+            raise HTTPException(status_code=400, detail="Inter-bot payload routing.target_node_id must match target_node")
     target_obj = message_obj.get("target")
-    if isinstance(target_obj, dict) and task.target_node:
+    if isinstance(target_obj, dict) and target_node:
         target_node_id = target_obj.get("node_id")
-        if isinstance(target_node_id, str) and target_node_id.strip() and target_node_id.strip() != task.target_node:
+        if isinstance(target_node_id, str) and target_node_id.strip() and target_node_id.strip() != target_node:
             raise HTTPException(status_code=400, detail="Inter-bot payload target.node_id must match target_node")
+
+
+def _validate_spec_task_if_enabled(task: TaskCreate) -> None:
+    if not INTERBOT_SPEC_VALIDATE_ENABLED:
+        return
+    if not (task.task or task.economics or task.source or task.routing):
+        return
+    instructions = _task_instructions(task)
+    if len(instructions) > 4000:
+        raise HTTPException(status_code=400, detail="Inter-bot payload task.instructions too long (max 4000)")
+    _task_consumer_id(task)
+    _task_economics(task)
+    _task_target_node(task)
 
 
 def _direct_dm_channel(a: str, b: str) -> str:
@@ -1736,33 +1953,40 @@ async def submit_task(
     authenticated_node: str = Depends(verify_request),
     x_mep_idempotency_key: Optional[str] = Header(default=None)
 ):
-    # Verify the signer is actually the consumer claiming to submit the task
-    if authenticated_node != task.consumer_id:
+    consumer_id = _task_consumer_id(task)
+    if authenticated_node != consumer_id:
         raise HTTPException(status_code=403, detail="Cannot submit tasks on behalf of another node")
 
     normalized_payload_uri = _normalize_artifact_uri(task.payload_uri, "payload_uri")
-    payload = task.payload or ""
+    payload = _task_instructions(task)
     if not payload and not normalized_payload_uri:
         raise HTTPException(status_code=400, detail="Task requires payload or payload_uri")
     if len(payload) > MAX_PAYLOAD_CHARS:
         raise HTTPException(status_code=413, detail="Task payload too large")
-    _validate_interbot_payload_if_enabled(task, payload)
-    if task.target_node and float(task.bounty) == 0.0:
-        await _anti_loop_check_and_record(task.consumer_id, task.target_node, payload)
-    
+    target_node = _task_target_node(task)
+    target_capability = _task_target_capability(task)
+    economics = _task_economics(task)
+    bounty = float(economics["bounty_seconds"])
+    if task.task or task.economics or task.source or task.routing:
+        _validate_spec_task_if_enabled(task)
+    else:
+        _validate_interbot_payload_if_enabled(consumer_id, economics, target_node, payload)
+    if target_node and bounty == 0.0:
+        await _anti_loop_check_and_record(consumer_id, target_node, payload)
+
     if x_mep_idempotency_key:
         existing = db.get_idempotency(authenticated_node, "/tasks/submit", x_mep_idempotency_key)
         if existing:
             return existing["response"]
 
-    consumer_balance = db.get_balance(task.consumer_id)
+    consumer_balance = db.get_balance(consumer_id)
     if consumer_balance is None:
         raise HTTPException(status_code=404, detail="Consumer node not found")
 
     # If bounty is positive, consumer is PAYING. Check consumer balance.
-    if task.bounty > 0 and consumer_balance < task.bounty:
+    if bounty > 0 and consumer_balance < bounty:
         raise HTTPException(status_code=400, detail="Insufficient SECONDS balance to pay for task")
-    if task.bounty < 0 and not task.secret_data:
+    if bounty < 0 and not task.secret_data:
         raise HTTPException(status_code=400, detail="Data market tasks (bounty < 0) require secret_data")
     if task.expires_in_seconds is not None:
         task.expires_in_seconds = max(
@@ -1775,38 +1999,44 @@ async def submit_task(
 
     # Note: If bounty is negative, consumer is SELLING data. We don't deduct here.
     # We will deduct from the provider when they complete the task.
-    if task.bounty > 0:
-        success = db.deduct_balance(task.consumer_id, task.bounty)
+    if bounty > 0:
+        success = db.deduct_balance(consumer_id, bounty)
         if not success:
-            log_event("task_rejected", f"Node {task.consumer_id} lacks SECONDS to submit task", consumer_id=task.consumer_id, bounty=task.bounty)
+            log_event("task_rejected", f"Node {consumer_id} lacks SECONDS to submit task", consumer_id=consumer_id, bounty=bounty)
             raise HTTPException(status_code=400, detail="Insufficient SECONDS balance")
-            
-        db.create_escrow(task_id, task.consumer_id, task.bounty, now)
-        new_balance = db.get_balance(task.consumer_id)
-        log_audit("ESCROW", task.consumer_id, -task.bounty, new_balance, task_id)
-        
-    log_event("task_submitted", f"Task {task_id[:8]} broadcasted by {task.consumer_id} for {task.bounty}", consumer_id=task.consumer_id, task_id=task_id, bounty=task.bounty)
+        db.create_escrow(task_id, consumer_id, bounty, now)
+        new_balance = db.get_balance(consumer_id)
+        log_audit("ESCROW", consumer_id, -bounty, new_balance, task_id)
+
+    log_event("task_submitted", f"Task {task_id[:8]} broadcasted by {consumer_id} for {bounty}", consumer_id=consumer_id, task_id=task_id, bounty=bounty)
 
     task_data = {
         "id": task_id,
-        "consumer_id": task.consumer_id,
+        "consumer_id": consumer_id,
         "payload": payload,
-        "bounty": task.bounty,
+        "bounty": bounty,
         "status": "bidding",
-        "target_node": task.target_node,
-        "model_requirement": task.model_requirement,
+        "source": task.source or {"node_id": consumer_id},
+        "intent": task.intent or {"type": "analysis.request"},
+        "task": {
+            "instructions": payload,
+            "expected_output": _task_expected_output(task),
+        },
+        "economics": economics,
+        "target_node": target_node,
+        "model_requirement": target_capability,
         "expires_in_seconds": task.expires_in_seconds,
         "payload_uri": normalized_payload_uri,
         "secret_data": task.secret_data
     }
     db.create_task(
         task_id,
-        task.consumer_id,
+        consumer_id,
         payload,
-        task.bounty,
+        bounty,
         "bidding",
-        task.target_node,
-        task.model_requirement,
+        target_node,
+        target_capability,
         now,
         result_payload=task.secret_data,
         payload_uri=normalized_payload_uri,
@@ -1816,44 +2046,43 @@ async def submit_task(
         active_tasks[task_id] = task_data
 
     # Target specific node if requested (Direct Message skips bidding)
-    if task.target_node:
+    if target_node:
         async with node_lock:
-            target_ws = connected_nodes.get(task.target_node)
+            target_ws = connected_nodes.get(target_node)
         if target_ws:
             try:
                 async with task_lock:
                     task_data["status"] = "assigned"
-                    task_data["provider_id"] = task.target_node
-                db.update_task_assignment(task_id, task.target_node, "assigned", time.time())
+                    task_data["provider_id"] = target_node
+                db.update_task_assignment(task_id, target_node, "assigned", time.time())
                 await target_ws.send_json({"event": "new_task", "data": task_data})
-                response_payload = {"status": "success", "task_id": task_id, "routed_to": task.target_node}
+                response_payload = {"status": "success", "task_id": task_id, "routed_to": target_node}
                 if x_mep_idempotency_key:
                     db.set_idempotency(authenticated_node, "/tasks/submit", x_mep_idempotency_key, response_payload, 200, time.time())
                 return response_payload
             except Exception as exc:
-                log_event("direct_message_failed", f"Failed to route {task_id[:8]} to {task.target_node}: {exc}", task_id=task_id, provider_id=task.target_node)
+                log_event("direct_message_failed", f"Failed to route {task_id[:8]} to {target_node}: {exc}", task_id=task_id, provider_id=target_node)
                 async with task_lock:
                     task_data["status"] = "bidding"
                     if "provider_id" in task_data:
                         del task_data["provider_id"]
                 db.update_task_status(task_id, "bidding", time.time())
                 async with node_lock:
-                    if connected_nodes.get(task.target_node) is target_ws:
-                        del connected_nodes[task.target_node]
+                    if connected_nodes.get(target_node) is target_ws:
+                        del connected_nodes[target_node]
                 return {"status": "error", "detail": "Target node disconnected"}
         return {"status": "error", "detail": "Target node not currently connected to Hub"}
 
-    model_requirement = _normalize_model_requirement(task.model_requirement)
     rfc_data = {
         "id": task_id,
-        "consumer_id": task.consumer_id,
-        "bounty": task.bounty,
-        "model_requirement": model_requirement,
+        "consumer_id": consumer_id,
+        "bounty": bounty,
+        "model_requirement": target_capability,
         "payload_uri": normalized_payload_uri
     }
     async with node_lock:
         broadcast_nodes = list(connected_nodes.items())
-    candidate_nodes = _select_rfc_recipients(task.consumer_id, model_requirement, broadcast_nodes)
+    candidate_nodes = _select_rfc_recipients(consumer_id, target_capability, broadcast_nodes)
     for node_id, ws in candidate_nodes:
         try:
             await ws.send_json({"event": "rfc", "data": rfc_data})
@@ -1868,7 +2097,7 @@ async def submit_task(
         discovery_query = _build_registry_query(
             alias=None,
             skill=None,
-            model=model_requirement,
+            model=target_capability,
             availability="online",
             min_score=None,
             min_reviews=None,

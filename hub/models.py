@@ -4,16 +4,29 @@ from typing import Optional, List, Dict, Any
 class NodeRegistration(BaseModel):
     pubkey: str = Field(..., description="Node's public key or UUID")
     alias: Optional[str] = None
+    node_id: Optional[str] = None
+    capabilities: Optional[List[str]] = None
+    connectivity: Optional[Dict[str, Any]] = None
+    auto_bid_policy: Optional[Dict[str, Any]] = None
 
 class TaskCreate(BaseModel):
-    consumer_id: str
+    consumer_id: Optional[str] = None
+    source: Optional[Dict[str, Any]] = None
+    intent: Optional[Dict[str, Any]] = None
+    task: Optional[Dict[str, Any]] = None
+    economics: Optional[Dict[str, Any]] = None
     payload: Optional[str] = None
-    bounty: float
-    target_node: Optional[str] = None  # Direct messaging / specific bot targeting
+    bounty: Optional[float] = None
+    bounty_ns: Optional[Any] = None
+    target_node: Optional[str] = None
+    routing: Optional[Dict[str, Any]] = None
     model_requirement: Optional[str] = None
     expires_in_seconds: Optional[int] = Field(default=None, ge=1)
     secret_data: Optional[str] = None
     payload_uri: Optional[str] = None  # IPFS or HTTP link to payload
+    in_reply_to: Optional[str] = None
+    result: Optional[Dict[str, Any]] = None
+    error: Optional[Dict[str, Any]] = None
 
 class TaskBid(BaseModel):
     task_id: str
@@ -24,6 +37,9 @@ class TaskResult(BaseModel):
     provider_id: str
     result_payload: Optional[str] = None
     result_uri: Optional[str] = None  # IPFS or HTTP link to result payload
+    in_reply_to: Optional[str] = None
+    result: Optional[Dict[str, Any]] = None
+    error: Optional[Dict[str, Any]] = None
 
 class TaskCancel(BaseModel):
     task_id: str

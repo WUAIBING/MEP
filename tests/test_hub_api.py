@@ -259,6 +259,42 @@ class TestInterBotSpecValidation(unittest.TestCase):
         self.assertEqual(resp.status_code, 400)
         self.assertIn("Legacy plaintext payload", resp.json()["detail"])
 
+    def test_spec_shaped_task_bounty_ns_is_converted_to_seconds(self):
+        consumer_priv, consumer_pub, consumer_id = _make_identity()
+        _register(consumer_pub)
+
+        resp = client.get(f"/balance/{consumer_id}")
+        initial_balance = resp.json()["balance_seconds"]
+
+        task_payload = json.dumps(
+            {
+                "source": {"node_id": consumer_id},
+                "intent": {"type": "analysis.request"},
+                "task": {
+                    "instructions": "spec-shaped compute task",
+                    "expected_output": {"result_type": "text"},
+                },
+                "economics": {
+                    "bounty_ns": 1_000_000_000,
+                    "currency": "MEP_NS",
+                    "market": "compute",
+                    "payment_direction": "sender_to_receiver",
+                },
+                "routing": {"target_capability": "text"},
+            }
+        )
+        headers = _auth_headers(consumer_priv, consumer_id, task_payload)
+        with _interbot_validation(True):
+            resp = client.post("/tasks/submit", content=task_payload, headers=headers)
+
+        self.assertEqual(resp.status_code, 200, f"Submit failed: {resp.text}")
+        task_id = resp.json()["task_id"]
+        stored_task = db.get_task(task_id)
+        self.assertEqual(stored_task["bounty"], 1.0)
+
+        resp = client.get(f"/balance/{consumer_id}")
+        self.assertEqual(resp.json()["balance_seconds"], initial_balance - 1.0)
+
 
 class TestAuthRejection(unittest.TestCase):
 
