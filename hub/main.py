@@ -495,12 +495,14 @@ def _normalize_model_requirement(value: Optional[str]) -> Optional[str]:
 
 
 def _task_consumer_id(task: TaskCreate) -> str:
+    source = task.source if isinstance(task.source, dict) else {}
+    source_node_id = source.get("node_id") if isinstance(source, dict) else None
+    if task.consumer_id and isinstance(source_node_id, str) and source_node_id.strip() and source_node_id.strip() != task.consumer_id:
+        raise HTTPException(status_code=400, detail="Task source.node_id mismatch with consumer_id")
     if task.consumer_id:
         return task.consumer_id
-    source = task.source if isinstance(task.source, dict) else {}
-    node_id = source.get("node_id") if isinstance(source, dict) else None
-    if isinstance(node_id, str) and node_id.strip():
-        return node_id.strip()
+    if isinstance(source_node_id, str) and source_node_id.strip():
+        return source_node_id.strip()
     raise HTTPException(status_code=400, detail="Task requires consumer_id or source.node_id")
 
 
@@ -530,57 +532,58 @@ def _task_economics(task: TaskCreate) -> dict:
         market = str(economics.get("market") or "").strip().lower() or None
         payment_direction = str(economics.get("payment_direction") or "").strip().lower() or None
 
-        bounty_quanta_value = economics.get("bounty_quanta")
-        if bounty_quanta_value is not None:
+        bounty_ns_value = economics.get("bounty_ns")
+        if bounty_ns_value is None:
+            bounty_ns_value = economics.get("bounty_quanta")
+        if bounty_ns_value is not None:
             if currency is None:
-                currency = "MEP_QUANTA"
-            if currency != "MEP_QUANTA":
-                raise HTTPException(status_code=400, detail="Task economics currency must be MEP_QUANTA")
-            if isinstance(bounty_quanta_value, bool):
-                raise HTTPException(status_code=400, detail="Task economics bounty_quanta must be an integer")
-            if isinstance(bounty_quanta_value, int):
-                bounty_quanta = bounty_quanta_value
-            elif isinstance(bounty_quanta_value, str) and bounty_quanta_value.strip().isdigit():
-                bounty_quanta = int(bounty_quanta_value.strip())
+                currency = "MEP_NS"
+            if currency not in {"MEP_NS", "MEP_QUANTA"}:
+                raise HTTPException(status_code=400, detail="Task economics currency must be MEP_NS")
+            if isinstance(bounty_ns_value, bool):
+                raise HTTPException(status_code=400, detail="Task economics bounty_ns must be an integer")
+            if isinstance(bounty_ns_value, int):
+                bounty_ns = bounty_ns_value
+            elif isinstance(bounty_ns_value, str) and bounty_ns_value.strip().isdigit():
+                bounty_ns = int(bounty_ns_value.strip())
             else:
-                raise HTTPException(status_code=400, detail="Task economics bounty_quanta must be an integer or decimal string")
-            if bounty_quanta < 0:
-                raise HTTPException(status_code=400, detail="Task economics bounty_quanta must be non-negative")
-            bounty_seconds_unsigned = float(bounty_quanta) / 1_000_000_000.0
+                raise HTTPException(status_code=400, detail="Task economics bounty_ns must be an integer or decimal string")
+            if bounty_ns < 0:
+                raise HTTPException(status_code=400, detail="Task economics bounty_ns must be non-negative")
+            bounty_seconds_unsigned = float(bounty_ns) / 1_000_000_000.0
 
             if market is None:
-                market = "chat" if bounty_quanta == 0 else "compute"
+                market = "chat" if bounty_ns == 0 else "compute"
             if payment_direction is None:
                 payment_direction = "none" if market == "chat" else ("receiver_to_sender" if market == "data" else "sender_to_receiver")
 
             if market == "chat":
-                if bounty_quanta != 0 or payment_direction != "none":
-                    raise HTTPException(status_code=400, detail="Task economics chat market requires bounty_quanta=0 and payment_direction=none")
+                if bounty_ns != 0 or payment_direction != "none":
+                    raise HTTPException(status_code=400, detail="Task economics chat market requires bounty_ns=0 and payment_direction=none")
                 bounty_seconds = 0.0
             elif market == "compute":
-                if bounty_quanta <= 0 or payment_direction != "sender_to_receiver":
-                    raise HTTPException(status_code=400, detail="Task economics compute market requires bounty_quanta>0 and payment_direction=sender_to_receiver")
+                if bounty_ns <= 0 or payment_direction != "sender_to_receiver":
+                    raise HTTPException(status_code=400, detail="Task economics compute market requires bounty_ns>0 and payment_direction=sender_to_receiver")
                 bounty_seconds = bounty_seconds_unsigned
             elif market == "data":
-                if bounty_quanta <= 0 or payment_direction != "receiver_to_sender":
-                    raise HTTPException(status_code=400, detail="Task economics data market requires bounty_quanta>0 and payment_direction=receiver_to_sender")
+                if bounty_ns <= 0 or payment_direction != "receiver_to_sender":
+                    raise HTTPException(status_code=400, detail="Task economics data market requires bounty_ns>0 and payment_direction=receiver_to_sender")
                 bounty_seconds = -bounty_seconds_unsigned
             else:
                 raise HTTPException(status_code=400, detail="Task economics market must be compute, chat, or data")
 
             return {
-                "bounty_quanta": bounty_quanta,
+                "bounty_ns": bounty_ns,
                 "bounty_seconds": bounty_seconds,
                 "market": market,
                 "payment_direction": payment_direction,
-                "currency": "MEP_QUANTA",
+                "currency": "SECONDS",
+                "wire_currency": "MEP_NS",
             }
 
         bounty_value = economics.get("bounty_seconds")
         if bounty_value is None:
             bounty_value = economics.get("bounty")
-        if bounty_value is None:
-            bounty_value = economics.get("bounty_ns")
         if bounty_value is None:
             bounty_value = task.bounty if task.bounty is not None else task.bounty_ns
         if bounty_value is None:
@@ -596,9 +599,11 @@ def _task_economics(task: TaskCreate) -> dict:
             payment_direction = "sender_to_receiver"
         return {
             "bounty_seconds": bounty_seconds,
+            "bounty_ns": int(abs(bounty_seconds) * 1_000_000_000),
             "market": market,
             "payment_direction": payment_direction,
-            "currency": (currency or "SECONDS"),
+            "currency": "SECONDS",
+            "wire_currency": (currency or "SECONDS"),
         }
     bounty_value = task.bounty if task.bounty is not None else task.bounty_ns
     if bounty_value is None:
@@ -611,9 +616,11 @@ def _task_economics(task: TaskCreate) -> dict:
     payment_direction = "receiver_to_sender" if bounty_seconds < 0 else ("none" if bounty_seconds == 0 else "sender_to_receiver")
     return {
         "bounty_seconds": bounty_seconds,
+        "bounty_ns": int(abs(bounty_seconds) * 1_000_000_000),
         "market": market,
         "payment_direction": payment_direction,
         "currency": "SECONDS",
+        "wire_currency": "SECONDS",
     }
 
 
@@ -711,42 +718,48 @@ def _validate_interbot_payload_if_enabled(consumer_id: str, task_economics: dict
 
     economics_obj = _interbot_require_object(message_obj.get("economics"), "economics")
     currency = economics_obj.get("currency")
-    if currency != "MEP_QUANTA":
-        raise HTTPException(status_code=400, detail="Inter-bot payload economics.currency must be MEP_QUANTA")
-    bounty_quanta_value = economics_obj.get("bounty_quanta")
-    if bounty_quanta_value is None:
-        raise HTTPException(status_code=400, detail="Inter-bot payload missing field: economics.bounty_quanta")
-    if isinstance(bounty_quanta_value, bool):
-        raise HTTPException(status_code=400, detail="Inter-bot payload economics.bounty_quanta must be an integer")
-    if isinstance(bounty_quanta_value, int):
-        bounty_quanta = bounty_quanta_value
-    elif isinstance(bounty_quanta_value, str) and bounty_quanta_value.strip().isdigit():
-        bounty_quanta = int(bounty_quanta_value.strip())
+    bounty_ns_value = economics_obj.get("bounty_ns")
+    if bounty_ns_value is None:
+        bounty_ns_value = economics_obj.get("bounty_quanta")
+    if bounty_ns_value is None and "bounty_seconds" in economics_obj:
+        if currency not in {None, "SECONDS"}:
+            raise HTTPException(status_code=400, detail="Inter-bot payload economics.currency must be MEP_NS")
+        bounty_ns_value = int(abs(float(economics_obj.get("bounty_seconds") or 0.0)) * 1_000_000_000)
+    elif currency not in {"MEP_NS", "MEP_QUANTA"}:
+        raise HTTPException(status_code=400, detail="Inter-bot payload economics.currency must be MEP_NS")
+    if bounty_ns_value is None:
+        raise HTTPException(status_code=400, detail="Inter-bot payload missing field: economics.bounty_ns")
+    if isinstance(bounty_ns_value, bool):
+        raise HTTPException(status_code=400, detail="Inter-bot payload economics.bounty_ns must be an integer")
+    if isinstance(bounty_ns_value, int):
+        bounty_ns = bounty_ns_value
+    elif isinstance(bounty_ns_value, str) and bounty_ns_value.strip().isdigit():
+        bounty_ns = int(bounty_ns_value.strip())
     else:
-        raise HTTPException(status_code=400, detail="Inter-bot payload economics.bounty_quanta must be an integer or decimal string")
-    if bounty_quanta < 0:
-        raise HTTPException(status_code=400, detail="Inter-bot payload economics.bounty_quanta must be non-negative")
+        raise HTTPException(status_code=400, detail="Inter-bot payload economics.bounty_ns must be an integer or decimal string")
+    if bounty_ns < 0:
+        raise HTTPException(status_code=400, detail="Inter-bot payload economics.bounty_ns must be non-negative")
 
-    market = economics_obj.get("market")
-    payment_direction = economics_obj.get("payment_direction")
+    market = economics_obj.get("market") or task_economics.get("market")
+    payment_direction = economics_obj.get("payment_direction") or task_economics.get("payment_direction")
     if market not in ("compute", "chat", "data"):
         raise HTTPException(status_code=400, detail="Inter-bot payload economics.market must be compute, chat, or data")
     if payment_direction not in ("sender_to_receiver", "receiver_to_sender", "none"):
         raise HTTPException(status_code=400, detail="Inter-bot payload economics.payment_direction invalid")
-    if market == "chat" and (bounty_quanta != 0 or payment_direction != "none"):
-        raise HTTPException(status_code=400, detail="Inter-bot payload economics chat market requires bounty_quanta=0 and payment_direction=none")
-    if market == "compute" and (bounty_quanta <= 0 or payment_direction != "sender_to_receiver"):
-        raise HTTPException(status_code=400, detail="Inter-bot payload economics compute market requires bounty_quanta>0 and payment_direction=sender_to_receiver")
-    if market == "data" and (bounty_quanta <= 0 or payment_direction != "receiver_to_sender"):
-        raise HTTPException(status_code=400, detail="Inter-bot payload economics data market requires bounty_quanta>0 and payment_direction=receiver_to_sender")
+    if market == "chat" and (bounty_ns != 0 or payment_direction != "none"):
+        raise HTTPException(status_code=400, detail="Inter-bot payload economics chat market requires bounty_ns=0 and payment_direction=none")
+    if market == "compute" and (bounty_ns <= 0 or payment_direction != "sender_to_receiver"):
+        raise HTTPException(status_code=400, detail="Inter-bot payload economics compute market requires bounty_ns>0 and payment_direction=sender_to_receiver")
+    if market == "data" and (bounty_ns <= 0 or payment_direction != "receiver_to_sender"):
+        raise HTTPException(status_code=400, detail="Inter-bot payload economics data market requires bounty_ns>0 and payment_direction=receiver_to_sender")
 
-    expected_quanta = task_economics.get("bounty_quanta")
-    if isinstance(expected_quanta, int):
-        if bounty_quanta != expected_quanta:
-            raise HTTPException(status_code=400, detail="Inter-bot payload economics.bounty_quanta must match task economics")
+    expected_bounty_ns = task_economics.get("bounty_ns")
+    if isinstance(expected_bounty_ns, int):
+        if bounty_ns != expected_bounty_ns:
+            raise HTTPException(status_code=400, detail="Inter-bot payload economics.bounty_ns must match task economics")
     else:
         bounty_seconds = float(task_economics.get("bounty_seconds") or 0.0)
-        message_seconds_unsigned = float(bounty_quanta) / 1_000_000_000.0
+        message_seconds_unsigned = float(bounty_ns) / 1_000_000_000.0
         message_seconds = 0.0 if market == "chat" else (-message_seconds_unsigned if market == "data" else message_seconds_unsigned)
         if abs(float(message_seconds) - float(bounty_seconds)) > 1e-9:
             raise HTTPException(status_code=400, detail="Inter-bot payload economics must match task bounty")
@@ -756,6 +769,24 @@ def _validate_interbot_payload_if_enabled(consumer_id: str, task_economics: dict
         target_node_id = routing_obj.get("target_node_id")
         if isinstance(target_node_id, str) and target_node_id.strip() and target_node_id.strip() != target_node:
             raise HTTPException(status_code=400, detail="Inter-bot payload routing.target_node_id must match target_node")
+    target_obj = message_obj.get("target")
+    if isinstance(target_obj, dict) and target_node:
+        target_node_id = target_obj.get("node_id")
+        if isinstance(target_node_id, str) and target_node_id.strip() and target_node_id.strip() != target_node:
+            raise HTTPException(status_code=400, detail="Inter-bot payload target.node_id must match target_node")
+
+
+def _validate_spec_task_if_enabled(task: TaskCreate) -> None:
+    if not INTERBOT_SPEC_VALIDATE_ENABLED:
+        return
+    if not (task.task or task.economics or task.source or task.routing):
+        return
+    instructions = _task_instructions(task)
+    if len(instructions) > 4000:
+        raise HTTPException(status_code=400, detail="Inter-bot payload task.instructions too long (max 4000)")
+    _task_consumer_id(task)
+    _task_economics(task)
+    _task_target_node(task)
 
 
 def _direct_dm_channel(a: str, b: str) -> str:
@@ -1936,10 +1967,13 @@ async def submit_task(
     target_capability = _task_target_capability(task)
     economics = _task_economics(task)
     bounty = float(economics["bounty_seconds"])
-    _validate_interbot_payload_if_enabled(consumer_id, economics, target_node, payload)
+    if task.task or task.economics or task.source or task.routing:
+        _validate_spec_task_if_enabled(task)
+    else:
+        _validate_interbot_payload_if_enabled(consumer_id, economics, target_node, payload)
     if target_node and bounty == 0.0:
         await _anti_loop_check_and_record(consumer_id, target_node, payload)
-    
+
     if x_mep_idempotency_key:
         existing = db.get_idempotency(authenticated_node, "/tasks/submit", x_mep_idempotency_key)
         if existing:
