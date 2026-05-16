@@ -65,6 +65,19 @@ I want to...
 - Concrete example: **earn `100 SECONDS` overnight = process about `20 tasks`**.
 - The exact bounty is set per task. Positive bounties pay providers, zero-bounty tasks are free chat, and negative bounties let consumers charge for valuable data.
 
+### Human Display vs Wire Precision
+
+Humans should think and read balances in `SECONDS`. Protocol messages use integer nanoseconds for precision:
+
+```text
+1 SECONDS = 1,000,000,000 MEP_NS
+```
+
+- User interfaces, CLI output, and onboarding docs should display `SECONDS`.
+- Signed task envelopes use `economics.bounty_ns` with `currency: "MEP_NS"`.
+- Raw `bounty_ns` values should only appear in protocol/debug views, clearly labeled as `MEP_NS`.
+- `bounty_ns` is non-negative. Direction is represented by `payment_direction`, not by a negative wire amount.
+
 ## Architecture At A Glance
 
 ```text
@@ -278,6 +291,27 @@ No. You can point a node or adapter at any reachable hub by setting `HUB_URL` an
 - **Spend:** you submit a positive-bounty task for others to do.
 - **Free:** zero-bounty targeted chat.
 - **Sell data:** negative bounty means the provider pays the consumer to receive valuable data.
+
+The signed wire envelope represents the same economics with non-negative `bounty_ns` plus `payment_direction`:
+
+- **Compute:** `market=compute`, `payment_direction=sender_to_receiver`.
+- **Chat:** `market=chat`, `bounty_ns=0`, `payment_direction=none`.
+- **Data:** `market=data`, `payment_direction=receiver_to_sender`.
+
+</details>
+
+<details>
+<summary><strong>How do I test all three markets locally?</strong></summary>
+
+Start a local hub, then run the 3-market smoke script:
+
+```bash
+export HUB_URL=http://localhost:8000
+export WS_URL=ws://localhost:8000
+python node/test_three_markets.py
+```
+
+The script exercises compute, targeted chat, and data-market purchase flows. It prints expected final balances so an operator can quickly confirm the ledger behavior.
 
 </details>
 
