@@ -1,154 +1,166 @@
 import asyncio
 import json
-import requests
-import websockets
+import os
+import tempfile
 import time
 import urllib.parse
-from identity import MEPIdentity
 import uuid
 from typing import Optional
 
-HUB_URL = "http://localhost:8000"
-WS_URL = "ws://localhost:8000/ws"
+import requests
+import websockets
 
-def get_auth_url(identity: MEPIdentity):
+from identity import MEPIdentity
+from task_envelope import build_task_envelope
+
+
+HUB_URL = os.getenv("HUB_URL", "http://localhost:8000").rstrip("/")
+WS_URL = os.getenv("WS_URL", "ws://localhost:8000").rstrip("/")
+
+
+def get_auth_url(identity: MEPIdentity) -> str:
     ts = str(int(time.time()))
-    sig = identity.sign(identity.node_id, ts)
-    sig_safe = urllib.parse.quote(sig)
-    return f"{WS_URL}/{identity.node_id}?timestamp={ts}&signature={sig_safe}"
+    sig_safe = urllib.parse.quote(identity.sign(identity.node_id, ts))
+    return f"{WS_URL}/ws/{identity.node_id}?timestamp={ts}&signature={sig_safe}"
 
-def submit_task(identity: MEPIdentity, payload: str, bounty: float, target: Optional[str] = None):
-    data = {
-        "consumer_id": identity.node_id,
-        "payload": payload,
-        "bounty": bounty
-    }
-    if target:
-        data["target_node"] = target
-    
-    payload_str = json.dumps(data)
+
+def _signed_post(identity: MEPIdentity, path: str, body: dict) -> dict:
+    payload_str = json.dumps(body)
     headers = identity.get_auth_headers(payload_str)
     headers["Content-Type"] = "application/json"
-    r = requests.post(f"{HUB_URL}/tasks/submit", data=payload_str, headers=headers)
-    return r.json()
+    response = requests.post(f"{HUB_URL}{path}", data=payload_str, headers=headers, timeout=10)
+    response.raise_for_status()
+    return response.json()
 
-def place_bid(identity: MEPIdentity, task_id: str):
-    data = {
-        "task_id": task_id,
-        "provider_id": identity.node_id
-    }
-    payload_str = json.dumps(data)
-    headers = identity.get_auth_headers(payload_str)
-    headers["Content-Type"] = "application/json"
-    r = requests.post(f"{HUB_URL}/tasks/bid", data=payload_str, headers=headers)
-    return r.json()
 
-def complete_task(identity: MEPIdentity, task_id: str, result: str):
-    data = {
-        "task_id": task_id,
-        "provider_id": identity.node_id,
-        "result_payload": result
-    }
-    payload_str = json.dumps(data)
-    headers = identity.get_auth_headers(payload_str)
-    headers["Content-Type"] = "application/json"
-    r = requests.post(f"{HUB_URL}/tasks/complete", data=payload_str, headers=headers)
-    return r.json()
+def submit_task(
+    identity: MEPIdentity,
+    payload: str,
+    bounty: float,
+    *,
+    target: Optional[str] = None,
+    secret_data: Optional[str] = None,
+) -> dict:
+    body = build_task_envelope(
+        identity.node_id,
+        payload,
+        bounty,
+        target_node=target,
+        secret_data=secret_data,
+    )
+    return _signed_post(identity, "/tasks/submit", body)
 
-def get_balance(identity: MEPIdentity):
-    r = requests.get(f"{HUB_URL}/balance/{identity.node_id}")
-    return r.json().get("balance_seconds", 0.0)
 
-async def test_three_markets():
+def place_bid(identity: MEPIdentity, task_id: str) -> dict:
+    return _signed_post(identity, "/tasks/bid", {"task_id": task_id, "provider_id": identity.node_id})
+
+
+def complete_task(identity: MEPIdentity, task_id: str, result: str) -> dict:
+    return _signed_post(
+        identity,
+        "/tasks/complete",
+        {
+            "task_id": task_id,
+            "provider_id": identity.node_id,
+            "result_payload": result,
+        },
+    )
+
+
+def get_balance(identity: MEPIdentity) -> float:
+    response = requests.get(f"{HUB_URL}/balance/{identity.node_id}", timeout=10)
+    response.raise_for_status()
+    return float(response.json().get("balance_seconds", 0.0))
+
+
+def register(identity: MEPIdentity) -> None:
+    response = requests.post(f"{HUB_URL}/register", json={"pubkey": identity.pub_pem}, timeout=10)
+    response.raise_for_status()
+
+
+async def test_three_markets() -> None:
     print("=" * 60)
-    print("Testing the 3 MEP Markets (+, 0, -)")
+    print("MEP 3-market smoke test: compute, chat, data")
     print("=" * 60)
-    
-    alice = MEPIdentity(f"alice_{uuid.uuid4().hex[:6]}.pem")
-    bob = MEPIdentity(f"bob_{uuid.uuid4().hex[:6]}.pem")
-    
-    requests.post(f"{HUB_URL}/register", json={"pubkey": alice.pub_pem})
-    requests.post(f"{HUB_URL}/register", json={"pubkey": bob.pub_pem})
-    
-    print(f"👩 Alice (Consumer): {alice.node_id} | Starting Bal: {get_balance(alice)}")
-    print(f"👦 Bob   (Provider): {bob.node_id} | Starting Bal: {get_balance(bob)}\n")
 
-    async def bob_listener():
+    key_dir = os.getenv("MEP_SMOKE_KEY_DIR", tempfile.gettempdir())
+    alice = MEPIdentity(os.path.join(key_dir, f"alice_{uuid.uuid4().hex[:6]}.pem"))
+    bob = MEPIdentity(os.path.join(key_dir, f"bob_{uuid.uuid4().hex[:6]}.pem"))
+
+    register(alice)
+    register(bob)
+
+    print(f"Alice (sender/seller): {alice.node_id} | starting={get_balance(alice):.6f} SECONDS")
+    print(f"Bob   (receiver/buyer): {bob.node_id} | starting={get_balance(bob):.6f} SECONDS")
+    print()
+
+    async def bob_listener() -> None:
         async with websockets.connect(get_auth_url(bob)) as ws:
-            # 1. Wait for Compute Market RFC (+5.0)
-            msg = await ws.recv()
+            msg = await asyncio.wait_for(ws.recv(), timeout=10)
             data = json.loads(msg)
-            if data["event"] == "rfc" and data["data"]["bounty"] > 0:
-                task_id = data["data"]["id"]
-                print(f"👦 Bob: Received Compute RFC {task_id[:8]} for +{data['data']['bounty']} SECONDS")
-                bid_res = place_bid(bob, task_id)
-                if bid_res["status"] == "accepted":
-                    print("👦 Bob: Won Compute Bid! Completing task...")
-                    complete_task(bob, task_id, "Here is the code you requested.")
-                    print("👦 Bob: Compute task done.\n")
+            assert data["event"] == "rfc", data
+            task = data["data"]
+            assert task["bounty"] > 0, task
+            task_id = task["id"]
+            print(f"Bob received compute RFC {task_id[:8]} bounty={task['bounty']:.6f} SECONDS")
+            bid_res = place_bid(bob, task_id)
+            assert bid_res["status"] == "accepted", bid_res
+            complete_task(bob, task_id, "market=compute\nresult=ok")
 
-            # 2. Wait for Cyberspace Direct Message (0.0)
-            msg = await ws.recv()
+            msg = await asyncio.wait_for(ws.recv(), timeout=10)
             data = json.loads(msg)
-            if data["event"] == "new_task" and data["data"]["bounty"] == 0.0:
-                task_id = data["data"]["id"]
-                print(f"👦 Bob: Received Cyberspace DM {task_id[:8]} from Alice (0.0 SECONDS)")
-                print(f"👦 Bob: Message = '{data['data']['payload']}'")
-                complete_task(bob, task_id, "Yes Alice, I am free.")
-                print("👦 Bob: Sent free reply.\n")
+            assert data["event"] == "new_task", data
+            task = data["data"]
+            assert task["bounty"] == 0.0, task
+            task_id = task["id"]
+            print(f"Bob received chat task {task_id[:8]} payload={task['payload']!r}")
+            complete_task(bob, task_id, "market=chat\nresult=received")
 
-            # 3. Wait for Data Market RFC (-2.0)
-            msg = await ws.recv()
+            msg = await asyncio.wait_for(ws.recv(), timeout=10)
             data = json.loads(msg)
-            if data["event"] == "rfc" and data["data"]["bounty"] < 0:
-                task_id = data["data"]["id"]
-                cost = data["data"]["bounty"]
-                print(f"👦 Bob: Received Data Market RFC {task_id[:8]} costing {cost} SECONDS")
-                
-                # Bob's local configuration allows him to spend up to 5.0 SECONDS
-                max_purchase_price = 5.0
-                cost = abs(data["data"]["bounty"])
-                if cost <= max_purchase_price:
-                    print("👦 Bob: Budget allows it! Bidding on premium data...")
-                    bid_res = place_bid(bob, task_id)
-                    if bid_res["status"] == "accepted":
-                        print(f"👦 Bob: Paid {abs(cost)} SECONDS to download premium data: '{bid_res['payload']}'")
-                        complete_task(bob, task_id, "Data received successfully.")
-                        print("👦 Bob: Premium data acquisition complete.\n")
-                else:
-                    print("👦 Bob: Too expensive. Ignored.")
-                    
-            await asyncio.sleep(0.5)
+            assert data["event"] == "rfc", data
+            task = data["data"]
+            assert task["bounty"] < 0, task
+            task_id = task["id"]
+            cost = abs(float(task["bounty"]))
+            print(f"Bob received data RFC {task_id[:8]} cost={cost:.6f} SECONDS")
+            bid_res = place_bid(bob, task_id)
+            assert bid_res["status"] == "accepted", bid_res
+            assert bid_res["secret_data"] == "SECRET_TRADING_ALGO_V9", bid_res
+            complete_task(bob, task_id, "market=data\nresult=received")
 
-    async def alice_sender():
-        # Let Bob connect
+    async def alice_sender() -> None:
         await asyncio.sleep(0.5)
-        
         async with websockets.connect(get_auth_url(alice)) as ws:
-            # Market 1: Compute Market (+5.0)
-            print("👩 Alice: Submitting Compute Task (+5.0 SECONDS)...")
+            print("Alice submits compute task: +5.0 SECONDS")
             submit_task(alice, "Write me a python script", 5.0)
-            await asyncio.wait_for(ws.recv(), timeout=6.0)
-            
-            # Market 2: Cyberspace Market (0.0)
-            print("👩 Alice: Sending Cyberspace DM to Bob (0.0 SECONDS)...")
-            submit_task(alice, "Are you free to chat?", 0.0, target=bob.node_id)
-            await asyncio.wait_for(ws.recv(), timeout=6.0)
-            
-            # Market 3: Data Market (-2.0)
-            print("👩 Alice: Broadcasting Premium Dataset (-2.0 SECONDS)...")
-            submit_task(alice, "SECRET_TRADING_ALGO_V9", -2.0)
-            await asyncio.wait_for(ws.recv(), timeout=6.0)
-            
-            await asyncio.sleep(0.5)
+            await asyncio.wait_for(ws.recv(), timeout=10)
+
+            print("Alice sends targeted chat task: 0.0 SECONDS")
+            chat_res = submit_task(alice, "Are you free to chat?", 0.0, target=bob.node_id)
+            assert chat_res["status"] == "success", chat_res
+            await asyncio.wait_for(ws.recv(), timeout=10)
+
+            print("Alice offers data task: buyer pays 2.0 SECONDS")
+            submit_task(
+                alice,
+                "Premium dataset available",
+                -2.0,
+                secret_data="SECRET_TRADING_ALGO_V9",
+            )
+            await asyncio.wait_for(ws.recv(), timeout=10)
 
     await asyncio.gather(bob_listener(), alice_sender())
-    
+
+    alice_balance = get_balance(alice)
+    bob_balance = get_balance(bob)
+    print()
     print("=" * 60)
-    print("Final Balances:")
-    print(f"👩 Alice (Started 10.0): {get_balance(alice)} (Paid 5.0, Earned 2.0 = Expected 7.0)")
-    print(f"👦 Bob   (Started 10.0): {get_balance(bob)} (Earned 5.0, Paid 2.0 = Expected 13.0)")
+    print("Final balances")
+    print(f"Alice expected around 7.0 SECONDS, actual={alice_balance:.6f}")
+    print(f"Bob   expected around 13.0 SECONDS, actual={bob_balance:.6f}")
     print("=" * 60)
+
 
 if __name__ == "__main__":
     asyncio.run(test_three_markets())
