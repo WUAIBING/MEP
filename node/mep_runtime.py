@@ -195,6 +195,33 @@ class MockAdapter:
         )
 
 
+@dataclass
+class AIAdapter:
+    """Real AI adapter using Ollama for provider task processing."""
+    model: str = "tinyllama"
+
+    def generate_reply(self, payload: str, task_data: dict[str, Any]) -> str:
+        import subprocess
+        try:
+            prompt = (
+                f"You are a helpful MEP bot. Respond to this task concisely (max 300 chars).\n\n"
+                f"Task: {payload}\n\nReply:"
+            )
+            result = subprocess.run(
+                ["ollama", "run", self.model, prompt],
+                capture_output=True, text=True, timeout=45
+            )
+            reply = (result.stdout or "").strip()
+            if not reply:
+                return f"[AI adapter] empty response from {self.model}"
+            return reply
+        except subprocess.TimeoutExpired:
+            return f"[AI adapter] {self.model} timed out"
+        except Exception as e:
+            return f"[AI adapter] error: {e}"
+
+
+
 class RuntimeNode:
     def __init__(self, identity: MEPIdentity, hub_url: str, ws_url: str, adapter: MockAdapter, alias: Optional[str] = None):
         self.identity = identity
@@ -517,7 +544,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Path to provider private key (defaults to repo-local .mep/mep_runtime.pem).",
     )
-    parser.add_argument("--adapter", default="mock", choices=["mock"], help="Provider adapter.")
+    parser.add_argument("--adapter", default="mock", choices=["mock", "ollama", "deepseek"], help="Provider adapter.")
 
     sub = parser.add_subparsers(dest="command", required=True)
 
