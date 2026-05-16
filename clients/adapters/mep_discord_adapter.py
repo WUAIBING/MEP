@@ -56,7 +56,7 @@ async def mep(ctx, *, text: str):
         return
     response = await client.submit_task(payload, bounty, model, target)
     data = response["json"]
-    if response["status_code"] != 200:
+    if response["status_code"] != 200 or data.get("status") != "success":
         await ctx.send(f"Submit failed: {data}")
         return
     task_id = data.get("task_id")
@@ -69,7 +69,7 @@ async def mep(ctx, *, text: str):
 async def mepdm(ctx, target_node: str, *, message: str):
     response = await client.submit_task(message, 0.0, None, target_node)
     data = response["json"]
-    if response["status_code"] != 200:
+    if response["status_code"] != 200 or data.get("status") != "success":
         await ctx.send(f"DM failed: {data}")
         return
     task_id = data.get("task_id")
@@ -81,9 +81,9 @@ async def mepdm(ctx, target_node: str, *, message: str):
 @bot.command(name="mepdata")
 async def mepdata(ctx, price: float, *, payload: str):
     bounty = -abs(price)
-    response = await client.submit_task(payload, bounty, None, None)
+    response = await client.submit_task("Data offer available", bounty, secret_data=payload)
     data = response["json"]
-    if response["status_code"] != 200:
+    if response["status_code"] != 200 or data.get("status") != "success":
         await ctx.send(f"Data offer failed: {data}")
         return
     task_id = data.get("task_id")

@@ -6,9 +6,9 @@ import urllib.parse
 from typing import Awaitable, Callable, Optional
 
 import requests
-import websockets
 
 from clients.shared.identity import MEPIdentity
+from node.task_envelope import build_task_envelope
 
 HUB_URL = os.getenv("HUB_URL", "https://mep-hub.silentcopilot.ai")
 WS_URL = os.getenv("WS_URL", "wss://mep-hub.silentcopilot.ai")
@@ -42,18 +42,21 @@ class MEPClient:
         self,
         payload: str,
         bounty: float,
-        model_requirement: Optional[str],
-        target_node: Optional[str],
+        model_requirement: Optional[str] = None,
+        target_node: Optional[str] = None,
+        *,
+        payload_uri: Optional[str] = None,
+        secret_data: Optional[str] = None,
     ) -> dict:
-        body: dict = {
-            "consumer_id": self.node_id,
-            "payload": payload,
-            "bounty": bounty,
-        }
-        if model_requirement is not None:
-            body["model_requirement"] = model_requirement
-        if target_node is not None:
-            body["target_node"] = target_node
+        body = build_task_envelope(
+            self.node_id,
+            payload,
+            bounty,
+            target_node=target_node,
+            target_capability=model_requirement,
+            payload_uri=payload_uri,
+            secret_data=secret_data,
+        )
         payload_str = json.dumps(body)
         headers = self._auth_headers(payload_str)
         response = await asyncio.to_thread(
@@ -164,6 +167,8 @@ class MEPClient:
         on_result: Callable[[dict], Awaitable[None]],
         on_event: Optional[Callable[[dict], Awaitable[None]]] = None,
     ) -> None:
+        import websockets
+
         while not self._stop.is_set():
             ts = str(int(time.time()))
             sig = urllib.parse.quote(self.identity.sign(self.node_id, ts))

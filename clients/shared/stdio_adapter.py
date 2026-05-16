@@ -28,7 +28,7 @@ class StdioAdapter:
             return
         response = await self.client.submit_task(payload, bounty, model, target)
         data = response["json"]
-        if response["status_code"] != 200:
+        if response["status_code"] != 200 or data.get("status") != "success":
             print(f"[{self.platform_name}] submit failed: {data}")
             return
         print(f"[{self.platform_name}] submitted task {data.get('task_id')}")
@@ -36,16 +36,16 @@ class StdioAdapter:
     async def _send_dm(self, target_node: str, message: str) -> None:
         response = await self.client.submit_task(message, 0.0, None, target_node)
         data = response["json"]
-        if response["status_code"] != 200:
+        if response["status_code"] != 200 or data.get("status") != "success":
             print(f"[{self.platform_name}] dm failed: {data}")
             return
         print(f"[{self.platform_name}] sent dm task {data.get('task_id')} to {target_node}")
 
     async def _offer_data(self, price: str, payload: str) -> None:
         bounty = -abs(float(price))
-        response = await self.client.submit_task(payload, bounty, None, None)
+        response = await self.client.submit_task("Data offer available", bounty, secret_data=payload)
         data = response["json"]
-        if response["status_code"] != 200:
+        if response["status_code"] != 200 or data.get("status") != "success":
             print(f"[{self.platform_name}] data offer failed: {data}")
             return
         print(f"[{self.platform_name}] offered data task {data.get('task_id')} for {bounty} SECONDS")
