@@ -257,7 +257,7 @@ class RuntimeNode:
         payload_str = json.dumps(payload)
         headers = self._auth_headers(payload_str)
         headers["Content-Type"] = "application/json"
-        code, _body, _raw = _safe_request("POST", f"{self.hub_url}/registry/heartbeat", data=payload_str, headers=headers, timeout=5)
+        code, _body, _raw = _safe_request("POST", f"{self.hub_url}/registry/heartbeat", data_body=payload_str, headers=headers, timeout=5)
         if code != 200:
             print(f"[mep run] heartbeat failed status={code}")
 
