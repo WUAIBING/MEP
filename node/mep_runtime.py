@@ -485,20 +485,24 @@ def cmd_doctor(args: argparse.Namespace) -> int:
 
 
 def cmd_run(args: argparse.Namespace) -> int:
-    if args.adapter != "mock":
-        print("[mep run] only adapter=mock is supported in this phase")
-        return 2
-    _ensure_key_parent(args.key_path)
+    if args.adapter == "ollama":
+        adapter = AIAdapter(model=os.getenv("MEP_AI_MODEL", "tinyllama"))
+        print(f"[mep run] adapter=ollama model={adapter.model}")
+    elif args.adapter != "mock":
+        print("[mep run] unsupported adapter, using mock")
+        adapter = MockAdapter()
+    else:
+        _ensure_key_parent(args.key_path)
     identity = MEPIdentity(args.key_path)
     alias = _resolve_runtime_alias(args.key_path, args.alias)
     runtime = RuntimeNode(
         identity=identity,
         hub_url=args.hub_url,
         ws_url=args.ws_url,
-        adapter=MockAdapter(),
+        adapter=adapter,
         alias=alias,
     )
-    print(f"[mep run] adapter=mock node_id={identity.node_id} alias={alias}")
+    print(f"[mep run] adapter={args.adapter} node_id={identity.node_id} alias={alias}")
     try:
         return asyncio.run(runtime.run_forever())
     except KeyboardInterrupt:
