@@ -31,6 +31,14 @@ from fastapi.testclient import TestClient  # noqa: E402
 client = TestClient(app)
 
 
+class _FakeWebSocket:
+    def __init__(self):
+        self.sent = []
+
+    async def send_json(self, payload):
+        self.sent.append(payload)
+
+
 # ---------------------------------------------------------------------------
 # Auth helpers (mirrors node/identity.py crypto)
 # ---------------------------------------------------------------------------
@@ -195,6 +203,167 @@ class TestTaskLifecycle(unittest.TestCase):
         resp = client.post("/tasks/submit", content=task_payload, headers=headers)
         self.assertEqual(resp.status_code, 400)
         self.assertIn("Insufficient", resp.json()["detail"])
+
+
+class TestThreeMarketSpecConformance(unittest.TestCase):
+    """Spec-shaped task envelopes should support compute, chat/DM, and data markets."""
+
+    def _submit_spec_task(
+        self,
+        private_key,
+        node_id: str,
+        *,
+        instructions: str,
+        bounty_ns: int,
+        market: str,
+        payment_direction: str,
+        target_node: str | None = None,
+        target_capability: str | None = None,
+        secret_data: str | None = None,
+    ) -> str:
+        payload = {
+            "source": {"node_id": node_id},
+            "intent": {"type": "conformance.request"},
+            "task": {
+                "instructions": instructions,
+                "expected_output": {"result_type": "text"},
+            },
+            "economics": {
+                "bounty_ns": bounty_ns,
+                "currency": "MEP_NS",
+                "market": market,
+                "payment_direction": payment_direction,
+            },
+        }
+        routing = {}
+        if target_node:
+            routing["target_node_id"] = target_node
+        if target_capability:
+            routing["target_capability"] = target_capability
+        if routing:
+            payload["routing"] = routing
+        if secret_data is not None:
+            payload["secret_data"] = secret_data
+
+        task_payload = json.dumps(payload)
+        headers = _auth_headers(private_key, node_id, task_payload)
+        resp = client.post("/tasks/submit", content=task_payload, headers=headers)
+        self.assertEqual(resp.status_code, 200, f"Submit failed: {resp.text}")
+        data = resp.json()
+        self.assertEqual(data["status"], "success")
+        return data["task_id"]
+
+    def _bid(self, private_key, provider_id: str, task_id: str) -> dict:
+        bid_payload = json.dumps({"task_id": task_id, "provider_id": provider_id})
+        headers = _auth_headers(private_key, provider_id, bid_payload)
+        resp = client.post("/tasks/bid", content=bid_payload, headers=headers)
+        self.assertEqual(resp.status_code, 200, f"Bid failed: {resp.text}")
+        data = resp.json()
+        self.assertEqual(data["status"], "accepted")
+        return data
+
+    def _complete(self, private_key, provider_id: str, task_id: str, result_payload: str) -> dict:
+        complete_payload = json.dumps(
+            {
+                "task_id": task_id,
+                "provider_id": provider_id,
+                "result_payload": result_payload,
+            }
+        )
+        headers = _auth_headers(private_key, provider_id, complete_payload)
+        resp = client.post("/tasks/complete", content=complete_payload, headers=headers)
+        self.assertEqual(resp.status_code, 200, f"Complete failed: {resp.text}")
+        data = resp.json()
+        self.assertEqual(data["status"], "success")
+        return data
+
+    def test_spec_compute_market_sender_pays_receiver(self):
+        consumer_priv, consumer_pub, consumer_id = _make_identity()
+        provider_priv, provider_pub, provider_id = _make_identity()
+        _register(consumer_pub)
+        _register(provider_pub)
+
+        consumer_before = client.get(f"/balance/{consumer_id}").json()["balance_seconds"]
+        provider_before = client.get(f"/balance/{provider_id}").json()["balance_seconds"]
+
+        task_id = self._submit_spec_task(
+            consumer_priv,
+            consumer_id,
+            instructions="compute this",
+            bounty_ns=1_000_000_000,
+            market="compute",
+            payment_direction="sender_to_receiver",
+            target_capability="text",
+        )
+        stored = db.get_task(task_id)
+        self.assertEqual(stored["payload"], "compute this")
+        self.assertEqual(stored["bounty"], 1.0)
+        self.assertEqual(stored["model_requirement"], "text")
+
+        self._bid(provider_priv, provider_id, task_id)
+        result = self._complete(provider_priv, provider_id, task_id, "computed")
+        self.assertEqual(result["earned"], 1.0)
+        self.assertEqual(client.get(f"/balance/{consumer_id}").json()["balance_seconds"], consumer_before - 1.0)
+        self.assertEqual(client.get(f"/balance/{provider_id}").json()["balance_seconds"], provider_before + 1.0)
+
+    def test_spec_chat_market_targeted_zero_bounty(self):
+        sender_priv, sender_pub, sender_id = _make_identity()
+        _, target_pub, target_id = _make_identity()
+        _register(sender_pub)
+        _register(target_pub)
+
+        sender_before = client.get(f"/balance/{sender_id}").json()["balance_seconds"]
+        fake_ws = _FakeWebSocket()
+        main.connected_nodes[target_id] = fake_ws
+        try:
+            task_id = self._submit_spec_task(
+                sender_priv,
+                sender_id,
+                instructions="hello target",
+                bounty_ns=0,
+                market="chat",
+                payment_direction="none",
+                target_node=target_id,
+            )
+        finally:
+            main.connected_nodes.pop(target_id, None)
+        stored = db.get_task(task_id)
+        self.assertEqual(stored["payload"], "hello target")
+        self.assertEqual(stored["bounty"], 0.0)
+        self.assertEqual(stored["target_node"], target_id)
+        self.assertEqual(stored["status"], "assigned")
+        self.assertEqual(stored["provider_id"], target_id)
+        self.assertEqual(fake_ws.sent[0]["event"], "new_task")
+        self.assertEqual(fake_ws.sent[0]["data"]["id"], task_id)
+        self.assertEqual(client.get(f"/balance/{sender_id}").json()["balance_seconds"], sender_before)
+
+    def test_spec_data_market_receiver_pays_sender_for_secret_data(self):
+        seller_priv, seller_pub, seller_id = _make_identity()
+        buyer_priv, buyer_pub, buyer_id = _make_identity()
+        _register(seller_pub)
+        _register(buyer_pub)
+
+        seller_before = client.get(f"/balance/{seller_id}").json()["balance_seconds"]
+        buyer_before = client.get(f"/balance/{buyer_id}").json()["balance_seconds"]
+        task_id = self._submit_spec_task(
+            seller_priv,
+            seller_id,
+            instructions="premium dataset",
+            bounty_ns=500_000_000,
+            market="data",
+            payment_direction="receiver_to_sender",
+            secret_data="encrypted-premium-data",
+        )
+        stored = db.get_task(task_id)
+        self.assertEqual(stored["bounty"], -0.5)
+        self.assertEqual(stored["result_payload"], "encrypted-premium-data")
+
+        bid_data = self._bid(buyer_priv, buyer_id, task_id)
+        self.assertEqual(bid_data["secret_data"], "encrypted-premium-data")
+        result = self._complete(buyer_priv, buyer_id, task_id, "data received")
+        self.assertEqual(result["earned"], -0.5)
+        self.assertEqual(client.get(f"/balance/{seller_id}").json()["balance_seconds"], seller_before + 0.5)
+        self.assertEqual(client.get(f"/balance/{buyer_id}").json()["balance_seconds"], buyer_before - 0.5)
 
 
 class TestInterBotSpecValidation(unittest.TestCase):
