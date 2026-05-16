@@ -345,8 +345,40 @@ class RuntimeNode:
     async def process_task(self, task_data: dict[str, Any]) -> None:
         task_id = str(task_data.get("id") or "")
         payload = str(task_data.get("payload") or "")
+        source_node = (
+            task_data.get("source", {}).get("node_id")
+            or task_data.get("source_node_id")
+            or task_data.get("sender_id")
+        )
+        print(f"[mep run] new_task id={task_id[:8]} source={source_node} market={task_data.get('market','?')} bounty={task_data.get('bounty',0)}")
         result = self.adapter.generate_reply(payload, task_data)
         self.complete(task_id, result)
+        # Auto-reply-DM: if this was a chat DM, send a fresh DM back to the sender
+        if source_node and source_node != self.node_id:
+            try:
+                from .task_envelope import build_task_envelope as _build_envelope
+                reply_envelope = _build_envelope(
+                    self.node_id,
+                    result,
+                    0.0,
+                    target_node=source_node,
+                )
+                reply_json = json.dumps(reply_envelope)
+                reply_headers = self._auth_headers(reply_json)
+                reply_headers["Content-Type"] = "application/json"
+                code, body, _raw = _safe_request(
+                    "POST",
+                    f"{self.hub_url}/tasks/submit",
+                    data_body=reply_json,
+                    headers=reply_headers,
+                    timeout=15.0,
+                )
+                if code == 200:
+                    print(f"[mep run] auto-reply-DM to {source_node[:12]} task={body.get('task_id','?')[:12]}")
+                else:
+                    print(f"[mep run] auto-reply-DM failed status={code}")
+            except Exception as e:
+                print(f"[mep run] auto-reply-DM error: {e}")
 
     def _ws_uri(self) -> str:
         ts = str(int(time.time()))
