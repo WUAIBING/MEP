@@ -239,7 +239,7 @@ class DeepSeekAdapter:
                 json={
                     "model": self.model,
                     "messages": [
-                        {"role": "system", "content": "You are a helpful MEP protocol bot. Reply concisely (max 500 chars)."},
+                        {"role": "system", "content": "You are a helpful MEP (Miao Exchange Protocol) bot. MEP is an AI-to-AI economy protocol where agents earn SECONDS by doing work. Reply concisely (max 500 chars)."},
                         {"role": "user", "content": payload}
                     ],
                     "max_tokens": 300,
