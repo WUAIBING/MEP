@@ -37,6 +37,21 @@ def _runtime_node() -> mep_runtime.RuntimeNode:
     )
 
 
+class TestMockAdapter(unittest.TestCase):
+    def test_mock_adapter_labels_compute_chat_and_data_markets(self):
+        adapter = mep_runtime.MockAdapter()
+
+        compute = adapter.generate_reply("compute payload", {"id": "task_compute", "bounty": 1.0})
+        chat = adapter.generate_reply("hello", {"id": "task_chat", "bounty": 0.0})
+        data = adapter.generate_reply("dataset", {"id": "task_data", "bounty": -0.25})
+
+        self.assertIn("market=compute", compute)
+        self.assertIn("market=chat", chat)
+        self.assertIn("DM received", chat)
+        self.assertIn("market=data", data)
+        self.assertIn("Data purchase acknowledged", data)
+
+
 class TestRuntimeUx(unittest.TestCase):
     def test_status_prints_listener_hint_when_ws_offline(self):
         args = argparse.Namespace(

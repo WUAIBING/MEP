@@ -118,11 +118,25 @@ class MockAdapter:
         if not snippet:
             snippet = "<empty>"
         task_id = str(task_data.get("id", ""))[:8]
+        try:
+            bounty = float(task_data.get("bounty") or 0.0)
+        except (TypeError, ValueError):
+            bounty = 0.0
+        if bounty == 0:
+            market = "chat"
+            next_step = "DM received by runtime listener."
+        elif bounty < 0:
+            market = "data"
+            next_step = "Data purchase acknowledged by runtime listener."
+        else:
+            market = "compute"
+            next_step = "Switch adapter to ollama/openai-compatible after doctor is green."
         return (
             "MOCK_ADAPTER_OK\n"
             f"task={task_id}\n"
+            f"market={market}\n"
             f"summary={snippet}\n"
-            "next=Switch adapter to ollama/openai-compatible after doctor is green."
+            f"next={next_step}"
         )
 
 
