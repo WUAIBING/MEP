@@ -12,11 +12,11 @@ Usage:
 """
 
 from urllib.parse import urlparse
-import websockets
 
 
 def ws_connect(uri: str, **kwargs):
     """Connect to a WebSocket URI, ensuring the Host header is correct."""
+    import websockets  # lazy import — websockets is optional
     parsed = urlparse(uri)
     kwargs.setdefault("host", parsed.hostname)
     return websockets.connect(uri, **kwargs)

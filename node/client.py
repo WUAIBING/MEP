@@ -4,10 +4,8 @@ import requests
 import uuid
 import time
 import urllib.parse
-import websockets
 from reputation import ReputationManager
 from identity import MEPIdentity
-from ws_connect import ws_connect
 
 WS_HEARTBEAT_INTERVAL_SECONDS = 60
 
@@ -78,7 +76,7 @@ class ChronosNode:
 
     async def listen(self):
         """Persistent WebSocket connection."""
-        import websockets
+        from ws_connect import ws_connect
 
         ts = str(int(time.time()))
         sig = self.identity.sign(self.node_id, ts)
