@@ -134,6 +134,7 @@ class RuntimeNode:
         self.ws_url = ws_url.rstrip("/")
         self.adapter = adapter
         self.running = True
+        self.max_purchase_price = float(os.getenv("MEP_MAX_PURCHASE_PRICE", "0.0"))
 
     def _auth_headers(self, payload: str) -> dict[str, str]:
         headers = self.identity.get_auth_headers(payload)
@@ -160,6 +161,23 @@ class RuntimeNode:
         )
         if code != 200:
             print(f"[mep run] bid failed task={task_id[:8]} status={code} detail={raw}")
+
+    def should_bid(self, task_data: dict[str, Any]) -> bool:
+        try:
+            bounty = float(task_data.get("bounty") or 0.0)
+        except (TypeError, ValueError):
+            return False
+        if bounty >= 0:
+            return True
+        cost = abs(bounty)
+        if cost <= self.max_purchase_price:
+            return True
+        task_id = str(task_data.get("id") or "")
+        print(
+            f"[mep run] skip data-market task={task_id[:8]} "
+            f"cost={cost:.6f} max_purchase_price={self.max_purchase_price:.6f}"
+        )
+        return False
 
     def complete(self, task_id: str, result_payload: str) -> None:
         payload = json.dumps(
@@ -216,7 +234,7 @@ class RuntimeNode:
                         if event == "rfc":
                             task = data.get("data", {})
                             task_id = str(task.get("id") or "")
-                            if task_id:
+                            if task_id and self.should_bid(task):
                                 self.bid(task_id)
                         elif event == "new_task":
                             await self.process_task(data.get("data", {}))
