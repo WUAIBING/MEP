@@ -252,6 +252,15 @@ class RuntimeNode:
         )
         return False
 
+    def heartbeat(self) -> None:
+        payload = {"node_id": self.node_id, "availability": "online"}
+        payload_str = json.dumps(payload)
+        headers = self._auth_headers(payload_str)
+        headers["Content-Type"] = "application/json"
+        code, _body, _raw = _safe_request("POST", f"{self.hub_url}/registry/heartbeat", data=payload_str, headers=headers, timeout=5)
+        if code != 200:
+            print(f"[mep run] heartbeat failed status={code}")
+
     def complete(self, task_id: str, result_payload: str) -> None:
         payload = json.dumps(
             {
@@ -294,11 +303,23 @@ class RuntimeNode:
             await self.process_task(data.get("data", {}))
 
     async def _recv_loop(self, ws: Any) -> None:
+        last_status_at = 0.0
+        STATUS_INTERVAL_SECONDS = 60.0
         while self.running:
             try:
                 msg = await asyncio.wait_for(ws.recv(), timeout=20.0)
             except asyncio.TimeoutError:
                 await ws.ping()
+                # Periodic status heartbeat (every 60s)
+                now = time.time()
+                if now - last_status_at >= STATUS_INTERVAL_SECONDS:
+                    code, diag, _ = self._safe_request("GET", f"/diagnostic?node_id={self.node_id}")
+                    online = diag.get("ws_connected") if diag else False
+                    print(f"[mep run] alive node={self.node_id} ws_connected={'OK' if online else 'NO'}")
+                    if not online:
+                        print("[mep run] hub reports ws_connected=false — may need reconnect")
+                    self.heartbeat()
+                    last_status_at = now
                 continue
             await self.handle_ws_event(json.loads(msg))
 
@@ -317,6 +338,7 @@ class RuntimeNode:
         print(f"[mep run] {message}")
         if not ok:
             return 2
+        reconnect_attempts = 0
         while self.running:
             uri = self._ws_uri()
             try:
@@ -326,7 +348,9 @@ class RuntimeNode:
             except KeyboardInterrupt:
                 self.running = False
             except Exception as exc:  # noqa: BLE001
-                print(f"[mep run] websocket reconnect after error: {exc}")
+                reconnect_attempts += 1
+                print(f"[mep run] disconnected node={self.node_id} error={exc}")
+                print(f"[mep run] reconnecting in 3s (attempt {reconnect_attempts})...")
                 await asyncio.sleep(3.0)
         return 0
 
