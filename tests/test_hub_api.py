@@ -365,6 +365,63 @@ class TestThreeMarketSpecConformance(unittest.TestCase):
         self.assertEqual(client.get(f"/balance/{seller_id}").json()["balance_seconds"], seller_before + 0.5)
         self.assertEqual(client.get(f"/balance/{buyer_id}").json()["balance_seconds"], buyer_before - 0.5)
 
+    def test_targeted_chat_to_offline_node_returns_error_body(self):
+        sender_priv, sender_pub, sender_id = _make_identity()
+        _, target_pub, target_id = _make_identity()
+        _register(sender_pub)
+        _register(target_pub)
+        main.connected_nodes.pop(target_id, None)
+
+        task_payload = json.dumps(
+            {
+                "source": {"node_id": sender_id},
+                "intent": {"type": "conformance.request"},
+                "task": {
+                    "instructions": "offline hello",
+                    "expected_output": {"result_type": "text"},
+                },
+                "economics": {
+                    "bounty_ns": 0,
+                    "currency": "MEP_NS",
+                    "market": "chat",
+                    "payment_direction": "none",
+                },
+                "routing": {"target_node_id": target_id},
+            }
+        )
+        headers = _auth_headers(sender_priv, sender_id, task_payload)
+        resp = client.post("/tasks/submit", content=task_payload, headers=headers)
+
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.json()["status"], "error")
+        self.assertIn("not currently connected", resp.json()["detail"])
+
+    def test_data_market_requires_secret_data(self):
+        seller_priv, seller_pub, seller_id = _make_identity()
+        _register(seller_pub)
+
+        task_payload = json.dumps(
+            {
+                "source": {"node_id": seller_id},
+                "intent": {"type": "conformance.request"},
+                "task": {
+                    "instructions": "premium dataset",
+                    "expected_output": {"result_type": "text"},
+                },
+                "economics": {
+                    "bounty_ns": 500_000_000,
+                    "currency": "MEP_NS",
+                    "market": "data",
+                    "payment_direction": "receiver_to_sender",
+                },
+            }
+        )
+        headers = _auth_headers(seller_priv, seller_id, task_payload)
+        resp = client.post("/tasks/submit", content=task_payload, headers=headers)
+
+        self.assertEqual(resp.status_code, 400)
+        self.assertIn("require secret_data", resp.json()["detail"])
+
 
 class TestInterBotSpecValidation(unittest.TestCase):
     def test_rejects_invalid_structured_payload_when_enabled(self):
