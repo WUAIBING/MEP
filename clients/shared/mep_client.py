@@ -168,13 +168,14 @@ class MEPClient:
         on_event: Optional[Callable[[dict], Awaitable[None]]] = None,
     ) -> None:
         import websockets
+        from urllib.parse import urlparse
 
         while not self._stop.is_set():
             ts = str(int(time.time()))
             sig = urllib.parse.quote(self.identity.sign(self.node_id, ts))
             uri = f"{WS_URL}/ws/{self.node_id}?timestamp={ts}&signature={sig}"
             try:
-                async with websockets.connect(uri) as ws:
+                async with websockets.connect(uri, host=urlparse(uri).hostname) as ws:
                     heartbeat_task: Optional[asyncio.Task] = None
                     if WS_HEARTBEAT_INTERVAL_SECONDS > 0:
                         heartbeat_task = asyncio.create_task(self._heartbeat_loop(ws))
