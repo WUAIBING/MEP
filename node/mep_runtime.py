@@ -218,8 +218,7 @@ class AIAdapter:
         except subprocess.TimeoutExpired:
             return f"[AI adapter] {self.model} timed out"
         except Exception as e:
-            [AI adapter] error: {e}
-        )
+            return f"[AI adapter] error: {e}"
 
 
 @dataclass
