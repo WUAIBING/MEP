@@ -218,7 +218,42 @@ class AIAdapter:
         except subprocess.TimeoutExpired:
             return f"[AI adapter] {self.model} timed out"
         except Exception as e:
-            return f"[AI adapter] error: {e}"
+            [AI adapter] error: {e}
+        )
+
+
+@dataclass
+class DeepSeekAdapter:
+    """Real AI adapter using DeepSeek API for provider task processing."""
+    api_key: str = ""
+    model: str = "deepseek-chat"
+
+    def generate_reply(self, payload: str, task_data: dict[str, Any]) -> str:
+        import requests as req
+        try:
+            resp = req.post(
+                "https://api.deepseek.com/v1/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {self.api_key}",
+                    "Content-Type": "application/json"
+                },
+                json={
+                    "model": self.model,
+                    "messages": [
+                        {"role": "system", "content": "You are a helpful MEP protocol bot. Reply concisely (max 500 chars)."},
+                        {"role": "user", "content": payload}
+                    ],
+                    "max_tokens": 300,
+                    "temperature": 0.7
+                },
+                timeout=30
+            )
+            if resp.status_code == 200:
+                return resp.json()["choices"][0]["message"]["content"].strip()
+            return f"[DeepSeek] API error {resp.status_code}: {resp.text[:200]}"
+        except Exception as e:
+            return f"[DeepSeek] error: {e}"
+
 
 
 
@@ -485,7 +520,15 @@ def cmd_doctor(args: argparse.Namespace) -> int:
 
 
 def cmd_run(args: argparse.Namespace) -> int:
-    if args.adapter == "ollama":
+    if args.adapter == "deepseek":
+        api_key = os.getenv("DEEPSEEK_API_KEY", "")
+        if not api_key:
+            print("[mep run] DEEPSEEK_API_KEY not set, falling back to mock")
+            adapter = MockAdapter()
+        else:
+            adapter = DeepSeekAdapter(api_key=api_key, model=os.getenv("MEP_AI_MODEL", "deepseek-chat"))
+            print(f"[mep run] adapter=deepseek model={adapter.model}")
+    elif args.adapter == "ollama":
         adapter = AIAdapter(model=os.getenv("MEP_AI_MODEL", "tinyllama"))
         print(f"[mep run] adapter=ollama model={adapter.model}")
     elif args.adapter != "mock":
