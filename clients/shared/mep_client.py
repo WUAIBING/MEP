@@ -9,6 +9,7 @@ import requests
 
 from clients.shared.identity import MEPIdentity
 from node.task_envelope import build_task_envelope
+from node.ws_connect import ws_connect
 
 HUB_URL = os.getenv("HUB_URL", "https://mep-hub.silentcopilot.ai")
 WS_URL = os.getenv("WS_URL", "wss://mep-hub.silentcopilot.ai")
@@ -167,14 +168,12 @@ class MEPClient:
         on_result: Callable[[dict], Awaitable[None]],
         on_event: Optional[Callable[[dict], Awaitable[None]]] = None,
     ) -> None:
-        import websockets
-
         while not self._stop.is_set():
             ts = str(int(time.time()))
             sig = urllib.parse.quote(self.identity.sign(self.node_id, ts))
             uri = f"{WS_URL}/ws/{self.node_id}?timestamp={ts}&signature={sig}"
             try:
-                async with websockets.connect(uri) as ws:
+                async with ws_connect(uri) as ws:
                     heartbeat_task: Optional[asyncio.Task] = None
                     if WS_HEARTBEAT_INTERVAL_SECONDS > 0:
                         heartbeat_task = asyncio.create_task(self._heartbeat_loop(ws))

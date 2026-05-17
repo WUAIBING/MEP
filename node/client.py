@@ -76,13 +76,13 @@ class ChronosNode:
 
     async def listen(self):
         """Persistent WebSocket connection."""
-        import websockets
+        from ws_connect import ws_connect
 
         ts = str(int(time.time()))
         sig = self.identity.sign(self.node_id, ts)
         sig_safe = urllib.parse.quote(sig)
         uri = f"{self.ws_url}/ws/{self.node_id}?timestamp={ts}&signature={sig_safe}"
-        async with websockets.connect(uri) as ws:
+        async with ws_connect(uri) as ws:
             print(f"[Node {self.node_id}] Connected to Hub via WebSocket.")
             heartbeat_task = asyncio.create_task(self._heartbeat_loop(ws))
             try:
