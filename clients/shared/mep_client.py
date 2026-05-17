@@ -168,12 +168,14 @@ class MEPClient:
         on_result: Callable[[dict], Awaitable[None]],
         on_event: Optional[Callable[[dict], Awaitable[None]]] = None,
     ) -> None:
+        backoff = 1.0
         while not self._stop.is_set():
             ts = str(int(time.time()))
             sig = urllib.parse.quote(self.identity.sign(self.node_id, ts))
             uri = f"{WS_URL}/ws/{self.node_id}?timestamp={ts}&signature={sig}"
             try:
                 async with ws_connect(uri) as ws:
+                    backoff = 1.0  # reset on successful connect
                     heartbeat_task: Optional[asyncio.Task] = None
                     if WS_HEARTBEAT_INTERVAL_SECONDS > 0:
                         heartbeat_task = asyncio.create_task(self._heartbeat_loop(ws))
@@ -189,8 +191,13 @@ class MEPClient:
                         if heartbeat_task:
                             heartbeat_task.cancel()
                             await asyncio.gather(heartbeat_task, return_exceptions=True)
-            except Exception:
-                await asyncio.sleep(2)
+            except Exception as exc:
+                err = str(exc)
+                if "403" in err or "InvalidStatus" in type(exc).__name__:
+                    backoff = min(backoff * 2, 60.0)
+                else:
+                    backoff = min(backoff * 1.5, 15.0)
+                await asyncio.sleep(backoff)
 
     async def _heartbeat_loop(self, ws) -> None:
         while not self._stop.is_set():

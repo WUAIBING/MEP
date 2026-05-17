@@ -258,17 +258,27 @@ class RuntimeNode:
         print(f"[mep run] {message}")
         if not ok:
             return 2
+        backoff = 1.0
         while self.running:
             uri = self._ws_uri()
             try:
                 async with ws_connect(uri) as ws:
                     print(f"[mep run] connected ws node={self.node_id}")
+                    backoff = 1.0  # reset backoff on successful connect
                     await self._recv_loop(ws)
             except KeyboardInterrupt:
                 self.running = False
             except Exception as exc:  # noqa: BLE001
-                print(f"[mep run] websocket reconnect after error: {exc}")
-                await asyncio.sleep(3.0)
+                err = str(exc)
+                # 403 means the proxy/nginx is rate-limiting this IP — hard backoff
+                if "403" in err or "InvalidStatus" in type(exc).__name__:
+                    print(f"[mep run] WS rejected (403/rate-limit). Backing off {backoff:.0f}s: {err}")
+                    await asyncio.sleep(backoff)
+                    backoff = min(backoff * 2, 60.0)
+                else:
+                    print(f"[mep run] websocket reconnect after error: {exc}")
+                    await asyncio.sleep(max(backoff, 3.0))
+                    backoff = min(backoff * 1.5, 15.0)
         return 0
 
 
