@@ -1,4 +1,6 @@
 import argparse
+import asyncio
+import json
 import unittest
 from unittest.mock import patch
 
@@ -35,6 +37,21 @@ def _runtime_node() -> mep_runtime.RuntimeNode:
         ws_url="ws://hub",
         adapter=mep_runtime.MockAdapter(),
     )
+
+
+class _FakeWebSocket:
+    def __init__(self, messages):
+        self.messages = list(messages)
+        self.pings = 0
+
+    async def recv(self):
+        item = self.messages.pop(0)
+        if item == "timeout":
+            raise asyncio.TimeoutError
+        return item
+
+    async def ping(self):
+        self.pings += 1
 
 
 class TestMockAdapter(unittest.TestCase):
@@ -118,6 +135,19 @@ class TestRuntimeBidPolicy(unittest.TestCase):
         node = _runtime_node()
 
         self.assertFalse(node.should_bid({"id": "task_bad", "bounty": "not-a-number"}))
+
+
+class TestRuntimeWebSocketLoop(unittest.TestCase):
+    def test_idle_timeout_pings_without_reconnecting(self):
+        node = _runtime_node()
+        task_payload = json.dumps({"event": "rfc", "data": {"id": "task_compute", "bounty": 1.0}})
+        ws = _FakeWebSocket(["timeout", task_payload])
+
+        with patch.object(node, "bid", side_effect=lambda task_id: setattr(node, "running", False)) as bid_mock:
+            asyncio.run(node._recv_loop(ws))
+
+        self.assertEqual(ws.pings, 1)
+        bid_mock.assert_called_once_with("task_compute")
 
 
 if __name__ == "__main__":

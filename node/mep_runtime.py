@@ -224,6 +224,25 @@ class RuntimeNode:
         sig = urllib.parse.quote(self.identity.sign(self.node_id, ts))
         return f"{self.ws_url}/ws/{self.node_id}?timestamp={ts}&signature={sig}"
 
+    async def handle_ws_event(self, data: dict[str, Any]) -> None:
+        event = data.get("event")
+        if event == "rfc":
+            task = data.get("data", {})
+            task_id = str(task.get("id") or "")
+            if task_id and self.should_bid(task):
+                self.bid(task_id)
+        elif event == "new_task":
+            await self.process_task(data.get("data", {}))
+
+    async def _recv_loop(self, ws: Any) -> None:
+        while self.running:
+            try:
+                msg = await asyncio.wait_for(ws.recv(), timeout=20.0)
+            except asyncio.TimeoutError:
+                await ws.ping()
+                continue
+            await self.handle_ws_event(json.loads(msg))
+
     async def run_forever(self) -> int:
         try:
             import websockets  # type: ignore
@@ -241,19 +260,7 @@ class RuntimeNode:
             try:
                 async with websockets.connect(uri) as ws:
                     print(f"[mep run] connected ws node={self.node_id}")
-                    while self.running:
-                        msg = await asyncio.wait_for(ws.recv(), timeout=20.0)
-                        data = json.loads(msg)
-                        event = data.get("event")
-                        if event == "rfc":
-                            task = data.get("data", {})
-                            task_id = str(task.get("id") or "")
-                            if task_id and self.should_bid(task):
-                                self.bid(task_id)
-                        elif event == "new_task":
-                            await self.process_task(data.get("data", {}))
-            except asyncio.TimeoutError:
-                continue
+                    await self._recv_loop(ws)
             except KeyboardInterrupt:
                 self.running = False
             except Exception as exc:  # noqa: BLE001
