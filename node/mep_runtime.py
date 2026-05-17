@@ -245,7 +245,10 @@ class RuntimeNode:
 
     async def run_forever(self) -> int:
         try:
-            import websockets  # type: ignore
+            from importlib.util import find_spec
+            if find_spec("websockets") is None:
+                raise ImportError("websockets not available")
+            from ws_connect import ws_connect  # type: ignore
         except ImportError:
             print("[mep run] missing optional dependency: websockets")
             print("[mep run] install with: pip install websockets")
@@ -258,7 +261,7 @@ class RuntimeNode:
         while self.running:
             uri = self._ws_uri()
             try:
-                async with websockets.connect(uri) as ws:
+                async with ws_connect(uri) as ws:
                     print(f"[mep run] connected ws node={self.node_id}")
                     await self._recv_loop(ws)
             except KeyboardInterrupt:
