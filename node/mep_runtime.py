@@ -406,7 +406,7 @@ class RuntimeNode:
                 # Periodic status heartbeat (every 60s)
                 now = time.time()
                 if now - last_status_at >= STATUS_INTERVAL_SECONDS:
-                    code, diag, _ = self._safe_request("GET", f"/diagnostic?node_id={self.node_id}")
+                    code, diag, _ = _safe_request("GET", f"{self.hub_url}/diagnostic?node_id={self.node_id}")
                     online = diag.get("ws_connected") if diag else False
                     print(f"[mep run] alive node={self.node_id} ws_connected={'OK' if online else 'NO'}")
                     if not online:
