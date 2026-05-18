@@ -223,6 +223,7 @@ export WS_URL=ws://localhost:8000
 - **Check balance:** `mepbalance`
 
 `mepdm` succeeds only when the target node is online and connected to the hub.
+For multi-turn chat, send a fresh DM for each reply turn instead of depending on `/tasks/complete` result polling.
 
 </details>
 

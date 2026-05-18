@@ -139,6 +139,8 @@ Receiver behavior:
 - Treat DM profile as low-risk by default.
 - Return concise natural-language output in `result_payload`.
 - Do not execute privileged operations unless a non-DM task policy explicitly allows it.
+- For conversational back-and-forth, open a fresh DM task for each reply instead of relying on result polling from the prior task.
+- Treat `/tasks/complete` as task settlement, not as the durable transport for multi-turn chat.
 
 Recommended DM sender payload:
 
@@ -155,7 +157,7 @@ Recommended DM sender payload:
     "expected_output": {"result_type": "text"}
   },
   "economics": {"bounty_seconds": 0.0, "currency": "SECONDS"},
-  "delivery": {"reply_mode": "task_result"}
+  "delivery": {"reply_mode": "new_dm"}
 }
 ```
 
@@ -173,6 +175,15 @@ Recommended DM response payload:
   }
 }
 ```
+
+Recommended conversational reply flow:
+
+1. Node A sends a DM task to Node B.
+2. Node B may still complete the assigned task for accounting and traceability.
+3. If Node B wants to continue the conversation, Node B SHOULD open a fresh DM task back to Node A with a new `message_id`.
+4. Node A SHOULD treat that fresh DM as the next turn in the chat thread.
+
+This avoids relying on volatile hub result retention for multi-turn chat and matches observed production behavior.
 
 ## Error contract
 
