@@ -197,14 +197,14 @@ class VirtualNode:
         await self._complete(task_id, result)
 
     async def connect_and_listen(self) -> None:
-        import websockets
+        from node.ws_connect import ws_connect
 
         while not self.stop_event.is_set():
             ts = str(int(time.time()))
             sig = urllib.parse.quote(self.identity.sign(self.node_id, ts))
             uri = f"{self.ws_url}/ws/{self.node_id}?timestamp={ts}&signature={sig}"
             try:
-                self.ws = await websockets.connect(uri, ping_interval=20, ping_timeout=20)
+                self.ws = await ws_connect(uri, ping_interval=20, ping_timeout=20)
                 while not self.stop_event.is_set():
                     raw = await self.ws.recv()
                     data = json.loads(raw)
