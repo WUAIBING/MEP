@@ -96,6 +96,60 @@ class TestSharedMEPClient(unittest.TestCase):
         self.assertEqual(response["status_code"], 200)
         self.assertEqual(response["json"], response_body)
 
+    def test_submit_dm_builds_threaded_interbot_envelope(self):
+        with (
+            patch("clients.shared.mep_client.MEPIdentity", return_value=_FakeIdentity()),
+            patch("clients.shared.mep_client.requests.Session") as session_cls,
+        ):
+            session = session_cls.return_value
+            session.post.return_value = _FakeResponse()
+            client = MEPClient("unused.pem")
+
+            response = asyncio.run(
+                client.submit_dm(
+                    "Please review PR 154",
+                    "node_reviewer",
+                    intent_type="review.request",
+                    context_id="pr154-review",
+                    reply_to_task_id="task_parent",
+                    reply_to_message_id="message_parent",
+                    turn_type="review_request",
+                )
+            )
+
+        submit_body = json.loads(session.post.call_args.kwargs["data"])
+        self.assertEqual(submit_body["routing"], {"target_node_id": "node_reviewer"})
+        body = json.loads(submit_body["task"]["instructions"])
+        self.assertEqual(body["spec_version"], "mep.interbot.v1")
+        self.assertEqual(body["target"]["node_id"], "node_reviewer")
+        self.assertEqual(body["conversation"]["context_id"], "pr154-review")
+        self.assertEqual(body["conversation"]["reply_to_task_id"], "task_parent")
+        self.assertEqual(body["conversation"]["reply_to_message_id"], "message_parent")
+        self.assertEqual(body["conversation"]["turn_type"], "review_request")
+        self.assertEqual(body["intent"], {"type": "review.request", "priority": "normal"})
+        self.assertEqual(body["task"]["instructions"], "Please review PR 154")
+        self.assertEqual(body["delivery"], {"reply_mode": "new_dm", "settlement_mode": "task_result"})
+        self.assertEqual(response["context_id"], "pr154-review")
+        self.assertTrue(response["message_id"])
+        self.assertTrue(response["trace_id"])
+
+    def test_extract_interbot_instructions_prefers_structured_task_text(self):
+        payload = json.dumps(
+            {
+                "spec_version": "mep.interbot.v1",
+                "task": {
+                    "instructions": "Structured instructions",
+                    "expected_output": {"result_type": "text"},
+                },
+            }
+        )
+
+        instructions, parsed = MEPClient.extract_interbot_instructions(payload)
+
+        self.assertEqual(instructions, "Structured instructions")
+        self.assertIsNotNone(parsed)
+        self.assertEqual(parsed["spec_version"], "mep.interbot.v1")
+
 
 if __name__ == "__main__":
     unittest.main()
