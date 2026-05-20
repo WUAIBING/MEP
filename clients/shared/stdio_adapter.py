@@ -1,5 +1,6 @@
 import asyncio
 import os
+import shlex
 import tempfile
 from typing import Optional
 
@@ -40,6 +41,60 @@ class StdioAdapter:
             print(f"[{self.platform_name}] dm failed: {data}")
             return
         print(f"[{self.platform_name}] sent dm task {data.get('task_id')} to {target_node}")
+
+    async def _send_structured_dm(self, text: str) -> None:
+        try:
+            parts = shlex.split(text)
+        except ValueError as exc:
+            print(f"[{self.platform_name}] mepdmx parse error: {exc}")
+            return
+        if len(parts) < 2:
+            print(
+                f"[{self.platform_name}] usage: mepdmx <node_id> <message> "
+                "[--context id] [--reply-task id] [--reply-message id] [--turn-type type] "
+                "[--intent type] [--priority level]"
+            )
+            return
+
+        target_node = parts[0]
+        options: dict[str, str] = {}
+        message_parts: list[str] = []
+        i = 1
+        while i < len(parts):
+            token = parts[i]
+            if token.startswith("--"):
+                if i + 1 >= len(parts):
+                    print(f"[{self.platform_name}] missing value for {token}")
+                    return
+                options[token] = parts[i + 1]
+                i += 2
+                continue
+            message_parts.append(token)
+            i += 1
+
+        message = " ".join(message_parts).strip()
+        if not message:
+            print(f"[{self.platform_name}] usage: mepdmx <node_id> <message> [options]")
+            return
+
+        response = await self.client.submit_dm(
+            message,
+            target_node,
+            context_id=options.get("--context"),
+            reply_to_task_id=options.get("--reply-task"),
+            reply_to_message_id=options.get("--reply-message"),
+            turn_type=options.get("--turn-type", "chat_turn"),
+            intent_type=options.get("--intent", "chat.request"),
+            priority=options.get("--priority", "normal"),
+        )
+        data = response["json"]
+        if response["status_code"] != 200 or data.get("status") != "success":
+            print(f"[{self.platform_name}] dm failed: {data}")
+            return
+        print(
+            f"[{self.platform_name}] sent threaded dm task {data.get('task_id')} "
+            f"to {target_node} context={response.get('context_id')}"
+        )
 
     async def _offer_data(self, price: str, payload: str) -> None:
         bounty = -abs(float(price))
@@ -87,6 +142,9 @@ class StdioAdapter:
                 return True
             await self._send_dm(parts[1], parts[2])
             return True
+        if text.startswith("mepdmx "):
+            await self._send_structured_dm(text[7:])
+            return True
         if text.startswith("mepdata "):
             parts = text.split(" ", 2)
             if len(parts) < 3:
@@ -115,7 +173,10 @@ class StdioAdapter:
         await self.client.register()
         listener = asyncio.create_task(self.client.listen_results(self._handle_result))
         print(f"[{self.platform_name}] connected as {self.client.node_id}")
-        print(f"[{self.platform_name}] commands: mep, mepdm, mepdata, mepcancel, mepresult, mepbalance, exit")
+        print(
+            f"[{self.platform_name}] commands: "
+            "mep, mepdm, mepdmx, mepdata, mepcancel, mepresult, mepbalance, exit"
+        )
         loop = asyncio.get_running_loop()
         try:
             keep_going = True

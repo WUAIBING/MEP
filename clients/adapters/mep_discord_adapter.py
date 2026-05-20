@@ -1,4 +1,5 @@
 import os
+import shlex
 import tempfile
 
 import discord
@@ -76,6 +77,65 @@ async def mepdm(ctx, target_node: str, *, message: str):
     if task_id:
         client.task_channels[task_id] = str(ctx.channel.id)
     await ctx.send(f"Sent DM task {task_id} to {target_node}")
+
+
+@bot.command(name="mepdmx")
+async def mepdmx(ctx, *, text: str):
+    try:
+        parts = shlex.split(text)
+    except ValueError as exc:
+        await ctx.send(f"Parse error: {exc}")
+        return
+    if len(parts) < 2:
+        await ctx.send(
+            "Usage: !mepdmx <node_id> <message> "
+            "[--context id] [--reply-task id] [--reply-message id] "
+            "[--turn-type type] [--intent type] [--priority level]"
+        )
+        return
+
+    target_node = parts[0]
+    options: dict[str, str] = {}
+    message_parts: list[str] = []
+    i = 1
+    while i < len(parts):
+        token = parts[i]
+        if token.startswith("--"):
+            if i + 1 >= len(parts):
+                await ctx.send(f"Missing value for {token}")
+                return
+            options[token] = parts[i + 1]
+            i += 2
+            continue
+        message_parts.append(token)
+        i += 1
+
+    message = " ".join(message_parts).strip()
+    if not message:
+        await ctx.send("Usage: !mepdmx <node_id> <message> [options]")
+        return
+
+    response = await client.submit_dm(
+        message,
+        target_node,
+        context_id=options.get("--context"),
+        reply_to_task_id=options.get("--reply-task"),
+        reply_to_message_id=options.get("--reply-message"),
+        turn_type=options.get("--turn-type", "chat_turn"),
+        intent_type=options.get("--intent", "chat.request"),
+        priority=options.get("--priority", "normal"),
+    )
+    data = response["json"]
+    if response["status_code"] != 200 or data.get("status") != "success":
+        await ctx.send(f"Threaded DM failed: {data}")
+        return
+    task_id = data.get("task_id")
+    if task_id:
+        client.task_channels[task_id] = str(ctx.channel.id)
+    await ctx.send(
+        f"Sent threaded DM task {task_id} to {target_node} "
+        f"(context {response.get('context_id')})"
+    )
 
 
 @bot.command(name="mepdata")
