@@ -150,6 +150,78 @@ class TestSharedMEPClient(unittest.TestCase):
         self.assertIsNotNone(parsed)
         self.assertEqual(parsed["spec_version"], "mep.interbot.v1")
 
+    def test_submit_review_verdict_dm_builds_structured_verdict_payload(self):
+        with (
+            patch("clients.shared.mep_client.MEPIdentity", return_value=_FakeIdentity()),
+            patch("clients.shared.mep_client.requests.Session") as session_cls,
+        ):
+            session = session_cls.return_value
+            session.post.return_value = _FakeResponse()
+            client = MEPClient("unused.pem")
+
+            response = asyncio.run(
+                client.submit_review_verdict_dm(
+                    "approve_with_conditions",
+                    "Threading model is sound, but docs should mention ack expectations.",
+                    "node_governor",
+                    context_id="pr154-review",
+                    reply_to_task_id="task_review_request",
+                    reply_to_message_id="message_review_request",
+                    conditions=["Document expected ack behavior", "Keep reply_mode=new_dm"],
+                    human_recommendation="Merge after the follow-up docs note lands.",
+                )
+            )
+
+        submit_body = json.loads(session.post.call_args.kwargs["data"])
+        body = json.loads(submit_body["task"]["instructions"])
+        self.assertEqual(body["intent"], {"type": "review.response", "priority": "normal"})
+        self.assertEqual(body["conversation"]["turn_type"], "approval")
+        self.assertEqual(body["conversation"]["context_id"], "pr154-review")
+        self.assertEqual(body["conversation"]["reply_to_task_id"], "task_review_request")
+        self.assertEqual(body["conversation"]["reply_to_message_id"], "message_review_request")
+        self.assertEqual(body["task"]["title"], "Review verdict")
+        self.assertEqual(
+            body["task"]["inputs"]["review_verdict"],
+            {
+                "decision": "approve_with_conditions",
+                "rationale": "Threading model is sound, but docs should mention ack expectations.",
+                "conditions": ["Document expected ack behavior", "Keep reply_mode=new_dm"],
+                "human_recommendation": "Merge after the follow-up docs note lands.",
+            },
+        )
+        self.assertEqual(response["context_id"], "pr154-review")
+
+    def test_extract_review_verdict_reads_structured_verdict_payload(self):
+        payload = json.dumps(
+            {
+                "spec_version": "mep.interbot.v1",
+                "task": {
+                    "instructions": "Review verdict: approve",
+                    "inputs": {
+                        "review_verdict": {
+                            "decision": "approve",
+                            "rationale": "Looks good.",
+                            "conditions": ["Ship a short follow-up doc note", ""],
+                            "human_recommendation": "Safe to merge.",
+                        }
+                    },
+                    "expected_output": {"result_type": "text"},
+                },
+            }
+        )
+
+        verdict = MEPClient.extract_review_verdict(payload)
+
+        self.assertEqual(
+            verdict,
+            {
+                "decision": "approve",
+                "rationale": "Looks good.",
+                "conditions": ["Ship a short follow-up doc note"],
+                "human_recommendation": "Safe to merge.",
+            },
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

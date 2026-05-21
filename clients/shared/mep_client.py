@@ -15,6 +15,7 @@ from node.ws_connect import ws_connect
 HUB_URL = os.getenv("HUB_URL", "https://mep-hub.silentcopilot.ai")
 WS_URL = os.getenv("WS_URL", "wss://mep-hub.silentcopilot.ai")
 WS_HEARTBEAT_INTERVAL_SECONDS = float(os.getenv("MEP_WS_HEARTBEAT_INTERVAL_SECONDS", "60"))
+REVIEW_VERDICTS = {"approve", "approve_with_conditions", "request_changes", "block"}
 
 
 class MEPClient:
@@ -144,8 +145,18 @@ class MEPClient:
         result_type: str = "text",
         human_note: Optional[str] = None,
         trace_id: Optional[str] = None,
+        task_title: Optional[str] = None,
+        task_inputs: Optional[dict[str, Any]] = None,
     ) -> dict[str, Any]:
         message_id = str(uuid.uuid4())
+        task: dict[str, Any] = {
+            "instructions": message,
+            "expected_output": {"result_type": result_type},
+        }
+        if task_title:
+            task["title"] = task_title
+        if task_inputs:
+            task["inputs"] = task_inputs
         return {
             "spec_version": "mep.interbot.v1",
             "message_id": message_id,
@@ -163,10 +174,7 @@ class MEPClient:
                 "turn_type": turn_type,
             },
             "intent": {"type": intent_type, "priority": priority},
-            "task": {
-                "instructions": message,
-                "expected_output": {"result_type": result_type},
-            },
+            "task": task,
             "economics": {"bounty_seconds": 0.0, "currency": "SECONDS"},
             "delivery": {"reply_mode": "new_dm", "settlement_mode": "task_result"},
             **({"human_note": human_note} if human_note else {}),
@@ -324,6 +332,101 @@ class MEPClient:
         response["context_id"] = envelope["conversation"]["context_id"]
         return response
 
+    def build_review_verdict_message(
+        self,
+        verdict: str,
+        rationale: str,
+        target_node: str,
+        *,
+        context_id: str,
+        target_alias: Optional[str] = None,
+        reply_to_task_id: Optional[str] = None,
+        reply_to_message_id: Optional[str] = None,
+        conditions: Optional[list[str]] = None,
+        human_recommendation: Optional[str] = None,
+        priority: str = "normal",
+        human_note: Optional[str] = None,
+    ) -> dict[str, Any]:
+        normalized_verdict = verdict.strip().lower()
+        if normalized_verdict not in REVIEW_VERDICTS:
+            raise ValueError(f"unsupported review verdict: {verdict}")
+
+        normalized_rationale = rationale.strip()
+        if not normalized_rationale:
+            raise ValueError("review rationale must be non-empty")
+
+        normalized_conditions = self._normalize_string_list(conditions)
+        normalized_recommendation = (
+            human_recommendation.strip() if isinstance(human_recommendation, str) else None
+        )
+        verdict_payload: dict[str, Any] = {
+            "decision": normalized_verdict,
+            "rationale": normalized_rationale,
+            "conditions": normalized_conditions,
+        }
+        if normalized_recommendation:
+            verdict_payload["human_recommendation"] = normalized_recommendation
+
+        message_lines = [
+            f"Review verdict: {normalized_verdict}",
+            f"Rationale: {normalized_rationale}",
+        ]
+        if normalized_conditions:
+            message_lines.append("Conditions:")
+            message_lines.extend(f"- {condition}" for condition in normalized_conditions)
+        if normalized_recommendation:
+            message_lines.append(f"Human recommendation: {normalized_recommendation}")
+
+        return self.build_interbot_message(
+            "\n".join(message_lines),
+            target_node,
+            target_alias=target_alias,
+            intent_type="review.response",
+            priority=priority,
+            context_id=context_id,
+            reply_to_task_id=reply_to_task_id,
+            reply_to_message_id=reply_to_message_id,
+            turn_type="approval",
+            result_type="text",
+            human_note=human_note,
+            task_title="Review verdict",
+            task_inputs={"review_verdict": verdict_payload},
+        )
+
+    async def submit_review_verdict_dm(
+        self,
+        verdict: str,
+        rationale: str,
+        target_node: str,
+        *,
+        context_id: str,
+        target_alias: Optional[str] = None,
+        reply_to_task_id: Optional[str] = None,
+        reply_to_message_id: Optional[str] = None,
+        conditions: Optional[list[str]] = None,
+        human_recommendation: Optional[str] = None,
+        priority: str = "normal",
+        human_note: Optional[str] = None,
+    ) -> dict:
+        envelope = self.build_review_verdict_message(
+            verdict,
+            rationale,
+            target_node,
+            context_id=context_id,
+            target_alias=target_alias,
+            reply_to_task_id=reply_to_task_id,
+            reply_to_message_id=reply_to_message_id,
+            conditions=conditions,
+            human_recommendation=human_recommendation,
+            priority=priority,
+            human_note=human_note,
+        )
+        response = await self.submit_task(json.dumps(envelope), 0.0, None, target_node)
+        response["message_id"] = envelope["message_id"]
+        response["trace_id"] = envelope["trace_id"]
+        response["context_id"] = envelope["conversation"]["context_id"]
+        return response
+
     async def post_brainstorm_message(
         self,
         session_id: str,
@@ -383,6 +486,36 @@ class MEPClient:
                 return instructions.strip(), parsed
         return payload_text, parsed
 
+    @classmethod
+    def extract_review_verdict(cls, payload_text: str) -> Optional[dict[str, Any]]:
+        parsed = cls.parse_interbot_payload(payload_text)
+        if not parsed:
+            return None
+        task = parsed.get("task")
+        if not isinstance(task, dict):
+            return None
+        inputs = task.get("inputs")
+        if not isinstance(inputs, dict):
+            return None
+        review_verdict = inputs.get("review_verdict")
+        if not isinstance(review_verdict, dict):
+            return None
+        decision = review_verdict.get("decision")
+        rationale = review_verdict.get("rationale")
+        if not isinstance(decision, str) or decision not in REVIEW_VERDICTS:
+            return None
+        if not isinstance(rationale, str) or not rationale.strip():
+            return None
+        extracted: dict[str, Any] = {
+            "decision": decision,
+            "rationale": rationale.strip(),
+            "conditions": cls._normalize_string_list(review_verdict.get("conditions")),
+        }
+        human_recommendation = review_verdict.get("human_recommendation")
+        if isinstance(human_recommendation, str) and human_recommendation.strip():
+            extracted["human_recommendation"] = human_recommendation.strip()
+        return extracted
+
     @staticmethod
     def _default_reply_intent_type(inbound_intent_type: Optional[str]) -> str:
         if inbound_intent_type == "review.request":
@@ -394,6 +527,18 @@ class MEPClient:
         if inbound_turn_type == "review_request":
             return "review_response"
         return "chat_turn"
+
+    @staticmethod
+    def _normalize_string_list(values: Any) -> list[str]:
+        if not isinstance(values, list):
+            return []
+        normalized: list[str] = []
+        for value in values:
+            if isinstance(value, str):
+                stripped = value.strip()
+                if stripped:
+                    normalized.append(stripped)
+        return normalized
 
     async def listen_results(
         self,
