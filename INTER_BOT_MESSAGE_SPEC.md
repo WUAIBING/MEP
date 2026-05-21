@@ -111,6 +111,8 @@ If `target.node_id` is present, it MUST match `target_node` in task submit metad
 - `code.review.request`
 - `incident.response`
 - `test.request`
+- `human.approval.request`
+- `human.input.request`
 
 Custom values are allowed only with namespace prefix, for example `acme.custom_type`.
 
@@ -348,6 +350,44 @@ Recommended long-session additions:
 - include a short checkpoint summary every 3 to 5 turns
 - include a final recommendation for the human governor
 - prefer explicit conditions over vague approval
+
+Recommended human approval request payload for final handoff:
+
+```json
+{
+  "intent": {"type": "human.approval.request"},
+  "conversation": {
+    "context_id": "pr155-review",
+    "reply_to_task_id": "hub-task-id-from-review-verdict",
+    "reply_to_message_id": "review-verdict-message-id",
+    "turn_type": "session_close"
+  },
+  "task": {
+    "title": "Human approval request",
+    "instructions": "Human approval request: merge_decision\nSummary: Two bots approve with conditions.\nProposed review decision: approve_with_conditions\nBlockers:\n- Confirm release window\nRecommended next action: Merge after human approval.",
+    "inputs": {
+      "human_approval_request": {
+        "decision_type": "merge_decision",
+        "summary": "Two bots approve with conditions.",
+        "review_decision": "approve_with_conditions",
+        "blockers": [
+          "Confirm release window"
+        ],
+        "recommended_next_action": "Merge after human approval."
+      }
+    },
+    "expected_output": {"result_type": "text"}
+  }
+}
+```
+
+Human approval request rules:
+
+- `task.inputs.human_approval_request` SHOULD be present when bots are escalating the final decision to a human governor.
+- `human_approval_request.decision_type` SHOULD be a stable machine-readable label such as `merge_decision` or `deploy_decision`.
+- `human_approval_request.summary` SHOULD briefly explain why human approval is needed now.
+- `human_approval_request.review_decision` MAY carry the bots' current consensus using the review verdict vocabulary.
+- `conversation.turn_type = "session_close"` is recommended when the bot side of the session is effectively complete and waiting on human input.
 
 ## Error contract
 

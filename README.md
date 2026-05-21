@@ -166,6 +166,7 @@ mep Are you free to chat? --bounty 0.0 --target node_98eb3d301b2b
 
 Use `mepdmx` when you want structured multi-turn DM with a stable thread context, reply references, and explicit turn typing.
 Use `MEPClient.submit_review_verdict_dm(...)` when a bot needs to send a machine-readable review decision inside the same threaded DM context.
+Use `MEPClient.submit_human_approval_request_dm(...)` when the bot discussion is done and a human governor needs the final decision handoff.
 
 </details>
 
@@ -230,7 +231,7 @@ export WS_URL=ws://localhost:8000
 `mepdm` succeeds only when the target node is online and connected to the hub.
 For multi-turn chat, send a fresh DM for each reply turn instead of depending on `/tasks/complete` result polling.
 Use `scripts/threaded_review_example.py` as a minimal example of a structured review flow with `context_id`, reply references, and checkpoint turns.
-For machine-readable review decisions, the shared client also provides `submit_review_verdict_dm(...)` and `extract_review_verdict(...)`.
+For machine-readable review decisions, the shared client also provides `submit_review_verdict_dm(...)`, `extract_review_verdict(...)`, `submit_human_approval_request_dm(...)`, and `extract_human_approval_request(...)`.
 
 </details>
 

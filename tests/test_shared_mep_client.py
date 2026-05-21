@@ -222,6 +222,79 @@ class TestSharedMEPClient(unittest.TestCase):
             },
         )
 
+    def test_submit_human_approval_request_dm_builds_structured_payload(self):
+        with (
+            patch("clients.shared.mep_client.MEPIdentity", return_value=_FakeIdentity()),
+            patch("clients.shared.mep_client.requests.Session") as session_cls,
+        ):
+            session = session_cls.return_value
+            session.post.return_value = _FakeResponse()
+            client = MEPClient("unused.pem")
+
+            response = asyncio.run(
+                client.submit_human_approval_request_dm(
+                    "Two bots approve with conditions; no remaining blocker in code.",
+                    "node_master_wu",
+                    context_id="pr155-review",
+                    reply_to_task_id="task_review_verdict",
+                    reply_to_message_id="message_review_verdict",
+                    review_decision="approve_with_conditions",
+                    blockers=["Need explicit merge confirmation from the human governor"],
+                    recommended_next_action="Merge after human approval.",
+                )
+            )
+
+        submit_body = json.loads(session.post.call_args.kwargs["data"])
+        body = json.loads(submit_body["task"]["instructions"])
+        self.assertEqual(body["intent"], {"type": "human.approval.request", "priority": "high"})
+        self.assertEqual(body["conversation"]["turn_type"], "session_close")
+        self.assertEqual(body["conversation"]["context_id"], "pr155-review")
+        self.assertEqual(body["task"]["title"], "Human approval request")
+        self.assertEqual(
+            body["task"]["inputs"]["human_approval_request"],
+            {
+                "decision_type": "merge_decision",
+                "summary": "Two bots approve with conditions; no remaining blocker in code.",
+                "review_decision": "approve_with_conditions",
+                "blockers": ["Need explicit merge confirmation from the human governor"],
+                "recommended_next_action": "Merge after human approval.",
+            },
+        )
+        self.assertEqual(response["context_id"], "pr155-review")
+
+    def test_extract_human_approval_request_reads_structured_payload(self):
+        payload = json.dumps(
+            {
+                "spec_version": "mep.interbot.v1",
+                "task": {
+                    "instructions": "Human approval request: merge_decision",
+                    "inputs": {
+                        "human_approval_request": {
+                            "decision_type": "merge_decision",
+                            "summary": "Need final merge confirmation.",
+                            "review_decision": "approve",
+                            "blockers": ["Confirm release window", ""],
+                            "recommended_next_action": "Merge after approval.",
+                        }
+                    },
+                    "expected_output": {"result_type": "text"},
+                },
+            }
+        )
+
+        request = MEPClient.extract_human_approval_request(payload)
+
+        self.assertEqual(
+            request,
+            {
+                "decision_type": "merge_decision",
+                "summary": "Need final merge confirmation.",
+                "review_decision": "approve",
+                "blockers": ["Confirm release window"],
+                "recommended_next_action": "Merge after approval.",
+            },
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
