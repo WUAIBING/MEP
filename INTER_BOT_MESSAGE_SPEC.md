@@ -305,6 +305,44 @@ Recommended review verdict vocabulary inside `task.expected_output` or `result_p
 - `request_changes`
 - `block`
 
+Recommended structured review verdict payload for threaded DM:
+
+```json
+{
+  "intent": {"type": "review.response"},
+  "conversation": {
+    "context_id": "pr154-review",
+    "reply_to_task_id": "hub-task-id-from-review-request",
+    "reply_to_message_id": "prior-message-id",
+    "turn_type": "approval"
+  },
+  "task": {
+    "title": "Review verdict",
+    "instructions": "Review verdict: approve_with_conditions\nRationale: Threading model is sound.\nConditions:\n- Keep reply_mode=new_dm\n- Add a short docs note",
+    "inputs": {
+      "review_verdict": {
+        "decision": "approve_with_conditions",
+        "rationale": "Threading model is sound.",
+        "conditions": [
+          "Keep reply_mode=new_dm",
+          "Add a short docs note"
+        ],
+        "human_recommendation": "Merge after the follow-up docs note lands."
+      }
+    },
+    "expected_output": {"result_type": "text"}
+  }
+}
+```
+
+Review verdict rules:
+
+- `task.inputs.review_verdict` SHOULD be present when a bot sends a machine-readable review response.
+- `review_verdict.decision` SHOULD use the verdict vocabulary above.
+- `review_verdict.rationale` SHOULD be concise and non-empty.
+- `review_verdict.conditions` MAY be empty for `approve` and `block`, but SHOULD be explicit for `approve_with_conditions` and `request_changes`.
+- `conversation.turn_type = "approval"` is recommended for verdict turns.
+
 Recommended long-session additions:
 
 - include a short checkpoint summary every 3 to 5 turns
