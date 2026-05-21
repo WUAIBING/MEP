@@ -16,6 +16,7 @@ HUB_URL = os.getenv("HUB_URL", "https://mep-hub.silentcopilot.ai")
 WS_URL = os.getenv("WS_URL", "wss://mep-hub.silentcopilot.ai")
 WS_HEARTBEAT_INTERVAL_SECONDS = float(os.getenv("MEP_WS_HEARTBEAT_INTERVAL_SECONDS", "60"))
 REVIEW_VERDICTS = {"approve", "approve_with_conditions", "request_changes", "block"}
+HUMAN_APPROVAL_DECISION_TYPES = {"merge_decision", "deploy_decision", "policy_decision"}
 
 
 class MEPClient:
@@ -427,6 +428,112 @@ class MEPClient:
         response["context_id"] = envelope["conversation"]["context_id"]
         return response
 
+    def build_human_approval_request_message(
+        self,
+        summary: str,
+        target_node: str,
+        *,
+        context_id: str,
+        decision_type: str = "merge_decision",
+        target_alias: Optional[str] = None,
+        reply_to_task_id: Optional[str] = None,
+        reply_to_message_id: Optional[str] = None,
+        review_decision: Optional[str] = None,
+        blockers: Optional[list[str]] = None,
+        recommended_next_action: Optional[str] = None,
+        priority: str = "high",
+        human_note: Optional[str] = None,
+    ) -> dict[str, Any]:
+        normalized_summary = summary.strip()
+        if not normalized_summary:
+            raise ValueError("human approval summary must be non-empty")
+
+        normalized_decision_type = decision_type.strip().lower()
+        if normalized_decision_type not in HUMAN_APPROVAL_DECISION_TYPES:
+            raise ValueError(f"unsupported human approval decision type: {decision_type}")
+
+        normalized_review_decision = review_decision.strip().lower() if isinstance(review_decision, str) else None
+        if normalized_review_decision and normalized_review_decision not in REVIEW_VERDICTS:
+            raise ValueError(f"unsupported review decision: {review_decision}")
+
+        normalized_blockers = self._normalize_string_list(blockers)
+        normalized_next_action = (
+            recommended_next_action.strip() if isinstance(recommended_next_action, str) else None
+        )
+        approval_payload: dict[str, Any] = {
+            "decision_type": normalized_decision_type,
+            "summary": normalized_summary,
+            "blockers": normalized_blockers,
+        }
+        if normalized_review_decision:
+            approval_payload["review_decision"] = normalized_review_decision
+        if normalized_next_action:
+            approval_payload["recommended_next_action"] = normalized_next_action
+
+        message_lines = [
+            f"Human approval request: {normalized_decision_type}",
+            f"Summary: {normalized_summary}",
+        ]
+        if normalized_review_decision:
+            message_lines.append(f"Proposed review decision: {normalized_review_decision}")
+        if normalized_blockers:
+            message_lines.append("Blockers:")
+            message_lines.extend(f"- {blocker}" for blocker in normalized_blockers)
+        if normalized_next_action:
+            message_lines.append(f"Recommended next action: {normalized_next_action}")
+
+        return self.build_interbot_message(
+            "\n".join(message_lines),
+            target_node,
+            target_alias=target_alias,
+            intent_type="human.approval.request",
+            priority=priority,
+            context_id=context_id,
+            reply_to_task_id=reply_to_task_id,
+            reply_to_message_id=reply_to_message_id,
+            turn_type="session_close",
+            result_type="text",
+            human_note=human_note,
+            task_title="Human approval request",
+            task_inputs={"human_approval_request": approval_payload},
+        )
+
+    async def submit_human_approval_request_dm(
+        self,
+        summary: str,
+        target_node: str,
+        *,
+        context_id: str,
+        decision_type: str = "merge_decision",
+        target_alias: Optional[str] = None,
+        reply_to_task_id: Optional[str] = None,
+        reply_to_message_id: Optional[str] = None,
+        review_decision: Optional[str] = None,
+        blockers: Optional[list[str]] = None,
+        recommended_next_action: Optional[str] = None,
+        priority: str = "high",
+        human_note: Optional[str] = None,
+    ) -> dict:
+        envelope = self.build_human_approval_request_message(
+            summary,
+            target_node,
+            context_id=context_id,
+            decision_type=decision_type,
+            target_alias=target_alias,
+            reply_to_task_id=reply_to_task_id,
+            reply_to_message_id=reply_to_message_id,
+            review_decision=review_decision,
+            blockers=blockers,
+            recommended_next_action=recommended_next_action,
+            priority=priority,
+            human_note=human_note,
+        )
+        response = await self.submit_task(json.dumps(envelope), 0.0, None, target_node)
+        response["message_id"] = envelope["message_id"]
+        response["trace_id"] = envelope["trace_id"]
+        response["context_id"] = envelope["conversation"]["context_id"]
+        return response
+
     async def post_brainstorm_message(
         self,
         session_id: str,
@@ -514,6 +621,39 @@ class MEPClient:
         human_recommendation = review_verdict.get("human_recommendation")
         if isinstance(human_recommendation, str) and human_recommendation.strip():
             extracted["human_recommendation"] = human_recommendation.strip()
+        return extracted
+
+    @classmethod
+    def extract_human_approval_request(cls, payload_text: str) -> Optional[dict[str, Any]]:
+        parsed = cls.parse_interbot_payload(payload_text)
+        if not parsed:
+            return None
+        task = parsed.get("task")
+        if not isinstance(task, dict):
+            return None
+        inputs = task.get("inputs")
+        if not isinstance(inputs, dict):
+            return None
+        approval_request = inputs.get("human_approval_request")
+        if not isinstance(approval_request, dict):
+            return None
+        decision_type = approval_request.get("decision_type")
+        summary = approval_request.get("summary")
+        if not isinstance(decision_type, str) or decision_type not in HUMAN_APPROVAL_DECISION_TYPES:
+            return None
+        if not isinstance(summary, str) or not summary.strip():
+            return None
+        extracted: dict[str, Any] = {
+            "decision_type": decision_type,
+            "summary": summary.strip(),
+            "blockers": cls._normalize_string_list(approval_request.get("blockers")),
+        }
+        review_decision = approval_request.get("review_decision")
+        if isinstance(review_decision, str) and review_decision in REVIEW_VERDICTS:
+            extracted["review_decision"] = review_decision
+        recommended_next_action = approval_request.get("recommended_next_action")
+        if isinstance(recommended_next_action, str) and recommended_next_action.strip():
+            extracted["recommended_next_action"] = recommended_next_action.strip()
         return extracted
 
     @staticmethod
