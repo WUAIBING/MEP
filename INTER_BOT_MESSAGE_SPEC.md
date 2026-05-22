@@ -171,6 +171,19 @@ Recommended behavior:
 - If a turn is a direct reply to a prior DM task, include `reply_to_task_id`.
 - If the runtime preserves logical message IDs beyond hub task IDs, also include `reply_to_message_id`.
 - Long sessions SHOULD emit a `checkpoint` turn at a predictable cadence, for example every 3 to 5 turns.
+- Long sessions MAY include `task.inputs.session_safety` so senders can declare machine-readable turn, timeout, and checkpoint guardrails.
+
+Recommended `task.inputs.session_safety` fields:
+
+- `max_turns`
+  - positive integer
+  - upper bound on the next conversational turn index a bot should allow before closing the session
+- `max_duration_seconds`
+  - positive integer
+  - maximum wall-clock age of the session before the runtime should stop and ask for a fresh handoff
+- `checkpoint_interval`
+  - positive integer
+  - cadence for emitting `checkpoint` turns, for example every 3 turns
 
 ## Compatibility mode (legacy plain text)
 
@@ -321,12 +334,16 @@ Recommended structured review verdict payload for threaded DM:
   "task": {
     "title": "Review verdict",
     "instructions": "Review verdict: approve_with_conditions\nRationale: Threading model is sound.\nConditions:\n- Keep reply_mode=new_dm\n- Add a short docs note",
+      "session_safety": {
+        "max_turns": 6,
+        "max_duration_seconds": 900,
+        "checkpoint_interval": 3
+      },
     "inputs": {
       "review_verdict": {
         "decision": "approve_with_conditions",
         "rationale": "Threading model is sound.",
         "conditions": [
-          "Keep reply_mode=new_dm",
           "Add a short docs note"
         ],
         "human_recommendation": "Merge after the follow-up docs note lands."
@@ -350,6 +367,7 @@ Recommended long-session additions:
 - include a short checkpoint summary every 3 to 5 turns
 - include a final recommendation for the human governor
 - prefer explicit conditions over vague approval
+- declare `task.inputs.session_safety` when the sender wants the receiver to enforce max-turn, timeout, or checkpoint cadence rules
 
 Recommended human approval request payload for final handoff:
 

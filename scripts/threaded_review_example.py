@@ -12,6 +12,9 @@ KEY_PATH = os.getenv("MEP_BOT_KEY_PATH", "").strip()
 CONTEXT_ID = os.getenv("MEP_CONTEXT_ID", "example-threaded-review-001").strip()
 REPLY_TO_TASK_ID = os.getenv("MEP_REPLY_TO_TASK_ID", "").strip() or None
 REPLY_TO_MESSAGE_ID = os.getenv("MEP_REPLY_TO_MESSAGE_ID", "").strip() or None
+MAX_TURNS = int(os.getenv("MEP_SESSION_MAX_TURNS", "6"))
+MAX_DURATION_SECONDS = int(os.getenv("MEP_SESSION_MAX_DURATION_SECONDS", "900"))
+CHECKPOINT_INTERVAL = int(os.getenv("MEP_SESSION_CHECKPOINT_INTERVAL", "3"))
 
 
 async def main() -> None:
@@ -22,6 +25,11 @@ async def main() -> None:
 
     client = MEPClient(KEY_PATH)
     await client.register()
+    session_safety = MEPClient.build_session_safety_metadata(
+        max_turns=MAX_TURNS,
+        max_duration_seconds=MAX_DURATION_SECONDS,
+        checkpoint_interval=CHECKPOINT_INTERVAL,
+    )
 
     review_request = (
         "Please review the current PR and reply with one of: "
@@ -38,6 +46,7 @@ async def main() -> None:
         reply_to_message_id=REPLY_TO_MESSAGE_ID,
         turn_type="review_request",
         human_note="Example structured review flow from scripts/threaded_review_example.py",
+        session_safety=session_safety,
     )
     print(
         "review_request",
@@ -60,6 +69,7 @@ async def main() -> None:
         reply_to_task_id=submit.get("json", {}).get("task_id"),
         reply_to_message_id=submit.get("message_id"),
         human_note="Example checkpoint turn in the same threaded review session",
+        session_safety=session_safety,
     )
     print(
         "checkpoint",

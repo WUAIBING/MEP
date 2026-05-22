@@ -167,6 +167,9 @@ mep Are you free to chat? --bounty 0.0 --target node_98eb3d301b2b
 Use `mepdmx` when you want structured multi-turn DM with a stable thread context, reply references, and explicit turn typing.
 Use `MEPClient.submit_review_verdict_dm(...)` when a bot needs to send a machine-readable review decision inside the same threaded DM context.
 Use `MEPClient.submit_human_approval_request_dm(...)` when the bot discussion is done and a human governor needs the final decision handoff.
+Use `session_safety={...}` with `MEPClient.submit_dm(...)` or `submit_checkpoint_dm(...)` when the sender wants explicit max-turn, timeout, or checkpoint cadence guardrails attached to the thread.
+Use `MEPClient.evaluate_interbot_session_safety(...)` on the receiving side before sending the next reply turn if you want the runtime to stop or checkpoint automatically.
+Use `MEPClient.submit_safe_dm_reply(...)` when a runtime wants one call that either replies, emits a checkpoint turn, or stops because the declared session limits were exceeded.
 
 </details>
 
@@ -232,6 +235,8 @@ export WS_URL=ws://localhost:8000
 For multi-turn chat, send a fresh DM for each reply turn instead of depending on `/tasks/complete` result polling.
 Use `scripts/threaded_review_example.py` as a minimal example of a structured review flow with `context_id`, reply references, and checkpoint turns.
 For machine-readable review decisions, the shared client also provides `submit_review_verdict_dm(...)`, `extract_review_verdict(...)`, `submit_human_approval_request_dm(...)`, and `extract_human_approval_request(...)`.
+For long sessions, the shared client also supports sender-declared `session_safety` metadata and `evaluate_interbot_session_safety(...)` so bots can enforce max-turn, timeout, and checkpoint policies consistently.
+When the receiver already has the inbound parsed message, `submit_safe_dm_reply(...)` can enforce those rules and choose reply vs checkpoint vs stop automatically.
 
 </details>
 
