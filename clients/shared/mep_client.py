@@ -148,6 +148,7 @@ class MEPClient:
         trace_id: Optional[str] = None,
         task_title: Optional[str] = None,
         task_inputs: Optional[dict[str, Any]] = None,
+        session_safety: Optional[dict[str, Any]] = None,
     ) -> dict[str, Any]:
         message_id = str(uuid.uuid4())
         task: dict[str, Any] = {
@@ -156,8 +157,12 @@ class MEPClient:
         }
         if task_title:
             task["title"] = task_title
-        if task_inputs:
-            task["inputs"] = task_inputs
+        inputs: dict[str, Any] = dict(task_inputs or {})
+        normalized_session_safety = self.build_session_safety_metadata(**session_safety) if session_safety else {}
+        if normalized_session_safety:
+            inputs["session_safety"] = normalized_session_safety
+        if inputs:
+            task["inputs"] = inputs
         return {
             "spec_version": "mep.interbot.v1",
             "message_id": message_id,
@@ -194,6 +199,7 @@ class MEPClient:
         reply_to_message_id: Optional[str] = None,
         turn_type: str = "chat_turn",
         human_note: Optional[str] = None,
+        session_safety: Optional[dict[str, Any]] = None,
     ) -> dict:
         envelope = self.build_interbot_message(
             message,
@@ -206,6 +212,7 @@ class MEPClient:
             reply_to_message_id=reply_to_message_id,
             turn_type=turn_type,
             human_note=human_note,
+            session_safety=session_safety,
         )
         response = await self.submit_task(json.dumps(envelope), 0.0, None, target_node)
         response["message_id"] = envelope["message_id"]
@@ -251,6 +258,7 @@ class MEPClient:
             turn_type=turn_type or self._default_reply_turn_type(inbound_turn_type),
             human_note=human_note,
             trace_id=inbound_message.get("trace_id") if isinstance(inbound_message.get("trace_id"), str) else None,
+            session_safety=self._extract_session_safety_from_message(inbound_message),
         )
 
     async def submit_dm_reply(
@@ -280,6 +288,77 @@ class MEPClient:
         response["context_id"] = envelope["conversation"]["context_id"]
         return response
 
+    async def submit_safe_dm_reply(
+        self,
+        reply_text: str,
+        inbound_message: dict[str, Any],
+        *,
+        next_turn_index: int,
+        checkpoint_summary: Optional[str] = None,
+        inbound_task_id: Optional[str] = None,
+        turn_type: Optional[str] = None,
+        intent_type: Optional[str] = None,
+        priority: Optional[str] = None,
+        human_note: Optional[str] = None,
+        now_ms: Optional[int] = None,
+    ) -> dict[str, Any]:
+        evaluation = self.evaluate_interbot_session_safety_message(
+            inbound_message,
+            next_turn_index=next_turn_index,
+            now_ms=now_ms,
+        )
+        context_id = self._extract_context_id(inbound_message)
+
+        if evaluation["should_stop"]:
+            return {
+                "status": "stopped",
+                "reply_action": "stop",
+                "context_id": context_id,
+                "session_safety": evaluation["session_safety"],
+                "safety": evaluation,
+            }
+
+        if evaluation["should_checkpoint"]:
+            source = inbound_message.get("source")
+            if not isinstance(source, dict) or not isinstance(source.get("node_id"), str):
+                raise ValueError("inbound inter-bot message is missing source.node_id")
+            summary = (
+                checkpoint_summary.strip()
+                if isinstance(checkpoint_summary, str) and checkpoint_summary.strip()
+                else f"Checkpoint: session reached turn {next_turn_index}. Confirm whether to continue."
+            )
+            checkpoint_response = await self.submit_checkpoint_dm(
+                summary,
+                source["node_id"],
+                context_id=context_id,
+                target_alias=source.get("alias") if isinstance(source.get("alias"), str) else None,
+                reply_to_task_id=inbound_task_id,
+                reply_to_message_id=inbound_message.get("message_id")
+                if isinstance(inbound_message.get("message_id"), str)
+                else None,
+                priority=priority or "normal",
+                human_note=human_note,
+                session_safety=self._extract_session_safety_from_message(inbound_message),
+            )
+            checkpoint_response["status"] = "checkpointed"
+            checkpoint_response["reply_action"] = "checkpoint"
+            checkpoint_response["safety"] = evaluation
+            return checkpoint_response
+
+        response = await self.submit_dm_reply(
+            reply_text,
+            inbound_message,
+            inbound_task_id=inbound_task_id,
+            turn_type=turn_type,
+            intent_type=intent_type,
+            priority=priority,
+            human_note=human_note,
+        )
+        response["status"] = "replied"
+        response["reply_action"] = "reply"
+        response["safety"] = evaluation
+        return response
+
     def build_checkpoint_message(
         self,
         summary: str,
@@ -291,6 +370,7 @@ class MEPClient:
         reply_to_message_id: Optional[str] = None,
         priority: str = "normal",
         human_note: Optional[str] = None,
+        session_safety: Optional[dict[str, Any]] = None,
     ) -> dict[str, Any]:
         return self.build_interbot_message(
             summary,
@@ -303,6 +383,7 @@ class MEPClient:
             reply_to_message_id=reply_to_message_id,
             turn_type="checkpoint",
             human_note=human_note,
+            session_safety=session_safety,
         )
 
     async def submit_checkpoint_dm(
@@ -316,6 +397,7 @@ class MEPClient:
         reply_to_message_id: Optional[str] = None,
         priority: str = "normal",
         human_note: Optional[str] = None,
+        session_safety: Optional[dict[str, Any]] = None,
     ) -> dict:
         envelope = self.build_checkpoint_message(
             summary,
@@ -326,6 +408,7 @@ class MEPClient:
             reply_to_message_id=reply_to_message_id,
             priority=priority,
             human_note=human_note,
+            session_safety=session_safety,
         )
         response = await self.submit_task(json.dumps(envelope), 0.0, None, target_node)
         response["message_id"] = envelope["message_id"]
@@ -624,6 +707,114 @@ class MEPClient:
         return extracted
 
     @classmethod
+    def extract_session_safety(cls, payload_text: str) -> Optional[dict[str, int]]:
+        parsed = cls.parse_interbot_payload(payload_text)
+        if not parsed:
+            return None
+        return cls._extract_session_safety_from_message(parsed)
+
+    @classmethod
+    def evaluate_interbot_session_safety_message(
+        cls,
+        message: dict[str, Any],
+        *,
+        next_turn_index: int,
+        now_ms: Optional[int] = None,
+    ) -> dict[str, Any]:
+        if next_turn_index < 1:
+            raise ValueError("next_turn_index must be at least 1")
+
+        session_safety = cls._extract_session_safety_from_message(message)
+        if not session_safety:
+            return {
+                "session_safety": None,
+                "next_turn_index": next_turn_index,
+                "elapsed_ms": None,
+                "should_checkpoint": False,
+                "should_stop": False,
+                "violations": [],
+            }
+
+        evaluated_now_ms = now_ms if now_ms is not None else int(time.time() * 1000)
+        started_at_ms = message.get("timestamp_ms") if isinstance(message.get("timestamp_ms"), int) else None
+        elapsed_ms = (
+            max(0, evaluated_now_ms - started_at_ms)
+            if started_at_ms is not None and evaluated_now_ms >= started_at_ms
+            else None
+        )
+        violations: list[str] = []
+
+        max_turns = session_safety.get("max_turns")
+        if isinstance(max_turns, int) and next_turn_index > max_turns:
+            violations.append("max_turns_exceeded")
+
+        max_duration_seconds = session_safety.get("max_duration_seconds")
+        if isinstance(max_duration_seconds, int) and elapsed_ms is not None:
+            if elapsed_ms > max_duration_seconds * 1000:
+                violations.append("max_duration_exceeded")
+
+        checkpoint_interval = session_safety.get("checkpoint_interval")
+        should_checkpoint = (
+            isinstance(checkpoint_interval, int)
+            and checkpoint_interval > 0
+            and next_turn_index > 1
+            and next_turn_index % checkpoint_interval == 0
+            and not violations
+        )
+
+        return {
+            "session_safety": session_safety,
+            "next_turn_index": next_turn_index,
+            "elapsed_ms": elapsed_ms,
+            "should_checkpoint": should_checkpoint,
+            "should_stop": bool(violations),
+            "violations": violations,
+        }
+
+    @classmethod
+    def evaluate_interbot_session_safety(
+        cls,
+        payload_text: str,
+        *,
+        next_turn_index: int,
+        now_ms: Optional[int] = None,
+    ) -> dict[str, Any]:
+        if next_turn_index < 1:
+            raise ValueError("next_turn_index must be at least 1")
+
+        parsed = cls.parse_interbot_payload(payload_text)
+        if not parsed:
+            raise ValueError("payload_text is not a valid mep.interbot.v1 payload")
+        return cls.evaluate_interbot_session_safety_message(
+            parsed,
+            next_turn_index=next_turn_index,
+            now_ms=now_ms,
+        )
+
+    @classmethod
+    def build_session_safety_metadata(
+        cls,
+        *,
+        max_turns: Optional[int] = None,
+        max_duration_seconds: Optional[int] = None,
+        checkpoint_interval: Optional[int] = None,
+    ) -> dict[str, int]:
+        normalized: dict[str, int] = {}
+        if max_turns is not None:
+            normalized["max_turns"] = cls._normalize_positive_int(max_turns, "max_turns")
+        if max_duration_seconds is not None:
+            normalized["max_duration_seconds"] = cls._normalize_positive_int(
+                max_duration_seconds, "max_duration_seconds"
+            )
+        if checkpoint_interval is not None:
+            normalized["checkpoint_interval"] = cls._normalize_positive_int(
+                checkpoint_interval, "checkpoint_interval"
+            )
+        if not normalized:
+            raise ValueError("at least one session safety guard must be provided")
+        return normalized
+
+    @classmethod
     def extract_human_approval_request(cls, payload_text: str) -> Optional[dict[str, Any]]:
         parsed = cls.parse_interbot_payload(payload_text)
         if not parsed:
@@ -679,6 +870,42 @@ class MEPClient:
                 if stripped:
                     normalized.append(stripped)
         return normalized
+
+    @classmethod
+    def _extract_session_safety_from_message(cls, message: dict[str, Any]) -> Optional[dict[str, int]]:
+        task = message.get("task")
+        if not isinstance(task, dict):
+            return None
+        inputs = task.get("inputs")
+        if not isinstance(inputs, dict):
+            return None
+        session_safety = inputs.get("session_safety")
+        if not isinstance(session_safety, dict):
+            return None
+
+        normalized: dict[str, int] = {}
+        for field in ("max_turns", "max_duration_seconds", "checkpoint_interval"):
+            value = session_safety.get(field)
+            if value is None:
+                continue
+            try:
+                normalized[field] = cls._normalize_positive_int(value, field)
+            except ValueError:
+                return None
+        return normalized or None
+
+    @staticmethod
+    def _normalize_positive_int(value: Any, field_name: str) -> int:
+        if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+            raise ValueError(f"{field_name} must be a positive integer")
+        return value
+
+    @staticmethod
+    def _extract_context_id(message: dict[str, Any]) -> Optional[str]:
+        conversation = message.get("conversation")
+        if isinstance(conversation, dict) and isinstance(conversation.get("context_id"), str):
+            return conversation.get("context_id")
+        return None
 
     async def listen_results(
         self,
