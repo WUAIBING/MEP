@@ -2,7 +2,7 @@ import asyncio
 import os
 import shlex
 import tempfile
-from typing import Optional
+from typing import Any, Optional
 
 from clients.shared.commands import parse_task_args
 from clients.shared.mep_client import MEPClient
@@ -16,11 +16,33 @@ class StdioAdapter:
         self.platform_name = platform_name
         self.default_model = default_model
         self.client = MEPClient(key_path)
+        self._recent_interbot_results: dict[str, dict[str, Any]] = {}
 
     async def _handle_result(self, data: dict) -> None:
         task_id = data.get("task_id")
         result = data.get("result_payload", "")
         print(f"[{self.platform_name}] task_result {task_id}: {result}")
+        if isinstance(task_id, str) and isinstance(result, str):
+            parsed = self.client.parse_interbot_payload(result)
+            if parsed:
+                self._remember_interbot_result(task_id, result, parsed)
+                context_id = None
+                conversation = parsed.get("conversation")
+                if isinstance(conversation, dict) and isinstance(conversation.get("context_id"), str):
+                    context_id = conversation["context_id"]
+                print(
+                    f"[{self.platform_name}] stored structured dm result {task_id}"
+                    + (f" context={context_id}" if context_id else "")
+                )
+
+    def _remember_interbot_result(self, task_id: str, payload_text: str, message: dict[str, Any]) -> None:
+        self._recent_interbot_results[task_id] = {
+            "payload_text": payload_text,
+            "message": message,
+        }
+        while len(self._recent_interbot_results) > 20:
+            oldest_task_id = next(iter(self._recent_interbot_results))
+            del self._recent_interbot_results[oldest_task_id]
 
     async def _submit(self, text: str) -> None:
         payload, bounty, model, target = parse_task_args(text, DEFAULT_BOUNTY, self.default_model)
@@ -96,6 +118,82 @@ class StdioAdapter:
             f"to {target_node} context={response.get('context_id')}"
         )
 
+    async def _send_safe_dm_reply(self, text: str) -> None:
+        try:
+            parts = shlex.split(text)
+        except ValueError as exc:
+            print(f"[{self.platform_name}] mepdmreplysafe parse error: {exc}")
+            return
+        if len(parts) < 3:
+            print(
+                f"[{self.platform_name}] usage: mepdmreplysafe <task_id> <next_turn_index> <reply> "
+                "[--checkpoint-summary text] [--turn-type type] [--intent type] [--priority level]"
+            )
+            return
+
+        task_id = parts[0]
+        try:
+            next_turn_index = int(parts[1])
+        except ValueError:
+            print(f"[{self.platform_name}] next_turn_index must be an integer")
+            return
+
+        options: dict[str, str] = {}
+        reply_parts: list[str] = []
+        i = 2
+        while i < len(parts):
+            token = parts[i]
+            if token.startswith("--"):
+                if i + 1 >= len(parts):
+                    print(f"[{self.platform_name}] missing value for {token}")
+                    return
+                options[token] = parts[i + 1]
+                i += 2
+                continue
+            reply_parts.append(token)
+            i += 1
+
+        reply_text = " ".join(reply_parts).strip()
+        if not reply_text:
+            print(
+                f"[{self.platform_name}] usage: mepdmreplysafe <task_id> <next_turn_index> <reply> [options]"
+            )
+            return
+
+        inbound = self._recent_interbot_results.get(task_id)
+        if not inbound:
+            print(f"[{self.platform_name}] no stored structured dm result for task {task_id}")
+            return
+
+        response = await self.client.submit_safe_dm_reply(
+            reply_text,
+            inbound["message"],
+            next_turn_index=next_turn_index,
+            checkpoint_summary=options.get("--checkpoint-summary"),
+            inbound_task_id=task_id,
+            turn_type=options.get("--turn-type"),
+            intent_type=options.get("--intent"),
+            priority=options.get("--priority"),
+        )
+
+        action = response.get("reply_action")
+        if action == "stop":
+            print(
+                f"[{self.platform_name}] safe reply stopped for {task_id}: "
+                f"{', '.join(response.get('safety', {}).get('violations', [])) or 'limits exceeded'}"
+            )
+            return
+
+        data = response.get("json", {})
+        if response.get("status_code") != 200 or data.get("status") != "success":
+            print(f"[{self.platform_name}] safe dm reply failed: {data}")
+            return
+
+        print(
+            f"[{self.platform_name}] safe reply {action} task {data.get('task_id')} "
+            f"context={response.get('context_id')}"
+        )
+
     async def _offer_data(self, price: str, payload: str) -> None:
         bounty = -abs(float(price))
         response = await self.client.submit_task("Data offer available", bounty, secret_data=payload)
@@ -145,6 +243,9 @@ class StdioAdapter:
         if text.startswith("mepdmx "):
             await self._send_structured_dm(text[7:])
             return True
+        if text.startswith("mepdmreplysafe "):
+            await self._send_safe_dm_reply(text[15:])
+            return True
         if text.startswith("mepdata "):
             parts = text.split(" ", 2)
             if len(parts) < 3:
@@ -175,7 +276,7 @@ class StdioAdapter:
         print(f"[{self.platform_name}] connected as {self.client.node_id}")
         print(
             f"[{self.platform_name}] commands: "
-            "mep, mepdm, mepdmx, mepdata, mepcancel, mepresult, mepbalance, exit"
+            "mep, mepdm, mepdmx, mepdmreplysafe, mepdata, mepcancel, mepresult, mepbalance, exit"
         )
         loop = asyncio.get_running_loop()
         try:
