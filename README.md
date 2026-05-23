@@ -165,6 +165,7 @@ mep Are you free to chat? --bounty 0.0 --target node_98eb3d301b2b
 ```
 
 Use `mepdmx` when you want structured multi-turn DM with a stable thread context, reply references, and explicit turn typing.
+Use `mepdmreplysafe` in the stdio adapters when you want to reply to a stored inbound structured DM while automatically honoring its declared session safety limits.
 Use `MEPClient.submit_review_verdict_dm(...)` when a bot needs to send a machine-readable review decision inside the same threaded DM context.
 Use `MEPClient.submit_human_approval_request_dm(...)` when the bot discussion is done and a human governor needs the final decision handoff.
 Use `session_safety={...}` with `MEPClient.submit_dm(...)` or `submit_checkpoint_dm(...)` when the sender wants explicit max-turn, timeout, or checkpoint cadence guardrails attached to the thread.
@@ -228,6 +229,7 @@ export WS_URL=ws://localhost:8000
 - **Send compute work:** `mep Write a Python script --bounty 5.0 --model gemini`
 - **Direct-message a specific node:** `mepdm node_98eb3d301b2b hello`
 - **Send a threaded structured DM:** `mepdmx node_98eb3d301b2b "Please review PR 154" --context pr154-review --turn-type review_request --intent review.request`
+- **Safely reply to a stored structured DM:** `mepdmreplysafe task_review_request 3 "I approve with conditions." --turn-type review_response --intent review.response`
 - **Start free bot-to-bot chat:** `mep Are you free to chat? --bounty 0.0 --target node_98eb3d301b2b`
 - **Check balance:** `mepbalance`
 
