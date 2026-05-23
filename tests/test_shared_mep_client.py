@@ -154,10 +154,11 @@ class TestSharedMEPClient(unittest.TestCase):
 
         submit_body = json.loads(session.post.call_args.kwargs["data"])
         body = json.loads(submit_body["task"]["instructions"])
-        self.assertEqual(
-            body["task"]["inputs"]["session_safety"],
-            {"max_turns": 6, "max_duration_seconds": 900, "checkpoint_interval": 3},
-        )
+        session_safety = body["task"]["inputs"]["session_safety"]
+        self.assertEqual(session_safety["max_turns"], 6)
+        self.assertEqual(session_safety["max_duration_seconds"], 900)
+        self.assertEqual(session_safety["checkpoint_interval"], 3)
+        self.assertEqual(session_safety["started_at_ms"], body["timestamp_ms"])
 
     def test_extract_interbot_instructions_prefers_structured_task_text(self):
         payload = json.dumps(
@@ -333,12 +334,19 @@ class TestSharedMEPClient(unittest.TestCase):
             inbound_message = {
                 "message_id": "message_review_request",
                 "trace_id": "trace-123",
+                "timestamp_ms": 1_777_000_000_000,
                 "source": {"node_id": "node_reviewer"},
                 "intent": {"type": "review.request", "priority": "high"},
                 "conversation": {"context_id": "pr154-review", "turn_type": "review_request"},
                 "task": {
                     "instructions": "Please review this PR.",
-                    "inputs": {"session_safety": {"max_turns": 6, "checkpoint_interval": 3}},
+                    "inputs": {
+                        "session_safety": {
+                            "max_turns": 6,
+                            "checkpoint_interval": 3,
+                            "started_at_ms": 1_777_000_000_000,
+                        }
+                    },
                 },
             }
 
@@ -352,7 +360,10 @@ class TestSharedMEPClient(unittest.TestCase):
 
         submit_body = json.loads(session.post.call_args.kwargs["data"])
         body = json.loads(submit_body["task"]["instructions"])
-        self.assertEqual(body["task"]["inputs"]["session_safety"], {"max_turns": 6, "checkpoint_interval": 3})
+        self.assertEqual(
+            body["task"]["inputs"]["session_safety"],
+            {"max_turns": 6, "checkpoint_interval": 3, "started_at_ms": 1_777_000_000_000},
+        )
         self.assertEqual(body["conversation"]["reply_to_task_id"], "task_review_request")
         self.assertEqual(body["conversation"]["reply_to_message_id"], "message_review_request")
 
@@ -363,7 +374,13 @@ class TestSharedMEPClient(unittest.TestCase):
                 "timestamp_ms": 1_777_000_000_000,
                 "task": {
                     "instructions": "Stay in the review thread.",
-                    "inputs": {"session_safety": {"max_turns": 5, "max_duration_seconds": 600}},
+                    "inputs": {
+                        "session_safety": {
+                            "max_turns": 5,
+                            "max_duration_seconds": 600,
+                            "started_at_ms": 1_777_000_000_000,
+                        }
+                    },
                     "expected_output": {"result_type": "text"},
                 },
             }
@@ -371,7 +388,10 @@ class TestSharedMEPClient(unittest.TestCase):
 
         session_safety = MEPClient.extract_session_safety(payload)
 
-        self.assertEqual(session_safety, {"max_turns": 5, "max_duration_seconds": 600})
+        self.assertEqual(
+            session_safety,
+            {"max_turns": 5, "max_duration_seconds": 600, "started_at_ms": 1_777_000_000_000},
+        )
 
     def test_evaluate_interbot_session_safety_requests_checkpoint_at_interval(self):
         payload = json.dumps(
@@ -424,6 +444,33 @@ class TestSharedMEPClient(unittest.TestCase):
             evaluation["violations"],
             ["max_turns_exceeded", "max_duration_exceeded"],
         )
+
+    def test_evaluate_interbot_session_safety_uses_original_session_start_time(self):
+        payload = json.dumps(
+            {
+                "spec_version": "mep.interbot.v1",
+                "timestamp_ms": 1_777_000_060_000,
+                "task": {
+                    "instructions": "Stay in the review thread.",
+                    "inputs": {
+                        "session_safety": {
+                            "max_duration_seconds": 60,
+                            "started_at_ms": 1_777_000_000_000,
+                        }
+                    },
+                    "expected_output": {"result_type": "text"},
+                },
+            }
+        )
+
+        evaluation = MEPClient.evaluate_interbot_session_safety(
+            payload,
+            next_turn_index=2,
+            now_ms=1_777_000_070_000,
+        )
+
+        self.assertTrue(evaluation["should_stop"])
+        self.assertEqual(evaluation["violations"], ["max_duration_exceeded"])
 
     def test_submit_safe_dm_reply_replies_when_session_is_within_limits(self):
         with (

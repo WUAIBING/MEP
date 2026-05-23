@@ -107,6 +107,27 @@ class TestStdioAdapter(unittest.IsolatedAsyncioTestCase):
         client.submit_safe_dm_reply.assert_awaited_once()
         print_mock.assert_any_call("[codex] safe reply stopped for task_review_request: max_turns_exceeded")
 
+    async def test_dispatch_line_safe_reply_reports_validation_errors(self):
+        adapter, client = self._make_adapter()
+        adapter._recent_interbot_results["task_review_request"] = {
+            "payload_text": "{}",
+            "message": {
+                "message_id": "message_review_request",
+                "conversation": {"context_id": "pr154-review", "turn_type": "review_request"},
+                "task": {"instructions": "Please review this PR."},
+            },
+        }
+        client.submit_safe_dm_reply = AsyncMock(side_effect=ValueError("next_turn_index must be at least 1"))
+
+        with patch("builtins.print") as print_mock:
+            keep_going = await adapter._dispatch_line(
+                'mepdmreplysafe task_review_request 0 "I approve with conditions."'
+            )
+
+        self.assertTrue(keep_going)
+        client.submit_safe_dm_reply.assert_awaited_once()
+        print_mock.assert_any_call("[codex] safe dm reply error: next_turn_index must be at least 1")
+
 
 if __name__ == "__main__":
     unittest.main()

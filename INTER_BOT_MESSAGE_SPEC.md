@@ -184,6 +184,9 @@ Recommended `task.inputs.session_safety` fields:
 - `checkpoint_interval`
   - positive integer
   - cadence for emitting `checkpoint` turns, for example every 3 turns
+- `started_at_ms`
+  - positive integer Unix epoch in milliseconds
+  - optional runtime-managed field used to preserve the original session start time across reply/checkpoint hops so total session age stays enforceable
 
 ## Compatibility mode (legacy plain text)
 
@@ -334,12 +337,12 @@ Recommended structured review verdict payload for threaded DM:
   "task": {
     "title": "Review verdict",
     "instructions": "Review verdict: approve_with_conditions\nRationale: Threading model is sound.\nConditions:\n- Keep reply_mode=new_dm\n- Add a short docs note",
+    "inputs": {
       "session_safety": {
         "max_turns": 6,
         "max_duration_seconds": 900,
         "checkpoint_interval": 3
       },
-    "inputs": {
       "review_verdict": {
         "decision": "approve_with_conditions",
         "rationale": "Threading model is sound.",

@@ -151,6 +151,7 @@ class MEPClient:
         session_safety: Optional[dict[str, Any]] = None,
     ) -> dict[str, Any]:
         message_id = str(uuid.uuid4())
+        timestamp_ms = int(time.time() * 1000)
         task: dict[str, Any] = {
             "instructions": message,
             "expected_output": {"result_type": result_type},
@@ -159,6 +160,8 @@ class MEPClient:
             task["title"] = task_title
         inputs: dict[str, Any] = dict(task_inputs or {})
         normalized_session_safety = self.build_session_safety_metadata(**session_safety) if session_safety else {}
+        if normalized_session_safety and "started_at_ms" not in normalized_session_safety:
+            normalized_session_safety["started_at_ms"] = timestamp_ms
         if normalized_session_safety:
             inputs["session_safety"] = normalized_session_safety
         if inputs:
@@ -167,7 +170,7 @@ class MEPClient:
             "spec_version": "mep.interbot.v1",
             "message_id": message_id,
             "trace_id": trace_id or str(uuid.uuid4()),
-            "timestamp_ms": int(time.time() * 1000),
+            "timestamp_ms": timestamp_ms,
             "source": {"node_id": self.node_id},
             "target": {
                 "node_id": target_node,
@@ -736,7 +739,9 @@ class MEPClient:
             }
 
         evaluated_now_ms = now_ms if now_ms is not None else int(time.time() * 1000)
-        started_at_ms = message.get("timestamp_ms") if isinstance(message.get("timestamp_ms"), int) else None
+        started_at_ms = session_safety.get("started_at_ms")
+        if not isinstance(started_at_ms, int):
+            started_at_ms = message.get("timestamp_ms") if isinstance(message.get("timestamp_ms"), int) else None
         elapsed_ms = (
             max(0, evaluated_now_ms - started_at_ms)
             if started_at_ms is not None and evaluated_now_ms >= started_at_ms
@@ -798,6 +803,7 @@ class MEPClient:
         max_turns: Optional[int] = None,
         max_duration_seconds: Optional[int] = None,
         checkpoint_interval: Optional[int] = None,
+        started_at_ms: Optional[int] = None,
     ) -> dict[str, int]:
         normalized: dict[str, int] = {}
         if max_turns is not None:
@@ -810,6 +816,8 @@ class MEPClient:
             normalized["checkpoint_interval"] = cls._normalize_positive_int(
                 checkpoint_interval, "checkpoint_interval"
             )
+        if started_at_ms is not None:
+            normalized["started_at_ms"] = cls._normalize_positive_int(started_at_ms, "started_at_ms")
         if not normalized:
             raise ValueError("at least one session safety guard must be provided")
         return normalized
@@ -884,7 +892,7 @@ class MEPClient:
             return None
 
         normalized: dict[str, int] = {}
-        for field in ("max_turns", "max_duration_seconds", "checkpoint_interval"):
+        for field in ("max_turns", "max_duration_seconds", "checkpoint_interval", "started_at_ms"):
             value = session_safety.get(field)
             if value is None:
                 continue

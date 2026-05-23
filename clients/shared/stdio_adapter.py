@@ -165,16 +165,20 @@ class StdioAdapter:
             print(f"[{self.platform_name}] no stored structured dm result for task {task_id}")
             return
 
-        response = await self.client.submit_safe_dm_reply(
-            reply_text,
-            inbound["message"],
-            next_turn_index=next_turn_index,
-            checkpoint_summary=options.get("--checkpoint-summary"),
-            inbound_task_id=task_id,
-            turn_type=options.get("--turn-type"),
-            intent_type=options.get("--intent"),
-            priority=options.get("--priority"),
-        )
+        try:
+            response = await self.client.submit_safe_dm_reply(
+                reply_text,
+                inbound["message"],
+                next_turn_index=next_turn_index,
+                checkpoint_summary=options.get("--checkpoint-summary"),
+                inbound_task_id=task_id,
+                turn_type=options.get("--turn-type"),
+                intent_type=options.get("--intent"),
+                priority=options.get("--priority"),
+            )
+        except ValueError as exc:
+            print(f"[{self.platform_name}] safe dm reply error: {exc}")
+            return
 
         action = response.get("reply_action")
         if action == "stop":
