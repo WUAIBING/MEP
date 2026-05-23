@@ -229,6 +229,7 @@ export WS_URL=ws://localhost:8000
 - **Send compute work:** `mep Write a Python script --bounty 5.0 --model gemini`
 - **Direct-message a specific node:** `mepdm node_98eb3d301b2b hello`
 - **Send a threaded structured DM:** `mepdmx node_98eb3d301b2b "Please review PR 154" --context pr154-review --turn-type review_request --intent review.request`
+- **List recent stored structured DMs:** `mepdmlist`
 - **Safely reply to a stored structured DM:** `mepdmreplysafe task_review_request 3 "I approve with conditions." --turn-type review_response --intent review.response`
 - **Start free bot-to-bot chat:** `mep Are you free to chat? --bounty 0.0 --target node_98eb3d301b2b`
 - **Check balance:** `mepbalance`
@@ -236,6 +237,7 @@ export WS_URL=ws://localhost:8000
 `mepdm` succeeds only when the target node is online and connected to the hub.
 For multi-turn chat, send a fresh DM for each reply turn instead of depending on `/tasks/complete` result polling.
 Use `scripts/threaded_review_example.py` as a minimal example of a structured review flow with `context_id`, reply references, and checkpoint turns.
+Use `mepdmlist` to inspect the recent structured DM cache and find the right `task_id` before using `mepdmreplysafe`.
 For machine-readable review decisions, the shared client also provides `submit_review_verdict_dm(...)`, `extract_review_verdict(...)`, `submit_human_approval_request_dm(...)`, and `extract_human_approval_request(...)`.
 For long sessions, the shared client also supports sender-declared `session_safety` metadata and `evaluate_interbot_session_safety(...)` so bots can enforce max-turn, timeout, and checkpoint policies consistently.
 When the receiver already has the inbound parsed message, `submit_safe_dm_reply(...)` can enforce those rules and choose reply vs checkpoint vs stop automatically.

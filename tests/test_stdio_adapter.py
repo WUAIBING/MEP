@@ -79,6 +79,54 @@ class TestStdioAdapter(unittest.IsolatedAsyncioTestCase):
         )
         print_mock.assert_any_call("[codex] safe reply reply task task_safe_reply context=pr154-review")
 
+    async def test_dispatch_line_dmlist_reports_when_empty(self):
+        adapter, _client = self._make_adapter()
+
+        with patch("builtins.print") as print_mock:
+            keep_going = await adapter._dispatch_line("mepdmlist")
+
+        self.assertTrue(keep_going)
+        print_mock.assert_any_call("[codex] no stored structured dm results")
+
+    async def test_dispatch_line_dmlist_shows_recent_structured_dm_results(self):
+        adapter, _client = self._make_adapter()
+        adapter._recent_interbot_results["task_review_request"] = {
+            "payload_text": "{}",
+            "message": {
+                "message_id": "message_review_request",
+                "source": {"node_id": "node_reviewer"},
+                "conversation": {"context_id": "pr154-review", "turn_type": "review_request"},
+                "intent": {"type": "review.request"},
+                "task": {"instructions": "Please review this PR."},
+            },
+        }
+        adapter._recent_interbot_results["task_checkpoint"] = {
+            "payload_text": "{}",
+            "message": {
+                "message_id": "message_checkpoint",
+                "source": {"node_id": "node_reviewer"},
+                "conversation": {"context_id": "pr154-review", "turn_type": "checkpoint"},
+                "intent": {"type": "coordination.request"},
+                "task": {"instructions": "Checkpoint summary"},
+            },
+        }
+
+        with patch("builtins.print") as print_mock:
+            keep_going = await adapter._dispatch_line("mepdmlist")
+
+        self.assertTrue(keep_going)
+        print_mock.assert_any_call("[codex] recent structured dm results:")
+        print_mock.assert_any_call(
+            "[codex] - task_id=task_checkpoint context_id=pr154-review "
+            "message_id=message_checkpoint source=node_reviewer "
+            "turn_type=checkpoint intent=coordination.request"
+        )
+        print_mock.assert_any_call(
+            "[codex] - task_id=task_review_request context_id=pr154-review "
+            "message_id=message_review_request source=node_reviewer "
+            "turn_type=review_request intent=review.request"
+        )
+
     async def test_dispatch_line_safe_reply_reports_stop_without_submitting_dm(self):
         adapter, client = self._make_adapter()
         adapter._recent_interbot_results["task_review_request"] = {
