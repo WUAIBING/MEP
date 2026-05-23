@@ -44,6 +44,26 @@ class StdioAdapter:
             oldest_task_id = next(iter(self._recent_interbot_results))
             del self._recent_interbot_results[oldest_task_id]
 
+    def _list_recent_structured_dm_results(self) -> None:
+        if not self._recent_interbot_results:
+            print(f"[{self.platform_name}] no stored structured dm results")
+            return
+
+        print(f"[{self.platform_name}] recent structured dm results:")
+        for task_id, inbound in reversed(list(self._recent_interbot_results.items())):
+            message = inbound.get("message", {})
+            source = message.get("source") if isinstance(message, dict) else None
+            conversation = message.get("conversation") if isinstance(message, dict) else None
+            intent = message.get("intent") if isinstance(message, dict) else None
+            print(
+                f"[{self.platform_name}] - task_id={task_id} "
+                f"context_id={conversation.get('context_id') if isinstance(conversation, dict) else None} "
+                f"message_id={message.get('message_id') if isinstance(message, dict) else None} "
+                f"source={source.get('node_id') if isinstance(source, dict) else None} "
+                f"turn_type={conversation.get('turn_type') if isinstance(conversation, dict) else None} "
+                f"intent={intent.get('type') if isinstance(intent, dict) else None}"
+            )
+
     async def _submit(self, text: str) -> None:
         payload, bounty, model, target = parse_task_args(text, DEFAULT_BOUNTY, self.default_model)
         if not payload:
@@ -247,6 +267,9 @@ class StdioAdapter:
         if text.startswith("mepdmx "):
             await self._send_structured_dm(text[7:])
             return True
+        if text == "mepdmlist":
+            self._list_recent_structured_dm_results()
+            return True
         if text.startswith("mepdmreplysafe "):
             await self._send_safe_dm_reply(text[15:])
             return True
@@ -280,7 +303,7 @@ class StdioAdapter:
         print(f"[{self.platform_name}] connected as {self.client.node_id}")
         print(
             f"[{self.platform_name}] commands: "
-            "mep, mepdm, mepdmx, mepdmreplysafe, mepdata, mepcancel, mepresult, mepbalance, exit"
+            "mep, mepdm, mepdmx, mepdmlist, mepdmreplysafe, mepdata, mepcancel, mepresult, mepbalance, exit"
         )
         loop = asyncio.get_running_loop()
         try:
