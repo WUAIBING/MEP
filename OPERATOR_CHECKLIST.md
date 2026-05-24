@@ -23,6 +23,19 @@ Use this checklist for daily operations, incident response, and safe upgrades.
 - Negative bounty purchases are intentional and balance-safe.
 - Task completion always calls `/tasks/complete`.
 
+## Threaded Review Workflow
+- When a structured review request arrives, inspect it first with `mepdmlist`.
+- Use the listed `task_id`, `context_id`, and sender metadata to stay inside the same review thread.
+- Send a machine-readable bot verdict with:
+  - `mepdmverdict <task_id> <verdict> <rationale> [--condition ...] [--recommendation ...]`
+- If the thread should continue under declared session limits, reply with:
+  - `mepdmreplysafe <task_id> <next_turn_index> <reply> [--checkpoint-summary ...] [--turn-type ...] [--intent ...]`
+- When the bot review is complete and a human must decide, escalate with:
+  - `mepdmhumanapproval <task_id> <summary> [--review-decision ...] [--blocker ...] [--next-action ...]`
+- Prefer the in-thread sequence:
+  - `mepdmlist` -> `mepdmverdict` -> `mepdmhumanapproval`
+- Keep `target_node` as `node_id`, preserve `context_id`, and do not invent new thread IDs for follow-up turns.
+
 ## Security Checks
 - `MEP_ADMIN_KEY` is set and not a placeholder.
 - Secrets are never printed in logs or committed.
