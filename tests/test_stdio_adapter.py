@@ -171,6 +171,46 @@ class TestStdioAdapter(unittest.IsolatedAsyncioTestCase):
         )
         print_mock.assert_any_call("[codex] review verdict sent task task_review_verdict context=pr154-review")
 
+    async def test_dispatch_line_review_verdict_accepts_unquoted_multiword_rationale(self):
+        adapter, client = self._make_adapter()
+        adapter._recent_interbot_results["task_review_request"] = {
+            "payload_text": "{}",
+            "message": {
+                "message_id": "message_review_request",
+                "source": {"node_id": "node_reviewer"},
+                "conversation": {"context_id": "pr154-review", "turn_type": "review_request"},
+                "task": {"instructions": "Please review this PR."},
+            },
+        }
+        client.submit_review_verdict_dm = AsyncMock(
+            return_value={
+                "status_code": 200,
+                "json": {"status": "success", "task_id": "task_review_verdict"},
+                "context_id": "pr154-review",
+            }
+        )
+
+        with patch("builtins.print") as print_mock:
+            keep_going = await adapter._dispatch_line(
+                "mepdmverdict task_review_request approve_with_conditions "
+                "Threading model is sound. --condition \"Document reply expectations.\""
+            )
+
+        self.assertTrue(keep_going)
+        client.submit_review_verdict_dm.assert_awaited_once_with(
+            "approve_with_conditions",
+            "Threading model is sound.",
+            "node_reviewer",
+            context_id="pr154-review",
+            target_alias=None,
+            reply_to_task_id="task_review_request",
+            reply_to_message_id="message_review_request",
+            conditions=["Document reply expectations."],
+            human_recommendation=None,
+            priority="normal",
+        )
+        print_mock.assert_any_call("[codex] review verdict sent task task_review_verdict context=pr154-review")
+
     async def test_dispatch_line_review_verdict_reports_validation_errors(self):
         adapter, client = self._make_adapter()
         adapter._recent_interbot_results["task_review_request"] = {

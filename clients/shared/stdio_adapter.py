@@ -233,13 +233,17 @@ class StdioAdapter:
 
         task_id = parts[0]
         verdict = parts[1]
-        rationale = parts[2]
+        rationale_parts: list[str] = []
         conditions: list[str] = []
         recommendation: Optional[str] = None
         priority = "normal"
-        i = 3
+        i = 2
         while i < len(parts):
             token = parts[i]
+            if not token.startswith("--"):
+                rationale_parts.append(token)
+                i += 1
+                continue
             if token == "--condition":
                 if i + 1 >= len(parts):
                     print(f"[{self.platform_name}] missing value for {token}")
@@ -262,6 +266,13 @@ class StdioAdapter:
                 i += 2
                 continue
             print(f"[{self.platform_name}] unknown option {token}")
+            return
+
+        rationale = " ".join(rationale_parts).strip()
+        if not rationale:
+            print(
+                f"[{self.platform_name}] usage: mepdmverdict <task_id> <verdict> <rationale> [options]"
+            )
             return
 
         inbound = self._recent_interbot_results.get(task_id)
