@@ -347,7 +347,7 @@ class StdioAdapter:
         _message, source, cached_target_node, context_id, reply_to_message_id = stored
         target_node = target_node_override or cached_target_node
         target_alias = target_alias_override
-        if target_alias is None and isinstance(source.get("alias"), str):
+        if target_alias is None and not target_node_override and isinstance(source.get("alias"), str):
             target_alias = source.get("alias")
 
         try:
