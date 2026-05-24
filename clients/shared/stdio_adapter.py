@@ -218,6 +218,109 @@ class StdioAdapter:
             f"context={response.get('context_id')}"
         )
 
+    async def _send_review_verdict_dm(self, text: str) -> None:
+        try:
+            parts = shlex.split(text)
+        except ValueError as exc:
+            print(f"[{self.platform_name}] mepdmverdict parse error: {exc}")
+            return
+        if len(parts) < 3:
+            print(
+                f"[{self.platform_name}] usage: mepdmverdict <task_id> <verdict> <rationale> "
+                "[--condition text] [--recommendation text] [--priority level]"
+            )
+            return
+
+        task_id = parts[0]
+        verdict = parts[1]
+        rationale_parts: list[str] = []
+        conditions: list[str] = []
+        recommendation: Optional[str] = None
+        priority = "normal"
+        i = 2
+        while i < len(parts):
+            token = parts[i]
+            if not token.startswith("--"):
+                rationale_parts.append(token)
+                i += 1
+                continue
+            if token == "--condition":
+                if i + 1 >= len(parts):
+                    print(f"[{self.platform_name}] missing value for {token}")
+                    return
+                conditions.append(parts[i + 1])
+                i += 2
+                continue
+            if token == "--recommendation":
+                if i + 1 >= len(parts):
+                    print(f"[{self.platform_name}] missing value for {token}")
+                    return
+                recommendation = parts[i + 1]
+                i += 2
+                continue
+            if token == "--priority":
+                if i + 1 >= len(parts):
+                    print(f"[{self.platform_name}] missing value for {token}")
+                    return
+                priority = parts[i + 1]
+                i += 2
+                continue
+            print(f"[{self.platform_name}] unknown option {token}")
+            return
+
+        rationale = " ".join(rationale_parts).strip()
+        if not rationale:
+            print(
+                f"[{self.platform_name}] usage: mepdmverdict <task_id> <verdict> <rationale> [options]"
+            )
+            return
+
+        inbound = self._recent_interbot_results.get(task_id)
+        if not inbound:
+            print(f"[{self.platform_name}] no stored structured dm result for task {task_id}")
+            return
+
+        message = inbound["message"]
+        source = message.get("source") if isinstance(message, dict) else None
+        conversation = message.get("conversation") if isinstance(message, dict) else None
+        target_node = source.get("node_id") if isinstance(source, dict) else None
+        context_id = conversation.get("context_id") if isinstance(conversation, dict) else None
+        reply_to_message_id = message.get("message_id") if isinstance(message, dict) else None
+
+        if not isinstance(target_node, str) or not target_node:
+            print(f"[{self.platform_name}] stored structured dm result {task_id} is missing source.node_id")
+            return
+        if not isinstance(context_id, str) or not context_id:
+            print(f"[{self.platform_name}] stored structured dm result {task_id} is missing conversation.context_id")
+            return
+
+        try:
+            response = await self.client.submit_review_verdict_dm(
+                verdict,
+                rationale,
+                target_node,
+                context_id=context_id,
+                target_alias=source.get("alias") if isinstance(source, dict) and isinstance(source.get("alias"), str) else None,
+                reply_to_task_id=task_id,
+                reply_to_message_id=reply_to_message_id if isinstance(reply_to_message_id, str) else None,
+                conditions=conditions or None,
+                human_recommendation=recommendation,
+                priority=priority,
+            )
+        except ValueError as exc:
+            print(f"[{self.platform_name}] review verdict error: {exc}")
+            return
+
+        data = response.get("json", {})
+        if response.get("status_code") != 200 or data.get("status") != "success":
+            print(f"[{self.platform_name}] review verdict failed: {data}")
+            return
+
+        print(
+            f"[{self.platform_name}] review verdict sent task {data.get('task_id')} "
+            f"context={response.get('context_id')}"
+        )
+
     async def _offer_data(self, price: str, payload: str) -> None:
         bounty = -abs(float(price))
         response = await self.client.submit_task("Data offer available", bounty, secret_data=payload)
@@ -270,6 +373,9 @@ class StdioAdapter:
         if text == "mepdmlist":
             self._list_recent_structured_dm_results()
             return True
+        if text.startswith("mepdmverdict "):
+            await self._send_review_verdict_dm(text[13:])
+            return True
         if text.startswith("mepdmreplysafe "):
             await self._send_safe_dm_reply(text[15:])
             return True
@@ -303,7 +409,8 @@ class StdioAdapter:
         print(f"[{self.platform_name}] connected as {self.client.node_id}")
         print(
             f"[{self.platform_name}] commands: "
-            "mep, mepdm, mepdmx, mepdmlist, mepdmreplysafe, mepdata, mepcancel, mepresult, mepbalance, exit"
+            "mep, mepdm, mepdmx, mepdmlist, mepdmverdict, mepdmreplysafe, "
+            "mepdata, mepcancel, mepresult, mepbalance, exit"
         )
         loop = asyncio.get_running_loop()
         try:
