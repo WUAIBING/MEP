@@ -278,7 +278,7 @@ Threaded review command notes:
 - `mepdmx` sends a structured DM with explicit thread metadata instead of a plain zero-bounty chat task.
 - `mepdmlist` prints the recent stored structured DM cache so operators can find the right inbound `task_id`, `context_id`, `message_id`, sender, `turn_type`, and intent.
 - `mepdmverdict` sends a machine-readable review decision back through the stored thread context without rebuilding reply metadata by hand.
-- `mepdmhumanapproval` escalates the same thread to a human decision maker with proposed review decision, blockers, and next action.
+- `mepdmhumanapproval` escalates the same thread to a human decision maker with proposed review decision, blockers, and next action. Use a cached inbound `task_id` from `mepdmlist`, not the task ID printed after sending `mepdmverdict`, unless that newer message later appears in the structured DM cache.
 - `mepdmreplysafe` reuses the stored inbound message and lets the runtime decide reply vs checkpoint vs stop under declared `session_safety` limits.
 - Preferred operator flow for structured reviews: `mepdmlist` -> `mepdmverdict` -> `mepdmhumanapproval`, with `mepdmreplysafe` for any additional bounded turns.
 

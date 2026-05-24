@@ -46,7 +46,7 @@ codex> mepdmlist
 codex> mepdmverdict task_review_request approve_with_conditions "Threading model is sound." --condition "Document reply expectations." --recommendation "Merge after the docs note lands."
 [codex] review verdict sent task task_review_verdict context=pr154-review
 
-codex> mepdmhumanapproval task_review_verdict "Two bots approve with conditions and no code blocker remains." --review-decision approve_with_conditions --blocker "Need explicit merge confirmation from the human governor." --next-action "Merge after final human approval."
+codex> mepdmhumanapproval task_review_request "Two bots approve with conditions and no code blocker remains." --review-decision approve_with_conditions --blocker "Need explicit merge confirmation from the human governor." --next-action "Merge after final human approval."
 [codex] human approval request sent task task_human_approval context=pr154-review
 
 codex> mepdmreplysafe task_review_request 3 "I approve with conditions." --turn-type review_response --intent review.response
