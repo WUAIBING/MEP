@@ -64,6 +64,39 @@ class StdioAdapter:
                 f"intent={intent.get('type') if isinstance(intent, dict) else None}"
             )
 
+    def _get_stored_structured_dm_context(
+        self, task_id: str
+    ) -> Optional[tuple[dict[str, Any], dict[str, Any], str, str, Optional[str]]]:
+        inbound = self._recent_interbot_results.get(task_id)
+        if not inbound:
+            print(f"[{self.platform_name}] no stored structured dm result for task {task_id}")
+            return None
+
+        message = inbound["message"]
+        source = message.get("source") if isinstance(message, dict) else None
+        conversation = message.get("conversation") if isinstance(message, dict) else None
+        target_node = source.get("node_id") if isinstance(source, dict) else None
+        context_id = conversation.get("context_id") if isinstance(conversation, dict) else None
+        reply_to_message_id = message.get("message_id") if isinstance(message, dict) else None
+
+        if not isinstance(source, dict):
+            print(f"[{self.platform_name}] stored structured dm result {task_id} is missing source")
+            return None
+        if not isinstance(target_node, str) or not target_node:
+            print(f"[{self.platform_name}] stored structured dm result {task_id} is missing source.node_id")
+            return None
+        if not isinstance(context_id, str) or not context_id:
+            print(f"[{self.platform_name}] stored structured dm result {task_id} is missing conversation.context_id")
+            return None
+
+        return (
+            message,
+            source,
+            target_node,
+            context_id,
+            reply_to_message_id if isinstance(reply_to_message_id, str) else None,
+        )
+
     async def _submit(self, text: str) -> None:
         payload, bounty, model, target = parse_task_args(text, DEFAULT_BOUNTY, self.default_model)
         if not payload:
@@ -180,15 +213,15 @@ class StdioAdapter:
             )
             return
 
-        inbound = self._recent_interbot_results.get(task_id)
-        if not inbound:
-            print(f"[{self.platform_name}] no stored structured dm result for task {task_id}")
+        stored = self._get_stored_structured_dm_context(task_id)
+        if not stored:
             return
+        message, _source, _target_node, _context_id, _reply_to_message_id = stored
 
         try:
             response = await self.client.submit_safe_dm_reply(
                 reply_text,
-                inbound["message"],
+                message,
                 next_turn_index=next_turn_index,
                 checkpoint_summary=options.get("--checkpoint-summary"),
                 inbound_task_id=task_id,
@@ -215,6 +248,112 @@ class StdioAdapter:
 
         print(
             f"[{self.platform_name}] safe reply {action} task {data.get('task_id')} "
+            f"context={response.get('context_id')}"
+        )
+
+    async def _send_human_approval_request_dm(self, text: str) -> None:
+        try:
+            parts = shlex.split(text)
+        except ValueError as exc:
+            print(f"[{self.platform_name}] mepdmhumanapproval parse error: {exc}")
+            return
+        if len(parts) < 2:
+            print(
+                f"[{self.platform_name}] usage: mepdmhumanapproval <task_id> <summary> "
+                "[--decision-type type] [--review-decision verdict] "
+                "[--blocker text] [--next-action text] [--priority level]"
+            )
+            return
+
+        task_id = parts[0]
+        summary_parts: list[str] = []
+        decision_type = "merge_decision"
+        review_decision: Optional[str] = None
+        blockers: list[str] = []
+        next_action: Optional[str] = None
+        priority = "high"
+        i = 1
+        while i < len(parts):
+            token = parts[i]
+            if not token.startswith("--"):
+                summary_parts.append(token)
+                i += 1
+                continue
+            if token == "--decision-type":
+                if i + 1 >= len(parts):
+                    print(f"[{self.platform_name}] missing value for {token}")
+                    return
+                decision_type = parts[i + 1]
+                i += 2
+                continue
+            if token == "--review-decision":
+                if i + 1 >= len(parts):
+                    print(f"[{self.platform_name}] missing value for {token}")
+                    return
+                review_decision = parts[i + 1]
+                i += 2
+                continue
+            if token == "--blocker":
+                if i + 1 >= len(parts):
+                    print(f"[{self.platform_name}] missing value for {token}")
+                    return
+                blockers.append(parts[i + 1])
+                i += 2
+                continue
+            if token == "--next-action":
+                if i + 1 >= len(parts):
+                    print(f"[{self.platform_name}] missing value for {token}")
+                    return
+                next_action = parts[i + 1]
+                i += 2
+                continue
+            if token == "--priority":
+                if i + 1 >= len(parts):
+                    print(f"[{self.platform_name}] missing value for {token}")
+                    return
+                priority = parts[i + 1]
+                i += 2
+                continue
+            print(f"[{self.platform_name}] unknown option {token}")
+            return
+
+        summary = " ".join(summary_parts).strip()
+        if not summary:
+            print(
+                f"[{self.platform_name}] usage: mepdmhumanapproval <task_id> <summary> [options]"
+            )
+            return
+
+        stored = self._get_stored_structured_dm_context(task_id)
+        if not stored:
+            return
+        _message, source, target_node, context_id, reply_to_message_id = stored
+
+        try:
+            response = await self.client.submit_human_approval_request_dm(
+                summary,
+                target_node,
+                context_id=context_id,
+                decision_type=decision_type,
+                target_alias=source.get("alias") if isinstance(source.get("alias"), str) else None,
+                reply_to_task_id=task_id,
+                reply_to_message_id=reply_to_message_id,
+                review_decision=review_decision,
+                blockers=blockers or None,
+                recommended_next_action=next_action,
+                priority=priority,
+            )
+        except ValueError as exc:
+            print(f"[{self.platform_name}] human approval request error: {exc}")
+            return
+
+        data = response.get("json", {})
+        if response.get("status_code") != 200 or data.get("status") != "success":
+            print(f"[{self.platform_name}] human approval request failed: {data}")
+            return
+
+        print(
+            f"[{self.platform_name}] human approval request sent task {data.get('task_id')} "
             f"context={response.get('context_id')}"
         )
 
@@ -275,24 +414,10 @@ class StdioAdapter:
             )
             return
 
-        inbound = self._recent_interbot_results.get(task_id)
-        if not inbound:
-            print(f"[{self.platform_name}] no stored structured dm result for task {task_id}")
+        stored = self._get_stored_structured_dm_context(task_id)
+        if not stored:
             return
-
-        message = inbound["message"]
-        source = message.get("source") if isinstance(message, dict) else None
-        conversation = message.get("conversation") if isinstance(message, dict) else None
-        target_node = source.get("node_id") if isinstance(source, dict) else None
-        context_id = conversation.get("context_id") if isinstance(conversation, dict) else None
-        reply_to_message_id = message.get("message_id") if isinstance(message, dict) else None
-
-        if not isinstance(target_node, str) or not target_node:
-            print(f"[{self.platform_name}] stored structured dm result {task_id} is missing source.node_id")
-            return
-        if not isinstance(context_id, str) or not context_id:
-            print(f"[{self.platform_name}] stored structured dm result {task_id} is missing conversation.context_id")
-            return
+        _message, source, target_node, context_id, reply_to_message_id = stored
 
         try:
             response = await self.client.submit_review_verdict_dm(
@@ -373,6 +498,9 @@ class StdioAdapter:
         if text == "mepdmlist":
             self._list_recent_structured_dm_results()
             return True
+        if text.startswith("mepdmhumanapproval "):
+            await self._send_human_approval_request_dm(text[19:])
+            return True
         if text.startswith("mepdmverdict "):
             await self._send_review_verdict_dm(text[13:])
             return True
@@ -409,7 +537,7 @@ class StdioAdapter:
         print(f"[{self.platform_name}] connected as {self.client.node_id}")
         print(
             f"[{self.platform_name}] commands: "
-            "mep, mepdm, mepdmx, mepdmlist, mepdmverdict, mepdmreplysafe, "
+            "mep, mepdm, mepdmx, mepdmlist, mepdmhumanapproval, mepdmverdict, mepdmreplysafe, "
             "mepdata, mepcancel, mepresult, mepbalance, exit"
         )
         loop = asyncio.get_running_loop()

@@ -233,6 +233,80 @@ class TestStdioAdapter(unittest.IsolatedAsyncioTestCase):
         client.submit_review_verdict_dm.assert_awaited_once()
         print_mock.assert_any_call("[codex] review verdict error: unsupported review verdict: maybe")
 
+    async def test_dispatch_line_human_approval_request_uses_stored_inbound_message(self):
+        adapter, client = self._make_adapter()
+        adapter._recent_interbot_results["task_review_verdict"] = {
+            "payload_text": "{}",
+            "message": {
+                "message_id": "message_review_verdict",
+                "source": {"node_id": "node_governor", "alias": "Governor"},
+                "conversation": {"context_id": "pr154-review", "turn_type": "approval"},
+                "task": {"instructions": "Review verdict ready."},
+            },
+        }
+        client.submit_human_approval_request_dm = AsyncMock(
+            return_value={
+                "status_code": 200,
+                "json": {"status": "success", "task_id": "task_human_approval"},
+                "context_id": "pr154-review",
+            }
+        )
+
+        with patch("builtins.print") as print_mock:
+            keep_going = await adapter._dispatch_line(
+                'mepdmhumanapproval task_review_verdict '
+                '"Two bots approve with conditions and no code blocker remains." '
+                '--review-decision approve_with_conditions '
+                '--blocker "Need explicit merge confirmation from the human governor." '
+                '--next-action "Merge after final human approval." '
+                '--priority high'
+            )
+
+        self.assertTrue(keep_going)
+        client.submit_human_approval_request_dm.assert_awaited_once_with(
+            "Two bots approve with conditions and no code blocker remains.",
+            "node_governor",
+            context_id="pr154-review",
+            decision_type="merge_decision",
+            target_alias="Governor",
+            reply_to_task_id="task_review_verdict",
+            reply_to_message_id="message_review_verdict",
+            review_decision="approve_with_conditions",
+            blockers=["Need explicit merge confirmation from the human governor."],
+            recommended_next_action="Merge after final human approval.",
+            priority="high",
+        )
+        print_mock.assert_any_call(
+            "[codex] human approval request sent task task_human_approval context=pr154-review"
+        )
+
+    async def test_dispatch_line_human_approval_request_reports_validation_errors(self):
+        adapter, client = self._make_adapter()
+        adapter._recent_interbot_results["task_review_verdict"] = {
+            "payload_text": "{}",
+            "message": {
+                "message_id": "message_review_verdict",
+                "source": {"node_id": "node_governor"},
+                "conversation": {"context_id": "pr154-review", "turn_type": "approval"},
+                "task": {"instructions": "Review verdict ready."},
+            },
+        }
+        client.submit_human_approval_request_dm = AsyncMock(
+            side_effect=ValueError("unsupported review decision: maybe")
+        )
+
+        with patch("builtins.print") as print_mock:
+            keep_going = await adapter._dispatch_line(
+                'mepdmhumanapproval task_review_verdict '
+                '"Two bots approve with conditions." --review-decision maybe'
+            )
+
+        self.assertTrue(keep_going)
+        client.submit_human_approval_request_dm.assert_awaited_once()
+        print_mock.assert_any_call(
+            "[codex] human approval request error: unsupported review decision: maybe"
+        )
+
     async def test_dispatch_line_safe_reply_reports_stop_without_submitting_dm(self):
         adapter, client = self._make_adapter()
         adapter._recent_interbot_results["task_review_request"] = {
@@ -267,6 +341,7 @@ class TestStdioAdapter(unittest.IsolatedAsyncioTestCase):
             "payload_text": "{}",
             "message": {
                 "message_id": "message_review_request",
+                "source": {"node_id": "node_reviewer"},
                 "conversation": {"context_id": "pr154-review", "turn_type": "review_request"},
                 "task": {"instructions": "Please review this PR."},
             },
