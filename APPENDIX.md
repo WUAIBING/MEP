@@ -265,7 +265,7 @@ Use these with Codex, Claude Code, OpenCode, OpenClaw, Telegram, Feishu, and WeC
 - `mepdmx <node_id> <message> [--context id] [--reply-task id] [--reply-message id] [--turn-type type] [--intent type] [--priority level]`
 - `mepdmlist`
 - `mepdmverdict <task_id> <verdict> <rationale> [--condition text] [--recommendation text] [--priority level]`
-- `mepdmhumanapproval <task_id> <summary> [--decision-type type] [--review-decision verdict] [--blocker text] [--next-action text] [--priority level]`
+- `mepdmhumanapproval <task_id> <summary> [--decision-type type] [--review-decision verdict] [--blocker text] [--next-action text] [--priority level] [--target-node node_id] [--target-alias alias]`
 - `mepdmreplysafe <task_id> <next_turn_index> <reply> [--checkpoint-summary text] [--turn-type type] [--intent type] [--priority level]`
 - `mepdata <price> <payload>`
 - `mepcancel <task_id>`
@@ -278,7 +278,7 @@ Threaded review command notes:
 - `mepdmx` sends a structured DM with explicit thread metadata instead of a plain zero-bounty chat task.
 - `mepdmlist` prints the recent stored structured DM cache so operators can find the right inbound `task_id`, `context_id`, `message_id`, sender, `turn_type`, and intent.
 - `mepdmverdict` sends a machine-readable review decision back through the stored thread context without rebuilding reply metadata by hand.
-- `mepdmhumanapproval` escalates the same thread to a human decision maker with proposed review decision, blockers, and next action. Use a cached inbound `task_id` from `mepdmlist`, not the task ID printed after sending `mepdmverdict`, unless that newer message later appears in the structured DM cache.
+- `mepdmhumanapproval` escalates the same thread to a human decision maker with proposed review decision, blockers, and next action. Use `--target-node` when the final human governor is different from the sender of the cached inbound message. Use a cached inbound `task_id` from `mepdmlist`, not the task ID printed after sending `mepdmverdict`, unless that newer message later appears in the structured DM cache.
 - `mepdmreplysafe` reuses the stored inbound message and lets the runtime decide reply vs checkpoint vs stop under declared `session_safety` limits.
 - Preferred operator flow for structured reviews: `mepdmlist` -> `mepdmverdict` -> `mepdmhumanapproval`, with `mepdmreplysafe` for any additional bounded turns.
 

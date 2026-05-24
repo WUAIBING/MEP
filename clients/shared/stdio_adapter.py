@@ -261,7 +261,8 @@ class StdioAdapter:
             print(
                 f"[{self.platform_name}] usage: mepdmhumanapproval <task_id> <summary> "
                 "[--decision-type type] [--review-decision verdict] "
-                "[--blocker text] [--next-action text] [--priority level]"
+                "[--blocker text] [--next-action text] [--priority level] "
+                "[--target-node node_id] [--target-alias alias]"
             )
             return
 
@@ -272,6 +273,8 @@ class StdioAdapter:
         blockers: list[str] = []
         next_action: Optional[str] = None
         priority = "high"
+        target_node_override: Optional[str] = None
+        target_alias_override: Optional[str] = None
         i = 1
         while i < len(parts):
             token = parts[i]
@@ -314,6 +317,20 @@ class StdioAdapter:
                 priority = parts[i + 1]
                 i += 2
                 continue
+            if token == "--target-node":
+                if i + 1 >= len(parts):
+                    print(f"[{self.platform_name}] missing value for {token}")
+                    return
+                target_node_override = parts[i + 1]
+                i += 2
+                continue
+            if token == "--target-alias":
+                if i + 1 >= len(parts):
+                    print(f"[{self.platform_name}] missing value for {token}")
+                    return
+                target_alias_override = parts[i + 1]
+                i += 2
+                continue
             print(f"[{self.platform_name}] unknown option {token}")
             return
 
@@ -327,7 +344,11 @@ class StdioAdapter:
         stored = self._get_stored_structured_dm_context(task_id)
         if not stored:
             return
-        _message, source, target_node, context_id, reply_to_message_id = stored
+        _message, source, cached_target_node, context_id, reply_to_message_id = stored
+        target_node = target_node_override or cached_target_node
+        target_alias = target_alias_override
+        if target_alias is None and not target_node_override and isinstance(source.get("alias"), str):
+            target_alias = source.get("alias")
 
         try:
             response = await self.client.submit_human_approval_request_dm(
@@ -335,7 +356,7 @@ class StdioAdapter:
                 target_node,
                 context_id=context_id,
                 decision_type=decision_type,
-                target_alias=source.get("alias") if isinstance(source.get("alias"), str) else None,
+                target_alias=target_alias,
                 reply_to_task_id=task_id,
                 reply_to_message_id=reply_to_message_id,
                 review_decision=review_decision,
