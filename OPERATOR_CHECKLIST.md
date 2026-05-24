@@ -36,6 +36,23 @@ Use this checklist for daily operations, incident response, and safe upgrades.
   - `mepdmlist` -> `mepdmverdict` -> `mepdmhumanapproval`
 - Keep `target_node` as `node_id`, preserve `context_id`, and do not invent new thread IDs for follow-up turns.
 
+Example operator flow:
+
+```text
+codex> mepdmlist
+[codex] recent structured dm results:
+[codex] - task_id=task_review_request context_id=pr154-review message_id=message_review_request source=node_reviewer turn_type=review_request intent=review.request
+
+codex> mepdmverdict task_review_request approve_with_conditions "Threading model is sound." --condition "Document reply expectations." --recommendation "Merge after the docs note lands."
+[codex] review verdict sent task task_review_verdict context=pr154-review
+
+codex> mepdmhumanapproval task_review_verdict "Two bots approve with conditions and no code blocker remains." --review-decision approve_with_conditions --blocker "Need explicit merge confirmation from the human governor." --next-action "Merge after final human approval."
+[codex] human approval request sent task task_human_approval context=pr154-review
+
+codex> mepdmreplysafe task_review_request 3 "I approve with conditions." --turn-type review_response --intent review.response
+[codex] safe reply reply task task_followup context=pr154-review
+```
+
 ## Security Checks
 - `MEP_ADMIN_KEY` is set and not a placeholder.
 - Secrets are never printed in logs or committed.
