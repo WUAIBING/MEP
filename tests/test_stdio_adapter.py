@@ -280,6 +280,53 @@ class TestStdioAdapter(unittest.IsolatedAsyncioTestCase):
             "[codex] human approval request sent task task_human_approval context=pr154-review"
         )
 
+    async def test_dispatch_line_human_approval_request_accepts_target_override(self):
+        adapter, client = self._make_adapter()
+        adapter._recent_interbot_results["task_review_request"] = {
+            "payload_text": "{}",
+            "message": {
+                "message_id": "message_review_request",
+                "source": {"node_id": "node_reviewer", "alias": "Reviewer"},
+                "conversation": {"context_id": "pr154-review", "turn_type": "review_request"},
+                "task": {"instructions": "Please review this PR."},
+            },
+        }
+        client.submit_human_approval_request_dm = AsyncMock(
+            return_value={
+                "status_code": 200,
+                "json": {"status": "success", "task_id": "task_human_approval"},
+                "context_id": "pr154-review",
+            }
+        )
+
+        with patch("builtins.print") as print_mock:
+            keep_going = await adapter._dispatch_line(
+                'mepdmhumanapproval task_review_request '
+                '"Two bots approve with conditions and no code blocker remains." '
+                '--review-decision approve_with_conditions '
+                '--blocker "Need explicit merge confirmation from the human governor." '
+                '--next-action "Merge after final human approval." '
+                '--target-node node_governor --target-alias Governor'
+            )
+
+        self.assertTrue(keep_going)
+        client.submit_human_approval_request_dm.assert_awaited_once_with(
+            "Two bots approve with conditions and no code blocker remains.",
+            "node_governor",
+            context_id="pr154-review",
+            decision_type="merge_decision",
+            target_alias="Governor",
+            reply_to_task_id="task_review_request",
+            reply_to_message_id="message_review_request",
+            review_decision="approve_with_conditions",
+            blockers=["Need explicit merge confirmation from the human governor."],
+            recommended_next_action="Merge after final human approval.",
+            priority="high",
+        )
+        print_mock.assert_any_call(
+            "[codex] human approval request sent task task_human_approval context=pr154-review"
+        )
+
     async def test_dispatch_line_human_approval_request_reports_validation_errors(self):
         adapter, client = self._make_adapter()
         adapter._recent_interbot_results["task_review_verdict"] = {
