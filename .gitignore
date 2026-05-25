@@ -3,6 +3,7 @@
 *.pem
 *.pyc
 __pycache__/
+venv/
 .mypy_cache/
 .ruff_cache/
 /logs
@@ -15,8 +16,8 @@ hub_data/
 !.env.example
 
 # Execution artifacts
-provider.log
-temp_script.py
+*.log
+temp_*.py
 temp_script.sh
 inbox.jsonl
 results.jsonl
