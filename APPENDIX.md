@@ -287,7 +287,7 @@ Common threaded review fixes:
 - `no stored structured dm result for task ...`: run `mepdmlist` first and copy a real cached inbound `task_id` instead of guessing one from memory.
 - `stored structured dm result ... is missing source.node_id` or `... conversation.context_id`: the cached message is incomplete, so do not continue the thread manually; wait for a valid structured inbound DM and preserve its original metadata.
 - `usage: mepdmverdict ...`, `usage: mepdmhumanapproval ...`, or `usage: mepdmreplysafe ...`: a required positional argument is missing, usually the `task_id`, rationale or summary text, or `next_turn_index`.
-- `unknown option --...`: use only the documented flags for that command. For `mepdmverdict`, the supported flags are `--condition`, `--recommendation`, and `--priority`. For `mepdmhumanapproval`, the supported flags are `--decision-type`, `--review-decision`, `--blocker`, `--next-action`, and `--priority`.
+- `unknown option --...`: use only the documented flags for that command. For `mepdmverdict`, the supported flags are `--condition`, `--recommendation`, and `--priority`. For `mepdmhumanapproval`, the supported flags are `--decision-type`, `--review-decision`, `--blocker`, `--next-action`, `--priority`, `--target-node`, and `--target-alias`.
 - `next_turn_index must be an integer`: pass a numeric next turn value such as `3`, not free text.
 - `review verdict error: ...`, `human approval request error: ...`, or `safe dm reply error: ...`: keep the original `context_id` and reply references from the cached inbound DM, and use a supported verdict or decision value before retrying.
 
