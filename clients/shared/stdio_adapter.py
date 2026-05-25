@@ -127,17 +127,32 @@ class StdioAdapter:
             print(
                 f"[{self.platform_name}] usage: mepdmx <node_id> <message> "
                 "[--context id] [--reply-task id] [--reply-message id] [--turn-type type] "
-                "[--intent type] [--priority <level>]"
+                "[--intent type] [--priority <level>] [--max-turns count] "
+                "[--max-duration-seconds seconds] [--checkpoint-interval count]"
             )
             return
 
         target_node = parts[0]
+        allowed_options = {
+            "--context",
+            "--reply-task",
+            "--reply-message",
+            "--turn-type",
+            "--intent",
+            "--priority",
+            "--max-turns",
+            "--max-duration-seconds",
+            "--checkpoint-interval",
+        }
         options: dict[str, str] = {}
         message_parts: list[str] = []
         i = 1
         while i < len(parts):
             token = parts[i]
             if token.startswith("--"):
+                if token not in allowed_options:
+                    print(f"[{self.platform_name}] unknown option {token}")
+                    return
                 if i + 1 >= len(parts):
                     print(f"[{self.platform_name}] missing value for {token}")
                     return
@@ -152,16 +167,43 @@ class StdioAdapter:
             print(f"[{self.platform_name}] usage: mepdmx <node_id> <message> [options]")
             return
 
-        response = await self.client.submit_dm(
-            message,
-            target_node,
-            context_id=options.get("--context"),
-            reply_to_task_id=options.get("--reply-task"),
-            reply_to_message_id=options.get("--reply-message"),
-            turn_type=options.get("--turn-type", "chat_turn"),
-            intent_type=options.get("--intent", "chat.request"),
-            priority=options.get("--priority", "normal"),
-        )
+        try:
+            max_turns = int(options["--max-turns"]) if "--max-turns" in options else None
+            max_duration_seconds = (
+                int(options["--max-duration-seconds"])
+                if "--max-duration-seconds" in options
+                else None
+            )
+            checkpoint_interval = (
+                int(options["--checkpoint-interval"])
+                if "--checkpoint-interval" in options
+                else None
+            )
+            session_safety = None
+            if (
+                max_turns is not None
+                or max_duration_seconds is not None
+                or checkpoint_interval is not None
+            ):
+                session_safety = self.client.build_session_safety_metadata(
+                    max_turns=max_turns,
+                    max_duration_seconds=max_duration_seconds,
+                    checkpoint_interval=checkpoint_interval,
+                )
+            response = await self.client.submit_dm(
+                message,
+                target_node,
+                context_id=options.get("--context"),
+                reply_to_task_id=options.get("--reply-task"),
+                reply_to_message_id=options.get("--reply-message"),
+                turn_type=options.get("--turn-type", "chat_turn"),
+                intent_type=options.get("--intent", "chat.request"),
+                priority=options.get("--priority", "normal"),
+                session_safety=session_safety,
+            )
+        except ValueError as exc:
+            print(f"[{self.platform_name}] threaded dm error: {exc}")
+            return
         data = response["json"]
         if response["status_code"] != 200 or data.get("status") != "success":
             print(f"[{self.platform_name}] dm failed: {data}")

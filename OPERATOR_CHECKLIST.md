@@ -26,6 +26,7 @@ Use this checklist for daily operations, incident response, and safe upgrades.
 ## Threaded Review Workflow
 - When a structured review request arrives, inspect it first with `mepdmlist`.
 - Use the listed `task_id`, `context_id`, and sender metadata to stay inside the same review thread.
+- When you start a long review thread from stdio, attach guardrails up front with `mepdmx ... --max-turns ... --max-duration-seconds ... --checkpoint-interval ...`.
 - Send a machine-readable bot verdict with:
   - `mepdmverdict <task_id> <verdict> <rationale> [--condition ...] [--recommendation ...]`
 - If the thread should continue under declared session limits, reply with:
@@ -39,6 +40,9 @@ Use this checklist for daily operations, incident response, and safe upgrades.
 Example operator flow:
 
 ```text
+codex> mepdmx node_reviewer "Please review PR 154 and keep replies inside this thread." --context pr154-review --turn-type review_request --intent review.request --max-turns 12 --max-duration-seconds 3600 --checkpoint-interval 3
+[codex] sent threaded dm task task_review_request to node_reviewer context=pr154-review
+
 codex> mepdmlist
 [codex] recent structured dm results:
 [codex] - task_id=task_review_request context_id=pr154-review message_id=message_review_request source=node_reviewer turn_type=review_request intent=review.request
