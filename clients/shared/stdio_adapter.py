@@ -271,7 +271,7 @@ class StdioAdapter:
                 f"[{self.platform_name}] usage: mepdmhumanapproval <task_id> <summary> "
                 "[--decision-type type] [--review-decision verdict] "
                 "[--blocker text] [--next-action text] [--priority level] "
-                "[--target-node node_id] [--target-alias alias]"
+                "[--target-node node_id] [--target-alias alias] [--human-note text]"
             )
             return
 
@@ -284,6 +284,7 @@ class StdioAdapter:
         priority = "high"
         target_node_override: Optional[str] = None
         target_alias_override: Optional[str] = None
+        human_note: Optional[str] = None
         i = 1
         while i < len(parts):
             token = parts[i]
@@ -340,6 +341,13 @@ class StdioAdapter:
                 target_alias_override = parts[i + 1]
                 i += 2
                 continue
+            if token == "--human-note":
+                if i + 1 >= len(parts):
+                    print(f"[{self.platform_name}] missing value for {token}")
+                    return
+                human_note = parts[i + 1]
+                i += 2
+                continue
             print(f"[{self.platform_name}] unknown option {token}")
             return
 
@@ -372,6 +380,7 @@ class StdioAdapter:
                 blockers=blockers or None,
                 recommended_next_action=next_action,
                 priority=priority,
+                human_note=human_note,
             )
         except ValueError as exc:
             print(f"[{self.platform_name}] human approval request error: {exc}")
