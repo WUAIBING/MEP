@@ -76,6 +76,48 @@ class TestStdioAdapter(unittest.IsolatedAsyncioTestCase):
             turn_type="review_response",
             intent_type="review.response",
             priority="high",
+            human_note=None,
+        )
+        print_mock.assert_any_call("[codex] safe reply reply task task_safe_reply context=pr154-review")
+
+    async def test_dispatch_line_safe_reply_accepts_human_note(self):
+        adapter, client = self._make_adapter()
+        adapter._recent_interbot_results["task_review_request"] = {
+            "payload_text": "{}",
+            "message": {
+                "message_id": "message_review_request",
+                "source": {"node_id": "node_reviewer"},
+                "conversation": {"context_id": "pr154-review", "turn_type": "review_request"},
+                "task": {"instructions": "Please review this PR."},
+            },
+        }
+        client.submit_safe_dm_reply = AsyncMock(
+            return_value={
+                "reply_action": "reply",
+                "status_code": 200,
+                "json": {"status": "success", "task_id": "task_safe_reply"},
+                "context_id": "pr154-review",
+            }
+        )
+
+        with patch("builtins.print") as print_mock:
+            keep_going = await adapter._dispatch_line(
+                'mepdmreplysafe task_review_request 3 "I approve with conditions." '
+                '--turn-type review_response --intent review.response '
+                '--human-note "Human asked to preserve final release context."'
+            )
+
+        self.assertTrue(keep_going)
+        client.submit_safe_dm_reply.assert_awaited_once_with(
+            "I approve with conditions.",
+            adapter._recent_interbot_results["task_review_request"]["message"],
+            next_turn_index=3,
+            checkpoint_summary=None,
+            inbound_task_id="task_review_request",
+            turn_type="review_response",
+            intent_type="review.response",
+            priority=None,
+            human_note="Human asked to preserve final release context.",
         )
         print_mock.assert_any_call("[codex] safe reply reply task task_safe_reply context=pr154-review")
 

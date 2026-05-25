@@ -127,7 +127,7 @@ class StdioAdapter:
             print(
                 f"[{self.platform_name}] usage: mepdmx <node_id> <message> "
                 "[--context id] [--reply-task id] [--reply-message id] [--turn-type type] "
-                "[--intent type] [--priority level]"
+                "[--intent type] [--priority <level>]"
             )
             return
 
@@ -180,7 +180,7 @@ class StdioAdapter:
         if len(parts) < 3:
             print(
                 f"[{self.platform_name}] usage: mepdmreplysafe <task_id> <next_turn_index> <reply> "
-                "[--checkpoint-summary text] [--turn-type type] [--intent type] [--priority level]"
+                "[--checkpoint-summary text] [--turn-type type] [--intent type] [--priority <level>] [--human-note text]"
             )
             return
 
@@ -198,6 +198,7 @@ class StdioAdapter:
             "--turn-type",
             "--intent",
             "--priority",
+            "--human-note",
         }
         i = 2
         while i < len(parts):
@@ -237,6 +238,7 @@ class StdioAdapter:
                 turn_type=options.get("--turn-type"),
                 intent_type=options.get("--intent"),
                 priority=options.get("--priority"),
+                human_note=options.get("--human-note"),
             )
         except ValueError as exc:
             print(f"[{self.platform_name}] safe dm reply error: {exc}")
@@ -270,7 +272,7 @@ class StdioAdapter:
             print(
                 f"[{self.platform_name}] usage: mepdmhumanapproval <task_id> <summary> "
                 "[--decision-type type] [--review-decision verdict] "
-                "[--blocker text] [--next-action text] [--priority level] "
+                "[--blocker text] [--next-action text] [--priority <level>] "
                 "[--target-node node_id] [--target-alias alias] [--human-note text]"
             )
             return
@@ -405,7 +407,7 @@ class StdioAdapter:
         if len(parts) < 3:
             print(
                 f"[{self.platform_name}] usage: mepdmverdict <task_id> <verdict> <rationale> "
-                "[--condition text] [--recommendation text] [--priority level] [--human-note text]"
+                "[--condition text] [--recommendation text] [--priority <level>] [--human-note text]"
             )
             return
 

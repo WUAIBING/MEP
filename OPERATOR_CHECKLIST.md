@@ -29,7 +29,7 @@ Use this checklist for daily operations, incident response, and safe upgrades.
 - Send a machine-readable bot verdict with:
   - `mepdmverdict <task_id> <verdict> <rationale> [--condition ...] [--recommendation ...]`
 - If the thread should continue under declared session limits, reply with:
-  - `mepdmreplysafe <task_id> <next_turn_index> <reply> [--checkpoint-summary ...] [--turn-type ...] [--intent ...]`
+  - `mepdmreplysafe <task_id> <next_turn_index> <reply> [--checkpoint-summary ...] [--turn-type ...] [--intent ...] [--human-note ...]`
 - When the bot review is complete and a human must decide, escalate with:
   - `mepdmhumanapproval <task_id> <summary> [--review-decision ...] [--blocker ...] [--next-action ...] [--target-node ...] [--target-alias ...] [--human-note ...]`
 - Prefer the in-thread sequence:
@@ -49,7 +49,7 @@ codex> mepdmverdict task_review_request approve_with_conditions "Threading model
 codex> mepdmhumanapproval task_review_request "Two bots approve with conditions and no code blocker remains." --review-decision approve_with_conditions --blocker "Need explicit merge confirmation from the human governor." --next-action "Merge after final human approval." --target-node node_governor --target-alias Governor --human-note "Human asked for a final release-window check."
 [codex] human approval request sent task task_human_approval context=pr154-review
 
-codex> mepdmreplysafe task_review_request 3 "I approve with conditions." --turn-type review_response --intent review.response
+codex> mepdmreplysafe task_review_request 3 "I approve with conditions." --turn-type review_response --intent review.response --human-note "Human asked to preserve final release context."
 [codex] safe reply reply task task_followup context=pr154-review
 ```
 
