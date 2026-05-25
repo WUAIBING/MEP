@@ -257,8 +257,12 @@ class StdioAdapter:
             print(f"[{self.platform_name}] safe dm reply failed: {data}")
             return
 
+        action_label = {
+            "reply": "safe reply task",
+            "checkpoint": "safe checkpoint task",
+        }.get(action, f"safe reply {action} task")
         print(
-            f"[{self.platform_name}] safe reply {action} task {data.get('task_id')} "
+            f"[{self.platform_name}] {action_label} {data.get('task_id')} "
             f"context={response.get('context_id')}"
         )
 

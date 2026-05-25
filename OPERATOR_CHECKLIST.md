@@ -50,7 +50,7 @@ codex> mepdmhumanapproval task_review_request "Two bots approve with conditions 
 [codex] human approval request sent task task_human_approval context=pr154-review
 
 codex> mepdmreplysafe task_review_request 3 "I approve with conditions." --turn-type review_response --intent review.response --human-note "Human asked to preserve final release context."
-[codex] safe reply reply task task_followup context=pr154-review
+[codex] safe reply task task_followup context=pr154-review
 ```
 
 ## Security Checks
