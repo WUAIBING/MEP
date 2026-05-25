@@ -193,10 +193,19 @@ class StdioAdapter:
 
         options: dict[str, str] = {}
         reply_parts: list[str] = []
+        allowed_options = {
+            "--checkpoint-summary",
+            "--turn-type",
+            "--intent",
+            "--priority",
+        }
         i = 2
         while i < len(parts):
             token = parts[i]
             if token.startswith("--"):
+                if token not in allowed_options:
+                    print(f"[{self.platform_name}] unknown option {token}")
+                    return
                 if i + 1 >= len(parts):
                     print(f"[{self.platform_name}] missing value for {token}")
                     return
