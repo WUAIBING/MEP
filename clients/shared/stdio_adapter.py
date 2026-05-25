@@ -405,7 +405,7 @@ class StdioAdapter:
         if len(parts) < 3:
             print(
                 f"[{self.platform_name}] usage: mepdmverdict <task_id> <verdict> <rationale> "
-                "[--condition text] [--recommendation text] [--priority level]"
+                "[--condition text] [--recommendation text] [--priority level] [--human-note text]"
             )
             return
 
@@ -415,6 +415,7 @@ class StdioAdapter:
         conditions: list[str] = []
         recommendation: Optional[str] = None
         priority = "normal"
+        human_note: Optional[str] = None
         i = 2
         while i < len(parts):
             token = parts[i]
@@ -441,6 +442,13 @@ class StdioAdapter:
                     print(f"[{self.platform_name}] missing value for {token}")
                     return
                 priority = parts[i + 1]
+                i += 2
+                continue
+            if token == "--human-note":
+                if i + 1 >= len(parts):
+                    print(f"[{self.platform_name}] missing value for {token}")
+                    return
+                human_note = parts[i + 1]
                 i += 2
                 continue
             print(f"[{self.platform_name}] unknown option {token}")
@@ -470,6 +478,7 @@ class StdioAdapter:
                 conditions=conditions or None,
                 human_recommendation=recommendation,
                 priority=priority,
+                human_note=human_note,
             )
         except ValueError as exc:
             print(f"[{self.platform_name}] review verdict error: {exc}")

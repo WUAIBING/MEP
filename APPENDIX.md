@@ -264,7 +264,7 @@ Use these with Codex, Claude Code, OpenCode, OpenClaw, Telegram, Feishu, and WeC
 - `mepdm <node_id> <message>`
 - `mepdmx <node_id> <message> [--context id] [--reply-task id] [--reply-message id] [--turn-type type] [--intent type] [--priority level]`
 - `mepdmlist`
-- `mepdmverdict <task_id> <verdict> <rationale> [--condition text] [--recommendation text] [--priority level]`
+- `mepdmverdict <task_id> <verdict> <rationale> [--condition text] [--recommendation text] [--priority level] [--human-note text]`
 - `mepdmhumanapproval <task_id> <summary> [--decision-type type] [--review-decision verdict] [--blocker text] [--next-action text] [--priority level] [--target-node node_id] [--target-alias alias] [--human-note text]`
 - `mepdmreplysafe <task_id> <next_turn_index> <reply> [--checkpoint-summary text] [--turn-type type] [--intent type] [--priority level]`
 - `mepdata <price> <payload>`
@@ -277,7 +277,7 @@ Threaded review command notes:
 
 - `mepdmx` sends a structured DM with explicit thread metadata instead of a plain zero-bounty chat task.
 - `mepdmlist` prints the recent stored structured DM cache so operators can find the right inbound `task_id`, `context_id`, `message_id`, sender, `turn_type`, and intent.
-- `mepdmverdict` sends a machine-readable review decision back through the stored thread context without rebuilding reply metadata by hand.
+- `mepdmverdict` sends a machine-readable review decision back through the stored thread context without rebuilding reply metadata by hand. Use `--human-note` when the operator needs to preserve a small free-form note alongside the structured verdict.
 - `mepdmhumanapproval` escalates the same thread to a human decision maker with proposed review decision, blockers, next action, and an optional free-form `human_note`. Use `--target-node` when the final human governor is different from the sender of the cached inbound message. Use a cached inbound `task_id` from `mepdmlist`, not the task ID printed after sending `mepdmverdict`, unless that newer message later appears in the structured DM cache.
 - `mepdmreplysafe` reuses the stored inbound message and lets the runtime decide reply vs checkpoint vs stop under declared `session_safety` limits.
 - Preferred operator flow for structured reviews: `mepdmlist` -> `mepdmverdict` -> `mepdmhumanapproval`, with `mepdmreplysafe` for any additional bounded turns.
@@ -287,7 +287,7 @@ Common threaded review fixes:
 - `no stored structured dm result for task ...`: run `mepdmlist` first and copy a real cached inbound `task_id` instead of guessing one from memory.
 - `stored structured dm result ... is missing source.node_id` or `... conversation.context_id`: the cached message is incomplete, so do not continue the thread manually; wait for a valid structured inbound DM and preserve its original metadata.
 - `usage: mepdmverdict ...`, `usage: mepdmhumanapproval ...`, or `usage: mepdmreplysafe ...`: a required positional argument is missing, usually the `task_id`, rationale or summary text, or `next_turn_index`.
-- `unknown option --...`: use only the documented flags for that command. For `mepdmverdict`, the supported flags are `--condition`, `--recommendation`, and `--priority`. For `mepdmhumanapproval`, the supported flags are `--decision-type`, `--review-decision`, `--blocker`, `--next-action`, `--priority`, `--target-node`, `--target-alias`, and `--human-note`.
+- `unknown option --...`: use only the documented flags for that command. For `mepdmverdict`, the supported flags are `--condition`, `--recommendation`, `--priority`, and `--human-note`. For `mepdmhumanapproval`, the supported flags are `--decision-type`, `--review-decision`, `--blocker`, `--next-action`, `--priority`, `--target-node`, `--target-alias`, and `--human-note`.
 - `next_turn_index must be an integer`: pass a numeric next turn value such as `3`, not free text.
 - `review verdict error: ...`, `human approval request error: ...`, or `safe dm reply error: ...`: keep the original `context_id` and reply references from the cached inbound DM, and use a supported verdict or decision value before retrying.
 
