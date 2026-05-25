@@ -39,6 +39,85 @@ class TestStdioAdapter(unittest.IsolatedAsyncioTestCase):
             "[codex] stored structured dm result task_review_request context=pr154-review"
         )
 
+    async def test_dispatch_line_structured_dm_accepts_session_safety_flags(self):
+        adapter, client = self._make_adapter()
+        client.build_session_safety_metadata.return_value = {
+            "max_turns": 12,
+            "max_duration_seconds": 3600,
+            "checkpoint_interval": 3,
+            "started_at_ms": 1_777_000_000_000,
+        }
+        client.submit_dm = AsyncMock(
+            return_value={
+                "status_code": 200,
+                "json": {"status": "success", "task_id": "task_threaded_dm"},
+                "context_id": "pr154-review",
+            }
+        )
+
+        with patch("builtins.print") as print_mock:
+            keep_going = await adapter._dispatch_line(
+                'mepdmx node_reviewer "Please review PR 154." '
+                "--context pr154-review --turn-type review_request --intent review.request "
+                "--priority high --max-turns 12 --max-duration-seconds 3600 "
+                "--checkpoint-interval 3"
+            )
+
+        self.assertTrue(keep_going)
+        client.build_session_safety_metadata.assert_called_once_with(
+            max_turns=12,
+            max_duration_seconds=3600,
+            checkpoint_interval=3,
+        )
+        client.submit_dm.assert_awaited_once_with(
+            "Please review PR 154.",
+            "node_reviewer",
+            context_id="pr154-review",
+            reply_to_task_id=None,
+            reply_to_message_id=None,
+            turn_type="review_request",
+            intent_type="review.request",
+            priority="high",
+            session_safety={
+                "max_turns": 12,
+                "max_duration_seconds": 3600,
+                "checkpoint_interval": 3,
+                "started_at_ms": 1_777_000_000_000,
+            },
+        )
+        print_mock.assert_any_call("[codex] sent threaded dm task task_threaded_dm to node_reviewer context=pr154-review")
+
+    async def test_dispatch_line_structured_dm_rejects_unknown_option(self):
+        adapter, client = self._make_adapter()
+        client.submit_dm = AsyncMock()
+
+        with patch("builtins.print") as print_mock:
+            keep_going = await adapter._dispatch_line(
+                'mepdmx node_reviewer "Please review PR 154." --bogus nope'
+            )
+
+        self.assertTrue(keep_going)
+        client.submit_dm.assert_not_awaited()
+        print_mock.assert_any_call("[codex] unknown option --bogus")
+
+    async def test_dispatch_line_structured_dm_reports_invalid_session_safety(self):
+        adapter, client = self._make_adapter()
+        client.build_session_safety_metadata.side_effect = ValueError(
+            "checkpoint_interval must be a positive integer"
+        )
+        client.submit_dm = AsyncMock()
+
+        with patch("builtins.print") as print_mock:
+            keep_going = await adapter._dispatch_line(
+                'mepdmx node_reviewer "Please review PR 154." --checkpoint-interval 0'
+            )
+
+        self.assertTrue(keep_going)
+        client.submit_dm.assert_not_awaited()
+        print_mock.assert_any_call(
+            "[codex] threaded dm error: checkpoint_interval must be a positive integer"
+        )
+
     async def test_dispatch_line_safe_reply_uses_stored_inbound_message(self):
         adapter, client = self._make_adapter()
         adapter._recent_interbot_results["task_review_request"] = {
