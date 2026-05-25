@@ -550,6 +550,92 @@ class TestSharedMEPClient(unittest.TestCase):
         self.assertEqual(body["conversation"]["turn_type"], "checkpoint")
         self.assertEqual(body["task"]["instructions"], "Checkpoint: 3 turns reached.")
 
+    def test_submit_safe_dm_reply_progresses_from_reply_to_checkpoint_to_stop(self):
+        with (
+            patch("clients.shared.mep_client.MEPIdentity", return_value=_FakeIdentity()),
+            patch("clients.shared.mep_client.requests.Session") as session_cls,
+        ):
+            session = session_cls.return_value
+            session.post.side_effect = [
+                _FakeResponse(json_data={"status": "success", "task_id": "task_reply"}),
+                _FakeResponse(json_data={"status": "success", "task_id": "task_checkpoint"}),
+            ]
+            client = MEPClient("unused.pem")
+            started_at_ms = 1_777_000_000_000
+            inbound_message = {
+                "message_id": "message_review_request",
+                "trace_id": "trace-123",
+                "timestamp_ms": started_at_ms,
+                "source": {"node_id": "node_reviewer", "alias": "Reviewer"},
+                "intent": {"type": "review.request", "priority": "high"},
+                "conversation": {"context_id": "pr154-review", "turn_type": "review_request"},
+                "task": {
+                    "instructions": "Please review this PR.",
+                    "inputs": {
+                        "session_safety": {
+                            "max_turns": 4,
+                            "checkpoint_interval": 3,
+                            "max_duration_seconds": 60,
+                            "started_at_ms": started_at_ms,
+                        }
+                    },
+                },
+            }
+
+            reply_response = asyncio.run(
+                client.submit_safe_dm_reply(
+                    "I approve with conditions.",
+                    inbound_message,
+                    inbound_task_id="task_review_request",
+                    next_turn_index=2,
+                    now_ms=1_777_000_010_000,
+                )
+            )
+            reply_submit_body = json.loads(session.post.call_args_list[0].kwargs["data"])
+            reply_message = json.loads(reply_submit_body["task"]["instructions"])
+
+            checkpoint_response = asyncio.run(
+                client.submit_safe_dm_reply(
+                    "I approve with conditions.",
+                    reply_message,
+                    inbound_task_id="task_reply",
+                    next_turn_index=3,
+                    checkpoint_summary="Checkpoint: two review turns completed.",
+                    now_ms=1_777_000_020_000,
+                )
+            )
+            checkpoint_submit_body = json.loads(session.post.call_args_list[1].kwargs["data"])
+            checkpoint_message = json.loads(checkpoint_submit_body["task"]["instructions"])
+
+            stop_response = asyncio.run(
+                client.submit_safe_dm_reply(
+                    "I approve with conditions.",
+                    checkpoint_message,
+                    inbound_task_id="task_checkpoint",
+                    next_turn_index=5,
+                    now_ms=1_777_000_070_000,
+                )
+            )
+
+        self.assertEqual(session.post.call_count, 2)
+        self.assertEqual(reply_response["reply_action"], "reply")
+        self.assertEqual(reply_response["status"], "replied")
+        self.assertEqual(
+            reply_message["task"]["inputs"]["session_safety"]["started_at_ms"],
+            started_at_ms,
+        )
+        self.assertEqual(checkpoint_response["reply_action"], "checkpoint")
+        self.assertEqual(checkpoint_response["status"], "checkpointed")
+        self.assertEqual(checkpoint_message["conversation"]["turn_type"], "checkpoint")
+        self.assertEqual(
+            checkpoint_message["task"]["inputs"]["session_safety"]["started_at_ms"],
+            started_at_ms,
+        )
+        self.assertEqual(stop_response["reply_action"], "stop")
+        self.assertEqual(stop_response["status"], "stopped")
+        self.assertEqual(stop_response["safety"]["violations"], ["max_turns_exceeded", "max_duration_exceeded"])
+        self.assertEqual(stop_response["session_safety"]["started_at_ms"], started_at_ms)
+
     def test_submit_safe_dm_reply_stops_when_session_limits_are_exceeded(self):
         with patch("clients.shared.mep_client.MEPIdentity", return_value=_FakeIdentity()):
             client = MEPClient("unused.pem")
