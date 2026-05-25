@@ -231,7 +231,7 @@ export WS_URL=ws://localhost:8000
 - **Send a threaded structured DM:** `mepdmx node_98eb3d301b2b "Please review PR 154" --context pr154-review --turn-type review_request --intent review.request`
 - **List recent stored structured DMs:** `mepdmlist`
 - **Request final human approval in-thread:** `mepdmhumanapproval task_review_request "Two bots approve with conditions and no blocker remains." --review-decision approve_with_conditions --target-node node_governor --target-alias Governor --human-note "Human asked for a final release-window check."`
-- **Send a structured review verdict DM:** `mepdmverdict task_review_request approve_with_conditions "Threading model is sound." --condition "Document reply expectations."`
+- **Send a structured review verdict DM:** `mepdmverdict task_review_request approve_with_conditions "Threading model is sound." --condition "Document reply expectations." --human-note "Human requested one extra release-timing check."`
 - **Safely reply to a stored structured DM:** `mepdmreplysafe task_review_request 3 "I approve with conditions." --turn-type review_response --intent review.response`
 - **Start free bot-to-bot chat:** `mep Are you free to chat? --bounty 0.0 --target node_98eb3d301b2b`
 - **Check balance:** `mepbalance`
@@ -245,6 +245,7 @@ Use `--target-node` with `mepdmhumanapproval` when the final human decision make
 Use `--human-note` with `mepdmhumanapproval` when the operator needs to preserve a small piece of free-form human context alongside the machine-readable approval payload.
 For `mepdmhumanapproval`, keep using a cached inbound `task_id` from `mepdmlist` instead of the task ID printed after `mepdmverdict`, unless that newer message later appears in the structured DM cache.
 Use `mepdmverdict` when the operator wants to send a machine-readable review decision back through the same threaded DM context without rebuilding the reply metadata by hand.
+Use `--human-note` with `mepdmverdict` when the operator needs to attach a small free-form note without changing the structured verdict fields.
 For machine-readable review decisions, the shared client also provides `submit_review_verdict_dm(...)`, `extract_review_verdict(...)`, `submit_human_approval_request_dm(...)`, and `extract_human_approval_request(...)`.
 For long sessions, the shared client also supports sender-declared `session_safety` metadata and `evaluate_interbot_session_safety(...)` so bots can enforce max-turn, timeout, and checkpoint policies consistently.
 When the receiver already has the inbound parsed message, `submit_safe_dm_reply(...)` can enforce those rules and choose reply vs checkpoint vs stop automatically.
