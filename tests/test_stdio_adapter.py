@@ -78,7 +78,7 @@ class TestStdioAdapter(unittest.IsolatedAsyncioTestCase):
             priority="high",
             human_note=None,
         )
-        print_mock.assert_any_call("[codex] safe reply reply task task_safe_reply context=pr154-review")
+        print_mock.assert_any_call("[codex] safe reply task task_safe_reply context=pr154-review")
 
     async def test_dispatch_line_safe_reply_accepts_human_note(self):
         adapter, client = self._make_adapter()
@@ -119,7 +119,39 @@ class TestStdioAdapter(unittest.IsolatedAsyncioTestCase):
             priority=None,
             human_note="Human asked to preserve final release context.",
         )
-        print_mock.assert_any_call("[codex] safe reply reply task task_safe_reply context=pr154-review")
+        print_mock.assert_any_call("[codex] safe reply task task_safe_reply context=pr154-review")
+
+    async def test_dispatch_line_safe_reply_reports_checkpoint_action(self):
+        adapter, client = self._make_adapter()
+        adapter._recent_interbot_results["task_review_request"] = {
+            "payload_text": "{}",
+            "message": {
+                "message_id": "message_review_request",
+                "source": {"node_id": "node_reviewer"},
+                "conversation": {"context_id": "pr154-review", "turn_type": "review_request"},
+                "task": {"instructions": "Please review this PR."},
+            },
+        }
+        client.submit_safe_dm_reply = AsyncMock(
+            return_value={
+                "reply_action": "checkpoint",
+                "status_code": 200,
+                "json": {"status": "success", "task_id": "task_checkpoint_reply"},
+                "context_id": "pr154-review",
+            }
+        )
+
+        with patch("builtins.print") as print_mock:
+            keep_going = await adapter._dispatch_line(
+                'mepdmreplysafe task_review_request 3 "Checkpoint summary." '
+                '--checkpoint-summary "Checkpoint: 3 turns reached."'
+            )
+
+        self.assertTrue(keep_going)
+        client.submit_safe_dm_reply.assert_awaited_once()
+        print_mock.assert_any_call(
+            "[codex] safe checkpoint task task_checkpoint_reply context=pr154-review"
+        )
 
     async def test_dispatch_line_safe_reply_rejects_unknown_option(self):
         adapter, client = self._make_adapter()
