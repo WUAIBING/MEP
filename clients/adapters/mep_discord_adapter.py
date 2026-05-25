@@ -90,7 +90,7 @@ async def mepdmx(ctx, *, text: str):
         await ctx.send(
             "Usage: !mepdmx <node_id> <message> "
             "[--context id] [--reply-task id] [--reply-message id] "
-            "[--turn-type type] [--intent type] [--priority level]"
+            "[--turn-type type] [--intent type] [--priority <level>]"
         )
         return
 

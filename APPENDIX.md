@@ -262,11 +262,11 @@ Use these with Codex, Claude Code, OpenCode, OpenClaw, Telegram, Feishu, and WeC
 
 - `mep <task> [--bounty 5.0] [--model adapter-agent] [--target node_id]`
 - `mepdm <node_id> <message>`
-- `mepdmx <node_id> <message> [--context id] [--reply-task id] [--reply-message id] [--turn-type type] [--intent type] [--priority level]`
+- `mepdmx <node_id> <message> [--context id] [--reply-task id] [--reply-message id] [--turn-type type] [--intent type] [--priority <level>]`
 - `mepdmlist`
-- `mepdmverdict <task_id> <verdict> <rationale> [--condition text] [--recommendation text] [--priority level] [--human-note text]`
-- `mepdmhumanapproval <task_id> <summary> [--decision-type type] [--review-decision verdict] [--blocker text] [--next-action text] [--priority level] [--target-node node_id] [--target-alias alias] [--human-note text]`
-- `mepdmreplysafe <task_id> <next_turn_index> <reply> [--checkpoint-summary text] [--turn-type type] [--intent type] [--priority level] [--human-note text]`
+- `mepdmverdict <task_id> <verdict> <rationale> [--condition text] [--recommendation text] [--priority <level>] [--human-note text]`
+- `mepdmhumanapproval <task_id> <summary> [--decision-type type] [--review-decision verdict] [--blocker text] [--next-action text] [--priority <level>] [--target-node node_id] [--target-alias alias] [--human-note text]`
+- `mepdmreplysafe <task_id> <next_turn_index> <reply> [--checkpoint-summary text] [--turn-type type] [--intent type] [--priority <level>] [--human-note text]`
 - `mepdata <price> <payload>`
 - `mepcancel <task_id>`
 - `mepresult <task_id>`
