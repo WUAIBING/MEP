@@ -302,6 +302,95 @@ class TestStdioAdapter(unittest.IsolatedAsyncioTestCase):
             "turn_type=review_request intent=review.request"
         )
 
+    async def test_dispatch_line_dmlist_filters_by_context(self):
+        adapter, _client = self._make_adapter()
+        adapter._recent_interbot_results["task_review_request"] = {
+            "payload_text": "{}",
+            "message": {
+                "message_id": "message_review_request",
+                "source": {"node_id": "node_reviewer"},
+                "conversation": {"context_id": "pr154-review", "turn_type": "review_request"},
+                "intent": {"type": "review.request"},
+            },
+        }
+        adapter._recent_interbot_results["task_other_context"] = {
+            "payload_text": "{}",
+            "message": {
+                "message_id": "message_other",
+                "source": {"node_id": "node_other"},
+                "conversation": {"context_id": "incident-42", "turn_type": "review_request"},
+                "intent": {"type": "review.request"},
+            },
+        }
+
+        with patch("builtins.print") as print_mock:
+            keep_going = await adapter._dispatch_line("mepdmlist --context pr154-review")
+
+        self.assertTrue(keep_going)
+        print_mock.assert_any_call("[codex] recent structured dm results for context=pr154-review:")
+        print_mock.assert_any_call(
+            "[codex] - task_id=task_review_request context_id=pr154-review "
+            "message_id=message_review_request source=node_reviewer "
+            "turn_type=review_request intent=review.request"
+        )
+        self.assertNotIn(
+            unittest.mock.call(
+                "[codex] - task_id=task_other_context context_id=incident-42 "
+                "message_id=message_other source=node_other "
+                "turn_type=review_request intent=review.request"
+            ),
+            print_mock.mock_calls,
+        )
+
+    async def test_dispatch_line_dmlist_honors_limit(self):
+        adapter, _client = self._make_adapter()
+        adapter._recent_interbot_results["task_review_request"] = {
+            "payload_text": "{}",
+            "message": {
+                "message_id": "message_review_request",
+                "source": {"node_id": "node_reviewer"},
+                "conversation": {"context_id": "pr154-review", "turn_type": "review_request"},
+                "intent": {"type": "review.request"},
+            },
+        }
+        adapter._recent_interbot_results["task_checkpoint"] = {
+            "payload_text": "{}",
+            "message": {
+                "message_id": "message_checkpoint",
+                "source": {"node_id": "node_reviewer"},
+                "conversation": {"context_id": "pr154-review", "turn_type": "checkpoint"},
+                "intent": {"type": "coordination.request"},
+            },
+        }
+
+        with patch("builtins.print") as print_mock:
+            keep_going = await adapter._dispatch_line("mepdmlist --limit 1")
+
+        self.assertTrue(keep_going)
+        print_mock.assert_any_call("[codex] recent structured dm results:")
+        print_mock.assert_any_call(
+            "[codex] - task_id=task_checkpoint context_id=pr154-review "
+            "message_id=message_checkpoint source=node_reviewer "
+            "turn_type=checkpoint intent=coordination.request"
+        )
+        self.assertNotIn(
+            unittest.mock.call(
+                "[codex] - task_id=task_review_request context_id=pr154-review "
+                "message_id=message_review_request source=node_reviewer "
+                "turn_type=review_request intent=review.request"
+            ),
+            print_mock.mock_calls,
+        )
+
+    async def test_dispatch_line_dmlist_rejects_unknown_option(self):
+        adapter, _client = self._make_adapter()
+
+        with patch("builtins.print") as print_mock:
+            keep_going = await adapter._dispatch_line("mepdmlist --bogus nope")
+
+        self.assertTrue(keep_going)
+        print_mock.assert_any_call("[codex] unknown option --bogus")
+
     async def test_dispatch_line_review_verdict_uses_stored_inbound_message(self):
         adapter, client = self._make_adapter()
         adapter._recent_interbot_results["task_review_request"] = {
