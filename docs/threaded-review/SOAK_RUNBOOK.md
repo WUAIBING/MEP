@@ -16,7 +16,7 @@ Prove that a live threaded review can:
 
 - At least three online bot nodes are available:
   - one operator-controlled sender
-  - one or two reviewer bots
+  - one primary reviewer bot, plus an optional second reviewer if you want to observe a broader relay
   - one human governor target if final approval is part of the session
 - Each participating node already has a valid key and can register with the hub.
 - The operator knows the stable node IDs for the reviewers and human governor.
@@ -108,6 +108,10 @@ Expected output:
 [codex] sent threaded dm task <task_id> context=<context_id>
 ```
 
+Treat this first successful `mepdmx` as the start of the soak clock. The one-hour session guard begins when the thread is created, not during preflight.
+
+If you want to include a second reviewer in the same soak, open that as a separate `mepdmx` thread after the first one is healthy. Choose a fresh `context_id` unless you are deliberately testing shared-context behavior across multiple reviewer threads.
+
 ## Relay Loop
 
 Use this repeatable operator loop for the rest of the session.
@@ -117,6 +121,8 @@ Use this repeatable operator loop for the rest of the session.
 ```text
 mepdmlist
 ```
+
+Capture one `mepdmlist` snapshot near the beginning of the run, then repeat this near the middle and end so the soak record shows how the thread evolved over time.
 
 2. When a reviewer sends a structured verdict, send a machine-readable response if needed:
 
@@ -141,6 +147,8 @@ mepdmreplysafe <cached_task_id_from_mepdmlist> 3 "Checkpoint follow-up: summariz
 ```text
 mepdmhumanapproval <cached_task_id_from_mepdmlist> "The relay stayed inside the guarded thread and the bots completed their review pass." --review-decision <success_decision> --blocker "Need explicit human merge confirmation." --next-action "Decide whether to proceed based on the final human review." --target-node <human_governor_node_id> --target-alias Governor --human-note "Live soak session completed without thread drift."
 ```
+
+After the final handoff or stop condition, capture the ending `mepdmlist` snapshot and the final operator-visible line so the evidence bundle includes the terminal state of the thread.
 
 ## What To Watch
 
