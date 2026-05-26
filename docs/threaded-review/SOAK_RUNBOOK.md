@@ -32,6 +32,18 @@ Use these defaults for a one-hour soak:
 
 These values are large enough for a real relay but small enough to prove checkpoint and stop behavior during the session.
 
+## Operator Inputs
+
+Before starting the session, choose these values for the specific soak you are running:
+
+- `<reviewer_node_id>`: the first reviewer bot that should receive the opening request
+- `<human_governor_node_id>`: the human decision maker if the session includes final approval
+- `<context_id>`: a fresh thread identifier for this soak run, for example `review-soak-20260525-01`
+- `<review_topic>`: the real subject under review, such as a PR, release candidate, incident plan, or design note
+- `<success_decision>`: the structured verdict you expect to hand to the governor if the relay succeeds
+
+Keep these values stable for the full session. Do not recycle an old `context_id`.
+
 ## Preflight
 
 1. Verify hub health:
@@ -59,13 +71,19 @@ python -m clients.adapters.mep_claude_code_adapter
 Use `mepdmx` to start the guarded thread from stdio:
 
 ```text
+mepdmx <reviewer_node_id> "Please review <review_topic>. Keep all follow-up turns in this thread, surface blockers early, and preserve context for a final human merge decision." --context <context_id> --turn-type review_request --intent review.request --priority high --max-turns 12 --max-duration-seconds 3600 --checkpoint-interval 3
+```
+
+Example:
+
+```text
 mepdmx node_reviewer_a "Please review PR 154. Keep all follow-up turns in this thread, surface blockers early, and preserve context for a final human merge decision." --context pr154-review-soak-001 --turn-type review_request --intent review.request --priority high --max-turns 12 --max-duration-seconds 3600 --checkpoint-interval 3
 ```
 
 Expected output:
 
 ```text
-[codex] sent threaded dm task task_review_request context=pr154-review-soak-001
+[codex] sent threaded dm task <task_id> context=<context_id>
 ```
 
 ## Relay Loop
@@ -81,25 +99,25 @@ mepdmlist
 2. When a reviewer sends a structured verdict, send a machine-readable response if needed:
 
 ```text
-mepdmverdict task_review_request approve_with_conditions "Threading model is sound." --condition "Document rollout timing." --recommendation "Continue the relay and escalate after the final checkpoint."
+mepdmverdict <cached_task_id_from_mepdmlist> approve_with_conditions "The thread is staying coherent and the current review state is actionable." --condition "Document the remaining rollout risks." --recommendation "Continue the relay and escalate after the next checkpoint."
 ```
 
 3. When the thread should continue within the same session, use bounded replies:
 
 ```text
-mepdmreplysafe task_review_request 2 "Continuing the review relay. Keep the next reply focused on blocking concerns." --turn-type review_response --intent review.response
+mepdmreplysafe <cached_task_id_from_mepdmlist> 2 "Continuing the review relay. Keep the next reply focused on blocking concerns." --turn-type review_response --intent review.response
 ```
 
 4. On the next bounded turn, keep using the cached inbound `task_id` shown by `mepdmlist`:
 
 ```text
-mepdmreplysafe task_review_request 3 "Checkpoint follow-up: summarize the top two remaining blockers before we escalate." --checkpoint-summary "Checkpoint: three turns completed; preserve the same context and highlight unresolved blockers." --turn-type review_response --intent review.response --human-note "Soak run checkpoint one."
+mepdmreplysafe <cached_task_id_from_mepdmlist> 3 "Checkpoint follow-up: summarize the top two remaining blockers before we escalate." --checkpoint-summary "Checkpoint: three turns completed; preserve the same context and highlight unresolved blockers." --turn-type review_response --intent review.response --human-note "Soak run checkpoint one."
 ```
 
 5. When bot review is complete and a human governor must decide, escalate in-thread:
 
 ```text
-mepdmhumanapproval task_review_request "Two bots approve with conditions and the relay stayed inside the guarded thread." --review-decision approve_with_conditions --blocker "Need explicit human merge confirmation." --next-action "Merge after the governor confirms release timing." --target-node node_governor --target-alias Governor --human-note "Live soak session completed without thread drift."
+mepdmhumanapproval <cached_task_id_from_mepdmlist> "The relay stayed inside the guarded thread and the bots completed their review pass." --review-decision <success_decision> --blocker "Need explicit human merge confirmation." --next-action "Decide whether to proceed based on the final human review." --target-node <human_governor_node_id> --target-alias Governor --human-note "Live soak session completed without thread drift."
 ```
 
 ## What To Watch
