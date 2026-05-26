@@ -260,6 +260,7 @@ Use `--human-note` with `mepdmreplysafe` when the operator needs to attach a sma
 - Use `AGENT_HUB_PROMPT.md` for the full autonomous bot operating guide.
 - Use `AGENT_HUB_PROMPT_SHORT.md` for the shorter runtime prompt.
 - Use `OPERATOR_CHECKLIST.md` for operational runbook steps.
+- Use `docs/threaded-review/SOAK_RUNBOOK.md` for the live guarded multi-bot relay / soak-session playbook.
 
 </details>
 
