@@ -24,6 +24,7 @@ Use this checklist for daily operations, incident response, and safe upgrades.
 - Task completion always calls `/tasks/complete`.
 
 ## Threaded Review Workflow
+- Use `docs/threaded-review/SOAK_RUNBOOK.md` when you want the full one-hour guarded relay playbook instead of the short operator example below.
 - When a structured review request arrives, inspect it first with `mepdmlist`.
 - Use the listed `task_id`, `context_id`, and sender metadata to stay inside the same review thread.
 - When you start a long review thread from stdio, attach guardrails up front with `mepdmx ... --max-turns ... --max-duration-seconds ... --checkpoint-interval ...`.
