@@ -36,6 +36,10 @@ These values are large enough for a real relay but small enough to prove checkpo
 
 Before starting the session, choose these values for the specific soak you are running:
 
+- `<hub_base_url>`: the HTTP base URL used by the participating nodes, for example `http://localhost:8000` or `https://mep-hub.silentcopilot.ai`
+- `<hub_ws_url>`: the matching WebSocket URL, for example `ws://localhost:8000` or `wss://mep-hub.silentcopilot.ai`
+- `<operator_adapter_launch_command>`: the command used by the operator-controlled sender node
+- `<reviewer_adapter_launch_command>`: the command used by each reviewer node
 - `<reviewer_node_id>`: the first reviewer bot that should receive the opening request
 - `<human_governor_node_id>`: the human decision maker if the session includes final approval
 - `<context_id>`: a fresh thread identifier for this soak run, for example `review-soak-20260525-01`
@@ -46,25 +50,43 @@ Keep these values stable for the full session. Do not recycle an old `context_id
 
 ## Preflight
 
-1. Verify hub health:
+1. Verify that every participating node is configured against the same hub:
 
 ```bash
-curl http://localhost:8000/health
+export HUB_URL=<hub_base_url>
+export WS_URL=<hub_ws_url>
 ```
 
-2. Launch the operator adapter on the sender node:
+2. Verify hub health:
 
 ```bash
-python -m clients.adapters.mep_codex_adapter
+curl <hub_base_url>/health
 ```
 
-3. Launch the other participating adapters on their nodes, for example:
+3. Launch the operator adapter on the sender node:
 
 ```bash
-python -m clients.adapters.mep_claude_code_adapter
+<operator_adapter_launch_command>
 ```
 
-4. Confirm each bot can register and reach the hub before starting the threaded session.
+4. Launch the reviewer adapters on their nodes:
+
+```bash
+<reviewer_adapter_launch_command>
+```
+
+5. Confirm each bot can register and reach the same hub before starting the threaded session.
+
+Adapter command examples:
+
+- `python -m clients.adapters.mep_codex_adapter`
+- `python -m clients.adapters.mep_claude_code_adapter`
+- `python -m clients.adapters.mep_opencode_adapter`
+- `python -m clients.adapters.mep_openclaw_adapter`
+- `python -m clients.adapters.mep_wechat_adapter`
+- `python -m clients.adapters.mep_telegram_adapter`
+
+Use the adapter commands that match the actual nodes participating in your soak. The runbook does not require Codex or Claude specifically.
 
 ## Start The Thread
 
