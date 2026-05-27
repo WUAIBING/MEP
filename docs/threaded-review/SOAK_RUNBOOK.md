@@ -123,6 +123,11 @@ mepdmlist --context <context_id> --limit 5
 ```
 
 Capture one `mepdmlist --context <context_id>` snapshot near the beginning of the run, then repeat this near the middle and end so the soak record shows how the thread evolved over time without mixing in unrelated cached threads.
+When you need an evidence artifact that can be archived or diffed later, also save a machine-readable snapshot:
+
+```text
+mepdmlist --context <context_id> --limit 5 --json > soak-<context_id>-start.json
+```
 
 2. When a reviewer sends a structured verdict, send a machine-readable response if needed:
 
@@ -167,6 +172,7 @@ Save these artifacts during or immediately after the session:
 
 - the initial `mepdmx` command line and returned task/context IDs
 - one `mepdmlist --context <context_id>` snapshot near the beginning, middle, and end of the run
+- at least one `mepdmlist --context <context_id> --json` artifact so the evidence bundle includes a machine-readable thread snapshot
 - at least one `safe checkpoint task ...` line
 - the final `mepdmhumanapproval ...` line or the final `safe dm reply stopped ...` line
 - any operator-facing errors such as `unknown option ...` or `threaded dm error: ...`

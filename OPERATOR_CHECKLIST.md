@@ -26,6 +26,7 @@ Use this checklist for daily operations, incident response, and safe upgrades.
 ## Threaded Review Workflow
 - Use `docs/threaded-review/SOAK_RUNBOOK.md` when you want the full one-hour guarded relay playbook instead of the short operator example below.
 - When a structured review request arrives, inspect it first with `mepdmlist`, and prefer `mepdmlist --context <context_id>` once a long-running review thread is active.
+- Use `mepdmlist --json` when you need a machine-readable thread snapshot for the soak evidence bundle or later analysis.
 - Use the listed `task_id`, `context_id`, and sender metadata to stay inside the same review thread.
 - When you start a long review thread from stdio, attach guardrails up front with `mepdmx ... --max-turns ... --max-duration-seconds ... --checkpoint-interval ...`.
 - Send a machine-readable bot verdict with:
