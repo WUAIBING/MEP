@@ -1,4 +1,6 @@
 import json
+import os
+import tempfile
 import unittest
 from unittest.mock import AsyncMock, patch
 
@@ -475,6 +477,129 @@ class TestStdioAdapter(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(keep_going)
         print_mock.assert_any_call("[codex] unknown option --bogus")
+
+    async def test_dispatch_line_dmsnapshot_writes_filtered_snapshot_to_default_file(self):
+        adapter, _client = self._make_adapter()
+        adapter._recent_interbot_results["task_review_request"] = {
+            "payload_text": '{"spec_version":"mep.interbot.v1"}',
+            "message": {
+                "message_id": "message_review_request",
+                "source": {"node_id": "node_reviewer"},
+                "conversation": {"context_id": "pr154-review", "turn_type": "review_request"},
+                "intent": {"type": "review.request"},
+                "task": {"instructions": "Please review this PR."},
+            },
+        }
+        adapter._recent_interbot_results["task_other_context"] = {
+            "payload_text": '{"spec_version":"mep.interbot.v1"}',
+            "message": {
+                "message_id": "message_other",
+                "source": {"node_id": "node_other"},
+                "conversation": {"context_id": "incident-42", "turn_type": "review_request"},
+                "intent": {"type": "review.request"},
+            },
+        }
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            current_dir = os.getcwd()
+            os.chdir(temp_dir)
+            try:
+                with patch("builtins.print") as print_mock:
+                    keep_going = await adapter._dispatch_line(
+                        "mepdmsnapshot --context pr154-review --label start --limit 1"
+                    )
+            finally:
+                os.chdir(current_dir)
+
+            self.assertTrue(keep_going)
+            snapshot_path = os.path.join(temp_dir, "soak-pr154-review-start.json")
+            self.assertTrue(os.path.exists(snapshot_path))
+            with open(snapshot_path, encoding="utf-8") as snapshot_file:
+                snapshot = json.load(snapshot_file)
+
+        self.assertEqual(snapshot["platform"], "codex")
+        self.assertEqual(snapshot["context_filter"], "pr154-review")
+        self.assertEqual(snapshot["limit"], 1)
+        self.assertEqual(snapshot["snapshot_label"], "start")
+        self.assertEqual(snapshot["count"], 1)
+        self.assertEqual(snapshot["results"][0]["task_id"], "task_review_request")
+        self.assertIn("captured_at_utc", snapshot)
+        print_mock.assert_any_call(
+            "[codex] wrote structured dm snapshot soak-pr154-review-start.json label=start count=1 context=pr154-review"
+        )
+
+    async def test_dispatch_line_dmsnapshot_honors_explicit_output_path(self):
+        adapter, _client = self._make_adapter()
+        adapter._recent_interbot_results["task_review_request"] = {
+            "payload_text": '{"spec_version":"mep.interbot.v1"}',
+            "message": {
+                "message_id": "message_review_request",
+                "source": {"node_id": "node_reviewer"},
+                "conversation": {"context_id": "pr154-review", "turn_type": "review_request"},
+                "intent": {"type": "review.request"},
+            },
+        }
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output_path = os.path.join(temp_dir, "evidence", "mid.json")
+            with patch("builtins.print") as print_mock:
+                keep_going = await adapter._dispatch_line(
+                    f'mepdmsnapshot --label mid --out "{output_path}"'
+                )
+
+            self.assertTrue(keep_going)
+            self.assertTrue(os.path.exists(output_path))
+            with open(output_path, encoding="utf-8") as snapshot_file:
+                snapshot = json.load(snapshot_file)
+
+        self.assertEqual(snapshot["snapshot_label"], "mid")
+        self.assertEqual(snapshot["count"], 1)
+        self.assertEqual(snapshot["context_filter"], None)
+        print_mock.assert_any_call(
+            f"[codex] wrote structured dm snapshot {output_path} label=mid count=1"
+        )
+
+    async def test_dispatch_line_dmsnapshot_writes_empty_snapshot(self):
+        adapter, _client = self._make_adapter()
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output_path = os.path.join(temp_dir, "empty.json")
+            with patch("builtins.print") as print_mock:
+                keep_going = await adapter._dispatch_line(
+                    f'mepdmsnapshot --label end --out "{output_path}"'
+                )
+
+            self.assertTrue(keep_going)
+            self.assertTrue(os.path.exists(output_path))
+            with open(output_path, encoding="utf-8") as snapshot_file:
+                snapshot = json.load(snapshot_file)
+
+        self.assertEqual(snapshot["snapshot_label"], "end")
+        self.assertEqual(snapshot["count"], 0)
+        self.assertEqual(snapshot["results"], [])
+        print_mock.assert_any_call(
+            f"[codex] wrote structured dm snapshot {output_path} label=end count=0"
+        )
+
+    async def test_dispatch_line_dmsnapshot_requires_label(self):
+        adapter, _client = self._make_adapter()
+
+        with patch("builtins.print") as print_mock:
+            keep_going = await adapter._dispatch_line("mepdmsnapshot --context pr154-review")
+
+        self.assertTrue(keep_going)
+        print_mock.assert_any_call(
+            "[codex] usage: mepdmsnapshot --label <label> [--context <context_id>] [--limit <count>] [--out <file>]"
+        )
+
+    async def test_dispatch_line_dmsnapshot_rejects_unknown_option(self):
+        adapter, _client = self._make_adapter()
+
+        with patch("builtins.print") as print_mock:
+            keep_going = await adapter._dispatch_line("mepdmsnapshot --label start --json")
+
+        self.assertTrue(keep_going)
+        print_mock.assert_any_call("[codex] unknown option --json")
 
     async def test_dispatch_line_review_verdict_uses_stored_inbound_message(self):
         adapter, client = self._make_adapter()

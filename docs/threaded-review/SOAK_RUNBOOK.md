@@ -123,10 +123,10 @@ mepdmlist --context <context_id> --limit 5
 ```
 
 Capture one `mepdmlist --context <context_id>` snapshot near the beginning of the run, then repeat this near the middle and end so the soak record shows how the thread evolved over time without mixing in unrelated cached threads.
-When you need an evidence artifact that can be archived or diffed later, also save a machine-readable snapshot:
+When you need an evidence artifact that can be archived or diffed later, write a machine-readable snapshot file:
 
 ```text
-mepdmlist --context <context_id> --limit 5 --json > soak-<context_id>-start.json
+mepdmsnapshot --context <context_id> --label start --limit 5
 ```
 
 2. When a reviewer sends a structured verdict, send a machine-readable response if needed:
@@ -155,7 +155,7 @@ mepdmhumanapproval --context <context_id> "The relay stayed inside the guarded t
 
 Use the cached `task_id` from `mepdmlist` when you want to target a specific stored inbound turn explicitly. Use `--context <context_id>` when you want the adapter to resolve the latest cached inbound turn for that thread automatically. Use `auto` with `mepdmreplysafe` when that cached inbound turn already carries `conversation.turn_index`, which the current stdio threaded-review flow emits from the initial `mepdmx` onward.
 
-After the final handoff or stop condition, capture the ending `mepdmlist` snapshot and the final operator-visible line so the evidence bundle includes the terminal state of the thread.
+After the final handoff or stop condition, capture the ending `mepdmlist` snapshot, write the final `mepdmsnapshot --context <context_id> --label end` artifact, and save the final operator-visible line so the evidence bundle includes the terminal state of the thread.
 
 ## What To Watch
 
@@ -175,7 +175,7 @@ Save these artifacts during or immediately after the session:
 
 - the initial `mepdmx` command line and returned task/context IDs
 - one `mepdmlist --context <context_id>` snapshot near the beginning, middle, and end of the run
-- at least one `mepdmlist --context <context_id> --json` artifact so the evidence bundle includes a machine-readable thread snapshot
+- `mepdmsnapshot --context <context_id> --label start|mid|end` artifacts so the evidence bundle includes machine-readable thread snapshots with stable names
 - at least one `safe checkpoint task ...` line
 - the final `mepdmhumanapproval ...` line or the final `safe dm reply stopped ...` line
 - any operator-facing errors such as `unknown option ...` or `threaded dm error: ...`

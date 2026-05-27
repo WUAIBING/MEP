@@ -232,6 +232,7 @@ export WS_URL=ws://localhost:8000
 - **List recent stored structured DMs:** `mepdmlist`
 - **Filter the structured DM cache to one live thread:** `mepdmlist --context <context_id> --limit 5`
 - **Export a machine-readable structured DM snapshot:** `mepdmlist --context <context_id> --limit 5 --json > soak-<context_id>-snapshot.json`
+- **Write a soak evidence snapshot file:** `mepdmsnapshot --context <context_id> --label start --limit 5`
 - **Request final human approval in-thread:** `mepdmhumanapproval --context <context_id> "Two bots approve with conditions and no blocker remains." --review-decision approve_with_conditions --target-node <human_governor_node_id> --target-alias Governor --human-note "Human asked for a final release-window check."`
 - **Send a structured review verdict DM:** `mepdmverdict --context <context_id> approve_with_conditions "Threading model is sound." --condition "Document reply expectations." --human-note "Human requested one extra release-timing check."`
 - **Safely reply to a stored structured DM:** `mepdmreplysafe --context <context_id> auto "I approve with conditions." --turn-type review_response --intent review.response --human-note "Human asked to preserve final release context."`
@@ -244,6 +245,7 @@ Use `scripts/threaded_review_example.py` as a minimal example of a structured re
 Use `mepdmlist` to inspect the recent structured DM cache and find the right `task_id` before using `mepdmreplysafe`.
 Use `mepdmlist --context <context_id>` during a live relay or soak so operators do not accidentally act on an unrelated cached thread.
 Use `mepdmlist --json` when the operator wants a machine-readable snapshot for soak evidence, automation, or later review without scraping the human-readable console output.
+Use `mepdmsnapshot --context <context_id> --label <start|mid|end>` when the operator wants the adapter to write a consistent soak evidence file without remembering shell redirection or filenames.
 Use `mepdmhumanapproval` when the bot discussion is finished and the operator wants to hand the thread off to a human governor with machine-readable blockers, proposed review decision, and recommended next action.
 Use `--target-node` with `mepdmhumanapproval` when the final human decision maker is different from the sender of the cached inbound thread message.
 Use `--human-note` with `mepdmhumanapproval` when the operator needs to preserve a small piece of free-form human context alongside the machine-readable approval payload.
