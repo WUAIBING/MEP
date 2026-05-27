@@ -114,6 +114,7 @@ class TestSharedMEPClient(unittest.TestCase):
                     reply_to_task_id="task_parent",
                     reply_to_message_id="message_parent",
                     turn_type="review_request",
+                    turn_index=1,
                 )
             )
 
@@ -126,6 +127,7 @@ class TestSharedMEPClient(unittest.TestCase):
         self.assertEqual(body["conversation"]["reply_to_task_id"], "task_parent")
         self.assertEqual(body["conversation"]["reply_to_message_id"], "message_parent")
         self.assertEqual(body["conversation"]["turn_type"], "review_request")
+        self.assertEqual(body["conversation"]["turn_index"], 1)
         self.assertEqual(body["intent"], {"type": "review.request", "priority": "normal"})
         self.assertEqual(body["task"]["instructions"], "Please review PR 154")
         self.assertEqual(body["delivery"], {"reply_mode": "new_dm", "settlement_mode": "task_result"})
@@ -196,6 +198,7 @@ class TestSharedMEPClient(unittest.TestCase):
                     reply_to_message_id="message_review_request",
                     conditions=["Document expected ack behavior", "Keep reply_mode=new_dm"],
                     human_recommendation="Merge after the follow-up docs note lands.",
+                    turn_index=2,
                 )
             )
 
@@ -203,6 +206,7 @@ class TestSharedMEPClient(unittest.TestCase):
         body = json.loads(submit_body["task"]["instructions"])
         self.assertEqual(body["intent"], {"type": "review.response", "priority": "normal"})
         self.assertEqual(body["conversation"]["turn_type"], "approval")
+        self.assertEqual(body["conversation"]["turn_index"], 2)
         self.assertEqual(body["conversation"]["context_id"], "pr154-review")
         self.assertEqual(body["conversation"]["reply_to_task_id"], "task_review_request")
         self.assertEqual(body["conversation"]["reply_to_message_id"], "message_review_request")
@@ -268,6 +272,7 @@ class TestSharedMEPClient(unittest.TestCase):
                     review_decision="approve_with_conditions",
                     blockers=["Need explicit merge confirmation from the human governor"],
                     recommended_next_action="Merge after human approval.",
+                    turn_index=3,
                 )
             )
 
@@ -275,6 +280,7 @@ class TestSharedMEPClient(unittest.TestCase):
         body = json.loads(submit_body["task"]["instructions"])
         self.assertEqual(body["intent"], {"type": "human.approval.request", "priority": "high"})
         self.assertEqual(body["conversation"]["turn_type"], "session_close")
+        self.assertEqual(body["conversation"]["turn_index"], 3)
         self.assertEqual(body["conversation"]["context_id"], "pr155-review")
         self.assertEqual(body["task"]["title"], "Human approval request")
         self.assertEqual(
@@ -337,7 +343,7 @@ class TestSharedMEPClient(unittest.TestCase):
                 "timestamp_ms": 1_777_000_000_000,
                 "source": {"node_id": "node_reviewer"},
                 "intent": {"type": "review.request", "priority": "high"},
-                "conversation": {"context_id": "pr154-review", "turn_type": "review_request"},
+                "conversation": {"context_id": "pr154-review", "turn_type": "review_request", "turn_index": 1},
                 "task": {
                     "instructions": "Please review this PR.",
                     "inputs": {
@@ -366,6 +372,7 @@ class TestSharedMEPClient(unittest.TestCase):
         )
         self.assertEqual(body["conversation"]["reply_to_task_id"], "task_review_request")
         self.assertEqual(body["conversation"]["reply_to_message_id"], "message_review_request")
+        self.assertEqual(body["conversation"]["turn_index"], 2)
 
     def test_extract_session_safety_reads_structured_payload(self):
         payload = json.dumps(
@@ -486,7 +493,7 @@ class TestSharedMEPClient(unittest.TestCase):
                 "timestamp_ms": 1_777_000_000_000,
                 "source": {"node_id": "node_reviewer"},
                 "intent": {"type": "review.request", "priority": "high"},
-                "conversation": {"context_id": "pr154-review", "turn_type": "review_request"},
+                "conversation": {"context_id": "pr154-review", "turn_type": "review_request", "turn_index": 1},
                 "task": {
                     "instructions": "Please review this PR.",
                     "inputs": {"session_safety": {"max_turns": 6, "checkpoint_interval": 3}},
@@ -509,6 +516,7 @@ class TestSharedMEPClient(unittest.TestCase):
         self.assertEqual(response["status"], "replied")
         self.assertFalse(response["safety"]["should_stop"])
         self.assertEqual(body["task"]["instructions"], "I approve with conditions.")
+        self.assertEqual(body["conversation"]["turn_index"], 2)
 
     def test_submit_safe_dm_reply_sends_checkpoint_when_interval_is_reached(self):
         with (
@@ -524,7 +532,7 @@ class TestSharedMEPClient(unittest.TestCase):
                 "timestamp_ms": 1_777_000_000_000,
                 "source": {"node_id": "node_reviewer", "alias": "Reviewer"},
                 "intent": {"type": "review.request", "priority": "high"},
-                "conversation": {"context_id": "pr154-review", "turn_type": "review_request"},
+                "conversation": {"context_id": "pr154-review", "turn_type": "review_request", "turn_index": 2},
                 "task": {
                     "instructions": "Please review this PR.",
                     "inputs": {"session_safety": {"max_turns": 6, "checkpoint_interval": 3}},
@@ -548,6 +556,7 @@ class TestSharedMEPClient(unittest.TestCase):
         self.assertEqual(response["status"], "checkpointed")
         self.assertTrue(response["safety"]["should_checkpoint"])
         self.assertEqual(body["conversation"]["turn_type"], "checkpoint")
+        self.assertEqual(body["conversation"]["turn_index"], 3)
         self.assertEqual(body["task"]["instructions"], "Checkpoint: 3 turns reached.")
 
     def test_submit_safe_dm_reply_progresses_from_reply_to_checkpoint_to_stop(self):
@@ -568,7 +577,7 @@ class TestSharedMEPClient(unittest.TestCase):
                 "timestamp_ms": started_at_ms,
                 "source": {"node_id": "node_reviewer", "alias": "Reviewer"},
                 "intent": {"type": "review.request", "priority": "high"},
-                "conversation": {"context_id": "pr154-review", "turn_type": "review_request"},
+                "conversation": {"context_id": "pr154-review", "turn_type": "review_request", "turn_index": 1},
                 "task": {
                     "instructions": "Please review this PR.",
                     "inputs": {
@@ -624,9 +633,11 @@ class TestSharedMEPClient(unittest.TestCase):
             reply_message["task"]["inputs"]["session_safety"]["started_at_ms"],
             started_at_ms,
         )
+        self.assertEqual(reply_message["conversation"]["turn_index"], 2)
         self.assertEqual(checkpoint_response["reply_action"], "checkpoint")
         self.assertEqual(checkpoint_response["status"], "checkpointed")
         self.assertEqual(checkpoint_message["conversation"]["turn_type"], "checkpoint")
+        self.assertEqual(checkpoint_message["conversation"]["turn_index"], 3)
         self.assertEqual(
             checkpoint_message["task"]["inputs"]["session_safety"]["started_at_ms"],
             started_at_ms,

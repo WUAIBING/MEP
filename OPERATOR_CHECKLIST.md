@@ -35,11 +35,13 @@ Use this checklist for daily operations, incident response, and safe upgrades.
 - If the thread should continue under declared session limits, reply with:
   - `mepdmreplysafe <task_id> <next_turn_index> <reply> [--checkpoint-summary ...] [--turn-type ...] [--intent ...] [--human-note ...]`
   - `mepdmreplysafe --context <context_id> <next_turn_index> <reply> [--checkpoint-summary ...] [--turn-type ...] [--intent ...] [--human-note ...]`
+  - `mepdmreplysafe --context <context_id> auto <reply> [--checkpoint-summary ...] [--turn-type ...] [--intent ...] [--human-note ...]`
 - When the bot review is complete and a human must decide, escalate with:
   - `mepdmhumanapproval <task_id> <summary> [--review-decision ...] [--blocker ...] [--next-action ...] [--target-node ...] [--target-alias ...] [--human-note ...]`
   - `mepdmhumanapproval --context <context_id> <summary> [--review-decision ...] [--blocker ...] [--next-action ...] [--target-node ...] [--target-alias ...] [--human-note ...]`
 - Prefer the in-thread sequence:
   - `mepdmlist` -> `mepdmverdict` -> `mepdmhumanapproval`
+- Prefer `mepdmreplysafe ... auto ...` once the thread was started by the current stdio flow, because those messages carry `conversation.turn_index` automatically.
 - Keep `target_node` as `node_id`, preserve `context_id`, and do not invent new thread IDs for follow-up turns.
 
 Example operator flow:

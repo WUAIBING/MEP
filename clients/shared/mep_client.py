@@ -149,9 +149,12 @@ class MEPClient:
         task_title: Optional[str] = None,
         task_inputs: Optional[dict[str, Any]] = None,
         session_safety: Optional[dict[str, Any]] = None,
+        turn_index: Optional[int] = None,
     ) -> dict[str, Any]:
         message_id = str(uuid.uuid4())
         timestamp_ms = int(time.time() * 1000)
+        if turn_index is not None and turn_index < 1:
+            raise ValueError("turn_index must be at least 1")
         task: dict[str, Any] = {
             "instructions": message,
             "expected_output": {"result_type": result_type},
@@ -181,6 +184,7 @@ class MEPClient:
                 "reply_to_task_id": reply_to_task_id,
                 "reply_to_message_id": reply_to_message_id,
                 "turn_type": turn_type,
+                **({"turn_index": turn_index} if turn_index is not None else {}),
             },
             "intent": {"type": intent_type, "priority": priority},
             "task": task,
@@ -203,6 +207,7 @@ class MEPClient:
         turn_type: str = "chat_turn",
         human_note: Optional[str] = None,
         session_safety: Optional[dict[str, Any]] = None,
+        turn_index: Optional[int] = None,
     ) -> dict:
         envelope = self.build_interbot_message(
             message,
@@ -216,6 +221,7 @@ class MEPClient:
             turn_type=turn_type,
             human_note=human_note,
             session_safety=session_safety,
+            turn_index=turn_index,
         )
         response = await self.submit_task(json.dumps(envelope), 0.0, None, target_node)
         response["message_id"] = envelope["message_id"]
@@ -245,6 +251,7 @@ class MEPClient:
         )
         conversation = inbound_message.get("conversation")
         inbound_turn_type = conversation.get("turn_type") if isinstance(conversation, dict) else None
+        next_turn_index = self._derive_reply_turn_index(inbound_message)
         return self.build_interbot_message(
             reply_text,
             source["node_id"],
@@ -262,6 +269,7 @@ class MEPClient:
             human_note=human_note,
             trace_id=inbound_message.get("trace_id") if isinstance(inbound_message.get("trace_id"), str) else None,
             session_safety=self._extract_session_safety_from_message(inbound_message),
+            turn_index=next_turn_index,
         )
 
     async def submit_dm_reply(
@@ -342,6 +350,7 @@ class MEPClient:
                 priority=priority or "normal",
                 human_note=human_note,
                 session_safety=self._extract_session_safety_from_message(inbound_message),
+                turn_index=next_turn_index,
             )
             checkpoint_response["status"] = "checkpointed"
             checkpoint_response["reply_action"] = "checkpoint"
@@ -374,6 +383,7 @@ class MEPClient:
         priority: str = "normal",
         human_note: Optional[str] = None,
         session_safety: Optional[dict[str, Any]] = None,
+        turn_index: Optional[int] = None,
     ) -> dict[str, Any]:
         return self.build_interbot_message(
             summary,
@@ -387,6 +397,7 @@ class MEPClient:
             turn_type="checkpoint",
             human_note=human_note,
             session_safety=session_safety,
+            turn_index=turn_index,
         )
 
     async def submit_checkpoint_dm(
@@ -401,6 +412,7 @@ class MEPClient:
         priority: str = "normal",
         human_note: Optional[str] = None,
         session_safety: Optional[dict[str, Any]] = None,
+        turn_index: Optional[int] = None,
     ) -> dict:
         envelope = self.build_checkpoint_message(
             summary,
@@ -412,6 +424,7 @@ class MEPClient:
             priority=priority,
             human_note=human_note,
             session_safety=session_safety,
+            turn_index=turn_index,
         )
         response = await self.submit_task(json.dumps(envelope), 0.0, None, target_node)
         response["message_id"] = envelope["message_id"]
@@ -433,6 +446,7 @@ class MEPClient:
         human_recommendation: Optional[str] = None,
         priority: str = "normal",
         human_note: Optional[str] = None,
+        turn_index: Optional[int] = None,
     ) -> dict[str, Any]:
         normalized_verdict = verdict.strip().lower()
         if normalized_verdict not in REVIEW_VERDICTS:
@@ -478,6 +492,7 @@ class MEPClient:
             human_note=human_note,
             task_title="Review verdict",
             task_inputs={"review_verdict": verdict_payload},
+            turn_index=turn_index,
         )
 
     async def submit_review_verdict_dm(
@@ -494,6 +509,7 @@ class MEPClient:
         human_recommendation: Optional[str] = None,
         priority: str = "normal",
         human_note: Optional[str] = None,
+        turn_index: Optional[int] = None,
     ) -> dict:
         envelope = self.build_review_verdict_message(
             verdict,
@@ -507,6 +523,7 @@ class MEPClient:
             human_recommendation=human_recommendation,
             priority=priority,
             human_note=human_note,
+            turn_index=turn_index,
         )
         response = await self.submit_task(json.dumps(envelope), 0.0, None, target_node)
         response["message_id"] = envelope["message_id"]
@@ -529,6 +546,7 @@ class MEPClient:
         recommended_next_action: Optional[str] = None,
         priority: str = "high",
         human_note: Optional[str] = None,
+        turn_index: Optional[int] = None,
     ) -> dict[str, Any]:
         normalized_summary = summary.strip()
         if not normalized_summary:
@@ -582,6 +600,7 @@ class MEPClient:
             human_note=human_note,
             task_title="Human approval request",
             task_inputs={"human_approval_request": approval_payload},
+            turn_index=turn_index,
         )
 
     async def submit_human_approval_request_dm(
@@ -599,6 +618,7 @@ class MEPClient:
         recommended_next_action: Optional[str] = None,
         priority: str = "high",
         human_note: Optional[str] = None,
+        turn_index: Optional[int] = None,
     ) -> dict:
         envelope = self.build_human_approval_request_message(
             summary,
@@ -613,6 +633,7 @@ class MEPClient:
             recommended_next_action=recommended_next_action,
             priority=priority,
             human_note=human_note,
+            turn_index=turn_index,
         )
         response = await self.submit_task(json.dumps(envelope), 0.0, None, target_node)
         response["message_id"] = envelope["message_id"]
@@ -866,6 +887,18 @@ class MEPClient:
         if inbound_turn_type == "review_request":
             return "review_response"
         return "chat_turn"
+
+    @staticmethod
+    def _derive_reply_turn_index(inbound_message: dict[str, Any]) -> Optional[int]:
+        conversation = inbound_message.get("conversation")
+        if not isinstance(conversation, dict):
+            return None
+        turn_index = conversation.get("turn_index")
+        if turn_index is None:
+            return None
+        if not isinstance(turn_index, int) or turn_index < 1:
+            raise ValueError("inbound inter-bot message has invalid conversation.turn_index")
+        return turn_index + 1
 
     @staticmethod
     def _normalize_string_list(values: Any) -> list[str]:

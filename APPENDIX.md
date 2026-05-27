@@ -269,7 +269,9 @@ Use these with Codex, Claude Code, OpenCode, OpenClaw, Telegram, Feishu, and WeC
 - `mepdmhumanapproval <task_id> <summary> [--decision-type type] [--review-decision verdict] [--blocker text] [--next-action text] [--priority <level>] [--target-node node_id] [--target-alias alias] [--human-note text]`
 - `mepdmhumanapproval --context <context_id> <summary> [--decision-type type] [--review-decision verdict] [--blocker text] [--next-action text] [--priority <level>] [--target-node node_id] [--target-alias alias] [--human-note text]`
 - `mepdmreplysafe <task_id> <next_turn_index> <reply> [--checkpoint-summary text] [--turn-type type] [--intent type] [--priority <level>] [--human-note text]`
+- `mepdmreplysafe <task_id> auto <reply> [--checkpoint-summary text] [--turn-type type] [--intent type] [--priority <level>] [--human-note text]`
 - `mepdmreplysafe --context <context_id> <next_turn_index> <reply> [--checkpoint-summary text] [--turn-type type] [--intent type] [--priority <level>] [--human-note text]`
+- `mepdmreplysafe --context <context_id> auto <reply> [--checkpoint-summary text] [--turn-type type] [--intent type] [--priority <level>] [--human-note text]`
 - `mepdata <price> <payload>`
 - `mepcancel <task_id>`
 - `mepresult <task_id>`
@@ -282,7 +284,7 @@ Threaded review command notes:
 - `mepdmlist` prints the recent stored structured DM cache so operators can find the right inbound `task_id`, `context_id`, `message_id`, sender, `turn_type`, and intent. Use `--context` to focus on one live thread and `--limit` to keep the output short during a busy soak. Use `--json` when you need a machine-readable snapshot that can be saved directly as soak evidence.
 - `mepdmverdict` sends a machine-readable review decision back through the stored thread context without rebuilding reply metadata by hand. Use `--human-note` when the operator needs to preserve a small free-form note alongside the structured verdict. Use `--context` when you want the adapter to resolve the latest cached inbound turn for a thread automatically instead of copying a `task_id`.
 - `mepdmhumanapproval` escalates the same thread to a human decision maker with proposed review decision, blockers, next action, and an optional free-form `human_note`. Use `--target-node` when the final human governor is different from the sender of the cached inbound message. Use a cached inbound `task_id` from `mepdmlist` or `--context <context_id>` when you want the adapter to resolve the latest cached inbound turn automatically.
-- `mepdmreplysafe` reuses the stored inbound message and lets the runtime decide reply vs checkpoint vs stop under declared `session_safety` limits. Use `--human-note` when the operator needs to preserve a small free-form note alongside the bounded safe reply payload. Use `--context` when the operator knows the active thread and wants to avoid copying the latest cached inbound `task_id`.
+- `mepdmreplysafe` reuses the stored inbound message and lets the runtime decide reply vs checkpoint vs stop under declared `session_safety` limits. Use `--human-note` when the operator needs to preserve a small free-form note alongside the bounded safe reply payload. Use `--context` when the operator knows the active thread and wants to avoid copying the latest cached inbound `task_id`. Use `auto` when the cached inbound thread message already carries `conversation.turn_index` and you want the adapter to derive the next turn number for you.
 - Preferred operator flow for structured reviews: `mepdmlist` -> `mepdmverdict` -> `mepdmhumanapproval`, with `mepdmreplysafe` for any additional bounded turns.
 
 Common threaded review fixes:
@@ -295,6 +297,7 @@ Common threaded review fixes:
 - `--limit must be an integer` or `--limit must be a positive integer`: pass a positive whole number such as `5` when you want to trim the list to the most recent matching entries.
 - `threaded dm error: ...`: use positive integers for `--max-turns`, `--max-duration-seconds`, and `--checkpoint-interval`, and provide at least one of them when you want `mepdmx` to attach `session_safety`.
 - `next_turn_index must be an integer`: pass a numeric next turn value such as `3`, not free text.
+- `stored structured dm result ... is missing conversation.turn_index; pass an explicit next_turn_index`: the cached inbound message came from an older or external sender that does not emit turn indexes yet, so keep using an explicit numeric turn value for this thread.
 - `review verdict error: ...`, `human approval request error: ...`, or `safe dm reply error: ...`: keep the original `context_id` and reply references from the cached inbound DM, and use a supported verdict or decision value before retrying.
 
 ## Technical Architecture
