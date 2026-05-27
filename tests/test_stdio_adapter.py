@@ -525,7 +525,7 @@ class TestStdioAdapter(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(snapshot["results"][0]["task_id"], "task_review_request")
         self.assertIn("captured_at_utc", snapshot)
         print_mock.assert_any_call(
-            "[codex] wrote structured dm snapshot soak-pr154-review-start.json label=start count=1 context=pr154-review"
+            f"[codex] wrote structured dm snapshot {snapshot_path} label=start count=1 context=pr154-review"
         )
 
     async def test_dispatch_line_dmsnapshot_honors_explicit_output_path(self):
@@ -541,11 +541,16 @@ class TestStdioAdapter(unittest.IsolatedAsyncioTestCase):
         }
 
         with tempfile.TemporaryDirectory() as temp_dir:
-            output_path = os.path.join(temp_dir, "evidence", "mid.json")
-            with patch("builtins.print") as print_mock:
-                keep_going = await adapter._dispatch_line(
-                    f'mepdmsnapshot --label mid --out "{output_path}"'
-                )
+            current_dir = os.getcwd()
+            os.chdir(temp_dir)
+            try:
+                output_path = os.path.join(temp_dir, "evidence", "mid.json")
+                with patch("builtins.print") as print_mock:
+                    keep_going = await adapter._dispatch_line(
+                        f'mepdmsnapshot --label mid --out "{output_path}"'
+                    )
+            finally:
+                os.chdir(current_dir)
 
             self.assertTrue(keep_going)
             self.assertTrue(os.path.exists(output_path))
@@ -563,11 +568,16 @@ class TestStdioAdapter(unittest.IsolatedAsyncioTestCase):
         adapter, _client = self._make_adapter()
 
         with tempfile.TemporaryDirectory() as temp_dir:
-            output_path = os.path.join(temp_dir, "empty.json")
-            with patch("builtins.print") as print_mock:
-                keep_going = await adapter._dispatch_line(
-                    f'mepdmsnapshot --label end --out "{output_path}"'
-                )
+            current_dir = os.getcwd()
+            os.chdir(temp_dir)
+            try:
+                output_path = os.path.join(temp_dir, "empty.json")
+                with patch("builtins.print") as print_mock:
+                    keep_going = await adapter._dispatch_line(
+                        f'mepdmsnapshot --label end --out "{output_path}"'
+                    )
+            finally:
+                os.chdir(current_dir)
 
             self.assertTrue(keep_going)
             self.assertTrue(os.path.exists(output_path))
@@ -600,6 +610,58 @@ class TestStdioAdapter(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(keep_going)
         print_mock.assert_any_call("[codex] unknown option --json")
+
+    async def test_dispatch_line_dmsnapshot_sanitizes_default_filename_components(self):
+        adapter, _client = self._make_adapter()
+        adapter._recent_interbot_results["task_review_request"] = {
+            "payload_text": '{"spec_version":"mep.interbot.v1"}',
+            "message": {
+                "message_id": "message_review_request",
+                "source": {"node_id": "node_reviewer"},
+                "conversation": {"context_id": "pr/154..review", "turn_type": "review_request"},
+                "intent": {"type": "review.request"},
+            },
+        }
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            current_dir = os.getcwd()
+            os.chdir(temp_dir)
+            try:
+                with patch("builtins.print") as print_mock:
+                    keep_going = await adapter._dispatch_line(
+                        "mepdmsnapshot --context pr/154..review --label start?"
+                    )
+            finally:
+                os.chdir(current_dir)
+
+            self.assertTrue(keep_going)
+            snapshot_path = os.path.join(temp_dir, "soak-pr-154--review-start.json")
+            self.assertTrue(os.path.exists(snapshot_path))
+
+        print_mock.assert_any_call(
+            "[codex] wrote structured dm snapshot "
+            + os.path.join(temp_dir, "soak-pr-154--review-start.json")
+            + " label=start? count=1 context=pr/154..review"
+        )
+
+    async def test_dispatch_line_dmsnapshot_rejects_output_path_outside_cwd(self):
+        adapter, _client = self._make_adapter()
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            current_dir = os.getcwd()
+            os.chdir(temp_dir)
+            try:
+                outside_path = os.path.abspath(os.path.join(temp_dir, "..", "escape.json"))
+                with patch("builtins.print") as print_mock:
+                    keep_going = await adapter._dispatch_line(
+                        f'mepdmsnapshot --label start --out "{outside_path}"'
+                    )
+            finally:
+                os.chdir(current_dir)
+
+        self.assertTrue(keep_going)
+        self.assertFalse(os.path.exists(outside_path))
+        print_mock.assert_any_call("[codex] --out must stay within the current working directory")
 
     async def test_dispatch_line_review_verdict_uses_stored_inbound_message(self):
         adapter, client = self._make_adapter()
