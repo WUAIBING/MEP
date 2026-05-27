@@ -1,4 +1,5 @@
 import asyncio
+import json
 import os
 import shlex
 import tempfile
@@ -44,6 +45,22 @@ class StdioAdapter:
             oldest_task_id = next(iter(self._recent_interbot_results))
             del self._recent_interbot_results[oldest_task_id]
 
+    def _format_structured_dm_result_snapshot(self, task_id: str, inbound: dict[str, Any]) -> dict[str, Any]:
+        message = inbound.get("message", {})
+        source = message.get("source") if isinstance(message, dict) else None
+        conversation = message.get("conversation") if isinstance(message, dict) else None
+        intent = message.get("intent") if isinstance(message, dict) else None
+        return {
+            "task_id": task_id,
+            "context_id": conversation.get("context_id") if isinstance(conversation, dict) else None,
+            "message_id": message.get("message_id") if isinstance(message, dict) else None,
+            "source_node_id": source.get("node_id") if isinstance(source, dict) else None,
+            "turn_type": conversation.get("turn_type") if isinstance(conversation, dict) else None,
+            "intent_type": intent.get("type") if isinstance(intent, dict) else None,
+            "payload_text": inbound.get("payload_text"),
+            "message": message if isinstance(message, dict) else None,
+        }
+
     def _list_recent_structured_dm_results(self, text: str = "") -> None:
         try:
             parts = shlex.split(text)
@@ -53,6 +70,7 @@ class StdioAdapter:
 
         context_filter: Optional[str] = None
         limit: Optional[int] = None
+        emit_json = False
         i = 0
         while i < len(parts):
             token = parts[i]
@@ -77,6 +95,10 @@ class StdioAdapter:
                     return
                 i += 2
                 continue
+            if token == "--json":
+                emit_json = True
+                i += 1
+                continue
             print(f"[{self.platform_name}] unknown option {token}")
             return
 
@@ -91,6 +113,24 @@ class StdioAdapter:
             entries = filtered_entries
         if limit is not None:
             entries = entries[:limit]
+
+        if emit_json:
+            print(
+                json.dumps(
+                    {
+                        "platform": self.platform_name,
+                        "context_filter": context_filter,
+                        "limit": limit,
+                        "count": len(entries),
+                        "results": [
+                            self._format_structured_dm_result_snapshot(task_id, inbound)
+                            for task_id, inbound in entries
+                        ],
+                    },
+                    indent=2,
+                )
+            )
+            return
 
         if not entries:
             if context_filter is not None:

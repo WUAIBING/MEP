@@ -382,6 +382,90 @@ class TestStdioAdapter(unittest.IsolatedAsyncioTestCase):
             print_mock.mock_calls,
         )
 
+    async def test_dispatch_line_dmlist_json_outputs_filtered_snapshot(self):
+        adapter, _client = self._make_adapter()
+        adapter._recent_interbot_results["task_review_request"] = {
+            "payload_text": '{"spec_version":"mep.interbot.v1"}',
+            "message": {
+                "message_id": "message_review_request",
+                "source": {"node_id": "node_reviewer"},
+                "conversation": {"context_id": "pr154-review", "turn_type": "review_request"},
+                "intent": {"type": "review.request"},
+                "task": {"instructions": "Please review this PR."},
+            },
+        }
+        adapter._recent_interbot_results["task_checkpoint"] = {
+            "payload_text": '{"spec_version":"mep.interbot.v1"}',
+            "message": {
+                "message_id": "message_checkpoint",
+                "source": {"node_id": "node_reviewer"},
+                "conversation": {"context_id": "pr154-review", "turn_type": "checkpoint"},
+                "intent": {"type": "coordination.request"},
+                "task": {"instructions": "Checkpoint summary"},
+            },
+        }
+        adapter._recent_interbot_results["task_other_context"] = {
+            "payload_text": '{"spec_version":"mep.interbot.v1"}',
+            "message": {
+                "message_id": "message_other",
+                "source": {"node_id": "node_other"},
+                "conversation": {"context_id": "incident-42", "turn_type": "review_request"},
+                "intent": {"type": "review.request"},
+            },
+        }
+
+        with patch("builtins.print") as print_mock:
+            keep_going = await adapter._dispatch_line("mepdmlist --context pr154-review --limit 1 --json")
+
+        self.assertTrue(keep_going)
+        self.assertEqual(print_mock.call_count, 1)
+        snapshot = json.loads(print_mock.call_args.args[0])
+        self.assertEqual(snapshot["platform"], "codex")
+        self.assertEqual(snapshot["context_filter"], "pr154-review")
+        self.assertEqual(snapshot["limit"], 1)
+        self.assertEqual(snapshot["count"], 1)
+        self.assertEqual(
+            snapshot["results"],
+            [
+                {
+                    "task_id": "task_checkpoint",
+                    "context_id": "pr154-review",
+                    "message_id": "message_checkpoint",
+                    "source_node_id": "node_reviewer",
+                    "turn_type": "checkpoint",
+                    "intent_type": "coordination.request",
+                    "payload_text": '{"spec_version":"mep.interbot.v1"}',
+                    "message": {
+                        "message_id": "message_checkpoint",
+                        "source": {"node_id": "node_reviewer"},
+                        "conversation": {"context_id": "pr154-review", "turn_type": "checkpoint"},
+                        "intent": {"type": "coordination.request"},
+                        "task": {"instructions": "Checkpoint summary"},
+                    },
+                }
+            ],
+        )
+
+    async def test_dispatch_line_dmlist_json_outputs_empty_snapshot(self):
+        adapter, _client = self._make_adapter()
+
+        with patch("builtins.print") as print_mock:
+            keep_going = await adapter._dispatch_line("mepdmlist --json")
+
+        self.assertTrue(keep_going)
+        self.assertEqual(print_mock.call_count, 1)
+        snapshot = json.loads(print_mock.call_args.args[0])
+        self.assertEqual(
+            snapshot,
+            {
+                "platform": "codex",
+                "context_filter": None,
+                "limit": None,
+                "count": 0,
+                "results": [],
+            },
+        )
+
     async def test_dispatch_line_dmlist_rejects_unknown_option(self):
         adapter, _client = self._make_adapter()
 
