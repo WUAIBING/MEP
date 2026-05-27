@@ -190,6 +190,29 @@ class StdioAdapter:
             reply_to_message_id if isinstance(reply_to_message_id, str) else None,
         )
 
+    def _get_latest_stored_task_id_for_context(self, context_id: str) -> Optional[str]:
+        for task_id, inbound in reversed(list(self._recent_interbot_results.items())):
+            message = inbound.get("message", {})
+            conversation = message.get("conversation") if isinstance(message, dict) else None
+            if isinstance(conversation, dict) and conversation.get("context_id") == context_id:
+                return task_id
+        print(f"[{self.platform_name}] no stored structured dm results for context={context_id}")
+        return None
+
+    def _resolve_stored_task_id_selector(self, parts: list[str], usage: str) -> Optional[tuple[str, list[str]]]:
+        if not parts:
+            print(usage)
+            return None
+        if parts[0] != "--context":
+            return parts[0], parts[1:]
+        if len(parts) < 2:
+            print(f"[{self.platform_name}] missing value for --context")
+            return None
+        task_id = self._get_latest_stored_task_id_for_context(parts[1])
+        if not task_id:
+            return None
+        return task_id, parts[2:]
+
     async def _submit(self, text: str) -> None:
         payload, bounty, model, target = parse_task_args(text, DEFAULT_BOUNTY, self.default_model)
         if not payload:
@@ -312,16 +335,20 @@ class StdioAdapter:
         except ValueError as exc:
             print(f"[{self.platform_name}] mepdmreplysafe parse error: {exc}")
             return
-        if len(parts) < 3:
-            print(
-                f"[{self.platform_name}] usage: mepdmreplysafe <task_id> <next_turn_index> <reply> "
-                "[--checkpoint-summary text] [--turn-type type] [--intent type] [--priority <level>] [--human-note text]"
-            )
+        usage = (
+            f"[{self.platform_name}] usage: mepdmreplysafe <task_id> <next_turn_index> <reply> "
+            "[--checkpoint-summary text] [--turn-type type] [--intent type] [--priority <level>] [--human-note text] "
+            "or mepdmreplysafe --context <context_id> <next_turn_index> <reply> [options]"
+        )
+        resolved = self._resolve_stored_task_id_selector(parts, usage)
+        if not resolved:
             return
-
-        task_id = parts[0]
+        task_id, parts = resolved
+        if len(parts) < 2:
+            print(usage)
+            return
         try:
-            next_turn_index = int(parts[1])
+            next_turn_index = int(parts[0])
         except ValueError:
             print(f"[{self.platform_name}] next_turn_index must be an integer")
             return
@@ -335,7 +362,7 @@ class StdioAdapter:
             "--priority",
             "--human-note",
         }
-        i = 2
+        i = 1
         while i < len(parts):
             token = parts[i]
             if token.startswith("--"):
@@ -353,9 +380,7 @@ class StdioAdapter:
 
         reply_text = " ".join(reply_parts).strip()
         if not reply_text:
-            print(
-                f"[{self.platform_name}] usage: mepdmreplysafe <task_id> <next_turn_index> <reply> [options]"
-            )
+            print(usage)
             return
 
         stored = self._get_stored_structured_dm_context(task_id)
@@ -407,16 +432,20 @@ class StdioAdapter:
         except ValueError as exc:
             print(f"[{self.platform_name}] mepdmhumanapproval parse error: {exc}")
             return
-        if len(parts) < 2:
-            print(
-                f"[{self.platform_name}] usage: mepdmhumanapproval <task_id> <summary> "
-                "[--decision-type type] [--review-decision verdict] "
-                "[--blocker text] [--next-action text] [--priority <level>] "
-                "[--target-node node_id] [--target-alias alias] [--human-note text]"
-            )
+        usage = (
+            f"[{self.platform_name}] usage: mepdmhumanapproval <task_id> <summary> "
+            "[--decision-type type] [--review-decision verdict] "
+            "[--blocker text] [--next-action text] [--priority <level>] "
+            "[--target-node node_id] [--target-alias alias] [--human-note text] "
+            "or mepdmhumanapproval --context <context_id> <summary> [options]"
+        )
+        resolved = self._resolve_stored_task_id_selector(parts, usage)
+        if not resolved:
             return
-
-        task_id = parts[0]
+        task_id, parts = resolved
+        if not parts:
+            print(usage)
+            return
         summary_parts: list[str] = []
         decision_type = "merge_decision"
         review_decision: Optional[str] = None
@@ -426,7 +455,7 @@ class StdioAdapter:
         target_node_override: Optional[str] = None
         target_alias_override: Optional[str] = None
         human_note: Optional[str] = None
-        i = 1
+        i = 0
         while i < len(parts):
             token = parts[i]
             if not token.startswith("--"):
@@ -494,9 +523,7 @@ class StdioAdapter:
 
         summary = " ".join(summary_parts).strip()
         if not summary:
-            print(
-                f"[{self.platform_name}] usage: mepdmhumanapproval <task_id> <summary> [options]"
-            )
+            print(usage)
             return
 
         stored = self._get_stored_structured_dm_context(task_id)
@@ -543,21 +570,25 @@ class StdioAdapter:
         except ValueError as exc:
             print(f"[{self.platform_name}] mepdmverdict parse error: {exc}")
             return
-        if len(parts) < 3:
-            print(
-                f"[{self.platform_name}] usage: mepdmverdict <task_id> <verdict> <rationale> "
-                "[--condition text] [--recommendation text] [--priority <level>] [--human-note text]"
-            )
+        usage = (
+            f"[{self.platform_name}] usage: mepdmverdict <task_id> <verdict> <rationale> "
+            "[--condition text] [--recommendation text] [--priority <level>] [--human-note text] "
+            "or mepdmverdict --context <context_id> <verdict> <rationale> [options]"
+        )
+        resolved = self._resolve_stored_task_id_selector(parts, usage)
+        if not resolved:
             return
-
-        task_id = parts[0]
-        verdict = parts[1]
+        task_id, parts = resolved
+        if len(parts) < 2:
+            print(usage)
+            return
+        verdict = parts[0]
         rationale_parts: list[str] = []
         conditions: list[str] = []
         recommendation: Optional[str] = None
         priority = "normal"
         human_note: Optional[str] = None
-        i = 2
+        i = 1
         while i < len(parts):
             token = parts[i]
             if not token.startswith("--"):
@@ -597,9 +628,7 @@ class StdioAdapter:
 
         rationale = " ".join(rationale_parts).strip()
         if not rationale:
-            print(
-                f"[{self.platform_name}] usage: mepdmverdict <task_id> <verdict> <rationale> [options]"
-            )
+            print(usage)
             return
 
         stored = self._get_stored_structured_dm_context(task_id)

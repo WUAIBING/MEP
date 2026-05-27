@@ -605,6 +605,55 @@ class TestStdioAdapter(unittest.IsolatedAsyncioTestCase):
         )
         print_mock.assert_any_call("[codex] review verdict sent task task_review_verdict context=pr154-review")
 
+    async def test_dispatch_line_review_verdict_accepts_context_selector(self):
+        adapter, client = self._make_adapter()
+        adapter._recent_interbot_results["task_review_request"] = {
+            "payload_text": "{}",
+            "message": {
+                "message_id": "message_review_request",
+                "source": {"node_id": "node_reviewer"},
+                "conversation": {"context_id": "pr154-review", "turn_type": "review_request"},
+                "task": {"instructions": "Please review this PR."},
+            },
+        }
+        adapter._recent_interbot_results["task_checkpoint"] = {
+            "payload_text": "{}",
+            "message": {
+                "message_id": "message_checkpoint",
+                "source": {"node_id": "node_reviewer"},
+                "conversation": {"context_id": "pr154-review", "turn_type": "checkpoint"},
+                "task": {"instructions": "Checkpoint summary."},
+            },
+        }
+        client.submit_review_verdict_dm = AsyncMock(
+            return_value={
+                "status_code": 200,
+                "json": {"status": "success", "task_id": "task_review_verdict"},
+                "context_id": "pr154-review",
+            }
+        )
+
+        with patch("builtins.print") as print_mock:
+            keep_going = await adapter._dispatch_line(
+                'mepdmverdict --context pr154-review approve_with_conditions "Threading model is sound."'
+            )
+
+        self.assertTrue(keep_going)
+        client.submit_review_verdict_dm.assert_awaited_once_with(
+            "approve_with_conditions",
+            "Threading model is sound.",
+            "node_reviewer",
+            context_id="pr154-review",
+            target_alias=None,
+            reply_to_task_id="task_checkpoint",
+            reply_to_message_id="message_checkpoint",
+            conditions=None,
+            human_recommendation=None,
+            priority="normal",
+            human_note=None,
+        )
+        print_mock.assert_any_call("[codex] review verdict sent task task_review_verdict context=pr154-review")
+
     async def test_dispatch_line_review_verdict_reports_validation_errors(self):
         adapter, client = self._make_adapter()
         adapter._recent_interbot_results["task_review_request"] = {
@@ -668,6 +717,59 @@ class TestStdioAdapter(unittest.IsolatedAsyncioTestCase):
             review_decision="approve_with_conditions",
             blockers=["Need explicit merge confirmation from the human governor."],
             recommended_next_action="Merge after final human approval.",
+            priority="high",
+            human_note=None,
+        )
+        print_mock.assert_any_call(
+            "[codex] human approval request sent task task_human_approval context=pr154-review"
+        )
+
+    async def test_dispatch_line_human_approval_request_accepts_context_selector(self):
+        adapter, client = self._make_adapter()
+        adapter._recent_interbot_results["task_review_request"] = {
+            "payload_text": "{}",
+            "message": {
+                "message_id": "message_review_request",
+                "source": {"node_id": "node_reviewer", "alias": "Reviewer"},
+                "conversation": {"context_id": "pr154-review", "turn_type": "review_request"},
+                "task": {"instructions": "Please review this PR."},
+            },
+        }
+        adapter._recent_interbot_results["task_review_verdict"] = {
+            "payload_text": "{}",
+            "message": {
+                "message_id": "message_review_verdict",
+                "source": {"node_id": "node_governor", "alias": "Governor"},
+                "conversation": {"context_id": "pr154-review", "turn_type": "approval"},
+                "task": {"instructions": "Review verdict ready."},
+            },
+        }
+        client.submit_human_approval_request_dm = AsyncMock(
+            return_value={
+                "status_code": 200,
+                "json": {"status": "success", "task_id": "task_human_approval"},
+                "context_id": "pr154-review",
+            }
+        )
+
+        with patch("builtins.print") as print_mock:
+            keep_going = await adapter._dispatch_line(
+                'mepdmhumanapproval --context pr154-review "Two bots approve with conditions." '
+                '--review-decision approve_with_conditions'
+            )
+
+        self.assertTrue(keep_going)
+        client.submit_human_approval_request_dm.assert_awaited_once_with(
+            "Two bots approve with conditions.",
+            "node_governor",
+            context_id="pr154-review",
+            decision_type="merge_decision",
+            target_alias="Governor",
+            reply_to_task_id="task_review_verdict",
+            reply_to_message_id="message_review_verdict",
+            review_decision="approve_with_conditions",
+            blockers=None,
+            recommended_next_action=None,
             priority="high",
             human_note=None,
         )
@@ -874,6 +976,72 @@ class TestStdioAdapter(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(keep_going)
         client.submit_safe_dm_reply.assert_awaited_once()
         print_mock.assert_any_call("[codex] safe reply stopped for task_review_request: max_turns_exceeded")
+
+    async def test_dispatch_line_safe_reply_accepts_context_selector(self):
+        adapter, client = self._make_adapter()
+        adapter._recent_interbot_results["task_review_request"] = {
+            "payload_text": "{}",
+            "message": {
+                "message_id": "message_review_request",
+                "source": {"node_id": "node_reviewer"},
+                "conversation": {"context_id": "pr154-review", "turn_type": "review_request"},
+                "task": {"instructions": "Please review this PR."},
+            },
+        }
+        adapter._recent_interbot_results["task_checkpoint"] = {
+            "payload_text": "{}",
+            "message": {
+                "message_id": "message_checkpoint",
+                "source": {"node_id": "node_reviewer"},
+                "conversation": {"context_id": "pr154-review", "turn_type": "checkpoint"},
+                "task": {"instructions": "Checkpoint summary."},
+            },
+        }
+        client.submit_safe_dm_reply = AsyncMock(
+            return_value={
+                "reply_action": "reply",
+                "status_code": 200,
+                "json": {"status": "success", "task_id": "task_followup"},
+                "context_id": "pr154-review",
+            }
+        )
+
+        with patch("builtins.print") as print_mock:
+            keep_going = await adapter._dispatch_line(
+                'mepdmreplysafe --context pr154-review 3 "I approve with conditions."'
+            )
+
+        self.assertTrue(keep_going)
+        client.submit_safe_dm_reply.assert_awaited_once_with(
+            "I approve with conditions.",
+            {
+                "message_id": "message_checkpoint",
+                "source": {"node_id": "node_reviewer"},
+                "conversation": {"context_id": "pr154-review", "turn_type": "checkpoint"},
+                "task": {"instructions": "Checkpoint summary."},
+            },
+            next_turn_index=3,
+            checkpoint_summary=None,
+            inbound_task_id="task_checkpoint",
+            turn_type=None,
+            intent_type=None,
+            priority=None,
+            human_note=None,
+        )
+        print_mock.assert_any_call("[codex] safe reply task task_followup context=pr154-review")
+
+    async def test_dispatch_line_safe_reply_reports_missing_context_selector(self):
+        adapter, client = self._make_adapter()
+        client.submit_safe_dm_reply = AsyncMock()
+
+        with patch("builtins.print") as print_mock:
+            keep_going = await adapter._dispatch_line(
+                'mepdmreplysafe --context missing-thread 3 "I approve with conditions."'
+            )
+
+        self.assertTrue(keep_going)
+        client.submit_safe_dm_reply.assert_not_awaited()
+        print_mock.assert_any_call("[codex] no stored structured dm results for context=missing-thread")
 
     async def test_dispatch_line_safe_reply_reports_validation_errors(self):
         adapter, client = self._make_adapter()

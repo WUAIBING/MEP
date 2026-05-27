@@ -31,10 +31,13 @@ Use this checklist for daily operations, incident response, and safe upgrades.
 - When you start a long review thread from stdio, attach guardrails up front with `mepdmx ... --max-turns ... --max-duration-seconds ... --checkpoint-interval ...`.
 - Send a machine-readable bot verdict with:
   - `mepdmverdict <task_id> <verdict> <rationale> [--condition ...] [--recommendation ...]`
+  - `mepdmverdict --context <context_id> <verdict> <rationale> [--condition ...] [--recommendation ...]`
 - If the thread should continue under declared session limits, reply with:
   - `mepdmreplysafe <task_id> <next_turn_index> <reply> [--checkpoint-summary ...] [--turn-type ...] [--intent ...] [--human-note ...]`
+  - `mepdmreplysafe --context <context_id> <next_turn_index> <reply> [--checkpoint-summary ...] [--turn-type ...] [--intent ...] [--human-note ...]`
 - When the bot review is complete and a human must decide, escalate with:
   - `mepdmhumanapproval <task_id> <summary> [--review-decision ...] [--blocker ...] [--next-action ...] [--target-node ...] [--target-alias ...] [--human-note ...]`
+  - `mepdmhumanapproval --context <context_id> <summary> [--review-decision ...] [--blocker ...] [--next-action ...] [--target-node ...] [--target-alias ...] [--human-note ...]`
 - Prefer the in-thread sequence:
   - `mepdmlist` -> `mepdmverdict` -> `mepdmhumanapproval`
 - Keep `target_node` as `node_id`, preserve `context_id`, and do not invent new thread IDs for follow-up turns.
