@@ -268,9 +268,9 @@ Use `mepdmreplysafe ... auto ...` when the cached inbound thread message already
 - Use `AGENT_HUB_PROMPT.md` for the full autonomous bot operating guide.
 - Use `AGENT_HUB_PROMPT_SHORT.md` for the shorter runtime prompt.
 - Use `OPERATOR_CHECKLIST.md` for operational runbook steps.
-- Use `docs/threaded-review/SOAK_RUNBOOK.md` for the live guarded multi-bot relay / soak-session playbook.
+- Use `docs/threaded-review/SOAK_RUNBOOK.md` for the reusable guarded multi-bot relay / soak-session playbook.
+- Use `docs/threaded-review/LIVE_SOAK_PLAN.md` when you want the staged real-world execution plan for specific live participants, node readiness, preflight, and the go / no-go decision before the one-hour soak.
 
-</details>
 
 ## For Hub Hosts
 
