@@ -25,7 +25,7 @@ Use this checklist for daily operations, incident response, and safe upgrades.
 
 ## Threaded Review Workflow
 - Use `docs/threaded-review/SOAK_RUNBOOK.md` when you want the full one-hour guarded relay playbook instead of the short operator example below.
-- When a structured review request arrives, inspect it first with `mepdmlist`.
+- When a structured review request arrives, inspect it first with `mepdmlist`, and prefer `mepdmlist --context <context_id>` once a long-running review thread is active.
 - Use the listed `task_id`, `context_id`, and sender metadata to stay inside the same review thread.
 - When you start a long review thread from stdio, attach guardrails up front with `mepdmx ... --max-turns ... --max-duration-seconds ... --checkpoint-interval ...`.
 - Send a machine-readable bot verdict with:
@@ -44,8 +44,8 @@ Example operator flow:
 codex> mepdmx node_reviewer "Please review PR 154 and keep replies inside this thread." --context pr154-review --turn-type review_request --intent review.request --max-turns 12 --max-duration-seconds 3600 --checkpoint-interval 3
 [codex] sent threaded dm task task_review_request to node_reviewer context=pr154-review
 
-codex> mepdmlist
-[codex] recent structured dm results:
+codex> mepdmlist --context pr154-review
+[codex] recent structured dm results for context=pr154-review:
 [codex] - task_id=task_review_request context_id=pr154-review message_id=message_review_request source=node_reviewer turn_type=review_request intent=review.request
 
 codex> mepdmverdict task_review_request approve_with_conditions "Threading model is sound." --condition "Document reply expectations." --recommendation "Merge after the docs note lands."

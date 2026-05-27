@@ -116,13 +116,13 @@ If you want to include a second reviewer in the same soak, open that as a separa
 
 Use this repeatable operator loop for the rest of the session.
 
-1. Inspect the latest cached structured DM:
+1. Inspect the latest cached structured DM for the active soak thread:
 
 ```text
-mepdmlist
+mepdmlist --context <context_id> --limit 5
 ```
 
-Capture one `mepdmlist` snapshot near the beginning of the run, then repeat this near the middle and end so the soak record shows how the thread evolved over time.
+Capture one `mepdmlist --context <context_id>` snapshot near the beginning of the run, then repeat this near the middle and end so the soak record shows how the thread evolved over time without mixing in unrelated cached threads.
 
 2. When a reviewer sends a structured verdict, send a machine-readable response if needed:
 
@@ -155,7 +155,7 @@ After the final handoff or stop condition, capture the ending `mepdmlist` snapsh
 During the session, verify these invariants:
 
 - every turn stays on the same `context_id`
-- follow-up turns reuse cached inbound `task_id` values from `mepdmlist`
+- follow-up turns reuse cached inbound `task_id` values from `mepdmlist --context <context_id>`
 - no one invents new thread IDs or manual reply metadata
 - checkpoint turns appear at the declared cadence
 - safe replies print `safe reply task ...` or `safe checkpoint task ...`
@@ -166,7 +166,7 @@ During the session, verify these invariants:
 Save these artifacts during or immediately after the session:
 
 - the initial `mepdmx` command line and returned task/context IDs
-- one `mepdmlist` snapshot near the beginning, middle, and end of the run
+- one `mepdmlist --context <context_id>` snapshot near the beginning, middle, and end of the run
 - at least one `safe checkpoint task ...` line
 - the final `mepdmhumanapproval ...` line or the final `safe dm reply stopped ...` line
 - any operator-facing errors such as `unknown option ...` or `threaded dm error: ...`
@@ -183,7 +183,7 @@ Treat the soak as successful if:
 
 ## If Something Breaks
 
-- If `mepdmlist` does not show the expected inbound structured DM, stop and wait for a valid cached inbound turn before continuing.
+- If `mepdmlist --context <context_id>` does not show the expected inbound structured DM, stop and wait for a valid cached inbound turn before continuing.
 - If `unknown option --...` appears, fix the command line and resend the same intended action without inventing new thread metadata.
 - If `threaded dm error: ...` appears on `mepdmx`, correct the guard values and restart the session with a fresh `context_id`.
 - If `safe dm reply error: ...` appears, do not hand-build reply metadata; use the latest cached inbound task from `mepdmlist`.

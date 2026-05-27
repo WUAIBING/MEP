@@ -44,13 +44,66 @@ class StdioAdapter:
             oldest_task_id = next(iter(self._recent_interbot_results))
             del self._recent_interbot_results[oldest_task_id]
 
-    def _list_recent_structured_dm_results(self) -> None:
-        if not self._recent_interbot_results:
+    def _list_recent_structured_dm_results(self, text: str = "") -> None:
+        try:
+            parts = shlex.split(text)
+        except ValueError as exc:
+            print(f"[{self.platform_name}] mepdmlist parse error: {exc}")
+            return
+
+        context_filter: Optional[str] = None
+        limit: Optional[int] = None
+        i = 0
+        while i < len(parts):
+            token = parts[i]
+            if token == "--context":
+                if i + 1 >= len(parts):
+                    print(f"[{self.platform_name}] missing value for {token}")
+                    return
+                context_filter = parts[i + 1]
+                i += 2
+                continue
+            if token == "--limit":
+                if i + 1 >= len(parts):
+                    print(f"[{self.platform_name}] missing value for {token}")
+                    return
+                try:
+                    limit = int(parts[i + 1])
+                except ValueError:
+                    print(f"[{self.platform_name}] --limit must be an integer")
+                    return
+                if limit <= 0:
+                    print(f"[{self.platform_name}] --limit must be a positive integer")
+                    return
+                i += 2
+                continue
+            print(f"[{self.platform_name}] unknown option {token}")
+            return
+
+        entries = list(reversed(list(self._recent_interbot_results.items())))
+        if context_filter is not None:
+            filtered_entries: list[tuple[str, dict[str, Any]]] = []
+            for task_id, inbound in entries:
+                message = inbound.get("message", {})
+                conversation = message.get("conversation") if isinstance(message, dict) else None
+                if isinstance(conversation, dict) and conversation.get("context_id") == context_filter:
+                    filtered_entries.append((task_id, inbound))
+            entries = filtered_entries
+        if limit is not None:
+            entries = entries[:limit]
+
+        if not entries:
+            if context_filter is not None:
+                print(f"[{self.platform_name}] no stored structured dm results for context={context_filter}")
+                return
             print(f"[{self.platform_name}] no stored structured dm results")
             return
 
-        print(f"[{self.platform_name}] recent structured dm results:")
-        for task_id, inbound in reversed(list(self._recent_interbot_results.items())):
+        header = f"[{self.platform_name}] recent structured dm results:"
+        if context_filter is not None:
+            header = f"[{self.platform_name}] recent structured dm results for context={context_filter}:"
+        print(header)
+        for task_id, inbound in entries:
             message = inbound.get("message", {})
             source = message.get("source") if isinstance(message, dict) else None
             conversation = message.get("conversation") if isinstance(message, dict) else None
@@ -593,6 +646,9 @@ class StdioAdapter:
             return True
         if text == "mepdmlist":
             self._list_recent_structured_dm_results()
+            return True
+        if text.startswith("mepdmlist "):
+            self._list_recent_structured_dm_results(text[10:])
             return True
         if text.startswith("mepdmhumanapproval "):
             await self._send_human_approval_request_dm(text[19:])
