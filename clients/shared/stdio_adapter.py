@@ -213,6 +213,26 @@ class StdioAdapter:
             return None
         return task_id, parts[2:]
 
+    def _derive_next_turn_index(self, task_id: str, message: dict[str, Any], *, require: bool = False) -> Optional[int]:
+        conversation = message.get("conversation") if isinstance(message, dict) else None
+        if not isinstance(conversation, dict):
+            if require:
+                print(f"[{self.platform_name}] stored structured dm result {task_id} is missing conversation")
+            return None
+        turn_index = conversation.get("turn_index")
+        if turn_index is None:
+            if require:
+                print(
+                    f"[{self.platform_name}] stored structured dm result {task_id} is missing conversation.turn_index; "
+                    "pass an explicit next_turn_index"
+                )
+            return None
+        if not isinstance(turn_index, int) or turn_index < 1:
+            if require:
+                print(f"[{self.platform_name}] stored structured dm result {task_id} has invalid conversation.turn_index")
+            return None
+        return turn_index + 1
+
     async def _submit(self, text: str) -> None:
         payload, bounty, model, target = parse_task_args(text, DEFAULT_BOUNTY, self.default_model)
         if not payload:
@@ -316,6 +336,7 @@ class StdioAdapter:
                 intent_type=options.get("--intent", "chat.request"),
                 priority=options.get("--priority", "normal"),
                 session_safety=session_safety,
+                turn_index=1,
             )
         except ValueError as exc:
             print(f"[{self.platform_name}] threaded dm error: {exc}")
@@ -338,7 +359,7 @@ class StdioAdapter:
         usage = (
             f"[{self.platform_name}] usage: mepdmreplysafe <task_id> <next_turn_index> <reply> "
             "[--checkpoint-summary text] [--turn-type type] [--intent type] [--priority <level>] [--human-note text] "
-            "or mepdmreplysafe --context <context_id> <next_turn_index> <reply> [options]"
+            "or mepdmreplysafe --context <context_id> <next_turn_index|auto> <reply> [options]"
         )
         resolved = self._resolve_stored_task_id_selector(parts, usage)
         if not resolved:
@@ -347,12 +368,6 @@ class StdioAdapter:
         if len(parts) < 2:
             print(usage)
             return
-        try:
-            next_turn_index = int(parts[0])
-        except ValueError:
-            print(f"[{self.platform_name}] next_turn_index must be an integer")
-            return
-
         options: dict[str, str] = {}
         reply_parts: list[str] = []
         allowed_options = {
@@ -387,6 +402,16 @@ class StdioAdapter:
         if not stored:
             return
         message, _source, _target_node, _context_id, _reply_to_message_id = stored
+        if parts[0] == "auto":
+            next_turn_index = self._derive_next_turn_index(task_id, message, require=True)
+            if next_turn_index is None:
+                return
+        else:
+            try:
+                next_turn_index = int(parts[0])
+            except ValueError:
+                print(f"[{self.platform_name}] next_turn_index must be an integer")
+                return
 
         try:
             response = await self.client.submit_safe_dm_reply(
@@ -530,25 +555,31 @@ class StdioAdapter:
         if not stored:
             return
         _message, source, cached_target_node, context_id, reply_to_message_id = stored
+        turn_index = self._derive_next_turn_index(task_id, _message)
         target_node = target_node_override or cached_target_node
         target_alias = target_alias_override
         if target_alias is None and not target_node_override and isinstance(source.get("alias"), str):
             target_alias = source.get("alias")
 
         try:
+            request_kwargs = {
+                "context_id": context_id,
+                "decision_type": decision_type,
+                "target_alias": target_alias,
+                "reply_to_task_id": task_id,
+                "reply_to_message_id": reply_to_message_id,
+                "review_decision": review_decision,
+                "blockers": blockers or None,
+                "recommended_next_action": next_action,
+                "priority": priority,
+                "human_note": human_note,
+            }
+            if turn_index is not None:
+                request_kwargs["turn_index"] = turn_index
             response = await self.client.submit_human_approval_request_dm(
                 summary,
                 target_node,
-                context_id=context_id,
-                decision_type=decision_type,
-                target_alias=target_alias,
-                reply_to_task_id=task_id,
-                reply_to_message_id=reply_to_message_id,
-                review_decision=review_decision,
-                blockers=blockers or None,
-                recommended_next_action=next_action,
-                priority=priority,
-                human_note=human_note,
+                **request_kwargs,
             )
         except ValueError as exc:
             print(f"[{self.platform_name}] human approval request error: {exc}")
@@ -635,20 +666,28 @@ class StdioAdapter:
         if not stored:
             return
         _message, source, target_node, context_id, reply_to_message_id = stored
+        turn_index = self._derive_next_turn_index(task_id, _message)
 
         try:
+            request_kwargs = {
+                "context_id": context_id,
+                "target_alias": source.get("alias")
+                if isinstance(source, dict) and isinstance(source.get("alias"), str)
+                else None,
+                "reply_to_task_id": task_id,
+                "reply_to_message_id": reply_to_message_id if isinstance(reply_to_message_id, str) else None,
+                "conditions": conditions or None,
+                "human_recommendation": recommendation,
+                "priority": priority,
+                "human_note": human_note,
+            }
+            if turn_index is not None:
+                request_kwargs["turn_index"] = turn_index
             response = await self.client.submit_review_verdict_dm(
                 verdict,
                 rationale,
                 target_node,
-                context_id=context_id,
-                target_alias=source.get("alias") if isinstance(source, dict) and isinstance(source.get("alias"), str) else None,
-                reply_to_task_id=task_id,
-                reply_to_message_id=reply_to_message_id if isinstance(reply_to_message_id, str) else None,
-                conditions=conditions or None,
-                human_recommendation=recommendation,
-                priority=priority,
-                human_note=human_note,
+                **request_kwargs,
             )
         except ValueError as exc:
             print(f"[{self.platform_name}] review verdict error: {exc}")

@@ -138,13 +138,13 @@ mepdmverdict --context <context_id> approve_with_conditions "The thread is stayi
 3. When the thread should continue within the same session, use bounded replies:
 
 ```text
-mepdmreplysafe --context <context_id> 2 "Continuing the review relay. Keep the next reply focused on blocking concerns." --turn-type review_response --intent review.response
+mepdmreplysafe --context <context_id> auto "Continuing the review relay. Keep the next reply focused on blocking concerns." --turn-type review_response --intent review.response
 ```
 
 4. On the next bounded turn, keep using the same thread context:
 
 ```text
-mepdmreplysafe --context <context_id> 3 "Checkpoint follow-up: summarize the top two remaining blockers before we escalate." --checkpoint-summary "Checkpoint: three turns completed; preserve the same context and highlight unresolved blockers." --turn-type review_response --intent review.response --human-note "Soak run checkpoint one."
+mepdmreplysafe --context <context_id> auto "Checkpoint follow-up: summarize the top two remaining blockers before we escalate." --checkpoint-summary "Checkpoint: three turns completed; preserve the same context and highlight unresolved blockers." --turn-type review_response --intent review.response --human-note "Soak run checkpoint one."
 ```
 
 5. When bot review is complete and a human governor must decide, escalate in-thread:
@@ -153,7 +153,7 @@ mepdmreplysafe --context <context_id> 3 "Checkpoint follow-up: summarize the top
 mepdmhumanapproval --context <context_id> "The relay stayed inside the guarded thread and the bots completed their review pass." --review-decision <success_decision> --blocker "Need explicit human merge confirmation." --next-action "Decide whether to proceed based on the final human review." --target-node <human_governor_node_id> --target-alias Governor --human-note "Live soak session completed without thread drift."
 ```
 
-Use the cached `task_id` from `mepdmlist` when you want to target a specific stored inbound turn explicitly. Use `--context <context_id>` when you want the adapter to resolve the latest cached inbound turn for that thread automatically.
+Use the cached `task_id` from `mepdmlist` when you want to target a specific stored inbound turn explicitly. Use `--context <context_id>` when you want the adapter to resolve the latest cached inbound turn for that thread automatically. Use `auto` with `mepdmreplysafe` when that cached inbound turn already carries `conversation.turn_index`, which the current stdio threaded-review flow emits from the initial `mepdmx` onward.
 
 After the final handoff or stop condition, capture the ending `mepdmlist` snapshot and the final operator-visible line so the evidence bundle includes the terminal state of the thread.
 
@@ -163,6 +163,7 @@ During the session, verify these invariants:
 
 - every turn stays on the same `context_id`
 - follow-up turns reuse cached inbound `task_id` values from `mepdmlist --context <context_id>`
+- bounded replies keep advancing `conversation.turn_index` without manual turn math
 - no one invents new thread IDs or manual reply metadata
 - checkpoint turns appear at the declared cadence
 - safe replies print `safe reply task ...` or `safe checkpoint task ...`

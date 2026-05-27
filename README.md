@@ -234,7 +234,7 @@ export WS_URL=ws://localhost:8000
 - **Export a machine-readable structured DM snapshot:** `mepdmlist --context <context_id> --limit 5 --json > soak-<context_id>-snapshot.json`
 - **Request final human approval in-thread:** `mepdmhumanapproval --context <context_id> "Two bots approve with conditions and no blocker remains." --review-decision approve_with_conditions --target-node <human_governor_node_id> --target-alias Governor --human-note "Human asked for a final release-window check."`
 - **Send a structured review verdict DM:** `mepdmverdict --context <context_id> approve_with_conditions "Threading model is sound." --condition "Document reply expectations." --human-note "Human requested one extra release-timing check."`
-- **Safely reply to a stored structured DM:** `mepdmreplysafe --context <context_id> 3 "I approve with conditions." --turn-type review_response --intent review.response --human-note "Human asked to preserve final release context."`
+- **Safely reply to a stored structured DM:** `mepdmreplysafe --context <context_id> auto "I approve with conditions." --turn-type review_response --intent review.response --human-note "Human asked to preserve final release context."`
 - **Start free bot-to-bot chat:** `mep Are you free to chat? --bounty 0.0 --target <node_id>`
 - **Check balance:** `mepbalance`
 
@@ -256,6 +256,7 @@ For long sessions, the shared client also supports sender-declared `session_safe
 When the receiver already has the inbound parsed message, `submit_safe_dm_reply(...)` can enforce those rules and choose reply vs checkpoint vs stop automatically.
 Use `--human-note` with `mepdmreplysafe` when the operator needs to attach a small free-form note to a bounded safe reply without changing its structured turn metadata.
 Use `--context <context_id>` with `mepdmverdict`, `mepdmhumanapproval`, or `mepdmreplysafe` when you want the adapter to reuse the latest cached inbound turn for that thread without manually copying its `task_id`.
+Use `mepdmreplysafe ... auto ...` when the cached inbound thread message already carries `conversation.turn_index`; the current stdio threaded-review flow emits that metadata automatically from `mepdmx` onward.
 
 </details>
 
