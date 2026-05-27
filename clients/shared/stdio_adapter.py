@@ -70,6 +70,18 @@ class StdioAdapter:
         sanitized = sanitized.strip("-")
         return sanitized or fallback
 
+    @staticmethod
+    def _resolve_snapshot_output_path(output_path: str) -> str:
+        base_dir = os.path.abspath(os.getcwd())
+        candidate_path = os.path.abspath(output_path)
+        try:
+            common_path = os.path.commonpath([base_dir, candidate_path])
+        except ValueError as exc:
+            raise ValueError("--out must stay within the current working directory") from exc
+        if common_path != base_dir:
+            raise ValueError("--out must stay within the current working directory")
+        return candidate_path
+
     def _parse_structured_dm_cache_options(
         self,
         text: str,
@@ -270,6 +282,11 @@ class StdioAdapter:
             safe_context = self._sanitize_snapshot_name_component(context_filter, "all")
             safe_label = self._sanitize_snapshot_name_component(label, "snapshot")
             output_path = f"soak-{safe_context}-{safe_label}.json"
+        try:
+            output_path = self._resolve_snapshot_output_path(output_path)
+        except ValueError as exc:
+            print(f"[{self.platform_name}] {exc}")
+            return
         try:
             output_dir = os.path.dirname(output_path)
             if output_dir:
