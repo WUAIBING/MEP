@@ -232,9 +232,9 @@ export WS_URL=ws://localhost:8000
 - **List recent stored structured DMs:** `mepdmlist`
 - **Filter the structured DM cache to one live thread:** `mepdmlist --context <context_id> --limit 5`
 - **Export a machine-readable structured DM snapshot:** `mepdmlist --context <context_id> --limit 5 --json > soak-<context_id>-snapshot.json`
-- **Request final human approval in-thread:** `mepdmhumanapproval <cached_task_id_from_mepdmlist> "Two bots approve with conditions and no blocker remains." --review-decision approve_with_conditions --target-node <human_governor_node_id> --target-alias Governor --human-note "Human asked for a final release-window check."`
-- **Send a structured review verdict DM:** `mepdmverdict <cached_task_id_from_mepdmlist> approve_with_conditions "Threading model is sound." --condition "Document reply expectations." --human-note "Human requested one extra release-timing check."`
-- **Safely reply to a stored structured DM:** `mepdmreplysafe <cached_task_id_from_mepdmlist> 3 "I approve with conditions." --turn-type review_response --intent review.response --human-note "Human asked to preserve final release context."`
+- **Request final human approval in-thread:** `mepdmhumanapproval --context <context_id> "Two bots approve with conditions and no blocker remains." --review-decision approve_with_conditions --target-node <human_governor_node_id> --target-alias Governor --human-note "Human asked for a final release-window check."`
+- **Send a structured review verdict DM:** `mepdmverdict --context <context_id> approve_with_conditions "Threading model is sound." --condition "Document reply expectations." --human-note "Human requested one extra release-timing check."`
+- **Safely reply to a stored structured DM:** `mepdmreplysafe --context <context_id> 3 "I approve with conditions." --turn-type review_response --intent review.response --human-note "Human asked to preserve final release context."`
 - **Start free bot-to-bot chat:** `mep Are you free to chat? --bounty 0.0 --target <node_id>`
 - **Check balance:** `mepbalance`
 
@@ -247,7 +247,7 @@ Use `mepdmlist --json` when the operator wants a machine-readable snapshot for s
 Use `mepdmhumanapproval` when the bot discussion is finished and the operator wants to hand the thread off to a human governor with machine-readable blockers, proposed review decision, and recommended next action.
 Use `--target-node` with `mepdmhumanapproval` when the final human decision maker is different from the sender of the cached inbound thread message.
 Use `--human-note` with `mepdmhumanapproval` when the operator needs to preserve a small piece of free-form human context alongside the machine-readable approval payload.
-For `mepdmhumanapproval`, keep using a cached inbound `task_id` from `mepdmlist` instead of the task ID printed after `mepdmverdict`, unless that newer message later appears in the structured DM cache.
+For `mepdmhumanapproval`, either pass a cached inbound `task_id` from `mepdmlist` or use `--context <context_id>` to resolve the latest cached inbound turn for that thread automatically.
 Use `mepdmverdict` when the operator wants to send a machine-readable review decision back through the same threaded DM context without rebuilding the reply metadata by hand.
 Use `--human-note` with `mepdmverdict` when the operator needs to attach a small free-form note without changing the structured verdict fields.
 For machine-readable review decisions, the shared client also provides `submit_review_verdict_dm(...)`, `extract_review_verdict(...)`, `submit_human_approval_request_dm(...)`, and `extract_human_approval_request(...)`.
@@ -255,6 +255,7 @@ Use `--max-turns`, `--max-duration-seconds`, and `--checkpoint-interval` with `m
 For long sessions, the shared client also supports sender-declared `session_safety` metadata and `evaluate_interbot_session_safety(...)` so bots can enforce max-turn, timeout, and checkpoint policies consistently.
 When the receiver already has the inbound parsed message, `submit_safe_dm_reply(...)` can enforce those rules and choose reply vs checkpoint vs stop automatically.
 Use `--human-note` with `mepdmreplysafe` when the operator needs to attach a small free-form note to a bounded safe reply without changing its structured turn metadata.
+Use `--context <context_id>` with `mepdmverdict`, `mepdmhumanapproval`, or `mepdmreplysafe` when you want the adapter to reuse the latest cached inbound turn for that thread without manually copying its `task_id`.
 
 </details>
 

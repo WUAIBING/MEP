@@ -132,26 +132,28 @@ mepdmlist --context <context_id> --limit 5 --json > soak-<context_id>-start.json
 2. When a reviewer sends a structured verdict, send a machine-readable response if needed:
 
 ```text
-mepdmverdict <cached_task_id_from_mepdmlist> approve_with_conditions "The thread is staying coherent and the current review state is actionable." --condition "Document the remaining rollout risks." --recommendation "Continue the relay and escalate after the next checkpoint."
+mepdmverdict --context <context_id> approve_with_conditions "The thread is staying coherent and the current review state is actionable." --condition "Document the remaining rollout risks." --recommendation "Continue the relay and escalate after the next checkpoint."
 ```
 
 3. When the thread should continue within the same session, use bounded replies:
 
 ```text
-mepdmreplysafe <cached_task_id_from_mepdmlist> 2 "Continuing the review relay. Keep the next reply focused on blocking concerns." --turn-type review_response --intent review.response
+mepdmreplysafe --context <context_id> 2 "Continuing the review relay. Keep the next reply focused on blocking concerns." --turn-type review_response --intent review.response
 ```
 
-4. On the next bounded turn, keep using the cached inbound `task_id` shown by `mepdmlist`:
+4. On the next bounded turn, keep using the same thread context:
 
 ```text
-mepdmreplysafe <cached_task_id_from_mepdmlist> 3 "Checkpoint follow-up: summarize the top two remaining blockers before we escalate." --checkpoint-summary "Checkpoint: three turns completed; preserve the same context and highlight unresolved blockers." --turn-type review_response --intent review.response --human-note "Soak run checkpoint one."
+mepdmreplysafe --context <context_id> 3 "Checkpoint follow-up: summarize the top two remaining blockers before we escalate." --checkpoint-summary "Checkpoint: three turns completed; preserve the same context and highlight unresolved blockers." --turn-type review_response --intent review.response --human-note "Soak run checkpoint one."
 ```
 
 5. When bot review is complete and a human governor must decide, escalate in-thread:
 
 ```text
-mepdmhumanapproval <cached_task_id_from_mepdmlist> "The relay stayed inside the guarded thread and the bots completed their review pass." --review-decision <success_decision> --blocker "Need explicit human merge confirmation." --next-action "Decide whether to proceed based on the final human review." --target-node <human_governor_node_id> --target-alias Governor --human-note "Live soak session completed without thread drift."
+mepdmhumanapproval --context <context_id> "The relay stayed inside the guarded thread and the bots completed their review pass." --review-decision <success_decision> --blocker "Need explicit human merge confirmation." --next-action "Decide whether to proceed based on the final human review." --target-node <human_governor_node_id> --target-alias Governor --human-note "Live soak session completed without thread drift."
 ```
+
+Use the cached `task_id` from `mepdmlist` when you want to target a specific stored inbound turn explicitly. Use `--context <context_id>` when you want the adapter to resolve the latest cached inbound turn for that thread automatically.
 
 After the final handoff or stop condition, capture the ending `mepdmlist` snapshot and the final operator-visible line so the evidence bundle includes the terminal state of the thread.
 
