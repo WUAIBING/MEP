@@ -3,6 +3,7 @@ import json
 import os
 import shlex
 import tempfile
+from datetime import datetime, timezone
 from typing import Any, Optional
 
 from clients.shared.commands import parse_task_args
@@ -61,47 +62,100 @@ class StdioAdapter:
             "message": message if isinstance(message, dict) else None,
         }
 
-    def _list_recent_structured_dm_results(self, text: str = "") -> None:
+    @staticmethod
+    def _sanitize_snapshot_name_component(value: Optional[str], fallback: str) -> str:
+        if not isinstance(value, str):
+            return fallback
+        sanitized = "".join(char if char.isalnum() or char in {"-", "_"} else "-" for char in value.strip())
+        sanitized = sanitized.strip("-")
+        return sanitized or fallback
+
+    def _parse_structured_dm_cache_options(
+        self,
+        text: str,
+        *,
+        command_name: str,
+        allowed_options: set[str],
+    ) -> Optional[dict[str, Any]]:
         try:
             parts = shlex.split(text)
         except ValueError as exc:
-            print(f"[{self.platform_name}] mepdmlist parse error: {exc}")
-            return
+            print(f"[{self.platform_name}] {command_name} parse error: {exc}")
+            return None
 
-        context_filter: Optional[str] = None
-        limit: Optional[int] = None
-        emit_json = False
+        options: dict[str, Any] = {
+            "context_filter": None,
+            "limit": None,
+            "emit_json": False,
+        }
         i = 0
         while i < len(parts):
             token = parts[i]
             if token == "--context":
+                if "--context" not in allowed_options:
+                    print(f"[{self.platform_name}] unknown option {token}")
+                    return None
                 if i + 1 >= len(parts):
                     print(f"[{self.platform_name}] missing value for {token}")
-                    return
-                context_filter = parts[i + 1]
+                    return None
+                options["context_filter"] = parts[i + 1]
                 i += 2
                 continue
             if token == "--limit":
+                if "--limit" not in allowed_options:
+                    print(f"[{self.platform_name}] unknown option {token}")
+                    return None
                 if i + 1 >= len(parts):
                     print(f"[{self.platform_name}] missing value for {token}")
-                    return
+                    return None
                 try:
                     limit = int(parts[i + 1])
                 except ValueError:
                     print(f"[{self.platform_name}] --limit must be an integer")
-                    return
+                    return None
                 if limit <= 0:
                     print(f"[{self.platform_name}] --limit must be a positive integer")
-                    return
+                    return None
+                options["limit"] = limit
                 i += 2
                 continue
             if token == "--json":
-                emit_json = True
+                if "--json" not in allowed_options:
+                    print(f"[{self.platform_name}] unknown option {token}")
+                    return None
+                options["emit_json"] = True
                 i += 1
                 continue
+            if token == "--label":
+                if "--label" not in allowed_options:
+                    print(f"[{self.platform_name}] unknown option {token}")
+                    return None
+                if i + 1 >= len(parts):
+                    print(f"[{self.platform_name}] missing value for {token}")
+                    return None
+                options["label"] = parts[i + 1]
+                i += 2
+                continue
+            if token == "--out":
+                if "--out" not in allowed_options:
+                    print(f"[{self.platform_name}] unknown option {token}")
+                    return None
+                if i + 1 >= len(parts):
+                    print(f"[{self.platform_name}] missing value for {token}")
+                    return None
+                options["out"] = parts[i + 1]
+                i += 2
+                continue
             print(f"[{self.platform_name}] unknown option {token}")
-            return
+            return None
+        return options
 
+    def _select_recent_structured_dm_entries(
+        self,
+        *,
+        context_filter: Optional[str] = None,
+        limit: Optional[int] = None,
+    ) -> list[tuple[str, dict[str, Any]]]:
         entries = list(reversed(list(self._recent_interbot_results.items())))
         if context_filter is not None:
             filtered_entries: list[tuple[str, dict[str, Any]]] = []
@@ -113,23 +167,52 @@ class StdioAdapter:
             entries = filtered_entries
         if limit is not None:
             entries = entries[:limit]
+        return entries
+
+    def _build_structured_dm_snapshot(
+        self,
+        *,
+        context_filter: Optional[str] = None,
+        limit: Optional[int] = None,
+        entries: Optional[list[tuple[str, dict[str, Any]]]] = None,
+        label: Optional[str] = None,
+    ) -> dict[str, Any]:
+        selected_entries = (
+            entries
+            if entries is not None
+            else self._select_recent_structured_dm_entries(context_filter=context_filter, limit=limit)
+        )
+        snapshot = {
+            "platform": self.platform_name,
+            "context_filter": context_filter,
+            "limit": limit,
+            "count": len(selected_entries),
+            "results": [
+                self._format_structured_dm_result_snapshot(task_id, inbound)
+                for task_id, inbound in selected_entries
+            ],
+        }
+        if label is not None:
+            snapshot["snapshot_label"] = label
+            snapshot["captured_at_utc"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        return snapshot
+
+    def _list_recent_structured_dm_results(self, text: str = "") -> None:
+        options = self._parse_structured_dm_cache_options(
+            text,
+            command_name="mepdmlist",
+            allowed_options={"--context", "--limit", "--json"},
+        )
+        if not options:
+            return
+        context_filter = options["context_filter"]
+        limit = options["limit"]
+        emit_json = options["emit_json"]
+
+        entries = self._select_recent_structured_dm_entries(context_filter=context_filter, limit=limit)
 
         if emit_json:
-            print(
-                json.dumps(
-                    {
-                        "platform": self.platform_name,
-                        "context_filter": context_filter,
-                        "limit": limit,
-                        "count": len(entries),
-                        "results": [
-                            self._format_structured_dm_result_snapshot(task_id, inbound)
-                            for task_id, inbound in entries
-                        ],
-                    },
-                    indent=2,
-                )
-            )
+            print(json.dumps(self._build_structured_dm_snapshot(context_filter=context_filter, limit=limit, entries=entries), indent=2))
             return
 
         if not entries:
@@ -156,6 +239,52 @@ class StdioAdapter:
                 f"turn_type={conversation.get('turn_type') if isinstance(conversation, dict) else None} "
                 f"intent={intent.get('type') if isinstance(intent, dict) else None}"
             )
+
+    def _write_structured_dm_snapshot(self, text: str = "") -> None:
+        usage = (
+            f"[{self.platform_name}] usage: mepdmsnapshot --label <label> "
+            "[--context <context_id>] [--limit <count>] [--out <file>]"
+        )
+        options = self._parse_structured_dm_cache_options(
+            text,
+            command_name="mepdmsnapshot",
+            allowed_options={"--context", "--limit", "--label", "--out"},
+        )
+        if not options:
+            return
+        label = options.get("label")
+        if not isinstance(label, str) or not label.strip():
+            print(usage)
+            return
+        context_filter = options["context_filter"]
+        limit = options["limit"]
+        entries = self._select_recent_structured_dm_entries(context_filter=context_filter, limit=limit)
+        snapshot = self._build_structured_dm_snapshot(
+            context_filter=context_filter,
+            limit=limit,
+            entries=entries,
+            label=label.strip(),
+        )
+        output_path = options.get("out")
+        if not isinstance(output_path, str) or not output_path.strip():
+            safe_context = self._sanitize_snapshot_name_component(context_filter, "all")
+            safe_label = self._sanitize_snapshot_name_component(label, "snapshot")
+            output_path = f"soak-{safe_context}-{safe_label}.json"
+        try:
+            output_dir = os.path.dirname(output_path)
+            if output_dir:
+                os.makedirs(output_dir, exist_ok=True)
+            with open(output_path, "w", encoding="utf-8", newline="\n") as snapshot_file:
+                json.dump(snapshot, snapshot_file, indent=2)
+                snapshot_file.write("\n")
+        except OSError as exc:
+            print(f"[{self.platform_name}] mepdmsnapshot write error: {exc}")
+            return
+        print(
+            f"[{self.platform_name}] wrote structured dm snapshot {output_path} "
+            f"label={label.strip()} count={snapshot['count']}"
+            + (f" context={context_filter}" if context_filter else "")
+        )
 
     def _get_stored_structured_dm_context(
         self, task_id: str
@@ -758,6 +887,10 @@ class StdioAdapter:
         if text.startswith("mepdmlist "):
             self._list_recent_structured_dm_results(text[10:])
             return True
+        if text.startswith("mepdmsnapshot"):
+            snapshot_args = text[14:].strip() if len(text) > 14 else ""
+            self._write_structured_dm_snapshot(snapshot_args)
+            return True
         if text.startswith("mepdmhumanapproval "):
             await self._send_human_approval_request_dm(text[19:])
             return True
@@ -797,7 +930,7 @@ class StdioAdapter:
         print(f"[{self.platform_name}] connected as {self.client.node_id}")
         print(
             f"[{self.platform_name}] commands: "
-            "mep, mepdm, mepdmx, mepdmlist, mepdmhumanapproval, mepdmverdict, mepdmreplysafe, "
+            "mep, mepdm, mepdmx, mepdmlist, mepdmsnapshot, mepdmhumanapproval, mepdmverdict, mepdmreplysafe, "
             "mepdata, mepcancel, mepresult, mepbalance, exit"
         )
         loop = asyncio.get_running_loop()
