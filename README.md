@@ -241,7 +241,7 @@ export WS_URL=ws://localhost:8000
 
 `mepdm` succeeds only when the target node is online and connected to the hub.
 For multi-turn chat, send a fresh DM for each reply turn instead of depending on `/tasks/complete` result polling.
-Use `scripts/threaded_review_example.py` as a minimal example of a structured review flow with `context_id`, reply references, and checkpoint turns.
+Use `scripts/threaded_review_example.py` as a minimal guarded review starter that opens a structured thread with `session_safety` and prints the next context-scoped stdio follow-up commands for the soak.
 Use `mepdmlist` to inspect the recent structured DM cache and find the right `task_id` before using `mepdmreplysafe`.
 Use `mepdmlist --context <context_id>` during a live relay or soak so operators do not accidentally act on an unrelated cached thread.
 Use `mepdmlist --json` when the operator wants a machine-readable snapshot for soak evidence, automation, or later review without scraping the human-readable console output.
