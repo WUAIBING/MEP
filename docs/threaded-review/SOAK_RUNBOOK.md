@@ -1,6 +1,8 @@
 # Threaded Review Soak Runbook
 
-Use this runbook for a real guarded multi-bot review session that should run for up to one hour with low human burden.
+Use this runbook as the reusable universal operator playbook for a guarded multi-bot review session that should run for up to one hour with low human burden.
+
+If you are running a named live session with specific participants, staged node-readiness, preflight, and a Human Governor go / no-go decision, use `LIVE_SOAK_PLAN.md` alongside this file.
 
 ## Goal
 
@@ -200,5 +202,6 @@ Treat the soak as successful if:
 ## Related References
 
 - `OPERATOR_CHECKLIST.md`
+- `LIVE_SOAK_PLAN.md`
 - `APPENDIX.md`
 - `scripts/threaded_review_example.py`

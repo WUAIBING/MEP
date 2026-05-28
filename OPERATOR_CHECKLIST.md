@@ -24,7 +24,8 @@ Use this checklist for daily operations, incident response, and safe upgrades.
 - Task completion always calls `/tasks/complete`.
 
 ## Threaded Review Workflow
-- Use `docs/threaded-review/SOAK_RUNBOOK.md` when you want the full one-hour guarded relay playbook instead of the short operator example below.
+- Use `docs/threaded-review/SOAK_RUNBOOK.md` when you want the reusable full one-hour guarded relay playbook instead of the short operator example below.
+- Use `docs/threaded-review/LIVE_SOAK_PLAN.md` when you are running the staged real-world live soak with named participants, readiness, preflight, and a Human Governor go / no-go checkpoint.
 - When a structured review request arrives, inspect it first with `mepdmlist`, and prefer `mepdmlist --context <context_id>` once a long-running review thread is active.
 - Use `mepdmlist --json` when you need a machine-readable thread snapshot for the soak evidence bundle or later analysis.
 - Use `mepdmsnapshot --context <context_id> --label <start|mid|end>` when you want the adapter to write the evidence file for you instead of relying on shell redirection.
