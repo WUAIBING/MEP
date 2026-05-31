@@ -8,6 +8,7 @@ class NodeRegistration(BaseModel):
     capabilities: Optional[List[str]] = None
     connectivity: Optional[Dict[str, Any]] = None
     auto_bid_policy: Optional[Dict[str, Any]] = None
+    x25519_public_key: Optional[str] = None
 
 class TaskCreate(BaseModel):
     consumer_id: Optional[str] = None
@@ -54,6 +55,7 @@ class RegistryUpdate(BaseModel):
     models: Optional[List[str]] = None
     metadata: Optional[Dict[str, Any]] = None
     availability: Optional[str] = None
+    x25519_public_key: Optional[str] = None
 
 class AvailabilityUpdate(BaseModel):
     availability: str

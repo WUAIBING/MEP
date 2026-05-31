@@ -127,6 +127,16 @@ class TestRegistration(unittest.TestCase):
         self.assertEqual(data1["node_id"], data2["node_id"])
         self.assertEqual(data1["balance"], data2["balance"])
 
+    def test_register_persists_x25519_public_key_in_registry(self):
+        _, pub_pem, node_id = _make_identity()
+        resp = client.post("/register", json={"pubkey": pub_pem, "alias": "enc-node", "x25519_public_key": "encpub"})
+        self.assertEqual(resp.status_code, 200, f"Register failed: {resp.text}")
+
+        registry = db.get_registry(node_id)
+        self.assertIsNotNone(registry)
+        self.assertEqual(registry["alias"], "enc-node")
+        self.assertEqual(registry["x25519_public_key"], "encpub")
+
 
 class TestBalance(unittest.TestCase):
 
@@ -614,6 +624,19 @@ class TestDiagnosticEndpoint(unittest.TestCase):
         self.assertIn("ws_connected", data)
         self.assertIn("last_ws_activity", data)
         self.assertTrue(data["auth_ok"])
+
+    def test_registry_update_can_persist_x25519_public_key(self):
+        priv, pub_pem, node_id = _make_identity()
+        _register(pub_pem)
+        update_payload = json.dumps({"alias": "diag-node", "x25519_public_key": "updated-encpub"})
+        headers = _auth_headers(priv, node_id, update_payload)
+
+        update_resp = client.post("/registry/update", content=update_payload, headers=headers)
+        self.assertEqual(update_resp.status_code, 200, f"Registry update failed: {update_resp.text}")
+
+        registry = db.get_registry(node_id)
+        self.assertIsNotNone(registry)
+        self.assertEqual(registry["x25519_public_key"], "updated-encpub")
 
 
 class TestOnboardDiagnose(unittest.TestCase):
