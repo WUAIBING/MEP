@@ -22,12 +22,62 @@ except ImportError:  # pragma: no cover - supports direct file execution
 
 DEFAULT_HUB_URL = os.getenv("HUB_URL", "http://localhost:8000")
 DEFAULT_WS_URL = os.getenv("WS_URL", "ws://localhost:8000")
-DEFAULT_KEY_DIR = os.getenv("MEP_KEY_DIR", os.path.join(os.path.expanduser("~"), ".mep"))
+
+
+def _find_git_root(start_path: Optional[str] = None) -> Optional[str]:
+    current = os.path.abspath(start_path or os.getcwd())
+    while True:
+        if os.path.isdir(os.path.join(current, ".git")):
+            return current
+        parent = os.path.dirname(current)
+        if parent == current:
+            return None
+        current = parent
+
+
+def _default_key_dir() -> str:
+    explicit = os.getenv("MEP_KEY_DIR")
+    if explicit:
+        return explicit
+    git_root = _find_git_root()
+    if git_root:
+        return os.path.join(git_root, ".mep")
+    return os.path.join(os.path.expanduser("~"), ".mep")
+
+
+DEFAULT_KEY_DIR = _default_key_dir()
 DEFAULT_KEY_PATH = os.getenv("MEP_PROVIDER_KEY_PATH", os.path.join(DEFAULT_KEY_DIR, "mep_runtime.pem"))
 
 
 def _ensure_key_parent(path: str) -> None:
     os.makedirs(os.path.dirname(path), exist_ok=True)
+
+
+def _alias_sidecar_path(key_path: str) -> str:
+    return f"{key_path}.alias"
+
+
+def _write_alias_sidecar(key_path: str, alias: str) -> None:
+    with open(_alias_sidecar_path(key_path), "w", encoding="utf-8") as handle:
+        handle.write(alias.strip() + "\n")
+
+
+def _read_alias_sidecar(key_path: str) -> Optional[str]:
+    path = _alias_sidecar_path(key_path)
+    if not os.path.exists(path):
+        return None
+    with open(path, "r", encoding="utf-8") as handle:
+        alias = handle.read().strip()
+    return alias or None
+
+
+def _resolve_runtime_alias(key_path: str, cli_alias: Optional[str]) -> str:
+    if cli_alias:
+        return cli_alias
+    persisted = _read_alias_sidecar(key_path)
+    if persisted:
+        return persisted
+    return "mep-runtime"
 
 
 def _json_or_none(resp: requests.Response) -> Optional[dict[str, Any]]:
@@ -67,10 +117,11 @@ def _status_badges(diag: dict[str, Any], *, ai_ready: bool) -> dict[str, bool]:
     ws_connected = bool(diag.get("ws_connected"))
     availability = str(diag.get("availability") or "").strip().lower()
     live_availability = availability in {"online", "idle", "busy"}
+    last_heartbeat = diag.get("last_heartbeat")
     return {
         "REGISTERED": registered,
         "WS_CONNECTED": ws_connected,
-        "HEARTBEATING": bool(diag.get("last_heartbeat")),
+        "HEARTBEATING": ws_connected and bool(last_heartbeat),
         "DM_READY": live_availability and ws_connected,
         "AI_READY": ai_ready,
     }
@@ -141,12 +192,13 @@ class MockAdapter:
 
 
 class RuntimeNode:
-    def __init__(self, identity: MEPIdentity, hub_url: str, ws_url: str, adapter: MockAdapter):
+    def __init__(self, identity: MEPIdentity, hub_url: str, ws_url: str, adapter: MockAdapter, alias: Optional[str] = None):
         self.identity = identity
         self.node_id = identity.node_id
         self.hub_url = hub_url.rstrip("/")
         self.ws_url = ws_url.rstrip("/")
         self.adapter = adapter
+        self.alias = alias
         self.running = True
         self.max_purchase_price = float(os.getenv("MEP_MAX_PURCHASE_PRICE", "0.0"))
 
@@ -156,7 +208,10 @@ class RuntimeNode:
         return headers
 
     def register(self, alias: Optional[str]) -> tuple[bool, str]:
-        payload = {"pubkey": self.identity.pub_pem}
+        payload = {
+            "pubkey": self.identity.pub_pem,
+            "x25519_public_key": self.identity.x25519_public_key,
+        }
         if alias:
             payload["alias"] = alias
         code, body, raw = _safe_request("POST", f"{self.hub_url}/register", json_body=payload)
@@ -254,7 +309,7 @@ class RuntimeNode:
             print("[mep run] install with: pip install websockets")
             return 2
 
-        ok, message = self.register(alias="mep-runtime")
+        ok, message = self.register(alias=self.alias)
         print(f"[mep run] {message}")
         if not ok:
             return 2
@@ -295,11 +350,16 @@ def cmd_init(args: argparse.Namespace) -> int:
     print(f"[mep init] node_id={identity.node_id}")
     if identity.generated_new_key:
         print(f"[mep init] generated key={identity.key_path}")
-    payload = {"pubkey": identity.pub_pem, "alias": args.alias}
+    payload = {
+        "pubkey": identity.pub_pem,
+        "alias": args.alias,
+        "x25519_public_key": identity.x25519_public_key,
+    }
     code, body, raw = _safe_request("POST", f"{args.hub_url.rstrip('/')}/register", json_body=payload)
     if code != 200:
         print(f"[mep init] register failed status={code} detail={raw}")
         return 2
+    _write_alias_sidecar(args.key_path, args.alias)
     print(f"[mep init] register ok balance={body.get('balance') if body else '?'}")
     status_args = argparse.Namespace(
         hub_url=args.hub_url,
@@ -319,7 +379,7 @@ def cmd_status(args: argparse.Namespace) -> int:
     if code != 200 or not body:
         print(f"[mep status] diagnostic failed status={code} detail={raw}")
         return 2
-    badges = _status_badges(body, ai_ready=args.adapter == "mock")
+    badges = _status_badges(body, ai_ready=args.adapter != "mock")
     _print_badges(badges)
     if badges["REGISTERED"] and not badges["WS_CONNECTED"]:
         _print_listener_hint(args)
@@ -343,7 +403,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         auth_status=args.auth_status,
         dm_status=args.dm_status,
         listener_contract_ok=args.listener_contract_ok,
-        ai_configured=args.adapter == "mock",
+        ai_configured=args.adapter != "mock",
         clock_skew_seconds=args.clock_skew_seconds,
     )
     code, result, raw = _safe_request(
@@ -375,8 +435,15 @@ def cmd_run(args: argparse.Namespace) -> int:
         return 2
     _ensure_key_parent(args.key_path)
     identity = MEPIdentity(args.key_path)
-    runtime = RuntimeNode(identity=identity, hub_url=args.hub_url, ws_url=args.ws_url, adapter=MockAdapter())
-    print(f"[mep run] adapter=mock node_id={identity.node_id}")
+    alias = _resolve_runtime_alias(args.key_path, args.alias)
+    runtime = RuntimeNode(
+        identity=identity,
+        hub_url=args.hub_url,
+        ws_url=args.ws_url,
+        adapter=MockAdapter(),
+        alias=alias,
+    )
+    print(f"[mep run] adapter=mock node_id={identity.node_id} alias={alias}")
     try:
         return asyncio.run(runtime.run_forever())
     except KeyboardInterrupt:
@@ -431,6 +498,7 @@ def build_parser() -> argparse.ArgumentParser:
     up_p.set_defaults(func=cmd_up)
 
     run_p = sub.add_parser("run", help="Run standardized listener runtime.")
+    run_p.add_argument("--alias", default=None, help="Node alias for registration; defaults to persisted alias if present.")
     run_p.set_defaults(func=cmd_run)
 
     status_p = sub.add_parser("status", help="Show quick node readiness badges.")

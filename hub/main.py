@@ -1554,7 +1554,16 @@ async def update_registry(payload: RegistryUpdate, authenticated_node: str = Dep
         existing = db.get_registry(authenticated_node)
         availability = existing.get("availability") if existing else "unknown"
     availability = await _coerce_live_availability(authenticated_node, availability)
-    db.upsert_registry(authenticated_node, payload.alias, skills, models, metadata, availability, time.time())
+    db.upsert_registry(
+        authenticated_node,
+        payload.alias,
+        skills,
+        models,
+        metadata,
+        availability,
+        time.time(),
+        payload.x25519_public_key,
+    )
     return {"status": "success", "node_id": authenticated_node}
 
 @app.post("/registry/availability")
