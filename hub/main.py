@@ -2448,7 +2448,7 @@ async def health_check():
 
 
 # ---------------------------------------------------------------------------
-# Diagnostic Endpoint 鈥?tiered approach (per Hermes DM discussion)
+# Diagnostic Endpoint — tiered approach (per Hermes DM discussion)
 # ---------------------------------------------------------------------------
 class DiagnosticResponse(BaseModel):
     node_id: Optional[str] = None
@@ -2613,11 +2613,11 @@ async def diagnostic(
     """
     Tiered diagnostic endpoint.
 
-    Tier 1 (public, no auth) 鈥?specify node_id as query param:
+    Tier 1 (public, no auth) — specify node_id as query param:
         GET /diagnostic?node_id=node_xxx
         Returns: {node_id, registered, availability, last_heartbeat}
 
-    Tier 2 (authenticated) 鈥?no query param, uses auth headers:
+    Tier 2 (authenticated) — no query param, uses auth headers:
         GET /diagnostic (with X-MEP-NodeID, X-MEP-Timestamp, X-MEP-Signature)
         Returns: full health report including ws_connected, last_ws_activity, auth_ok
 
