@@ -230,5 +230,36 @@ class TestRuntimeWebSocketLoop(unittest.TestCase):
         bid_mock.assert_called_once_with("task_compute")
 
 
+class TestRuntimeKeyDirResolution(unittest.TestCase):
+    def test_find_git_root_detects_worktree_dot_git_file(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = os.path.join(tmpdir, "wt")
+            nested = os.path.join(repo, "a", "b")
+            os.makedirs(nested)
+            # git worktrees/submodules use a .git *file* pointing elsewhere,
+            # not a .git directory.
+            with open(os.path.join(repo, ".git"), "w", encoding="utf-8") as handle:
+                handle.write("gitdir: /elsewhere/.git/worktrees/wt\n")
+            self.assertEqual(
+                os.path.realpath(mep_runtime._find_git_root(nested)),  # noqa: SLF001
+                os.path.realpath(repo),
+            )
+
+    def test_default_key_path_prefers_explicit_env(self):
+        with patch.dict(os.environ, {"MEP_PROVIDER_KEY_PATH": "/custom/key.pem"}, clear=False):
+            self.assertEqual(mep_runtime._default_key_path(), "/custom/key.pem")  # noqa: SLF001
+
+    def test_default_key_dir_prefers_explicit_env(self):
+        with patch.dict(os.environ, {"MEP_KEY_DIR": "/custom/dir"}, clear=False):
+            self.assertEqual(mep_runtime._default_key_dir(), "/custom/dir")  # noqa: SLF001
+
+    def test_key_path_resolved_lazily_when_flag_omitted(self):
+        with patch.dict(os.environ, {"MEP_PROVIDER_KEY_PATH": "/lazy/key.pem"}, clear=False):
+            with patch.object(mep_runtime, "cmd_status", return_value=0) as status_mock:
+                mep_runtime.main(["status"])
+        args = status_mock.call_args.args[0]
+        self.assertEqual(args.key_path, "/lazy/key.pem")
+
+
 if __name__ == "__main__":
     unittest.main()
