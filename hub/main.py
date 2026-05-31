@@ -1534,8 +1534,8 @@ async def register_node(node: NodeRegistration, request: Request):
     # Registration derives the Node ID from the validated Ed25519 public key PEM
     node_id = auth.derive_node_id(validated_pubkey)
     balance = db.register_node(node_id, validated_pubkey)
-    if node.alias or getattr(node, 'x25519_public_key', None):
-        db.upsert_registry(node_id, node.alias, [], [], {}, "offline", time.time(), getattr(node, 'x25519_public_key', None))
+    if node.alias or node.x25519_public_key:
+        db.upsert_registry(node_id, node.alias, [], [], {}, "offline", time.time(), node.x25519_public_key)
 
     log_event("node_registered", f"Node {node_id} registered with starting balance {balance}", node_id=node_id, starting_balance=balance)
     log_audit("REGISTER", node_id, balance, balance, "START_BONUS")

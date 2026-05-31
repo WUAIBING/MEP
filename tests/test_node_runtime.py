@@ -57,6 +57,11 @@ class _FakeWebSocket:
         self.pings += 1
 
 
+class _FakeRuntime:
+    async def run_forever(self):
+        return 0
+
+
 class TestMockAdapter(unittest.TestCase):
     def test_mock_adapter_labels_compute_chat_and_data_markets(self):
         adapter = mep_runtime.MockAdapter()
@@ -163,6 +168,27 @@ class TestRuntimeUx(unittest.TestCase):
             request_mock.call_args.kwargs["json_body"],
             {"pubkey": "pub", "alias": "runtime-alias", "x25519_public_key": "encpub"},
         )
+
+    def test_run_reads_persisted_alias_when_cli_alias_missing(self):
+        args = argparse.Namespace(
+            hub_url="http://hub",
+            ws_url="ws://hub",
+            key_path="C:/tmp/test_key.pem",
+            adapter="mock",
+            alias=None,
+        )
+        fake_runtime = _FakeRuntime()
+        with (
+            patch("node.mep_runtime._ensure_key_parent"),
+            patch("node.mep_runtime.MEPIdentity", return_value=_FakeIdentity()),
+            patch("node.mep_runtime._resolve_runtime_alias", return_value="persisted-alias") as resolve_alias_mock,
+            patch("node.mep_runtime.RuntimeNode", return_value=fake_runtime) as runtime_cls,
+            patch("node.mep_runtime.asyncio.run", return_value=0),
+        ):
+            code = mep_runtime.cmd_run(args)
+        self.assertEqual(code, 0)
+        resolve_alias_mock.assert_called_once_with(args.key_path, None)
+        self.assertEqual(runtime_cls.call_args.kwargs["alias"], "persisted-alias")
 
 
 class TestRuntimeBidPolicy(unittest.TestCase):
