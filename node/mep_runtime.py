@@ -27,7 +27,8 @@ DEFAULT_WS_URL = os.getenv("WS_URL", "ws://localhost:8000")
 def _find_git_root(start_path: Optional[str] = None) -> Optional[str]:
     current = os.path.abspath(start_path or os.getcwd())
     while True:
-        if os.path.isdir(os.path.join(current, ".git")):
+        git_marker = os.path.join(current, ".git")
+        if os.path.isdir(git_marker) or os.path.isfile(git_marker):
             return current
         parent = os.path.dirname(current)
         if parent == current:
@@ -45,8 +46,11 @@ def _default_key_dir() -> str:
     return os.path.join(os.path.expanduser("~"), ".mep")
 
 
-DEFAULT_KEY_DIR = _default_key_dir()
-DEFAULT_KEY_PATH = os.getenv("MEP_PROVIDER_KEY_PATH", os.path.join(DEFAULT_KEY_DIR, "mep_runtime.pem"))
+def _default_key_path() -> str:
+    explicit = os.getenv("MEP_PROVIDER_KEY_PATH")
+    if explicit:
+        return explicit
+    return os.path.join(_default_key_dir(), "mep_runtime.pem")
 
 
 def _ensure_key_parent(path: str) -> None:
@@ -484,7 +488,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="MEP unified runtime for fast onboarding.")
     parser.add_argument("--hub-url", default=DEFAULT_HUB_URL, help="Hub base URL.")
     parser.add_argument("--ws-url", default=DEFAULT_WS_URL, help="Hub websocket URL.")
-    parser.add_argument("--key-path", default=DEFAULT_KEY_PATH, help="Path to provider private key.")
+    parser.add_argument(
+        "--key-path",
+        default=None,
+        help="Path to provider private key (defaults to repo-local .mep/mep_runtime.pem).",
+    )
     parser.add_argument("--adapter", default="mock", choices=["mock"], help="Provider adapter.")
 
     sub = parser.add_subparsers(dest="command", required=True)
@@ -529,6 +537,8 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: Optional[list[str]] = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    if getattr(args, "key_path", None) is None:
+        args.key_path = _default_key_path()
     return int(args.func(args))
 
 
