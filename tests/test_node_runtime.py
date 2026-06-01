@@ -114,10 +114,10 @@ class TestRuntimeUx(unittest.TestCase):
             key_path = os.path.join(tmpdir, "runtime.pem")
             mep_runtime._write_alias_sidecar(key_path, "persisted-alias")  # noqa: SLF001
 
-            self.assertEqual(mep_runtime._resolve_runtime_alias(key_path, "cli-alias"), "cli-alias")  # noqa: SLF001
-            self.assertEqual(mep_runtime._resolve_runtime_alias(key_path, None), "persisted-alias")  # noqa: SLF001
+            self.assertEqual(mep_runtime._resolve_runtime_alias(key_path, "cli-alias", node_id="node_fallback"), "cli-alias")  # noqa: SLF001
+            self.assertEqual(mep_runtime._resolve_runtime_alias(key_path, None, node_id="node_fallback"), "persisted-alias")  # noqa: SLF001
             os.remove(mep_runtime._alias_sidecar_path(key_path))  # noqa: SLF001
-            self.assertEqual(mep_runtime._resolve_runtime_alias(key_path, None), "mep-runtime")  # noqa: SLF001
+            self.assertEqual(mep_runtime._resolve_runtime_alias(key_path, None, node_id="node_fallback"), "node_fallback")  # noqa: SLF001
 
     def test_init_persists_alias_sidecar(self):
         args = argparse.Namespace(
@@ -140,6 +140,29 @@ class TestRuntimeUx(unittest.TestCase):
             code = mep_runtime.cmd_init(args)
         self.assertEqual(code, 0)
         write_alias_mock.assert_called_once_with(args.key_path, "fresh-node")
+
+    def test_init_defaults_alias_to_node_id_when_none_is_provided(self):
+        args = argparse.Namespace(
+            hub_url="http://hub",
+            ws_url="ws://hub",
+            key_path="C:/tmp/test_key.pem",
+            adapter="mock",
+            alias=None,
+        )
+        fake_identity = _FakeIdentity()
+        fake_identity.generated_new_key = False
+        fake_identity.key_path = args.key_path
+        with (
+            patch("node.mep_runtime._ensure_key_parent"),
+            patch("node.mep_runtime.MEPIdentity", return_value=fake_identity),
+            patch("node.mep_runtime._safe_request", return_value=(200, {"balance": 10.0}, "")) as request_mock,
+            patch("node.mep_runtime._write_alias_sidecar") as write_alias_mock,
+            patch("node.mep_runtime.cmd_status", return_value=0),
+        ):
+            code = mep_runtime.cmd_init(args)
+        self.assertEqual(code, 0)
+        self.assertEqual(request_mock.call_args.kwargs["json_body"]["alias"], "node_runtime")
+        write_alias_mock.assert_called_once_with(args.key_path, "node_runtime")
 
     def test_up_runs_even_if_doctor_fails(self):
         args = argparse.Namespace(
@@ -188,7 +211,7 @@ class TestRuntimeUx(unittest.TestCase):
         ):
             code = mep_runtime.cmd_run(args)
         self.assertEqual(code, 0)
-        resolve_alias_mock.assert_called_once_with(args.key_path, None)
+        resolve_alias_mock.assert_called_once_with(args.key_path, None, node_id="node_runtime")
         self.assertEqual(runtime_cls.call_args.kwargs["alias"], "persisted-alias")
 
 

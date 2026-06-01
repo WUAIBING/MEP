@@ -22,7 +22,6 @@ except ImportError:  # pragma: no cover - supports direct file execution
 
 DEFAULT_HUB_URL = os.getenv("HUB_URL", "http://localhost:8000")
 DEFAULT_WS_URL = os.getenv("WS_URL", "ws://localhost:8000")
-DEFAULT_RUNTIME_ALIAS = "mep-runtime"
 LEGACY_RUNTIME_KEY_NAME = "mep_runtime.pem"
 
 
@@ -118,13 +117,13 @@ def _read_alias_sidecar(key_path: str) -> Optional[str]:
     return alias or None
 
 
-def _resolve_runtime_alias(key_path: str, cli_alias: Optional[str]) -> str:
+def _resolve_runtime_alias(key_path: str, cli_alias: Optional[str], *, node_id: str) -> str:
     if cli_alias:
         return cli_alias
     persisted = _read_alias_sidecar(key_path)
     if persisted:
         return persisted
-    return DEFAULT_RUNTIME_ALIAS
+    return node_id
 
 
 class RuntimeKeyPathError(ValueError):
@@ -461,19 +460,20 @@ def _print_listener_hint(args: argparse.Namespace) -> None:
 def cmd_init(args: argparse.Namespace) -> int:
     _ensure_key_parent(args.key_path)
     identity = MEPIdentity(args.key_path)
+    alias = _resolve_runtime_alias(args.key_path, args.alias, node_id=identity.node_id)
     print(f"[mep init] node_id={identity.node_id}")
     if identity.generated_new_key:
         print(f"[mep init] generated key={identity.key_path}")
     payload = {
         "pubkey": identity.pub_pem,
-        "alias": args.alias,
+        "alias": alias,
         "x25519_public_key": identity.x25519_public_key,
     }
     code, body, raw = _safe_request("POST", f"{args.hub_url.rstrip('/')}/register", json_body=payload)
     if code != 200:
         print(f"[mep init] register failed status={code} detail={raw}")
         return 2
-    _write_alias_sidecar(args.key_path, args.alias)
+    _write_alias_sidecar(args.key_path, alias)
     print(f"[mep init] register ok balance={body.get('balance') if body else '?'}")
     status_args = argparse.Namespace(
         hub_url=args.hub_url,
@@ -549,7 +549,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         return 2
     _ensure_key_parent(args.key_path)
     identity = MEPIdentity(args.key_path)
-    alias = _resolve_runtime_alias(args.key_path, args.alias)
+    alias = _resolve_runtime_alias(args.key_path, args.alias, node_id=identity.node_id)
     runtime = RuntimeNode(
         identity=identity,
         hub_url=args.hub_url,
@@ -608,15 +608,15 @@ def build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="command", required=True)
 
     init_p = sub.add_parser("init", help="Generate/load key and register node.")
-    init_p.add_argument("--alias", default=DEFAULT_RUNTIME_ALIAS, help="Node alias for registration.")
+    init_p.add_argument("--alias", default=None, help="Node alias for registration; defaults to the node_id if no persisted alias exists.")
     init_p.set_defaults(func=cmd_init)
 
     up_p = sub.add_parser("up", help="One-command bootstrap: init + doctor + run.")
-    up_p.add_argument("--alias", default=DEFAULT_RUNTIME_ALIAS, help="Node alias for registration.")
+    up_p.add_argument("--alias", default=None, help="Node alias for registration; defaults to the node_id if no persisted alias exists.")
     up_p.set_defaults(func=cmd_up)
 
     run_p = sub.add_parser("run", help="Run standardized listener runtime.")
-    run_p.add_argument("--alias", default=None, help="Node alias for registration; defaults to persisted alias if present.")
+    run_p.add_argument("--alias", default=None, help="Node alias for registration; defaults to persisted alias or node_id if none exists.")
     run_p.set_defaults(func=cmd_run)
 
     status_p = sub.add_parser("status", help="Show quick node readiness badges.")
