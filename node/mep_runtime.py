@@ -566,6 +566,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         print("[mep run] unsupported adapter, using mock")
         adapter = MockAdapter()
     else:
+        adapter = MockAdapter()
         _ensure_key_parent(args.key_path)
     identity = MEPIdentity(args.key_path)
     alias = _resolve_runtime_alias(args.key_path, args.alias)
