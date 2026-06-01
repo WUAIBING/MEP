@@ -195,6 +195,67 @@ class MockAdapter:
         )
 
 
+@dataclass
+class AIAdapter:
+    """Real AI adapter using Ollama for provider task processing."""
+    model: str = "tinyllama"
+
+    def generate_reply(self, payload: str, task_data: dict[str, Any]) -> str:
+        import subprocess
+        try:
+            prompt = (
+                f"You are a helpful MEP bot. Respond to this task concisely (max 300 chars).\n\n"
+                f"Task: {payload}\n\nReply:"
+            )
+            result = subprocess.run(
+                ["ollama", "run", self.model, prompt],
+                capture_output=True, text=True, timeout=45
+            )
+            reply = (result.stdout or "").strip()
+            if not reply:
+                return f"[AI adapter] empty response from {self.model}"
+            return reply
+        except subprocess.TimeoutExpired:
+            return f"[AI adapter] {self.model} timed out"
+        except Exception as e:
+            return f"[AI adapter] error: {e}"
+
+
+@dataclass
+class DeepSeekAdapter:
+    """Real AI adapter using DeepSeek API for provider task processing."""
+    api_key: str = ""
+    model: str = "deepseek-chat"
+
+    def generate_reply(self, payload: str, task_data: dict[str, Any]) -> str:
+        import requests as req
+        try:
+            resp = req.post(
+                "https://api.deepseek.com/v1/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {self.api_key}",
+                    "Content-Type": "application/json"
+                },
+                json={
+                    "model": self.model,
+                    "messages": [
+                        {"role": "system", "content": "You are a helpful MEP (Miao Exchange Protocol) bot. MEP is an AI-to-AI economy protocol where agents earn SECONDS by doing work. Reply concisely (max 500 chars)."},
+                        {"role": "user", "content": payload}
+                    ],
+                    "max_tokens": 300,
+                    "temperature": 0.7
+                },
+                timeout=30
+            )
+            if resp.status_code == 200:
+                return resp.json()["choices"][0]["message"]["content"].strip()
+            return f"[DeepSeek] API error {resp.status_code}: {resp.text[:200]}"
+        except Exception as e:
+            return f"[DeepSeek] error: {e}"
+
+
+
+
 class RuntimeNode:
     def __init__(self, identity: MEPIdentity, hub_url: str, ws_url: str, adapter: MockAdapter, alias: Optional[str] = None):
         self.identity = identity
@@ -252,6 +313,15 @@ class RuntimeNode:
         )
         return False
 
+    def heartbeat(self) -> None:
+        payload = {"node_id": self.node_id, "availability": "online"}
+        payload_str = json.dumps(payload)
+        headers = self._auth_headers(payload_str)
+        headers["Content-Type"] = "application/json"
+        code, _body, _raw = _safe_request("POST", f"{self.hub_url}/registry/heartbeat", data_body=payload_str, headers=headers, timeout=5)
+        if code != 200:
+            print(f"[mep run] heartbeat failed status={code}")
+
     def complete(self, task_id: str, result_payload: str) -> None:
         payload = json.dumps(
             {
@@ -275,8 +345,40 @@ class RuntimeNode:
     async def process_task(self, task_data: dict[str, Any]) -> None:
         task_id = str(task_data.get("id") or "")
         payload = str(task_data.get("payload") or "")
+        source_node = (
+            task_data.get("source", {}).get("node_id")
+            or task_data.get("source_node_id")
+            or task_data.get("sender_id")
+        )
+        print(f"[mep run] new_task id={task_id[:8]} source={source_node} market={task_data.get('market','?')} bounty={task_data.get('bounty',0)}")
         result = self.adapter.generate_reply(payload, task_data)
         self.complete(task_id, result)
+        # Auto-reply-DM: if this was a chat DM, send a fresh DM back to the sender
+        if source_node and source_node != self.node_id:
+            try:
+                from .task_envelope import build_task_envelope as _build_envelope
+                reply_envelope = _build_envelope(
+                    self.node_id,
+                    result,
+                    0.0,
+                    target_node=source_node,
+                )
+                reply_json = json.dumps(reply_envelope)
+                reply_headers = self._auth_headers(reply_json)
+                reply_headers["Content-Type"] = "application/json"
+                code, body, _raw = _safe_request(
+                    "POST",
+                    f"{self.hub_url}/tasks/submit",
+                    data_body=reply_json,
+                    headers=reply_headers,
+                    timeout=15.0,
+                )
+                if code == 200:
+                    print(f"[mep run] auto-reply-DM to {source_node[:12]} task={body.get('task_id','?')[:12]}")
+                else:
+                    print(f"[mep run] auto-reply-DM failed status={code}")
+            except Exception as e:
+                print(f"[mep run] auto-reply-DM error: {e}")
 
     def _ws_uri(self) -> str:
         ts = str(int(time.time()))
@@ -294,11 +396,23 @@ class RuntimeNode:
             await self.process_task(data.get("data", {}))
 
     async def _recv_loop(self, ws: Any) -> None:
+        last_status_at = 0.0
+        STATUS_INTERVAL_SECONDS = 60.0
         while self.running:
             try:
                 msg = await asyncio.wait_for(ws.recv(), timeout=20.0)
             except asyncio.TimeoutError:
                 await ws.ping()
+                # Periodic status heartbeat (every 60s)
+                now = time.time()
+                if now - last_status_at >= STATUS_INTERVAL_SECONDS:
+                    code, diag, _ = _safe_request("GET", f"{self.hub_url}/diagnostic?node_id={self.node_id}")
+                    online = diag.get("ws_connected") if diag else False
+                    print(f"[mep run] alive node={self.node_id} ws_connected={'OK' if online else 'NO'}")
+                    if not online:
+                        print("[mep run] hub reports ws_connected=false — may need reconnect")
+                    self.heartbeat()
+                    last_status_at = now
                 continue
             await self.handle_ws_event(json.loads(msg))
 
@@ -317,6 +431,7 @@ class RuntimeNode:
         print(f"[mep run] {message}")
         if not ok:
             return 2
+        reconnect_attempts = 0
         while self.running:
             uri = self._ws_uri()
             try:
@@ -326,7 +441,9 @@ class RuntimeNode:
             except KeyboardInterrupt:
                 self.running = False
             except Exception as exc:  # noqa: BLE001
-                print(f"[mep run] websocket reconnect after error: {exc}")
+                reconnect_attempts += 1
+                print(f"[mep run] disconnected node={self.node_id} error={exc}")
+                print(f"[mep run] reconnecting in 3s (attempt {reconnect_attempts})...")
                 await asyncio.sleep(3.0)
         return 0
 
@@ -434,20 +551,33 @@ def cmd_doctor(args: argparse.Namespace) -> int:
 
 
 def cmd_run(args: argparse.Namespace) -> int:
-    if args.adapter != "mock":
-        print("[mep run] only adapter=mock is supported in this phase")
-        return 2
-    _ensure_key_parent(args.key_path)
+    if args.adapter == "deepseek":
+        api_key = os.getenv("DEEPSEEK_API_KEY", "")
+        if not api_key:
+            print("[mep run] DEEPSEEK_API_KEY not set, falling back to mock")
+            adapter = MockAdapter()
+        else:
+            adapter = DeepSeekAdapter(api_key=api_key, model=os.getenv("MEP_AI_MODEL", "deepseek-chat"))
+            print(f"[mep run] adapter=deepseek model={adapter.model}")
+    elif args.adapter == "ollama":
+        adapter = AIAdapter(model=os.getenv("MEP_AI_MODEL", "tinyllama"))
+        print(f"[mep run] adapter=ollama model={adapter.model}")
+    elif args.adapter != "mock":
+        print("[mep run] unsupported adapter, using mock")
+        adapter = MockAdapter()
+    else:
+        adapter = MockAdapter()
+        _ensure_key_parent(args.key_path)
     identity = MEPIdentity(args.key_path)
     alias = _resolve_runtime_alias(args.key_path, args.alias)
     runtime = RuntimeNode(
         identity=identity,
         hub_url=args.hub_url,
         ws_url=args.ws_url,
-        adapter=MockAdapter(),
+        adapter=adapter,
         alias=alias,
     )
-    print(f"[mep run] adapter=mock node_id={identity.node_id} alias={alias}")
+    print(f"[mep run] adapter={args.adapter} node_id={identity.node_id} alias={alias}")
     try:
         return asyncio.run(runtime.run_forever())
     except KeyboardInterrupt:
@@ -493,7 +623,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Path to provider private key (defaults to repo-local .mep/mep_runtime.pem).",
     )
-    parser.add_argument("--adapter", default="mock", choices=["mock"], help="Provider adapter.")
+    parser.add_argument("--adapter", default="mock", choices=["mock", "ollama", "deepseek"], help="Provider adapter.")
 
     sub = parser.add_subparsers(dest="command", required=True)
 
