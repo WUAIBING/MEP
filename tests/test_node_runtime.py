@@ -6,6 +6,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
+from node.identity import MEPIdentity
 from node import mep_runtime
 
 
@@ -183,7 +184,7 @@ class TestRuntimeUx(unittest.TestCase):
             patch("node.mep_runtime.MEPIdentity", return_value=_FakeIdentity()),
             patch("node.mep_runtime._resolve_runtime_alias", return_value="persisted-alias") as resolve_alias_mock,
             patch("node.mep_runtime.RuntimeNode", return_value=fake_runtime) as runtime_cls,
-            patch("node.mep_runtime.asyncio.run", return_value=0),
+            patch("node.mep_runtime.asyncio.run", side_effect=lambda coro: (coro.close(), 0)[1]),
         ):
             code = mep_runtime.cmd_run(args)
         self.assertEqual(code, 0)
@@ -259,6 +260,64 @@ class TestRuntimeKeyDirResolution(unittest.TestCase):
                 mep_runtime.main(["status"])
         args = status_mock.call_args.args[0]
         self.assertEqual(args.key_path, "/lazy/key.pem")
+
+    def test_create_new_local_identity_uses_node_id_canonical_path(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            key_path = mep_runtime._create_new_local_identity(tmpdir)  # noqa: SLF001
+            identity = MEPIdentity(key_path)
+            self.assertEqual(os.path.basename(key_path), f"{identity.node_id}.pem")
+            self.assertTrue(os.path.exists(key_path))
+            self.assertTrue(os.path.exists(key_path.replace(".pem", "_enc.pem")))
+
+    def test_choose_existing_local_identity_migrates_legacy_runtime_filename(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            legacy_path = os.path.join(tmpdir, "mep_runtime.pem")
+            identity = MEPIdentity(legacy_path)
+            mep_runtime._write_alias_sidecar(legacy_path, "legacy-node")  # noqa: SLF001
+
+            selected = mep_runtime._choose_existing_local_identity(tmpdir, None)  # noqa: SLF001
+
+            canonical_path = os.path.join(tmpdir, f"{identity.node_id}.pem")
+            self.assertEqual(selected, canonical_path)
+            self.assertTrue(os.path.exists(canonical_path))
+            self.assertFalse(os.path.exists(legacy_path))
+            self.assertEqual(mep_runtime._read_alias_sidecar(canonical_path), "legacy-node")  # noqa: SLF001
+
+    def test_choose_existing_local_identity_uses_alias_to_disambiguate(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            alpha = os.path.join(tmpdir, "alpha.pem")
+            beta = os.path.join(tmpdir, "beta.pem")
+            beta_id = MEPIdentity(beta)
+            MEPIdentity(alpha)
+            mep_runtime._write_alias_sidecar(alpha, "alpha-bot")  # noqa: SLF001
+            mep_runtime._write_alias_sidecar(beta, "beta-bot")  # noqa: SLF001
+
+            selected = mep_runtime._choose_existing_local_identity(tmpdir, "beta-bot")  # noqa: SLF001
+
+            self.assertEqual(selected, os.path.join(tmpdir, f"{beta_id.node_id}.pem"))
+            self.assertTrue(os.path.exists(alpha))
+            self.assertTrue(os.path.exists(os.path.join(tmpdir, f"{beta_id.node_id}.pem")))
+
+    def test_choose_existing_local_identity_rejects_ambiguous_directory(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            MEPIdentity(os.path.join(tmpdir, "alpha.pem"))
+            MEPIdentity(os.path.join(tmpdir, "beta.pem"))
+
+            with self.assertRaises(mep_runtime.RuntimeKeyPathError):
+                mep_runtime._choose_existing_local_identity(tmpdir, None)  # noqa: SLF001
+
+    def test_main_rejects_run_without_key_when_identity_selection_is_ambiguous(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with patch.object(mep_runtime, "_default_key_dir", return_value=tmpdir):
+                MEPIdentity(os.path.join(tmpdir, "alpha.pem"))
+                MEPIdentity(os.path.join(tmpdir, "beta.pem"))
+
+                with patch("builtins.print") as print_mock:
+                    code = mep_runtime.main(["run"])
+
+            self.assertEqual(code, 2)
+            printed = "\n".join(str(call.args[0]) for call in print_mock.call_args_list if call.args)
+            self.assertIn("multiple local identities found", printed)
 
 
 if __name__ == "__main__":

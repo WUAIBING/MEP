@@ -22,6 +22,8 @@ except ImportError:  # pragma: no cover - supports direct file execution
 
 DEFAULT_HUB_URL = os.getenv("HUB_URL", "http://localhost:8000")
 DEFAULT_WS_URL = os.getenv("WS_URL", "ws://localhost:8000")
+DEFAULT_RUNTIME_ALIAS = "mep-runtime"
+LEGACY_RUNTIME_KEY_NAME = "mep_runtime.pem"
 
 
 def _find_git_root(start_path: Optional[str] = None) -> Optional[str]:
@@ -50,11 +52,52 @@ def _default_key_path() -> str:
     explicit = os.getenv("MEP_PROVIDER_KEY_PATH")
     if explicit:
         return explicit
-    return os.path.join(_default_key_dir(), "mep_runtime.pem")
+    return os.path.join(_default_key_dir(), LEGACY_RUNTIME_KEY_NAME)
 
 
 def _ensure_key_parent(path: str) -> None:
     os.makedirs(os.path.dirname(path), exist_ok=True)
+
+
+def _same_path(left: str, right: str) -> bool:
+    return os.path.normcase(os.path.abspath(left)) == os.path.normcase(os.path.abspath(right))
+
+
+def _canonical_key_path(key_dir: str, node_id: str) -> str:
+    return os.path.join(key_dir, f"{node_id}.pem")
+
+
+def _enc_key_path(key_path: str) -> str:
+    return key_path.replace(".pem", "_enc.pem")
+
+
+def _pending_key_path(key_dir: str) -> str:
+    return os.path.join(key_dir, f".pending-runtime-{os.getpid()}-{int(time.time() * 1000)}.pem")
+
+
+def _is_identity_key_file(filename: str) -> bool:
+    return (
+        filename.endswith(".pem")
+        and not filename.endswith("_enc.pem")
+        and not filename.startswith(".pending-runtime-")
+    )
+
+
+def _list_local_identity_key_paths(key_dir: str) -> list[str]:
+    if not os.path.isdir(key_dir):
+        return []
+    return [
+        os.path.join(key_dir, name)
+        for name in sorted(os.listdir(key_dir))
+        if _is_identity_key_file(name) and os.path.isfile(os.path.join(key_dir, name))
+    ]
+
+
+def _move_file_if_present(source: str, destination: str) -> None:
+    if _same_path(source, destination) or not os.path.exists(source):
+        return
+    _ensure_key_parent(destination)
+    os.replace(source, destination)
 
 
 def _alias_sidecar_path(key_path: str) -> str:
@@ -81,7 +124,74 @@ def _resolve_runtime_alias(key_path: str, cli_alias: Optional[str]) -> str:
     persisted = _read_alias_sidecar(key_path)
     if persisted:
         return persisted
-    return "mep-runtime"
+    return DEFAULT_RUNTIME_ALIAS
+
+
+class RuntimeKeyPathError(ValueError):
+    """Raised when runtime identity selection is ambiguous or missing."""
+
+
+def _canonicalize_local_identity(key_path: str, key_dir: str) -> str:
+    identity = MEPIdentity(key_path)
+    canonical_path = _canonical_key_path(key_dir, identity.node_id)
+    if _same_path(key_path, canonical_path):
+        return canonical_path
+
+    _move_file_if_present(key_path, canonical_path)
+    _move_file_if_present(_enc_key_path(key_path), _enc_key_path(canonical_path))
+
+    source_alias = _alias_sidecar_path(key_path)
+    dest_alias = _alias_sidecar_path(canonical_path)
+    if os.path.exists(source_alias) and not os.path.exists(dest_alias):
+        _move_file_if_present(source_alias, dest_alias)
+
+    return canonical_path
+
+
+def _choose_existing_local_identity(key_dir: str, cli_alias: Optional[str]) -> Optional[str]:
+    candidates = _list_local_identity_key_paths(key_dir)
+    if not candidates:
+        return None
+
+    if cli_alias:
+        matching = [path for path in candidates if _read_alias_sidecar(path) == cli_alias]
+        if len(matching) == 1:
+            return _canonicalize_local_identity(matching[0], key_dir)
+        if len(matching) > 1:
+            raise RuntimeKeyPathError(
+                f"multiple local identities in {key_dir} use alias={cli_alias!r}; pass --key-path explicitly"
+            )
+
+    if len(candidates) == 1:
+        return _canonicalize_local_identity(candidates[0], key_dir)
+
+    raise RuntimeKeyPathError(
+        f"multiple local identities found in {key_dir}; pass --key-path or --alias for an existing node"
+    )
+
+
+def _create_new_local_identity(key_dir: str) -> str:
+    os.makedirs(key_dir, exist_ok=True)
+    pending_path = _pending_key_path(key_dir)
+    return _canonicalize_local_identity(pending_path, key_dir)
+
+
+def _resolve_default_runtime_key_path(command: str, cli_alias: Optional[str]) -> str:
+    explicit = os.getenv("MEP_PROVIDER_KEY_PATH")
+    if explicit:
+        return explicit
+
+    key_dir = _default_key_dir()
+    chosen = _choose_existing_local_identity(key_dir, cli_alias)
+    if chosen:
+        return chosen
+
+    if command in {"init", "up"}:
+        return _create_new_local_identity(key_dir)
+
+    raise RuntimeKeyPathError(
+        f"no local identity found in {key_dir}; run `init`/`up` first or pass --key-path explicitly"
+    )
 
 
 def _json_or_none(resp: requests.Response) -> Optional[dict[str, Any]]:
@@ -491,18 +601,18 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--key-path",
         default=None,
-        help="Path to provider private key (defaults to repo-local .mep/mep_runtime.pem).",
+        help="Path to provider private key (defaults to repo-local .mep/{node_id}.pem after discovery/provisioning).",
     )
     parser.add_argument("--adapter", default="mock", choices=["mock"], help="Provider adapter.")
 
     sub = parser.add_subparsers(dest="command", required=True)
 
     init_p = sub.add_parser("init", help="Generate/load key and register node.")
-    init_p.add_argument("--alias", default="mep-runtime", help="Node alias for registration.")
+    init_p.add_argument("--alias", default=DEFAULT_RUNTIME_ALIAS, help="Node alias for registration.")
     init_p.set_defaults(func=cmd_init)
 
     up_p = sub.add_parser("up", help="One-command bootstrap: init + doctor + run.")
-    up_p.add_argument("--alias", default="mep-runtime", help="Node alias for registration.")
+    up_p.add_argument("--alias", default=DEFAULT_RUNTIME_ALIAS, help="Node alias for registration.")
     up_p.set_defaults(func=cmd_up)
 
     run_p = sub.add_parser("run", help="Run standardized listener runtime.")
@@ -538,7 +648,14 @@ def main(argv: Optional[list[str]] = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     if getattr(args, "key_path", None) is None:
-        args.key_path = _default_key_path()
+        try:
+            args.key_path = _resolve_default_runtime_key_path(
+                command=str(getattr(args, "command", "") or ""),
+                cli_alias=getattr(args, "alias", None),
+            )
+        except RuntimeKeyPathError as exc:
+            print(f"[mep {args.command}] {exc}")
+            return 2
     return int(args.func(args))
 
 
