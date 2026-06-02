@@ -128,6 +128,9 @@ ASSIGNMENT_SWEEP_INTERVAL_SECONDS = int(os.getenv("MEP_ASSIGNMENT_SWEEP_INTERVAL
 MAINTENANCE_SWEEP_INTERVAL_SECONDS = int(os.getenv("MEP_MAINTENANCE_SWEEP_INTERVAL_SECONDS", "60"))
 REGISTRY_RECONCILE_LIMIT = int(os.getenv("MEP_REGISTRY_RECONCILE_LIMIT", "1000"))
 REGISTRY_RECONCILE_STALE_SECONDS = float(os.getenv("MEP_REGISTRY_RECONCILE_STALE_SECONDS", "180"))
+DM_QUEUE_ENABLED = os.getenv("MEP_DM_QUEUE_ENABLED", "true").lower() in ("1", "true", "yes", "on")
+MAX_QUEUED_DMS_PER_NODE = int(os.getenv("MEP_MAX_QUEUED_DMS_PER_NODE", "50"))
+QUEUED_DM_STATUS = "queued_dm"
 COMPLETED_TASK_CACHE_TTL_SECONDS = int(os.getenv("MEP_COMPLETED_TASK_CACHE_TTL_SECONDS", "3600"))
 COMPLETED_TASK_CACHE_MAX_ITEMS = int(os.getenv("MEP_COMPLETED_TASK_CACHE_MAX_ITEMS", "1000"))
 IDEMPOTENCY_TTL_SECONDS = int(os.getenv("MEP_IDEMPOTENCY_TTL_SECONDS", "86400"))
@@ -2078,6 +2081,26 @@ async def submit_task(
                     if connected_nodes.get(target_node) is target_ws:
                         del connected_nodes[target_node]
                 return {"status": "error", "detail": "Target node disconnected"}
+        # Target offline. For zero-bounty direct messages, store-and-forward the DM
+        # so it is delivered when the target reconnects (voicemail, not a dropped
+        # call). Escrow-backed targeted tasks (bounty != 0) keep the fail-fast path.
+        if DM_QUEUE_ENABLED and bounty == 0.0:
+            if db.count_queued_dms_for_node(target_node) >= MAX_QUEUED_DMS_PER_NODE:
+                return {"status": "error", "detail": "Target node DM queue is full"}
+            async with task_lock:
+                task_data["status"] = QUEUED_DM_STATUS
+                task_data["provider_id"] = target_node
+            db.update_task_assignment(task_id, target_node, QUEUED_DM_STATUS, time.time())
+            log_event(
+                "direct_message_queued",
+                f"Queued DM {task_id[:8]} for offline {target_node}",
+                task_id=task_id,
+                provider_id=target_node,
+            )
+            response_payload = {"status": "queued", "task_id": task_id, "queued_for": target_node}
+            if x_mep_idempotency_key:
+                db.set_idempotency(authenticated_node, "/tasks/submit", x_mep_idempotency_key, response_payload, 200, time.time())
+            return response_payload
         return {"status": "error", "detail": "Target node not currently connected to Hub"}
 
     rfc_data = {
@@ -2882,6 +2905,44 @@ async def hub_landing(request: Request):
 </html>"""
     return HTMLResponse(html)
 
+async def _flush_queued_dms(node_id: str, websocket: WebSocket) -> None:
+    """Deliver store-and-forward DMs queued while node_id was offline.
+
+    Each queued DM is pushed as a new_task event (same shape as live delivery)
+    then marked assigned. A delivery failure leaves the DM queued for the next
+    reconnect, so nothing is lost.
+    """
+    if not DM_QUEUE_ENABLED:
+        return
+    try:
+        queued = db.get_queued_dms_for_node(node_id)
+    except Exception as exc:
+        log_event("dm_flush_error", f"Failed to load queued DMs for {node_id}: {exc}", node_id=node_id)
+        return
+    for row in queued:
+        task_id = row["task_id"]
+        payload = row.get("payload") or ""
+        event_data = {
+            "id": task_id,
+            "consumer_id": row.get("consumer_id"),
+            "payload": payload,
+            "bounty": row.get("bounty"),
+            "status": "assigned",
+            "target_node": node_id,
+            "provider_id": node_id,
+            "model_requirement": row.get("model_requirement"),
+            "payload_uri": row.get("payload_uri"),
+            "task": {"instructions": payload},
+        }
+        try:
+            await websocket.send_json({"event": "new_task", "data": event_data})
+        except Exception as exc:
+            log_event("dm_flush_error", f"Failed to deliver queued DM {task_id[:8]} to {node_id}: {exc}", task_id=task_id, node_id=node_id)
+            break
+        db.update_task_assignment(task_id, node_id, "assigned", time.time())
+        log_event("direct_message_delivered", f"Delivered queued DM {task_id[:8]} to {node_id}", task_id=task_id, provider_id=node_id)
+
+
 @app.websocket("/ws/{node_id}")
 async def websocket_endpoint(
     websocket: WebSocket,
@@ -2932,6 +2993,7 @@ async def websocket_endpoint(
     async with node_lock:
         connected_nodes[node_id] = websocket
     db.update_registry_availability(node_id, "online", time.time())
+    await _flush_queued_dms(node_id, websocket)
     try:
         while True:
             await websocket.receive_text()

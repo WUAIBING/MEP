@@ -450,6 +450,50 @@ def get_active_tasks() -> list:
     _release_conn(conn)
     return result
 
+def get_queued_dms_for_node(node_id: str) -> list:
+    """Return store-and-forward DMs queued for node_id while it was offline, oldest first."""
+    conn = _get_conn()
+    if not _is_postgres():
+        conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+    if _is_postgres():
+        cursor.execute(
+            "SELECT * FROM tasks WHERE target_node = %s AND status = 'queued_dm' ORDER BY created_at ASC",
+            (node_id,),
+        )
+    else:
+        cursor.execute(
+            "SELECT * FROM tasks WHERE target_node = ? AND status = 'queued_dm' ORDER BY created_at ASC",
+            (node_id,),
+        )
+    rows = cursor.fetchall()
+    if _is_postgres():
+        result = [_row_to_dict(cursor, row) for row in rows]
+    else:
+        result = [dict(row) for row in rows]
+    _release_conn(conn)
+    return result
+
+
+def count_queued_dms_for_node(node_id: str) -> int:
+    """Count store-and-forward DMs currently queued for node_id."""
+    conn = _get_conn()
+    cursor = conn.cursor()
+    if _is_postgres():
+        cursor.execute(
+            "SELECT COUNT(*) FROM tasks WHERE target_node = %s AND status = 'queued_dm'",
+            (node_id,),
+        )
+    else:
+        cursor.execute(
+            "SELECT COUNT(*) FROM tasks WHERE target_node = ? AND status = 'queued_dm'",
+            (node_id,),
+        )
+    row = cursor.fetchone()
+    _release_conn(conn)
+    return int(row[0]) if row else 0
+
+
 def get_assigned_tasks_before(cutoff_ts: float) -> list:
     conn = _get_conn()
     if not _is_postgres():
