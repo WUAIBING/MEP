@@ -329,6 +329,15 @@ class TestRuntimeKeyDirResolution(unittest.TestCase):
             with self.assertRaises(mep_runtime.RuntimeKeyPathError):
                 mep_runtime._choose_existing_local_identity(tmpdir, None)  # noqa: SLF001
 
+    def test_choose_existing_local_identity_rejects_single_alias_mismatch(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            only_key = os.path.join(tmpdir, "only.pem")
+            MEPIdentity(only_key)
+            mep_runtime._write_alias_sidecar(only_key, "alpha-bot")  # noqa: SLF001
+
+            with self.assertRaisesRegex(mep_runtime.RuntimeKeyPathError, "matches alias"):
+                mep_runtime._choose_existing_local_identity(tmpdir, "beta-bot")  # noqa: SLF001
+
     def test_main_rejects_run_without_key_when_identity_selection_is_ambiguous(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             with patch.object(mep_runtime, "_default_key_dir", return_value=tmpdir):

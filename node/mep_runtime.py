@@ -160,6 +160,10 @@ def _choose_existing_local_identity(key_dir: str, cli_alias: Optional[str]) -> O
             raise RuntimeKeyPathError(
                 f"multiple local identities in {key_dir} use alias={cli_alias!r}; pass --key-path explicitly"
             )
+        if len(candidates) == 1:
+            raise RuntimeKeyPathError(
+                f"no local identity in {key_dir} matches alias={cli_alias!r}; pass --key-path explicitly"
+            )
 
     if len(candidates) == 1:
         return _canonicalize_local_identity(candidates[0], key_dir)
