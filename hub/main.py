@@ -2091,6 +2091,13 @@ async def submit_task(
                 task_data["status"] = QUEUED_DM_STATUS
                 task_data["provider_id"] = target_node
             db.update_task_assignment(task_id, target_node, QUEUED_DM_STATUS, time.time())
+            # Persist the full new_task envelope so the queued DM is flushed on
+            # reconnect with the exact same shape as live delivery (no thinner
+            # event contract for offline recipients).
+            try:
+                db.set_task_envelope(task_id, json.dumps(task_data))
+            except Exception as exc:
+                log_event("dm_queue_envelope_error", f"Failed to persist DM envelope {task_id[:8]}: {exc}", task_id=task_id)
             log_event(
                 "direct_message_queued",
                 f"Queued DM {task_id[:8]} for offline {target_node}",
@@ -2905,6 +2912,42 @@ async def hub_landing(request: Request):
 </html>"""
     return HTMLResponse(html)
 
+def _build_queued_dm_event(row: dict, node_id: str, payload: str) -> dict:
+    """Build the new_task `data` for a queued DM so it matches the live targeted
+    delivery shape. Prefers the persisted full envelope (byte-identical to live);
+    falls back to reconstruction for legacy rows queued before envelope capture.
+    """
+    envelope_raw = row.get("envelope_json")
+    if envelope_raw:
+        try:
+            data = json.loads(envelope_raw)
+            if isinstance(data, dict):
+                data["status"] = "assigned"
+                data["provider_id"] = node_id
+                return data
+        except (ValueError, TypeError):
+            pass
+    # Fallback: reconstruct the live-shaped envelope from the stored columns and
+    # the same defaults the submit path applies for a zero-bounty DM.
+    consumer_id = row.get("consumer_id")
+    return {
+        "id": row["task_id"],
+        "consumer_id": consumer_id,
+        "payload": payload,
+        "bounty": row.get("bounty"),
+        "status": "assigned",
+        "source": {"node_id": consumer_id},
+        "intent": {"type": "analysis.request"},
+        "task": {"instructions": payload, "expected_output": {}},
+        "economics": {},
+        "target_node": node_id,
+        "provider_id": node_id,
+        "model_requirement": row.get("model_requirement"),
+        "expires_in_seconds": row.get("expires_in_seconds"),
+        "payload_uri": row.get("payload_uri"),
+        "secret_data": row.get("result_payload"),
+    }
+
 async def _flush_queued_dms(node_id: str, websocket: WebSocket) -> None:
     """Deliver store-and-forward DMs queued while node_id was offline.
 
@@ -2922,18 +2965,7 @@ async def _flush_queued_dms(node_id: str, websocket: WebSocket) -> None:
     for row in queued:
         task_id = row["task_id"]
         payload = row.get("payload") or ""
-        event_data = {
-            "id": task_id,
-            "consumer_id": row.get("consumer_id"),
-            "payload": payload,
-            "bounty": row.get("bounty"),
-            "status": "assigned",
-            "target_node": node_id,
-            "provider_id": node_id,
-            "model_requirement": row.get("model_requirement"),
-            "payload_uri": row.get("payload_uri"),
-            "task": {"instructions": payload},
-        }
+        event_data = _build_queued_dm_event(row, node_id, payload)
         try:
             await websocket.send_json({"event": "new_task", "data": event_data})
         except Exception as exc:

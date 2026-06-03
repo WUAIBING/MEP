@@ -445,6 +445,50 @@ class TestThreeMarketSpecConformance(unittest.TestCase):
         self.assertEqual(stored["provider_id"], target_id)
         self.assertEqual(db.count_queued_dms_for_node(target_id), 0)
 
+    def test_queued_dm_flush_matches_live_targeted_shape(self):
+        """A queued DM must be flushed with the same new_task event contract as a
+        live targeted delivery, so offline recipients are not handed a thinner
+        payload (regression guard for the store-and-forward shape mismatch)."""
+        import asyncio
+
+        sender_priv, sender_pub, sender_id = _make_identity()
+        _, target_pub, target_id = _make_identity()
+        _register(sender_pub)
+        _register(target_pub)
+
+        # 1) Live targeted delivery: target online, capture the new_task data.
+        live_ws = _FakeWebSocket()
+        main.connected_nodes[target_id] = live_ws
+        try:
+            live_resp = self._submit_offline_dm(sender_priv, sender_id, target_id, instructions="same body")
+        finally:
+            main.connected_nodes.pop(target_id, None)
+        self.assertEqual(live_resp.json()["status"], "success")
+        live_data = live_ws.sent[0]["data"]
+
+        # 2) Queued delivery: target offline -> queue -> reconnect -> flush.
+        main.connected_nodes.pop(target_id, None)
+        queued_resp = self._submit_offline_dm(sender_priv, sender_id, target_id, instructions="same body")
+        self.assertEqual(queued_resp.json()["status"], "queued")
+        flush_ws = _FakeWebSocket()
+        asyncio.run(main._flush_queued_dms(target_id, flush_ws))
+        self.assertEqual(len(flush_ws.sent), 1)
+        flushed_data = flush_ws.sent[0]["data"]
+
+        # Core contract fields must be identical (task_id differs per submit).
+        for field in (
+            "consumer_id", "payload", "bounty", "status", "provider_id",
+            "source", "intent", "task", "economics", "target_node",
+            "model_requirement", "payload_uri",
+        ):
+            self.assertEqual(
+                flushed_data.get(field), live_data.get(field),
+                f"queued-flush field '{field}' diverged from live targeted delivery",
+            )
+        # source.node_id (used for reply routing) must survive store-and-forward.
+        self.assertEqual(flushed_data["source"]["node_id"], sender_id)
+        self.assertEqual(flushed_data["task"]["expected_output"], live_data["task"]["expected_output"])
+
     def test_dm_queue_full_rejected(self):
         sender_priv, sender_pub, sender_id = _make_identity()
         _, target_pub, target_id = _make_identity()
