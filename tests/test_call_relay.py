@@ -11,7 +11,15 @@ import unittest
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(__file__)), "hub"))
 
-from call_relay import CallRelay, _clamp_grace_ms, DEFAULT_GRACE_MS, MAX_GRACE_MS  # noqa: E402
+from call_relay import (  # noqa: E402
+    CallRelay,
+    _clamp_grace_ms,
+    _clamp_timeout_ms,
+    DEFAULT_GRACE_MS,
+    MAX_GRACE_MS,
+    DEFAULT_TIMEOUT_MS,
+    MAX_TIMEOUT_MS,
+)
 
 PING = 0.02
 TIMEOUT_MS = 80
@@ -57,6 +65,17 @@ def _mk(mesh):
     relay = CallRelay(mesh.send, is_online=mesh.is_online, ping_interval=PING)
     mesh.relay = relay
     return relay
+
+
+async def _wait_until(predicate, timeout=2.0, step=PING / 2):
+    """Await until predicate() is truthy (bounded), to avoid timing-fragile
+    fixed sleeps in real-time relay tests."""
+    deadline = asyncio.get_event_loop().time() + timeout
+    while asyncio.get_event_loop().time() < deadline:
+        if predicate():
+            return True
+        await asyncio.sleep(step)
+    return bool(predicate())
 
 
 class CallRelayTests(unittest.IsolatedAsyncioTestCase):
@@ -174,7 +193,11 @@ class CallRelayTests(unittest.IsolatedAsyncioTestCase):
         mesh.silent.add("B")
         await relay.handle("A", {"event": "call.invite", "context_id": "c", "callee": "B", "timeout_ms": TIMEOUT_MS})
         await relay.handle("B", {"event": "call.accept", "context_id": "c"})
-        await asyncio.sleep(PING * 3)
+        # Poll for the silent-peer teardown instead of racing a fixed sleep, so
+        # the test isn't timing-fragile under a slow/loaded runner. Teardown
+        # removes the session and emits exactly one hangup, so we can wait for
+        # the first hangup and then assert the terminal outcome.
+        await _wait_until(lambda: mesh.events("A", "call.hangup"))
         hangups = mesh.events("A", "call.hangup")
         self.assertEqual(len(hangups), 1)
         self.assertEqual(hangups[-1].get("terminal_state"), "peer_lost")
@@ -199,6 +222,31 @@ class CallRelayTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(_clamp_grace_ms(999_999), MAX_GRACE_MS)
         self.assertEqual(_clamp_grace_ms(12_345), 12_345)
         self.assertEqual(_clamp_grace_ms("bad"), DEFAULT_GRACE_MS)
+
+    def test_clamp_timeout(self):
+        # missing/invalid -> default (never raises on untrusted WS input)
+        self.assertEqual(_clamp_timeout_ms(None), DEFAULT_TIMEOUT_MS)
+        self.assertEqual(_clamp_timeout_ms("bad"), DEFAULT_TIMEOUT_MS)
+        self.assertEqual(_clamp_timeout_ms([1, 2]), DEFAULT_TIMEOUT_MS)
+        # zero/negative -> default (a 0/negative timeout would fire instantly)
+        self.assertEqual(_clamp_timeout_ms(0), DEFAULT_TIMEOUT_MS)
+        self.assertEqual(_clamp_timeout_ms(-100), DEFAULT_TIMEOUT_MS)
+        # absurdly large capped to MAX (can't pin an invite session/timer)
+        self.assertEqual(_clamp_timeout_ms(10**9), MAX_TIMEOUT_MS)
+        # legitimate small + in-range positive values pass through unchanged
+        self.assertEqual(_clamp_timeout_ms(80), 80)
+        self.assertEqual(_clamp_timeout_ms(45_000), 45_000)
+
+    async def test_invite_with_invalid_timeout_does_not_raise(self):
+        mesh = Mesh()
+        mesh.connect("A")
+        mesh.connect("B")
+        relay = _mk(mesh)
+        # a non-numeric timeout_ms must not raise inside the handler; the
+        # session is created with the default timeout instead.
+        await relay.handle("A", {"event": "call.invite", "context_id": "c", "callee": "B", "timeout_ms": "garbage"})
+        self.assertIsNotNone(mesh.last("B", "call.incoming"))
+        self.assertEqual(relay.get("c").timeout_ms, DEFAULT_TIMEOUT_MS)
 
 
 if __name__ == "__main__":

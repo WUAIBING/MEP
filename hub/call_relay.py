@@ -41,6 +41,7 @@ TERMINAL_STATES = {"completed", "declined", "timeout", "peer_lost", "rejected"}
 DEFAULT_GRACE_MS = 10_000
 MAX_GRACE_MS = 60_000
 DEFAULT_TIMEOUT_MS = 30_000
+MAX_TIMEOUT_MS = 300_000
 MAX_CALLS_PER_NODE = 3
 MISSED_PONG_LIMIT = 2
 
@@ -53,6 +54,21 @@ def _clamp_grace_ms(value: Optional[float]) -> int:
     except (TypeError, ValueError):
         return DEFAULT_GRACE_MS
     return max(0, min(MAX_GRACE_MS, v))
+
+
+def _clamp_timeout_ms(value: Optional[float]) -> int:
+    """Validate/clamp a caller-supplied invite timeout. Untrusted WS input:
+    default on missing/invalid/non-positive (a 0/negative timeout would fire
+    instantly), and cap to MAX so a caller can't pin an invite session/timer."""
+    if value is None:
+        return DEFAULT_TIMEOUT_MS
+    try:
+        v = int(value)
+    except (TypeError, ValueError):
+        return DEFAULT_TIMEOUT_MS
+    if v <= 0:
+        return DEFAULT_TIMEOUT_MS
+    return min(MAX_TIMEOUT_MS, v)
 
 
 @dataclass
@@ -139,11 +155,17 @@ class CallRelay:
             if context_id in self._sessions:
                 await self._send(caller, {"event": "call.rejected", "context_id": context_id, "reason": "duplicate_context"})
                 return
-            # replay / staleness guard
+            # replay / staleness guard (untrusted input -> reject unparseable)
             expires_at = msg.get("expires_at")
-            if expires_at is not None and float(expires_at) < time.time():
-                await self._send(caller, {"event": "call.rejected", "context_id": context_id, "reason": "expired_invite"})
-                return
+            if expires_at is not None:
+                try:
+                    expired = float(expires_at) < time.time()
+                except (TypeError, ValueError):
+                    await self._send(caller, {"event": "call.rejected", "context_id": context_id, "reason": "bad_request"})
+                    return
+                if expired:
+                    await self._send(caller, {"event": "call.rejected", "context_id": context_id, "reason": "expired_invite"})
+                    return
             if self.active_count_for(caller) >= self._max_calls_per_node:
                 await self._send(caller, {"event": "call.rejected", "context_id": context_id, "reason": "cap"})
                 return
@@ -154,7 +176,7 @@ class CallRelay:
                 context_id=context_id,
                 caller=caller,
                 callee=callee,
-                timeout_ms=int(msg.get("timeout_ms") or DEFAULT_TIMEOUT_MS),
+                timeout_ms=_clamp_timeout_ms(msg.get("timeout_ms")),
                 grace_ms=_clamp_grace_ms(msg.get("reconnect_grace_ms")),
             )
             self._sessions[context_id] = session
@@ -254,6 +276,10 @@ class CallRelay:
         try:
             while True:
                 await asyncio.sleep(self._ping_interval)
+                # Decide state transitions under the lock, but defer all socket
+                # sends until after releasing it so a stalled send can't block
+                # other relay state transitions.
+                ping_targets: Tuple[str, ...] = ()
                 async with self._lock:
                     s = self._sessions.get(context_id)
                     if not s or s.state != "active":
@@ -269,8 +295,9 @@ class CallRelay:
                         target = survivor
                     else:
                         target = None
-                        for p in s.participants():
-                            await self._send(p, {"event": "call.ping", "context_id": context_id})
+                        ping_targets = s.participants()
+                for p in ping_targets:
+                    await self._send(p, {"event": "call.ping", "context_id": context_id})
                 if target is not None:
                     await self._send(target, {"event": "call.hangup", "context_id": context_id, "reason": "peer_lost", "terminal_state": "peer_lost"})
                     return
