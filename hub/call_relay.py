@@ -201,6 +201,10 @@ class CallRelay:
         await self._send(s.caller, {"event": "call.declined", "context_id": context_id, "reason": msg.get("reason")})
 
     async def _on_frame(self, node_id: str, msg: dict) -> None:
+        # v1 design choice: protocol violations (frame for an unknown/non-active
+        # session, or from a WS identity that isn't a participant) are dropped
+        # silently rather than answered with an error. They're caller bugs, not
+        # runtime conditions; revisit for v2 if we want explicit call.error codes.
         context_id = msg.get("context_id")
         s = self._sessions.get(context_id)
         if not s or s.state != "active":
