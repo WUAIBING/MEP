@@ -80,6 +80,20 @@ def _ensure_tasks_expires_in_seconds_column(cursor):
         if "expires_in_seconds" not in columns:
             cursor.execute("ALTER TABLE tasks ADD COLUMN expires_in_seconds INTEGER")
 
+
+def _ensure_tasks_envelope_json_column(cursor):
+    if _is_postgres():
+        cursor.execute(
+            "SELECT column_name FROM information_schema.columns WHERE table_name = 'tasks' AND column_name = 'envelope_json'"
+        )
+        if not cursor.fetchone():
+            cursor.execute("ALTER TABLE tasks ADD COLUMN envelope_json TEXT")
+    else:
+        cursor.execute("PRAGMA table_info(tasks)")
+        columns = [row[1] for row in cursor.fetchall()]
+        if "envelope_json" not in columns:
+            cursor.execute("ALTER TABLE tasks ADD COLUMN envelope_json TEXT")
+
 def init_db():
     conn = _get_conn()
     cursor = conn.cursor()
@@ -109,6 +123,7 @@ def init_db():
         )
     ''')
     _ensure_tasks_expires_in_seconds_column(cursor)
+    _ensure_tasks_envelope_json_column(cursor)
     if not _is_postgres():
         try:
             cursor.execute("ALTER TABLE tasks ADD COLUMN payload_uri TEXT")
@@ -343,6 +358,24 @@ def update_task_assignment(task_id: str, provider_id: str, status: str, updated_
     conn.commit()
     _release_conn(conn)
 
+def set_task_envelope(task_id: str, envelope_json: str):
+    """Persist the full new_task envelope (JSON) for a queued DM so it can be
+    replayed on reconnect with the exact same shape as live delivery."""
+    conn = _get_conn()
+    cursor = conn.cursor()
+    if _is_postgres():
+        cursor.execute(
+            "UPDATE tasks SET envelope_json = %s WHERE task_id = %s",
+            (envelope_json, task_id)
+        )
+    else:
+        cursor.execute(
+            "UPDATE tasks SET envelope_json = ? WHERE task_id = ?",
+            (envelope_json, task_id)
+        )
+    conn.commit()
+    _release_conn(conn)
+
 def update_task_result(task_id: str, provider_id: str, result_payload: str, status: str, updated_at: float, result_uri: Optional[str] = None):
     conn = _get_conn()
     cursor = conn.cursor()
@@ -449,6 +482,50 @@ def get_active_tasks() -> list:
     result = [dict(row) for row in rows]
     _release_conn(conn)
     return result
+
+def get_queued_dms_for_node(node_id: str) -> list:
+    """Return store-and-forward DMs queued for node_id while it was offline, oldest first."""
+    conn = _get_conn()
+    if not _is_postgres():
+        conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+    if _is_postgres():
+        cursor.execute(
+            "SELECT * FROM tasks WHERE target_node = %s AND status = 'queued_dm' ORDER BY created_at ASC",
+            (node_id,),
+        )
+    else:
+        cursor.execute(
+            "SELECT * FROM tasks WHERE target_node = ? AND status = 'queued_dm' ORDER BY created_at ASC",
+            (node_id,),
+        )
+    rows = cursor.fetchall()
+    if _is_postgres():
+        result = [_row_to_dict(cursor, row) for row in rows]
+    else:
+        result = [dict(row) for row in rows]
+    _release_conn(conn)
+    return result
+
+
+def count_queued_dms_for_node(node_id: str) -> int:
+    """Count store-and-forward DMs currently queued for node_id."""
+    conn = _get_conn()
+    cursor = conn.cursor()
+    if _is_postgres():
+        cursor.execute(
+            "SELECT COUNT(*) FROM tasks WHERE target_node = %s AND status = 'queued_dm'",
+            (node_id,),
+        )
+    else:
+        cursor.execute(
+            "SELECT COUNT(*) FROM tasks WHERE target_node = ? AND status = 'queued_dm'",
+            (node_id,),
+        )
+    row = cursor.fetchone()
+    _release_conn(conn)
+    return int(row[0]) if row else 0
+
 
 def get_assigned_tasks_before(cutoff_ts: float) -> list:
     conn = _get_conn()
