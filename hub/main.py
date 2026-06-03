@@ -17,6 +17,7 @@ from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import ed25519
 import db
 import auth
+from call_relay import CallRelay
 from logger import log_event, log_audit
 
 from models import (
@@ -47,6 +48,42 @@ rate_limits: Dict[str, List[float]] = {}
 task_lock = asyncio.Lock()
 node_lock = asyncio.Lock()
 mesh_lock = asyncio.Lock()
+
+CALL_RELAY_ENABLED = os.getenv("MEP_CALL_RELAY_ENABLED", "1") not in ("0", "false", "False")
+
+
+async def _call_relay_send(node_id: str, message: dict) -> bool:
+    """Deliver a call.* event to a node's current live socket (used by CallRelay)."""
+    ws = connected_nodes.get(node_id)
+    if ws is None:
+        return False
+    try:
+        await ws.send_json(message)
+        return True
+    except Exception:
+        async with node_lock:
+            if connected_nodes.get(node_id) is ws:
+                del connected_nodes[node_id]
+        return False
+
+
+call_relay = CallRelay(
+    _call_relay_send,
+    is_online=lambda nid: nid in connected_nodes,
+)
+
+
+def _parse_call_event(raw: str) -> Optional[dict]:
+    """Return a parsed call.* event dict, or None if the frame isn't a call event."""
+    try:
+        msg = json.loads(raw)
+    except (ValueError, TypeError):
+        return None
+    if isinstance(msg, dict) and str(msg.get("event", "")).startswith("call."):
+        return msg
+    return None
+
+
 anti_loop_lock = asyncio.Lock()
 brainstorm_lock = asyncio.Lock()
 mesh_assemblies: Dict[str, dict] = {}
@@ -3028,10 +3065,16 @@ async def websocket_endpoint(
     await _flush_queued_dms(node_id, websocket)
     try:
         while True:
-            await websocket.receive_text()
+            raw = await websocket.receive_text()
             await _track_node_activity(node_id)
+            if CALL_RELAY_ENABLED and raw:
+                event = _parse_call_event(raw)
+                if event is not None:
+                    await call_relay.handle(node_id, event)
     except WebSocketDisconnect:
         async with node_lock:
             if connected_nodes.get(node_id) is websocket:
                 del connected_nodes[node_id]
         db.update_registry_availability(node_id, "offline", time.time())
+        if CALL_RELAY_ENABLED:
+            await call_relay.on_node_disconnect(node_id)
