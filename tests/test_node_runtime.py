@@ -336,6 +336,56 @@ class TestRuntimeWebSocketLoop(unittest.TestCase):
 
         asyncio.run(_run())
 
+    def test_process_task_live_bridge_falls_back_when_frame_send_fails_after_accept(self):
+        node = _runtime_node()
+        node.live_call_enabled = True
+        node.dm_to_call_bridge_enabled = True
+        node._ws = _FakeWebSocket([])
+        node.call_invite_timeout_ms = 100
+
+        task_data = {
+            "id": "task_bridge_frame_fail",
+            "bounty": 0.0,
+            "payload": json.dumps(
+                {
+                    "spec_version": "mep.interbot.v1",
+                    "message_id": "msg-bridge-frame-fail",
+                    "trace_id": "trace-bridge-frame-fail",
+                    "source": {"node_id": "node_peer"},
+                    "target": {"node_id": node.node_id},
+                    "conversation": {"context_id": "ctx-bridge-frame-fail"},
+                    "intent": {"type": "chat.request", "priority": "normal"},
+                    "task": {"instructions": "Reply over live call unless the frame send fails."},
+                    "economics": {"bounty_seconds": 0.0, "currency": "SECONDS"},
+                    "delivery": {"reply_mode": "new_dm", "settlement_mode": "task_result"},
+                }
+            ),
+        }
+
+        original_send_ws_event = node._send_ws_event
+
+        async def _send_ws_event(payload):
+            if payload.get("event") == "call.frame":
+                return False
+            return await original_send_ws_event(payload)
+
+        async def _run() -> None:
+            with (
+                patch.object(node.adapter, "generate_reply", return_value="Fallback after frame failure"),
+                patch.object(node, "_send_ws_event", side_effect=_send_ws_event) as send_mock,
+                patch.object(node, "complete") as complete_mock,
+            ):
+                task = asyncio.create_task(node.process_task(task_data))
+                await asyncio.sleep(0)
+                await node.handle_ws_event({"event": "call.accepted", "context_id": "ctx-bridge-frame-fail"})
+                await task
+
+                self.assertEqual(json.loads(node._ws.sent[0])["event"], "call.invite")
+                self.assertEqual(send_mock.await_count, 2)
+                complete_mock.assert_called_once_with("task_bridge_frame_fail", "Fallback after frame failure")
+
+        asyncio.run(_run())
+
     def test_process_task_live_bridge_falls_back_to_task_result_when_call_is_declined(self):
         node = _runtime_node()
         node.live_call_enabled = True

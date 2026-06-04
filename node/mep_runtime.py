@@ -531,7 +531,7 @@ class RuntimeNode:
             )
             return False
 
-        await self._send_ws_event(
+        frame_sent = await self._send_ws_event(
             {
                 "event": "call.frame",
                 "context_id": context_id,
@@ -540,7 +540,12 @@ class RuntimeNode:
                 "payload": result_payload,
             }
         )
-        await self._send_ws_event({"event": "call.hangup", "context_id": context_id})
+        if not frame_sent:
+            print(f"[mep run] live bridge frame send failed context={context_id} peer={peer_node}")
+            return False
+        hangup_sent = await self._send_ws_event({"event": "call.hangup", "context_id": context_id})
+        if not hangup_sent:
+            print(f"[mep run] live bridge hangup send failed context={context_id} peer={peer_node}")
         settlement = (
             "LIVE_CALL_BRIDGE_OK\n"
             f"context={context_id}\n"
@@ -564,13 +569,19 @@ class RuntimeNode:
             if not context_id or not caller:
                 return
             if self.live_call_enabled and self.call_auto_accept:
-                await self._send_ws_event({"event": "call.accept", "context_id": context_id})
-                print(f"[mep run] auto-accepted live call context={context_id} caller={caller}")
+                sent = await self._send_ws_event({"event": "call.accept", "context_id": context_id})
+                if sent:
+                    print(f"[mep run] auto-accepted live call context={context_id} caller={caller}")
+                else:
+                    print(f"[mep run] auto-accept failed context={context_id} caller={caller}")
             else:
-                await self._send_ws_event(
+                sent = await self._send_ws_event(
                     {"event": "call.decline", "context_id": context_id, "reason": "manual_required"}
                 )
-                print(f"[mep run] declined live call context={context_id} caller={caller}")
+                if sent:
+                    print(f"[mep run] declined live call context={context_id} caller={caller}")
+                else:
+                    print(f"[mep run] live call decline failed context={context_id} caller={caller}")
             return
         if event == "call.accepted":
             self._resolve_call_bridge(context_id, {"status": "accepted", "context_id": context_id})

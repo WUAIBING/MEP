@@ -311,6 +311,7 @@ class TestStdioAdapter(unittest.IsolatedAsyncioTestCase):
                 "event": "call.frame",
                 "context_id": "ctx-live",
                 "seq": 0,
+                "content_type": "text/plain",
                 "payload": "hello over live lane",
             }
         )
