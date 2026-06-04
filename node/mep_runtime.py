@@ -425,6 +425,8 @@ class RuntimeNode:
 
         def _cleanup(done_task: asyncio.Task[Any]) -> None:
             self._background_tasks.discard(done_task)
+            if done_task.cancelled():
+                return
             try:
                 done_task.result()
             except Exception as exc:  # noqa: BLE001
@@ -942,6 +944,10 @@ class RuntimeNode:
             finally:
                 self._ws = None
                 self._cancel_pending_call_bridges("socket_closed")
+                for task in list(self._background_tasks):
+                    task.cancel()
+                if self._background_tasks:
+                    await asyncio.gather(*self._background_tasks, return_exceptions=True)
         return 0
 
 

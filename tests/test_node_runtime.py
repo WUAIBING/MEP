@@ -62,6 +62,17 @@ class _FakeWebSocket:
         self.sent.append(payload)
 
 
+class _FakeConnectContext:
+    def __init__(self, ws):
+        self.ws = ws
+
+    async def __aenter__(self):
+        return self.ws
+
+    async def __aexit__(self, exc_type, exc, tb):
+        return False
+
+
 class _FakeRuntime:
     async def run_forever(self):
         return 0
@@ -256,6 +267,36 @@ class TestRuntimeWebSocketLoop(unittest.TestCase):
 
         self.assertEqual(ws.pings, 1)
         bid_mock.assert_called_once_with("task_compute")
+
+    def test_run_forever_cancels_background_tasks_cleanly_on_shutdown(self):
+        node = _runtime_node()
+
+        async def _pending_task() -> None:
+            await asyncio.Event().wait()
+
+        async def _recv_loop(_ws) -> None:
+            node.running = False
+
+        async def _run() -> asyncio.Task:
+            with (
+                patch.object(node, "register", return_value=(True, "registered")),
+                patch.object(node, "_recv_loop", side_effect=_recv_loop),
+                patch("node.ws_connect.ws_connect", return_value=_FakeConnectContext(_FakeWebSocket([]))),
+                patch("builtins.print") as print_mock,
+            ):
+                node._schedule_background_task(_pending_task(), label="pending_shutdown")  # noqa: SLF001
+                pending_task = next(iter(node._background_tasks))  # noqa: SLF001
+                code = await node.run_forever()
+
+            self.assertEqual(code, 0)
+            self.assertTrue(pending_task.cancelled())
+            self.assertFalse(node._background_tasks)  # noqa: SLF001
+            printed = "\n".join(str(call.args[0]) for call in print_mock.call_args_list if call.args)
+            self.assertNotIn("background task error", printed)
+            return pending_task
+
+        pending_task = asyncio.run(_run())
+        self.assertTrue(pending_task.cancelled())
 
     def test_process_task_uses_interbot_instructions_for_adapter_input(self):
         node = _runtime_node()
