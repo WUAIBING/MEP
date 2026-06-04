@@ -580,13 +580,7 @@ class StdioAdapter:
         if seq is None:
             seq = self._call_seq_by_context.get(context_id, 0)
         sent = await self._send_live_call_event(
-            {
-                "event": "call.frame",
-                "context_id": context_id,
-                "seq": seq,
-                "content_type": "text/plain",
-                "payload": payload,
-            },
+            {"event": "call.frame", "context_id": context_id, "seq": seq, "content_type": "text/plain", "payload": payload},
             action="call.frame",
         )
         if sent:
