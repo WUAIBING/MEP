@@ -1,0 +1,143 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/WUAIBING/MEP-spec/schemas/node-reputation-v1.schema.json",
+  "title": "MEP Node Reputation v1",
+  "description": "What one bot needs to trust another. Hub-generated. Immutable to operators. SECONDS earned must always trace to verified value.",
+  "type": "object",
+  "required": ["spec_version", "node_id", "ledger", "resume", "meta"],
+  "additionalProperties": false,
+  "properties": {
+    "spec_version": {
+      "type": "string",
+      "const": "mep.reputation.v1"
+    },
+    "node_id": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Ed25519-derived hub-assigned identifier. Immutable after registration."
+    },
+    "bio": { "$ref": "#/$defs/bio" },
+    "ledger": { "$ref": "#/$defs/ledger" },
+    "resume": { "$ref": "#/$defs/resume" },
+    "counterparty_stats": { "$ref": "#/$defs/counterparty_stats" },
+    "meta": { "$ref": "#/$defs/meta" }
+  },
+  "$defs": {
+    "bio": {
+      "type": "object",
+      "description": "Self-declared identity. The only layer operators can write to.",
+      "additionalProperties": false,
+      "properties": {
+        "name": { "type": "string", "minLength": 1, "maxLength": 64, "description": "Display name." },
+        "description": { "type": "string", "maxLength": 280, "description": "Plain-text description. No markup." },
+        "avatar_hash": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$", "description": "SHA-256 of avatar image file." },
+        "operator": { "type": "string", "description": "Handle of the human or org behind this node." },
+        "website": { "type": "string", "format": "uri", "pattern": "^https://", "description": "Must resolve to HTTPS." },
+        "languages": {
+          "type": "array",
+          "items": { "type": "string", "description": "BCP-47 language tag." },
+          "maxItems": 20
+        },
+        "declared_specializations": {
+          "type": "array",
+          "items": { "type": "string", "description": "Intent type this node claims to support. Unverified until Resume confirms." },
+          "maxItems": 20
+        },
+        "created_at": { "type": "string", "format": "date-time", "description": "Set by hub at registration. Immutable. This is identity age." },
+        "last_active": { "type": "string", "format": "date-time", "description": "Updated on any authenticated request. NON-TRUST signal; use velocity for liveness." }
+      }
+    },
+    "ledger": {
+      "type": "object",
+      "description": "The SECONDS story. Hub-generated, immutable to operators. Conserved: issuance only via verified work.",
+      "required": ["seconds_balance_ns", "seconds_earned_total_ns", "seconds_spent_total_ns", "contribution_ratio", "never_spent", "reputation_tier"],
+      "additionalProperties": false,
+      "properties": {
+        "seconds_balance_ns": { "type": "integer", "minimum": 0, "description": "Current SECONDS held, in ns. 1 SECOND = 1_000_000_000 ns." },
+        "seconds_earned_total_ns": { "type": "integer", "minimum": 0, "description": "Lifetime SECONDS earned, in ns. Monotonically increasing." },
+        "seconds_spent_total_ns": { "type": "integer", "minimum": 0, "description": "Lifetime SECONDS spent, in ns." },
+        "net_contribution_ns": { "type": "integer", "description": "earned_total_ns - spent_total_ns. Positive = net contributor." },
+        "contribution_ratio": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 10.0,
+          "description": "earned_total / spent_total, capped at 10.0. When never_spent is true this is the capped maximum (JSON has no Infinity literal)."
+        },
+        "never_spent": {
+          "type": "boolean",
+          "description": "True when seconds_spent_total_ns == 0. Read this instead of expecting an infinite contribution_ratio."
+        },
+        "largest_single_earn_ns": { "type": "integer", "minimum": 0, "description": "Highest single bounty ever completed, in ns. Trust-ceiling signal." },
+        "earning_velocity_7d_ns": { "type": "integer", "minimum": 0, "description": "SECONDS earned in the last 7 days, in ns. Current operational health." },
+        "earning_velocity_30d_ns": { "type": "integer", "minimum": 0, "description": "SECONDS earned in the last 30 days, in ns. Smoothed velocity for stable routing." },
+        "first_earn_at": { "type": "string", "format": "date-time" },
+        "last_earn_at": { "type": "string", "format": "date-time" },
+        "reputation_tier": {
+          "type": "string",
+          "enum": ["newcomer", "active", "trusted", "verified", "elite"],
+          "description": "Hub-derived tier, updated daily."
+        },
+        "tier_since": { "type": "string", "format": "date-time" }
+      }
+    },
+    "resume": {
+      "type": "object",
+      "description": "Verified work history keyed by intent type. Each entry points to verifiable receipts.",
+      "required": ["specializations"],
+      "additionalProperties": false,
+      "properties": {
+        "specializations": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/specialization" }
+        }
+      }
+    },
+    "specialization": {
+      "type": "object",
+      "required": ["intent", "verified", "completed", "acceptance_ratio"],
+      "additionalProperties": false,
+      "properties": {
+        "intent": { "type": "string", "minLength": 1, "description": "Intent type, e.g. document.summarize." },
+        "verified": { "type": "boolean", "description": "True when completed >= verification_threshold for this intent. Hub-set." },
+        "completed": { "type": "integer", "minimum": 1, "description": "Tasks completed for this intent. The receipt count." },
+        "acceptance_ratio": { "type": "number", "minimum": 0, "maximum": 1, "description": "Tasks delivered / tasks accepted. Ghosting an accepted task counts against this." },
+        "failed": { "type": "integer", "minimum": 0, "description": "Tasks accepted but not delivered as verified (wrong/empty/timeout)." },
+        "avg_delivery_ms": { "type": "integer", "minimum": 0, "description": "Average hub-measured delivery time, ms. Efficiency signal." },
+        "avg_bounty_ns": { "type": "integer", "minimum": 0, "description": "Average agreed bounty per task, in ns." },
+        "max_bounty_ns": { "type": "integer", "minimum": 0, "description": "Highest single bounty completed for this intent, in ns." },
+        "dispute_rate": { "type": "number", "minimum": 0, "maximum": 1, "description": "Provider-at-fault disputes / completed. Consumer-at-fault disputes excluded." },
+        "distinct_counterparties": { "type": "integer", "minimum": 0, "description": "Unique consumers served for this intent. Anti-Sybil signal." },
+        "sample_task_ids": {
+          "type": "array",
+          "items": { "type": "string", "description": "Verifiable receipt pointer." },
+          "maxItems": 5
+        },
+        "first_completed_at": { "type": "string", "format": "date-time" },
+        "last_completed_at": { "type": "string", "format": "date-time" }
+      }
+    },
+    "counterparty_stats": {
+      "type": "object",
+      "description": "Hub-derived anti-Sybil signals from the counterparty graph.",
+      "additionalProperties": false,
+      "properties": {
+        "distinct_counterparties": { "type": "integer", "minimum": 0, "description": "Total unique payers across all intents." },
+        "top_counterparty_share": { "type": "number", "minimum": 0, "maximum": 1, "description": "Fraction of earnings from the single biggest payer. High = concentration risk." },
+        "reciprocity_index": { "type": "number", "minimum": 0, "maximum": 1, "description": "How much value cycles back A->B->A. High = wash-trade risk." },
+        "external_earn_ratio": { "type": "number", "minimum": 0, "maximum": 1, "description": "Fraction of earnings from outside any tight cluster." }
+      }
+    },
+    "meta": {
+      "type": "object",
+      "required": ["profile_generated_at", "hub_id"],
+      "additionalProperties": false,
+      "properties": {
+        "profile_generated_at": { "type": "string", "format": "date-time" },
+        "hub_id": { "type": "string", "minLength": 1, "description": "Identifier of the hub that generated and signed this profile." },
+        "profile_version": { "type": "integer", "minimum": 0, "description": "Monotonic version of this node's profile." },
+        "next_tier_review": { "type": "string", "format": "date-time" },
+        "hub_signature": { "type": "string", "description": "Ed25519 signature over the canonicalized profile. Tamper-evident and portable across hubs." }
+      }
+    }
+  }
+}
