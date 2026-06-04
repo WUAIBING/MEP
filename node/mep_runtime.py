@@ -9,6 +9,7 @@ import json
 import os
 import time
 import urllib.parse
+import uuid
 from dataclasses import dataclass
 from typing import Any, Optional
 
@@ -19,10 +20,35 @@ try:
 except ImportError:  # pragma: no cover - supports direct file execution
     from identity import MEPIdentity
 
+try:
+    from node.task_envelope import build_task_envelope
+except ImportError:  # pragma: no cover - supports direct file execution
+    from task_envelope import build_task_envelope
+
+try:
+    from clients.shared.mep_client import MEPClient
+except ImportError:  # pragma: no cover - direct file execution from node/ may not see repo root
+    MEPClient = None  # type: ignore[assignment]
+
 
 DEFAULT_HUB_URL = os.getenv("HUB_URL", "http://localhost:8000")
 DEFAULT_WS_URL = os.getenv("WS_URL", "ws://localhost:8000")
 LEGACY_RUNTIME_KEY_NAME = "mep_runtime.pem"
+
+
+def _env_truthy(name: str, default: str = "0") -> bool:
+    return os.getenv(name, default) not in ("0", "false", "False", "")
+
+
+def _env_positive_int(name: str, default: int) -> int:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        return default
+    return value if value > 0 else default
 
 
 def _find_git_root(start_path: Optional[str] = None) -> Optional[str]:
@@ -318,6 +344,14 @@ class RuntimeNode:
         self.alias = alias
         self.running = True
         self.max_purchase_price = float(os.getenv("MEP_MAX_PURCHASE_PRICE", "0.0"))
+        self.live_call_enabled = _env_truthy("MEP_LIVE_CALL_ENABLED")
+        self.dm_to_call_bridge_enabled = _env_truthy("MEP_DM_TO_CALL_BRIDGE_ENABLED")
+        self.call_auto_accept = _env_truthy("MEP_CALL_AUTO_ACCEPT")
+        self.call_invite_timeout_ms = _env_positive_int("MEP_CALL_INVITE_TIMEOUT_MS", 30000)
+        self.call_reconnect_grace_ms = _env_positive_int("MEP_CALL_RECONNECT_GRACE_MS", 10000)
+        self._ws: Any = None
+        self._background_tasks: set[asyncio.Task[Any]] = set()
+        self._pending_call_bridges: dict[str, asyncio.Future[dict[str, Any]]] = {}
 
     def _auth_headers(self, payload: str) -> dict[str, str]:
         headers = self.identity.get_auth_headers(payload)
@@ -385,10 +419,460 @@ class RuntimeNode:
         else:
             print(f"[mep run] complete failed task={task_id[:8]} status={code} detail={raw}")
 
+    def _schedule_background_task(self, coroutine: Any, *, label: str) -> None:
+        task = asyncio.create_task(coroutine)
+        self._background_tasks.add(task)
+
+        def _cleanup(done_task: asyncio.Task[Any]) -> None:
+            self._background_tasks.discard(done_task)
+            try:
+                done_task.result()
+            except Exception as exc:  # noqa: BLE001
+                print(f"[mep run] background task error label={label} detail={exc}")
+
+        task.add_done_callback(_cleanup)
+
+    async def _send_ws_event(self, payload: dict[str, Any]) -> bool:
+        if self._ws is None:
+            return False
+        try:
+            await self._ws.send(json.dumps(payload))
+            return True
+        except Exception as exc:  # noqa: BLE001
+            print(f"[mep run] ws send failed event={payload.get('event')} detail={exc}")
+            return False
+
+    def _resolve_call_bridge(self, context_id: Optional[str], outcome: dict[str, Any]) -> None:
+        if not context_id:
+            return
+        future = self._pending_call_bridges.get(context_id)
+        if future is not None and not future.done():
+            future.set_result(outcome)
+
+    def _cancel_pending_call_bridges(self, reason: str) -> None:
+        for context_id, future in list(self._pending_call_bridges.items()):
+            if not future.done():
+                future.set_result({"status": "rejected", "reason": reason, "context_id": context_id})
+
+    def _bridge_eligible_interbot_message(
+        self, task_data: dict[str, Any], interbot_message: Optional[dict[str, Any]]
+    ) -> bool:
+        if not (
+            self.live_call_enabled
+            and self.dm_to_call_bridge_enabled
+            and self._ws is not None
+            and MEPClient is not None
+            and interbot_message is not None
+        ):
+            return False
+        try:
+            bounty = float(task_data.get("bounty") or 0.0)
+        except (TypeError, ValueError):
+            return False
+        if bounty != 0.0:
+            return False
+        source = interbot_message.get("source")
+        if not isinstance(source, dict) or not isinstance(source.get("node_id"), str):
+            return False
+        conversation = interbot_message.get("conversation")
+        if not isinstance(conversation, dict) or not isinstance(conversation.get("context_id"), str):
+            return False
+        return True
+
+    async def _attempt_live_call_bridge(
+        self,
+        task_data: dict[str, Any],
+        interbot_message: dict[str, Any],
+        result_payload: str,
+    ) -> bool:
+        conversation = interbot_message["conversation"]
+        source = interbot_message["source"]
+        context_id = conversation["context_id"]
+        peer_node = source["node_id"]
+        if context_id in self._pending_call_bridges:
+            print(f"[mep run] live bridge skipped duplicate context={context_id}")
+            return False
+
+        loop = asyncio.get_running_loop()
+        future: asyncio.Future[dict[str, Any]] = loop.create_future()
+        self._pending_call_bridges[context_id] = future
+        invite_payload = {
+            "event": "call.invite",
+            "context_id": context_id,
+            "callee": peer_node,
+            "timeout_ms": self.call_invite_timeout_ms,
+            "reconnect_grace_ms": self.call_reconnect_grace_ms,
+            "bridge": {
+                "mode": "dm_upgrade",
+                "origin_task_id": task_data.get("id"),
+                "origin_message_id": interbot_message.get("message_id"),
+                "trace_id": interbot_message.get("trace_id"),
+                "intent_type": interbot_message.get("intent", {}).get("type"),
+            },
+        }
+        if not await self._send_ws_event(invite_payload):
+            self._pending_call_bridges.pop(context_id, None)
+            return False
+
+        print(f"[mep run] live bridge invite context={context_id} peer={peer_node}")
+        timeout_seconds = max(1.0, self.call_invite_timeout_ms / 1000.0 + 1.0)
+        try:
+            outcome = await asyncio.wait_for(future, timeout=timeout_seconds)
+        except asyncio.TimeoutError:
+            print(f"[mep run] live bridge timeout context={context_id} peer={peer_node}")
+            return False
+        finally:
+            self._pending_call_bridges.pop(context_id, None)
+
+        if outcome.get("status") != "accepted":
+            print(
+                f"[mep run] live bridge fallback context={context_id} "
+                f"peer={peer_node} reason={outcome.get('reason', 'not_accepted')}"
+            )
+            return False
+
+        await self._send_ws_event(
+            {
+                "event": "call.frame",
+                "context_id": context_id,
+                "seq": 0,
+                "content_type": "text/plain",
+                "payload": result_payload,
+            }
+        )
+        await self._send_ws_event({"event": "call.hangup", "context_id": context_id})
+        settlement = (
+            "LIVE_CALL_BRIDGE_OK\n"
+            f"context={context_id}\n"
+            f"peer={peer_node}\n"
+            "transport=call.frame\n"
+            f"origin_task={str(task_data.get('id') or '')[:8]}"
+        )
+        self.complete(str(task_data.get("id") or ""), settlement)
+        print(f"[mep run] live bridge completed context={context_id} peer={peer_node}")
+        return True
+
+    async def _handle_call_event(self, data: dict[str, Any]) -> None:
+        event = str(data.get("event") or "")
+        context_id = data.get("context_id") if isinstance(data.get("context_id"), str) else None
+        if event == "call.ping":
+            if context_id:
+                await self._send_ws_event({"event": "call.pong", "context_id": context_id})
+            return
+        if event == "call.incoming":
+            caller = data.get("caller") if isinstance(data.get("caller"), str) else None
+            if not context_id or not caller:
+                return
+            if self.live_call_enabled and self.call_auto_accept:
+                await self._send_ws_event({"event": "call.accept", "context_id": context_id})
+                print(f"[mep run] auto-accepted live call context={context_id} caller={caller}")
+            else:
+                await self._send_ws_event(
+                    {"event": "call.decline", "context_id": context_id, "reason": "manual_required"}
+                )
+                print(f"[mep run] declined live call context={context_id} caller={caller}")
+            return
+        if event == "call.accepted":
+            self._resolve_call_bridge(context_id, {"status": "accepted", "context_id": context_id})
+            return
+        if event in {"call.declined", "call.timeout", "call.rejected", "call.cancelled"}:
+            self._resolve_call_bridge(
+                context_id,
+                {
+                    "status": "rejected",
+                    "reason": data.get("reason") or event.removeprefix("call."),
+                    "context_id": context_id,
+                },
+            )
+            return
+        if event == "call.frame":
+            sender = data.get("sender") if isinstance(data.get("sender"), str) else "unknown"
+            snippet = str(data.get("payload") or "").strip().replace("\n", " ")[:160]
+            print(f"[mep run] live frame context={context_id} sender={sender} payload={snippet}")
+            return
+        if event in {"call.hangup", "call.suspended", "call.resumed"}:
+            print(f"[mep run] {event} context={context_id} detail={data}")
+
+    @staticmethod
+    def _interbot_reply_mode(interbot_message: dict[str, Any]) -> Optional[str]:
+        delivery = interbot_message.get("delivery")
+        if isinstance(delivery, dict) and isinstance(delivery.get("reply_mode"), str):
+            return delivery["reply_mode"]
+        return None
+
+    @staticmethod
+    def _interbot_source_node(interbot_message: dict[str, Any]) -> Optional[str]:
+        source = interbot_message.get("source")
+        if isinstance(source, dict) and isinstance(source.get("node_id"), str):
+            return source["node_id"]
+        return None
+
+    def _can_use_structured_dm_fallback(self, interbot_message: Optional[dict[str, Any]]) -> bool:
+        if MEPClient is None or interbot_message is None:
+            return False
+        if self._interbot_reply_mode(interbot_message) != "new_dm":
+            return False
+        # Bound auto-replies to declared safe threads to avoid unbounded bot loops.
+        return MEPClient.extract_session_safety(json.dumps(interbot_message)) is not None
+
+    def _build_interbot_message(
+        self,
+        message: str,
+        target_node: str,
+        *,
+        context_id: str,
+        reply_to_task_id: Optional[str],
+        reply_to_message_id: Optional[str],
+        turn_type: str,
+        intent_type: str,
+        priority: str,
+        trace_id: Optional[str],
+        session_safety: Optional[dict[str, Any]],
+        turn_index: Optional[int],
+    ) -> dict[str, Any]:
+        message_id = str(uuid.uuid4())
+        timestamp_ms = int(time.time() * 1000)
+        task: dict[str, Any] = {
+            "instructions": message,
+            "expected_output": {"result_type": "text"},
+        }
+        inputs: dict[str, Any] = {}
+        if session_safety:
+            normalized_session_safety = dict(session_safety)
+            if "started_at_ms" not in normalized_session_safety:
+                normalized_session_safety["started_at_ms"] = timestamp_ms
+            inputs["session_safety"] = normalized_session_safety
+        if inputs:
+            task["inputs"] = inputs
+        conversation: dict[str, Any] = {
+            "context_id": context_id,
+            "reply_to_task_id": reply_to_task_id,
+            "reply_to_message_id": reply_to_message_id,
+            "turn_type": turn_type,
+        }
+        if turn_index is not None:
+            conversation["turn_index"] = turn_index
+        return {
+            "spec_version": "mep.interbot.v1",
+            "message_id": message_id,
+            "trace_id": trace_id or str(uuid.uuid4()),
+            "timestamp_ms": timestamp_ms,
+            "source": {"node_id": self.node_id},
+            "target": {"node_id": target_node},
+            "conversation": conversation,
+            "intent": {"type": intent_type, "priority": priority},
+            "task": task,
+            "economics": {"bounty_seconds": 0.0, "currency": "SECONDS"},
+            "delivery": {"reply_mode": "new_dm", "settlement_mode": "task_result"},
+        }
+
+    def _build_interbot_reply_message(
+        self,
+        reply_text: str,
+        inbound_message: dict[str, Any],
+        *,
+        inbound_task_id: Optional[str],
+        turn_type: Optional[str] = None,
+        intent_type: Optional[str] = None,
+        priority: Optional[str] = None,
+    ) -> dict[str, Any]:
+        if MEPClient is None:
+            raise RuntimeError("MEPClient is unavailable")
+        source = inbound_message.get("source")
+        if not isinstance(source, dict) or not isinstance(source.get("node_id"), str):
+            raise ValueError("inbound inter-bot message is missing source.node_id")
+        inbound_intent = inbound_message.get("intent")
+        conversation = inbound_message.get("conversation")
+        inbound_priority = (
+            inbound_intent.get("priority")
+            if isinstance(inbound_intent, dict) and isinstance(inbound_intent.get("priority"), str)
+            else "normal"
+        )
+        inbound_turn_type = conversation.get("turn_type") if isinstance(conversation, dict) else None
+        return self._build_interbot_message(
+            reply_text,
+            source["node_id"],
+            context_id=conversation.get("context_id") if isinstance(conversation, dict) else str(uuid.uuid4()),
+            reply_to_task_id=inbound_task_id,
+            reply_to_message_id=inbound_message.get("message_id")
+            if isinstance(inbound_message.get("message_id"), str)
+            else None,
+            turn_type=turn_type or MEPClient._default_reply_turn_type(inbound_turn_type),
+            intent_type=intent_type
+            or MEPClient._default_reply_intent_type(
+                inbound_intent.get("type") if isinstance(inbound_intent, dict) else None
+            ),
+            priority=priority or inbound_priority,
+            trace_id=inbound_message.get("trace_id") if isinstance(inbound_message.get("trace_id"), str) else None,
+            session_safety=MEPClient._extract_session_safety_from_message(inbound_message),
+            turn_index=MEPClient._derive_reply_turn_index(inbound_message),
+        )
+
+    def _build_checkpoint_message(
+        self,
+        summary: str,
+        target_node: str,
+        *,
+        context_id: str,
+        reply_to_task_id: Optional[str],
+        reply_to_message_id: Optional[str],
+        priority: str,
+        session_safety: Optional[dict[str, Any]],
+        turn_index: Optional[int],
+        trace_id: Optional[str],
+    ) -> dict[str, Any]:
+        return self._build_interbot_message(
+            summary,
+            target_node,
+            context_id=context_id,
+            reply_to_task_id=reply_to_task_id,
+            reply_to_message_id=reply_to_message_id,
+            turn_type="checkpoint",
+            intent_type="coordination.request",
+            priority=priority,
+            trace_id=trace_id,
+            session_safety=session_safety,
+            turn_index=turn_index,
+        )
+
+    def _submit_structured_interbot_message(self, envelope: dict[str, Any]) -> tuple[bool, dict[str, Any], str]:
+        target = envelope.get("target", {})
+        target_node = target.get("node_id") if isinstance(target, dict) else None
+        if not isinstance(target_node, str) or not target_node:
+            return False, {}, "missing target.node_id"
+        outer = build_task_envelope(self.node_id, json.dumps(envelope), 0.0, target_node=target_node)
+        payload = json.dumps(outer)
+        code, body, raw = _safe_request(
+            "POST",
+            f"{self.hub_url}/tasks/submit",
+            data_body=payload,
+            headers=self._auth_headers(payload),
+            timeout=20.0,
+        )
+        if code == 200 and body:
+            return True, body, raw
+        return False, body or {}, raw
+
+    async def _submit_safe_structured_dm_reply(
+        self,
+        reply_text: str,
+        inbound_message: dict[str, Any],
+        *,
+        inbound_task_id: Optional[str],
+    ) -> Optional[dict[str, Any]]:
+        if MEPClient is None or not self._can_use_structured_dm_fallback(inbound_message):
+            return None
+        next_turn_index = MEPClient._derive_reply_turn_index(inbound_message)
+        if next_turn_index is None:
+            return None
+        evaluation = MEPClient.evaluate_interbot_session_safety_message(
+            inbound_message,
+            next_turn_index=next_turn_index,
+        )
+        context_id = MEPClient._extract_context_id(inbound_message)
+        session_safety = MEPClient._extract_session_safety_from_message(inbound_message)
+        if evaluation["should_stop"]:
+            return {
+                "status": "stopped",
+                "reply_action": "stop",
+                "context_id": context_id,
+                "session_safety": session_safety,
+                "safety": evaluation,
+            }
+        source = inbound_message.get("source")
+        if not isinstance(source, dict) or not isinstance(source.get("node_id"), str):
+            return None
+        inbound_priority = inbound_message.get("intent", {}).get("priority") if isinstance(inbound_message.get("intent"), dict) else "normal"
+        if evaluation["should_checkpoint"]:
+            envelope = self._build_checkpoint_message(
+                f"Checkpoint: session reached turn {next_turn_index}. Confirm whether to continue.",
+                source["node_id"],
+                context_id=context_id or str(uuid.uuid4()),
+                reply_to_task_id=inbound_task_id,
+                reply_to_message_id=inbound_message.get("message_id")
+                if isinstance(inbound_message.get("message_id"), str)
+                else None,
+                priority=inbound_priority if isinstance(inbound_priority, str) else "normal",
+                session_safety=session_safety,
+                turn_index=next_turn_index,
+                trace_id=inbound_message.get("trace_id") if isinstance(inbound_message.get("trace_id"), str) else None,
+            )
+            ok, body, raw = self._submit_structured_interbot_message(envelope)
+            if not ok:
+                print(f"[mep run] structured checkpoint failed context={context_id} detail={raw}")
+                return None
+            return {
+                "status": "checkpointed",
+                "reply_action": "checkpoint",
+                "context_id": context_id,
+                "message_id": envelope["message_id"],
+                "trace_id": envelope["trace_id"],
+                "task_id": body.get("task_id"),
+                "session_safety": session_safety,
+                "safety": evaluation,
+            }
+        envelope = self._build_interbot_reply_message(reply_text, inbound_message, inbound_task_id=inbound_task_id)
+        ok, body, raw = self._submit_structured_interbot_message(envelope)
+        if not ok:
+            print(f"[mep run] structured dm reply failed context={context_id} detail={raw}")
+            return None
+        return {
+            "status": "replied",
+            "reply_action": "reply",
+            "context_id": context_id,
+            "message_id": envelope["message_id"],
+            "trace_id": envelope["trace_id"],
+            "task_id": body.get("task_id"),
+            "session_safety": session_safety,
+            "safety": evaluation,
+        }
+
+    @staticmethod
+    def _dm_fallback_settlement(task_id: str, dm_response: dict[str, Any]) -> str:
+        action = dm_response.get("reply_action", "unknown")
+        context_id = dm_response.get("context_id") or "unknown"
+        if action == "reply":
+            return (
+                "DM_REPLY_SENT\n"
+                f"context={context_id}\n"
+                f"reply_task={dm_response.get('task_id') or '?'}\n"
+                f"origin_task={task_id[:8]}"
+            )
+        if action == "checkpoint":
+            return (
+                "DM_CHECKPOINT_SENT\n"
+                f"context={context_id}\n"
+                f"reply_task={dm_response.get('task_id') or '?'}\n"
+                f"origin_task={task_id[:8]}"
+            )
+        violations = ",".join(dm_response.get("safety", {}).get("violations", [])) or "session_limits"
+        return (
+            "DM_REPLY_STOPPED\n"
+            f"context={context_id}\n"
+            f"reason={violations}\n"
+            f"origin_task={task_id[:8]}"
+        )
+
     async def process_task(self, task_data: dict[str, Any]) -> None:
         task_id = str(task_data.get("id") or "")
         payload = str(task_data.get("payload") or "")
-        result = self.adapter.generate_reply(payload, task_data)
+        instructions = payload
+        interbot_message: Optional[dict[str, Any]] = None
+        if MEPClient is not None:
+            instructions, interbot_message = MEPClient.extract_interbot_instructions(payload)
+        result = self.adapter.generate_reply(instructions, task_data)
+        if self._bridge_eligible_interbot_message(task_data, interbot_message):
+            bridged = await self._attempt_live_call_bridge(task_data, interbot_message, result)
+            if bridged:
+                return
+        dm_response = await self._submit_safe_structured_dm_reply(
+            result,
+            interbot_message,
+            inbound_task_id=task_id,
+        )
+        if dm_response is not None:
+            self.complete(task_id, self._dm_fallback_settlement(task_id, dm_response))
+            return
         self.complete(task_id, result)
 
     def _ws_uri(self) -> str:
@@ -404,7 +888,9 @@ class RuntimeNode:
             if task_id and self.should_bid(task):
                 self.bid(task_id)
         elif event == "new_task":
-            await self.process_task(data.get("data", {}))
+            self._schedule_background_task(self.process_task(data.get("data", {})), label="process_task")
+        elif isinstance(event, str) and event.startswith("call."):
+            await self._handle_call_event(data)
 
     async def _recv_loop(self, ws: Any) -> None:
         while self.running:
@@ -434,6 +920,7 @@ class RuntimeNode:
             uri = self._ws_uri()
             try:
                 async with ws_connect(uri) as ws:
+                    self._ws = ws
                     print(f"[mep run] connected ws node={self.node_id}")
                     await self._recv_loop(ws)
             except KeyboardInterrupt:
@@ -441,6 +928,9 @@ class RuntimeNode:
             except Exception as exc:  # noqa: BLE001
                 print(f"[mep run] websocket reconnect after error: {exc}")
                 await asyncio.sleep(3.0)
+            finally:
+                self._ws = None
+                self._cancel_pending_call_bridges("socket_closed")
         return 0
 
 

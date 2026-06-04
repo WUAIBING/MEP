@@ -3,6 +3,7 @@ import json
 import os
 import shlex
 import tempfile
+import uuid
 from datetime import datetime, timezone
 from typing import Any, Optional
 
@@ -19,6 +20,9 @@ class StdioAdapter:
         self.default_model = default_model
         self.client = MEPClient(key_path)
         self._recent_interbot_results: dict[str, dict[str, Any]] = {}
+        self.live_call_enabled = os.getenv("MEP_LIVE_CALL_ENABLED", "0") not in ("0", "false", "False", "")
+        self.call_auto_accept = os.getenv("MEP_CALL_AUTO_ACCEPT", "0") not in ("0", "false", "False", "")
+        self._call_seq_by_context: dict[str, int] = {}
 
     async def _handle_result(self, data: dict) -> None:
         task_id = data.get("task_id")
@@ -36,6 +40,54 @@ class StdioAdapter:
                     f"[{self.platform_name}] stored structured dm result {task_id}"
                     + (f" context={context_id}" if context_id else "")
                 )
+
+    async def _send_live_call_event(self, payload: dict[str, Any], *, action: str) -> bool:
+        ok = await self.client.send_ws_event(payload)
+        if not ok:
+            print(f"[{self.platform_name}] {action} failed: live socket is not connected")
+            return False
+        return True
+
+    async def _handle_call_event(self, data: dict[str, Any]) -> None:
+        event = str(data.get("event") or "")
+        context_id = data.get("context_id") if isinstance(data.get("context_id"), str) else None
+        if event == "call.ping":
+            if context_id:
+                await self._send_live_call_event({"event": "call.pong", "context_id": context_id}, action="call.pong")
+            return
+        if event == "call.incoming":
+            caller = data.get("caller") if isinstance(data.get("caller"), str) else None
+            if self.live_call_enabled and self.call_auto_accept and context_id:
+                sent = await self._send_live_call_event({"event": "call.accept", "context_id": context_id}, action="call.accept")
+                if sent:
+                    print(f"[{self.platform_name}] auto-accepted live call context={context_id} caller={caller}")
+                return
+            print(
+                f"[{self.platform_name}] incoming live call context={context_id} caller={caller} "
+                f"(use: mepcallaccept {context_id} | mepcalldecline {context_id} <reason>)"
+            )
+            return
+        if event == "call.accepted":
+            print(f"[{self.platform_name}] live call accepted context={context_id}")
+            return
+        if event in {"call.declined", "call.timeout", "call.rejected", "call.cancelled"}:
+            print(
+                f"[{self.platform_name}] live call {event.removeprefix('call.')} "
+                f"context={context_id} reason={data.get('reason')}"
+            )
+            return
+        if event == "call.frame":
+            sender = data.get("sender") if isinstance(data.get("sender"), str) else "unknown"
+            payload = str(data.get("payload") or "")
+            print(f"[{self.platform_name}] live frame context={context_id} sender={sender}: {payload}")
+            return
+        if event in {"call.hangup", "call.suspended", "call.resumed"}:
+            print(f"[{self.platform_name}] {event} context={context_id} detail={data}")
+
+    async def _handle_event(self, data: dict[str, Any]) -> None:
+        event = str(data.get("event") or "")
+        if event.startswith("call."):
+            await self._handle_call_event(data)
 
     def _remember_interbot_result(self, task_id: str, payload_text: str, message: dict[str, Any]) -> None:
         self._recent_interbot_results[task_id] = {
@@ -398,6 +450,151 @@ class StdioAdapter:
             print(f"[{self.platform_name}] dm failed: {data}")
             return
         print(f"[{self.platform_name}] sent dm task {data.get('task_id')} to {target_node}")
+
+    async def _start_live_call(self, text: str) -> None:
+        try:
+            parts = shlex.split(text)
+        except ValueError as exc:
+            print(f"[{self.platform_name}] mepcall parse error: {exc}")
+            return
+        if not parts:
+            print(
+                f"[{self.platform_name}] usage: mepcall <node_id> "
+                "[--context <context_id>] [--timeout-ms <ms>] [--grace-ms <ms>]"
+            )
+            return
+        target_node = parts[0]
+        context_id = str(uuid.uuid4())
+        timeout_ms = 30000
+        grace_ms = 10000
+        i = 1
+        while i < len(parts):
+            token = parts[i]
+            if token == "--context":
+                if i + 1 >= len(parts):
+                    print(f"[{self.platform_name}] missing value for {token}")
+                    return
+                context_id = parts[i + 1]
+                i += 2
+                continue
+            if token == "--timeout-ms":
+                if i + 1 >= len(parts):
+                    print(f"[{self.platform_name}] missing value for {token}")
+                    return
+                try:
+                    timeout_ms = int(parts[i + 1])
+                except ValueError:
+                    print(f"[{self.platform_name}] --timeout-ms must be an integer")
+                    return
+                i += 2
+                continue
+            if token == "--grace-ms":
+                if i + 1 >= len(parts):
+                    print(f"[{self.platform_name}] missing value for {token}")
+                    return
+                try:
+                    grace_ms = int(parts[i + 1])
+                except ValueError:
+                    print(f"[{self.platform_name}] --grace-ms must be an integer")
+                    return
+                i += 2
+                continue
+            print(f"[{self.platform_name}] unknown option {token}")
+            return
+        sent = await self._send_live_call_event(
+            {
+                "event": "call.invite",
+                "context_id": context_id,
+                "callee": target_node,
+                "timeout_ms": timeout_ms,
+                "reconnect_grace_ms": grace_ms,
+            },
+            action="call.invite",
+        )
+        if sent:
+            self._call_seq_by_context.setdefault(context_id, 0)
+            print(f"[{self.platform_name}] live call invite sent context={context_id} callee={target_node}")
+
+    async def _accept_live_call(self, text: str) -> None:
+        context_id = text.strip()
+        if not context_id:
+            print(f"[{self.platform_name}] usage: mepcallaccept <context_id>")
+            return
+        sent = await self._send_live_call_event({"event": "call.accept", "context_id": context_id}, action="call.accept")
+        if sent:
+            self._call_seq_by_context.setdefault(context_id, 0)
+            print(f"[{self.platform_name}] live call accepted context={context_id}")
+
+    async def _decline_live_call(self, text: str) -> None:
+        try:
+            parts = shlex.split(text)
+        except ValueError as exc:
+            print(f"[{self.platform_name}] mepcalldecline parse error: {exc}")
+            return
+        if not parts:
+            print(f"[{self.platform_name}] usage: mepcalldecline <context_id> [reason]")
+            return
+        context_id = parts[0]
+        reason = "declined"
+        if len(parts) > 1:
+            reason = " ".join(parts[1:]).strip() or reason
+        sent = await self._send_live_call_event(
+            {"event": "call.decline", "context_id": context_id, "reason": reason},
+            action="call.decline",
+        )
+        if sent:
+            print(f"[{self.platform_name}] live call declined context={context_id} reason={reason}")
+
+    async def _send_live_call_frame(self, text: str) -> None:
+        try:
+            parts = shlex.split(text)
+        except ValueError as exc:
+            print(f"[{self.platform_name}] mepcallframe parse error: {exc}")
+            return
+        if len(parts) < 2:
+            print(f"[{self.platform_name}] usage: mepcallframe <context_id> <message> [--seq <n>]")
+            return
+        context_id = parts[0]
+        seq = None
+        message_parts: list[str] = []
+        i = 1
+        while i < len(parts):
+            token = parts[i]
+            if token == "--seq":
+                if i + 1 >= len(parts):
+                    print(f"[{self.platform_name}] missing value for {token}")
+                    return
+                try:
+                    seq = int(parts[i + 1])
+                except ValueError:
+                    print(f"[{self.platform_name}] --seq must be an integer")
+                    return
+                i += 2
+                continue
+            message_parts.append(token)
+            i += 1
+        payload = " ".join(message_parts).strip()
+        if not payload:
+            print(f"[{self.platform_name}] usage: mepcallframe <context_id> <message> [--seq <n>]")
+            return
+        if seq is None:
+            seq = self._call_seq_by_context.get(context_id, 0)
+        sent = await self._send_live_call_event(
+            {"event": "call.frame", "context_id": context_id, "seq": seq, "payload": payload},
+            action="call.frame",
+        )
+        if sent:
+            self._call_seq_by_context[context_id] = seq + 1
+            print(f"[{self.platform_name}] live frame sent context={context_id} seq={seq}")
+
+    async def _hangup_live_call(self, text: str) -> None:
+        context_id = text.strip()
+        if not context_id:
+            print(f"[{self.platform_name}] usage: mepcallhangup <context_id>")
+            return
+        sent = await self._send_live_call_event({"event": "call.hangup", "context_id": context_id}, action="call.hangup")
+        if sent:
+            print(f"[{self.platform_name}] live call hangup sent context={context_id}")
 
     async def _send_structured_dm(self, text: str) -> None:
         try:
@@ -895,6 +1092,21 @@ class StdioAdapter:
                 return True
             await self._send_dm(parts[1], parts[2])
             return True
+        if text.startswith("mepcall "):
+            await self._start_live_call(text[8:])
+            return True
+        if text.startswith("mepcallaccept "):
+            await self._accept_live_call(text[14:])
+            return True
+        if text.startswith("mepcalldecline "):
+            await self._decline_live_call(text[15:])
+            return True
+        if text.startswith("mepcallframe "):
+            await self._send_live_call_frame(text[13:])
+            return True
+        if text.startswith("mepcallhangup "):
+            await self._hangup_live_call(text[14:])
+            return True
         if text.startswith("mepdmx "):
             await self._send_structured_dm(text[7:])
             return True
@@ -943,11 +1155,12 @@ class StdioAdapter:
 
     async def run(self) -> None:
         await self.client.register()
-        listener = asyncio.create_task(self.client.listen_results(self._handle_result))
+        listener = asyncio.create_task(self.client.listen_results(self._handle_result, self._handle_event))
         print(f"[{self.platform_name}] connected as {self.client.node_id}")
         print(
             f"[{self.platform_name}] commands: "
-            "mep, mepdm, mepdmx, mepdmlist, mepdmsnapshot, mepdmhumanapproval, mepdmverdict, mepdmreplysafe, "
+            "mep, mepdm, mepcall, mepcallaccept, mepcalldecline, mepcallframe, mepcallhangup, "
+            "mepdmx, mepdmlist, mepdmsnapshot, mepdmhumanapproval, mepdmverdict, mepdmreplysafe, "
             "mepdata, mepcancel, mepresult, mepbalance, exit"
         )
         loop = asyncio.get_running_loop()
