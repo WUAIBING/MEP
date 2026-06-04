@@ -26,6 +26,7 @@ class MEPClient:
         self.session = requests.Session()
         self.task_channels: dict[str, str] = {}
         self._stop = asyncio.Event()
+        self._active_ws = None
 
     async def register(self) -> dict:
         response = await asyncio.to_thread(
@@ -959,6 +960,7 @@ class MEPClient:
             uri = f"{WS_URL}/ws/{self.node_id}?timestamp={ts}&signature={sig}"
             try:
                 async with ws_connect(uri) as ws:
+                    self._active_ws = ws
                     heartbeat_task: Optional[asyncio.Task] = None
                     if WS_HEARTBEAT_INTERVAL_SECONDS > 0:
                         heartbeat_task = asyncio.create_task(self._heartbeat_loop(ws))
@@ -971,11 +973,19 @@ class MEPClient:
                             elif on_event is not None:
                                 await on_event(data)
                     finally:
+                        self._active_ws = None
                         if heartbeat_task:
                             heartbeat_task.cancel()
                             await asyncio.gather(heartbeat_task, return_exceptions=True)
             except Exception:
+                self._active_ws = None
                 await asyncio.sleep(2)
+
+    async def send_ws_event(self, payload: dict[str, Any]) -> bool:
+        if self._active_ws is None:
+            return False
+        await self._active_ws.send(json.dumps(payload))
+        return True
 
     async def _heartbeat_loop(self, ws) -> None:
         while not self._stop.is_set():

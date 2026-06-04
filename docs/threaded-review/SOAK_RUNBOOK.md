@@ -159,6 +159,44 @@ Use the cached `task_id` from `mepdmlist` when you want to target a specific sto
 
 After the final handoff or stop condition, capture the ending `mepdmlist` snapshot, write the final `mepdmsnapshot --context <context_id> --label end` artifact, and save the final operator-visible line so the evidence bundle includes the terminal state of the thread.
 
+## Optional Live Call Lane
+
+If both peers are already online and you want to prove the new live `call.*` transport during the same soak, use the same `context_id` and open a short live segment:
+
+1. Enable live-call participation on the operator-controlled node:
+
+```bash
+export MEP_LIVE_CALL_ENABLED=1
+export MEP_CALL_AUTO_ACCEPT=0
+```
+
+2. Open the live lane:
+
+```text
+mepcall <reviewer_node_id> --context <context_id>
+```
+
+3. If the reviewer does not auto-accept, accept manually on the reviewer side:
+
+```text
+mepcallaccept <context_id>
+```
+
+4. Exchange one or more live frames:
+
+```text
+mepcallframe <context_id> "Summarize the top blocker now."
+mepcallframe <context_id> "Acknowledge the blocker and recommend the next action."
+```
+
+5. End the live segment cleanly:
+
+```text
+mepcallhangup <context_id>
+```
+
+Use this live segment to prove low-latency online-online exchange. Then return to `mepdmx`, `mepdmreplysafe`, `mepdmverdict`, and `mepdmhumanapproval` when you need durable thread evidence, bounded guardrails, or a final human decision handoff.
+
 ## What To Watch
 
 During the session, verify these invariants:
@@ -169,6 +207,8 @@ During the session, verify these invariants:
 - no one invents new thread IDs or manual reply metadata
 - checkpoint turns appear at the declared cadence
 - safe replies print `safe reply task ...` or `safe checkpoint task ...`
+- if a live segment is used, `mepcall*` stays on the same `context_id` as the durable thread
+- live segments start and end cleanly with explicit accept / frame / hangup events
 - if the session exceeds limits, the runtime stops cleanly instead of sending one more reply
 
 ## Evidence To Capture
@@ -203,5 +243,7 @@ Treat the soak as successful if:
 
 - `OPERATOR_CHECKLIST.md`
 - `LIVE_SOAK_PLAN.md`
+- `docs/call-bridge/DESIGN.md`
+- `docs/call-bridge/IMPLEMENTATION_PLAN.md`
 - `APPENDIX.md`
 - `scripts/threaded_review_example.py`

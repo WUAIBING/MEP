@@ -257,6 +257,67 @@ class TestStdioAdapter(unittest.IsolatedAsyncioTestCase):
         client.submit_safe_dm_reply.assert_not_awaited()
         print_mock.assert_any_call("[codex] unknown option --bogus")
 
+    async def test_handle_event_auto_accepts_incoming_live_call_when_enabled(self):
+        adapter, client = self._make_adapter()
+        adapter.live_call_enabled = True
+        adapter.call_auto_accept = True
+        client.send_ws_event = AsyncMock(return_value=True)
+
+        with patch("builtins.print") as print_mock:
+            await adapter._handle_event({"event": "call.incoming", "context_id": "ctx-live", "caller": "node_peer"})
+
+        client.send_ws_event.assert_awaited_once_with({"event": "call.accept", "context_id": "ctx-live"})
+        print_mock.assert_any_call("[codex] auto-accepted live call context=ctx-live caller=node_peer")
+
+    async def test_handle_event_replies_to_call_ping(self):
+        adapter, client = self._make_adapter()
+        client.send_ws_event = AsyncMock(return_value=True)
+
+        await adapter._handle_event({"event": "call.ping", "context_id": "ctx-ping"})
+
+        client.send_ws_event.assert_awaited_once_with({"event": "call.pong", "context_id": "ctx-ping"})
+
+    async def test_dispatch_line_mepcall_sends_invite(self):
+        adapter, client = self._make_adapter()
+        client.send_ws_event = AsyncMock(return_value=True)
+
+        with patch("builtins.print") as print_mock:
+            keep_going = await adapter._dispatch_line(
+                "mepcall node_peer --context ctx-live --timeout-ms 12000 --grace-ms 4000"
+            )
+
+        self.assertTrue(keep_going)
+        client.send_ws_event.assert_awaited_once_with(
+            {
+                "event": "call.invite",
+                "context_id": "ctx-live",
+                "callee": "node_peer",
+                "timeout_ms": 12000,
+                "reconnect_grace_ms": 4000,
+            }
+        )
+        print_mock.assert_any_call("[codex] live call invite sent context=ctx-live callee=node_peer")
+
+    async def test_dispatch_line_mepcallframe_auto_increments_seq(self):
+        adapter, client = self._make_adapter()
+        client.send_ws_event = AsyncMock(return_value=True)
+
+        with patch("builtins.print") as print_mock:
+            keep_going = await adapter._dispatch_line('mepcallframe ctx-live "hello over live lane"')
+
+        self.assertTrue(keep_going)
+        client.send_ws_event.assert_awaited_once_with(
+            {
+                "event": "call.frame",
+                "context_id": "ctx-live",
+                "seq": 0,
+                "content_type": "text/plain",
+                "payload": "hello over live lane",
+            }
+        )
+        self.assertEqual(adapter._call_seq_by_context["ctx-live"], 1)
+        print_mock.assert_any_call("[codex] live frame sent context=ctx-live seq=0")
+
     async def test_dispatch_line_dmlist_reports_when_empty(self):
         adapter, _client = self._make_adapter()
 

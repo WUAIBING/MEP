@@ -23,6 +23,14 @@ class _FakeResponse:
         return self._json_data
 
 
+class _FakeWebSocket:
+    def __init__(self):
+        self.sent = []
+
+    async def send(self, payload: str) -> None:
+        self.sent.append(payload)
+
+
 class TestSharedMEPClient(unittest.TestCase):
     def test_submit_task_uses_spec_shaped_envelope(self):
         with (
@@ -57,6 +65,25 @@ class TestSharedMEPClient(unittest.TestCase):
             },
         )
         self.assertEqual(body["routing"], {"target_node_id": "node_provider", "target_capability": "text"})
+
+    def test_send_ws_event_uses_active_socket_when_present(self):
+        with patch("clients.shared.mep_client.MEPIdentity", return_value=_FakeIdentity()):
+            client = MEPClient("unused.pem")
+            ws = _FakeWebSocket()
+            client._active_ws = ws
+
+            sent = asyncio.run(client.send_ws_event({"event": "call.accept", "context_id": "ctx-1"}))
+
+        self.assertTrue(sent)
+        self.assertEqual(json.loads(ws.sent[0]), {"event": "call.accept", "context_id": "ctx-1"})
+
+    def test_send_ws_event_returns_false_without_active_socket(self):
+        with patch("clients.shared.mep_client.MEPIdentity", return_value=_FakeIdentity()):
+            client = MEPClient("unused.pem")
+
+            sent = asyncio.run(client.send_ws_event({"event": "call.accept", "context_id": "ctx-1"}))
+
+        self.assertFalse(sent)
 
     def test_submit_task_can_send_secret_data_offer(self):
         with (

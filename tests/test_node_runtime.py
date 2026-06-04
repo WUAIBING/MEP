@@ -47,6 +47,7 @@ class _FakeWebSocket:
     def __init__(self, messages):
         self.messages = list(messages)
         self.pings = 0
+        self.sent = []
 
     async def recv(self):
         item = self.messages.pop(0)
@@ -56,6 +57,20 @@ class _FakeWebSocket:
 
     async def ping(self):
         self.pings += 1
+
+    async def send(self, payload):
+        self.sent.append(payload)
+
+
+class _FakeConnectContext:
+    def __init__(self, ws):
+        self.ws = ws
+
+    async def __aenter__(self):
+        return self.ws
+
+    async def __aexit__(self, exc_type, exc, tb):
+        return False
 
 
 class _FakeRuntime:
@@ -252,6 +267,316 @@ class TestRuntimeWebSocketLoop(unittest.TestCase):
 
         self.assertEqual(ws.pings, 1)
         bid_mock.assert_called_once_with("task_compute")
+
+    def test_run_forever_cancels_background_tasks_cleanly_on_shutdown(self):
+        node = _runtime_node()
+
+        async def _pending_task() -> None:
+            await asyncio.Event().wait()
+
+        async def _recv_loop(_ws) -> None:
+            node.running = False
+
+        async def _run() -> asyncio.Task:
+            with (
+                patch.object(node, "register", return_value=(True, "registered")),
+                patch.object(node, "_recv_loop", side_effect=_recv_loop),
+                patch("node.ws_connect.ws_connect", return_value=_FakeConnectContext(_FakeWebSocket([]))),
+                patch("builtins.print") as print_mock,
+            ):
+                node._schedule_background_task(_pending_task(), label="pending_shutdown")  # noqa: SLF001
+                pending_task = next(iter(node._background_tasks))  # noqa: SLF001
+                code = await node.run_forever()
+
+            self.assertEqual(code, 0)
+            self.assertTrue(pending_task.cancelled())
+            self.assertFalse(node._background_tasks)  # noqa: SLF001
+            printed = "\n".join(str(call.args[0]) for call in print_mock.call_args_list if call.args)
+            self.assertNotIn("background task error", printed)
+            return pending_task
+
+        pending_task = asyncio.run(_run())
+        self.assertTrue(pending_task.cancelled())
+
+    def test_process_task_uses_interbot_instructions_for_adapter_input(self):
+        node = _runtime_node()
+        task_data = {
+            "id": "task_interbot",
+            "bounty": 0.0,
+            "payload": json.dumps(
+                {
+                    "spec_version": "mep.interbot.v1",
+                    "message_id": "msg-1",
+                    "trace_id": "trace-1",
+                    "source": {"node_id": "node_peer"},
+                    "target": {"node_id": node.node_id},
+                    "conversation": {"context_id": "ctx-1"},
+                    "intent": {"type": "chat.request", "priority": "normal"},
+                    "task": {"instructions": "Use only this instruction text."},
+                    "economics": {"bounty_seconds": 0.0, "currency": "SECONDS"},
+                    "delivery": {"reply_mode": "new_dm", "settlement_mode": "task_result"},
+                }
+            ),
+        }
+        with (
+            patch.object(node.adapter, "generate_reply", return_value="reply") as adapter_mock,
+            patch.object(node, "complete") as complete_mock,
+        ):
+            asyncio.run(node.process_task(task_data))
+
+        adapter_mock.assert_called_once_with("Use only this instruction text.", task_data)
+        complete_mock.assert_called_once_with("task_interbot", "reply")
+
+    def test_process_task_live_bridge_sends_frame_and_settles_when_call_is_accepted(self):
+        node = _runtime_node()
+        node.live_call_enabled = True
+        node.dm_to_call_bridge_enabled = True
+        node._ws = _FakeWebSocket([])
+        node.call_invite_timeout_ms = 100
+
+        task_data = {
+            "id": "task_bridge",
+            "bounty": 0.0,
+            "payload": json.dumps(
+                {
+                    "spec_version": "mep.interbot.v1",
+                    "message_id": "msg-bridge",
+                    "trace_id": "trace-bridge",
+                    "source": {"node_id": "node_peer"},
+                    "target": {"node_id": node.node_id},
+                    "conversation": {"context_id": "ctx-bridge"},
+                    "intent": {"type": "chat.request", "priority": "normal"},
+                    "task": {"instructions": "Reply over live call."},
+                    "economics": {"bounty_seconds": 0.0, "currency": "SECONDS"},
+                    "delivery": {"reply_mode": "new_dm", "settlement_mode": "task_result"},
+                }
+            ),
+        }
+
+        async def _run() -> None:
+            with (
+                patch.object(node.adapter, "generate_reply", return_value="Live reply"),
+                patch.object(node, "complete") as complete_mock,
+            ):
+                task = asyncio.create_task(node.process_task(task_data))
+                await asyncio.sleep(0)
+                invite = json.loads(node._ws.sent[0])
+                self.assertEqual(invite["event"], "call.invite")
+                self.assertEqual(invite["context_id"], "ctx-bridge")
+                self.assertEqual(invite["callee"], "node_peer")
+
+                await node.handle_ws_event({"event": "call.accepted", "context_id": "ctx-bridge"})
+                await task
+
+                events = [json.loads(payload)["event"] for payload in node._ws.sent]
+                self.assertEqual(events, ["call.invite", "call.frame", "call.hangup"])
+                complete_mock.assert_called_once()
+                settled_payload = complete_mock.call_args.args[1]
+                self.assertIn("LIVE_CALL_BRIDGE_OK", settled_payload)
+                self.assertIn("context=ctx-bridge", settled_payload)
+
+        asyncio.run(_run())
+
+    def test_process_task_live_bridge_falls_back_when_frame_send_fails_after_accept(self):
+        node = _runtime_node()
+        node.live_call_enabled = True
+        node.dm_to_call_bridge_enabled = True
+        node._ws = _FakeWebSocket([])
+        node.call_invite_timeout_ms = 100
+
+        task_data = {
+            "id": "task_bridge_frame_fail",
+            "bounty": 0.0,
+            "payload": json.dumps(
+                {
+                    "spec_version": "mep.interbot.v1",
+                    "message_id": "msg-bridge-frame-fail",
+                    "trace_id": "trace-bridge-frame-fail",
+                    "source": {"node_id": "node_peer"},
+                    "target": {"node_id": node.node_id},
+                    "conversation": {"context_id": "ctx-bridge-frame-fail"},
+                    "intent": {"type": "chat.request", "priority": "normal"},
+                    "task": {"instructions": "Reply over live call unless the frame send fails."},
+                    "economics": {"bounty_seconds": 0.0, "currency": "SECONDS"},
+                    "delivery": {"reply_mode": "new_dm", "settlement_mode": "task_result"},
+                }
+            ),
+        }
+
+        original_send_ws_event = node._send_ws_event
+
+        async def _send_ws_event(payload):
+            if payload.get("event") == "call.frame":
+                return False
+            return await original_send_ws_event(payload)
+
+        async def _run() -> None:
+            with (
+                patch.object(node.adapter, "generate_reply", return_value="Fallback after frame failure"),
+                patch.object(node, "_send_ws_event", side_effect=_send_ws_event) as send_mock,
+                patch.object(node, "complete") as complete_mock,
+            ):
+                task = asyncio.create_task(node.process_task(task_data))
+                await asyncio.sleep(0)
+                await node.handle_ws_event({"event": "call.accepted", "context_id": "ctx-bridge-frame-fail"})
+                await task
+
+                self.assertEqual(json.loads(node._ws.sent[0])["event"], "call.invite")
+                self.assertEqual(send_mock.await_count, 2)
+                complete_mock.assert_called_once_with("task_bridge_frame_fail", "Fallback after frame failure")
+
+        asyncio.run(_run())
+
+    def test_process_task_live_bridge_falls_back_to_task_result_when_call_is_declined(self):
+        node = _runtime_node()
+        node.live_call_enabled = True
+        node.dm_to_call_bridge_enabled = True
+        node._ws = _FakeWebSocket([])
+        node.call_invite_timeout_ms = 100
+
+        task_data = {
+            "id": "task_bridge_declined",
+            "bounty": 0.0,
+            "payload": json.dumps(
+                {
+                    "spec_version": "mep.interbot.v1",
+                    "message_id": "msg-bridge-declined",
+                    "trace_id": "trace-bridge-declined",
+                    "source": {"node_id": "node_peer"},
+                    "target": {"node_id": node.node_id},
+                    "conversation": {"context_id": "ctx-bridge-declined"},
+                    "intent": {"type": "chat.request", "priority": "normal"},
+                    "task": {"instructions": "Reply over live call if possible."},
+                    "economics": {"bounty_seconds": 0.0, "currency": "SECONDS"},
+                    "delivery": {"reply_mode": "new_dm", "settlement_mode": "task_result"},
+                }
+            ),
+        }
+
+        async def _run() -> None:
+            with (
+                patch.object(node.adapter, "generate_reply", return_value="Fallback reply"),
+                patch.object(node, "complete") as complete_mock,
+            ):
+                task = asyncio.create_task(node.process_task(task_data))
+                await asyncio.sleep(0)
+                await node.handle_ws_event(
+                    {"event": "call.declined", "context_id": "ctx-bridge-declined", "reason": "busy"}
+                )
+                await task
+
+                events = [json.loads(payload)["event"] for payload in node._ws.sent]
+                self.assertEqual(events, ["call.invite"])
+                complete_mock.assert_called_once_with("task_bridge_declined", "Fallback reply")
+
+        asyncio.run(_run())
+
+    def test_process_task_live_bridge_decline_falls_back_to_bounded_structured_dm_reply(self):
+        node = _runtime_node()
+        node.live_call_enabled = True
+        node.dm_to_call_bridge_enabled = True
+        node._ws = _FakeWebSocket([])
+        node.call_invite_timeout_ms = 100
+
+        task_data = {
+            "id": "task_bridge_structured",
+            "bounty": 0.0,
+            "payload": json.dumps(
+                {
+                    "spec_version": "mep.interbot.v1",
+                    "message_id": "msg-bridge-structured",
+                    "trace_id": "trace-bridge-structured",
+                    "source": {"node_id": "node_peer"},
+                    "target": {"node_id": node.node_id},
+                    "conversation": {"context_id": "ctx-bridge-structured", "turn_type": "review_request", "turn_index": 1},
+                    "intent": {"type": "review.request", "priority": "high"},
+                    "task": {
+                        "instructions": "Reply over live call if possible, otherwise stay in the bounded DM thread.",
+                        "inputs": {"session_safety": {"max_turns": 4, "checkpoint_interval": 3}},
+                    },
+                    "economics": {"bounty_seconds": 0.0, "currency": "SECONDS"},
+                    "delivery": {"reply_mode": "new_dm", "settlement_mode": "task_result"},
+                }
+            ),
+        }
+
+        async def _run() -> None:
+            with (
+                patch.object(node.adapter, "generate_reply", return_value="Structured fallback reply"),
+                patch.object(
+                    node,
+                    "_submit_structured_interbot_message",
+                    return_value=(True, {"task_id": "task_reply_out"}, ""),
+                ) as submit_mock,
+                patch.object(node, "complete") as complete_mock,
+            ):
+                task = asyncio.create_task(node.process_task(task_data))
+                await asyncio.sleep(0)
+                await node.handle_ws_event(
+                    {"event": "call.declined", "context_id": "ctx-bridge-structured", "reason": "busy"}
+                )
+                await task
+
+                envelope = submit_mock.call_args.args[0]
+                self.assertEqual(envelope["target"]["node_id"], "node_peer")
+                self.assertEqual(envelope["task"]["instructions"], "Structured fallback reply")
+                self.assertEqual(envelope["conversation"]["context_id"], "ctx-bridge-structured")
+                self.assertEqual(envelope["conversation"]["reply_to_task_id"], "task_bridge_structured")
+                self.assertEqual(envelope["conversation"]["turn_type"], "review_response")
+                self.assertEqual(envelope["conversation"]["turn_index"], 2)
+                complete_mock.assert_called_once()
+                settled_payload = complete_mock.call_args.args[1]
+                self.assertIn("DM_REPLY_SENT", settled_payload)
+                self.assertIn("reply_task=task_reply_out", settled_payload)
+
+        asyncio.run(_run())
+
+    def test_process_task_stops_bounded_structured_dm_reply_when_session_limit_is_exceeded(self):
+        node = _runtime_node()
+        task_data = {
+            "id": "task_stop_structured",
+            "bounty": 0.0,
+            "payload": json.dumps(
+                {
+                    "spec_version": "mep.interbot.v1",
+                    "message_id": "msg-stop-structured",
+                    "trace_id": "trace-stop-structured",
+                    "source": {"node_id": "node_peer"},
+                    "target": {"node_id": node.node_id},
+                    "conversation": {"context_id": "ctx-stop-structured", "turn_type": "chat_turn", "turn_index": 1},
+                    "intent": {"type": "chat.request", "priority": "normal"},
+                    "task": {
+                        "instructions": "This thread is already at its max turn budget.",
+                        "inputs": {"session_safety": {"max_turns": 1}},
+                    },
+                    "economics": {"bounty_seconds": 0.0, "currency": "SECONDS"},
+                    "delivery": {"reply_mode": "new_dm", "settlement_mode": "task_result"},
+                }
+            ),
+        }
+
+        with (
+            patch.object(node.adapter, "generate_reply", return_value="Should not be sent"),
+            patch.object(node, "_submit_structured_interbot_message") as submit_mock,
+            patch.object(node, "complete") as complete_mock,
+        ):
+            asyncio.run(node.process_task(task_data))
+
+        submit_mock.assert_not_called()
+        complete_mock.assert_called_once()
+        settled_payload = complete_mock.call_args.args[1]
+        self.assertIn("DM_REPLY_STOPPED", settled_payload)
+        self.assertIn("reason=max_turns_exceeded", settled_payload)
+
+    def test_runtime_auto_accepts_incoming_live_call_when_enabled(self):
+        node = _runtime_node()
+        node.live_call_enabled = True
+        node.call_auto_accept = True
+        node._ws = _FakeWebSocket([])
+
+        asyncio.run(node.handle_ws_event({"event": "call.incoming", "context_id": "ctx-auto", "caller": "node_peer"}))
+
+        self.assertEqual([json.loads(payload)["event"] for payload in node._ws.sent], ["call.accept"])
 
 
 class TestRuntimeKeyDirResolution(unittest.TestCase):
