@@ -16,6 +16,10 @@ DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")
 GLM_API_KEY = os.getenv("GLM_API_KEY")
 MINIMAX_API_KEY = os.getenv("MINIMAX_API_KEY")
 
+
+def _allow_code_execution() -> bool:
+    return os.getenv("SE_ALLOW_CODE_EXECUTION", "false").lower() in ("1", "true", "yes")
+
 class MultiBrain:
     def __init__(self):
         self.history = [] # Stores {"role": "user/model", "content": "..."} (Normalized)
@@ -96,6 +100,8 @@ class SentinelEngineer:
         self.brain = MultiBrain()
 
     def execute_code(self, code, language="python"):
+        if not _allow_code_execution():
+            return "", "Code execution disabled by default. Set SE_ALLOW_CODE_EXECUTION=true only in a sandboxed environment.", 126
         filename = "temp_script.py" if language == "python" else "temp_script.sh"
         with open(filename, "w") as f:
             f.write(code)
