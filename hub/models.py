@@ -21,6 +21,8 @@ class TaskCreate(BaseModel):
     bounty_ns: Optional[Any] = None
     target_node: Optional[str] = None
     routing: Optional[Dict[str, Any]] = None
+    verifier: Optional[Dict[str, Any]] = None
+    verifier_type: Optional[str] = None
     model_requirement: Optional[str] = None
     expires_in_seconds: Optional[int] = Field(default=None, ge=1)
     secret_data: Optional[str] = None
@@ -43,6 +45,9 @@ class TaskResult(BaseModel):
     error: Optional[Dict[str, Any]] = None
 
 class TaskCancel(BaseModel):
+    task_id: str
+
+class TaskVerificationAccept(BaseModel):
     task_id: str
 
 class NodeBalance(BaseModel):

@@ -94,6 +94,20 @@ def _ensure_tasks_envelope_json_column(cursor):
         if "envelope_json" not in columns:
             cursor.execute("ALTER TABLE tasks ADD COLUMN envelope_json TEXT")
 
+
+def _ensure_tasks_verifier_type_column(cursor):
+    if _is_postgres():
+        cursor.execute(
+            "SELECT column_name FROM information_schema.columns WHERE table_name = 'tasks' AND column_name = 'verifier_type'"
+        )
+        if not cursor.fetchone():
+            cursor.execute("ALTER TABLE tasks ADD COLUMN verifier_type TEXT")
+    else:
+        cursor.execute("PRAGMA table_info(tasks)")
+        columns = [row[1] for row in cursor.fetchall()]
+        if "verifier_type" not in columns:
+            cursor.execute("ALTER TABLE tasks ADD COLUMN verifier_type TEXT")
+
 def init_db():
     conn = _get_conn()
     cursor = conn.cursor()
@@ -118,12 +132,14 @@ def init_db():
             result_payload TEXT,
             payload_uri TEXT,
             result_uri TEXT,
+            verifier_type TEXT,
             created_at REAL NOT NULL,
             updated_at REAL NOT NULL
         )
     ''')
     _ensure_tasks_expires_in_seconds_column(cursor)
     _ensure_tasks_envelope_json_column(cursor)
+    _ensure_tasks_verifier_type_column(cursor)
     if not _is_postgres():
         try:
             cursor.execute("ALTER TABLE tasks ADD COLUMN payload_uri TEXT")
@@ -326,18 +342,19 @@ def create_task(
     result_payload: Optional[str] = None,
     payload_uri: Optional[str] = None,
     expires_in_seconds: Optional[int] = None,
+    verifier_type: Optional[str] = None,
 ):
     conn = _get_conn()
     cursor = conn.cursor()
     if _is_postgres():
         cursor.execute(
-            "INSERT INTO tasks (task_id, consumer_id, provider_id, payload, bounty, status, target_node, model_requirement, expires_in_seconds, result_payload, payload_uri, created_at, updated_at) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
-            (task_id, consumer_id, None, payload, bounty, status, target_node, model_requirement, expires_in_seconds, result_payload, payload_uri, created_at, created_at)
+            "INSERT INTO tasks (task_id, consumer_id, provider_id, payload, bounty, status, target_node, model_requirement, expires_in_seconds, result_payload, payload_uri, verifier_type, created_at, updated_at) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
+            (task_id, consumer_id, None, payload, bounty, status, target_node, model_requirement, expires_in_seconds, result_payload, payload_uri, verifier_type, created_at, created_at)
         )
     else:
         cursor.execute(
-            "INSERT INTO tasks (task_id, consumer_id, provider_id, payload, bounty, status, target_node, model_requirement, expires_in_seconds, result_payload, payload_uri, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (task_id, consumer_id, None, payload, bounty, status, target_node, model_requirement, expires_in_seconds, result_payload, payload_uri, created_at, created_at)
+            "INSERT INTO tasks (task_id, consumer_id, provider_id, payload, bounty, status, target_node, model_requirement, expires_in_seconds, result_payload, payload_uri, verifier_type, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (task_id, consumer_id, None, payload, bounty, status, target_node, model_requirement, expires_in_seconds, result_payload, payload_uri, verifier_type, created_at, created_at)
         )
     conn.commit()
     _release_conn(conn)
@@ -391,6 +408,120 @@ def update_task_result(task_id: str, provider_id: str, result_payload: str, stat
         )
     conn.commit()
     _release_conn(conn)
+
+def submit_task_result_for_verification(
+    task_id: str,
+    provider_id: str,
+    result_payload: str,
+    updated_at: float,
+    result_uri: Optional[str] = None,
+    idem_node_id: Optional[str] = None,
+    idem_endpoint: Optional[str] = None,
+    idem_key: Optional[str] = None,
+    expected_status: str = "assigned",
+) -> dict:
+    """Store a provider result without releasing escrow until the verifier accepts."""
+    conn = _get_conn()
+    cursor = conn.cursor()
+    try:
+        if not _is_postgres():
+            cursor.execute("BEGIN IMMEDIATE")
+
+        if idem_node_id and idem_endpoint and idem_key:
+            if _is_postgres():
+                cursor.execute(
+                    "SELECT response, status_code FROM idempotency WHERE node_id = %s AND endpoint = %s AND idem_key = %s",
+                    (idem_node_id, idem_endpoint, idem_key),
+                )
+            else:
+                cursor.execute(
+                    "SELECT response, status_code FROM idempotency WHERE node_id = ? AND endpoint = ? AND idem_key = ?",
+                    (idem_node_id, idem_endpoint, idem_key),
+                )
+            existing = cursor.fetchone()
+            if existing:
+                conn.rollback()
+                return {
+                    "status": "idempotent",
+                    "response": json.loads(existing[0]),
+                    "status_code": existing[1],
+                }
+
+        if _is_postgres():
+            cursor.execute(
+                "SELECT provider_id, status, verifier_type FROM tasks WHERE task_id = %s FOR UPDATE",
+                (task_id,),
+            )
+        else:
+            cursor.execute(
+                "SELECT provider_id, status, verifier_type FROM tasks WHERE task_id = ?",
+                (task_id,),
+            )
+        row = cursor.fetchone()
+        if not row:
+            conn.rollback()
+            return {"status": "not_found"}
+        assigned_provider, task_status, verifier_type = row[0], row[1], row[2]
+        if verifier_type != "manual_acceptance":
+            conn.rollback()
+            return {"status": "not_verifier_gated"}
+        if task_status == "submitted_result" and assigned_provider == provider_id:
+            response_payload = {"status": "pending_verification", "task_id": task_id, "verifier_type": verifier_type}
+            if idem_node_id and idem_endpoint and idem_key:
+                payload = json.dumps(response_payload)
+                if _is_postgres():
+                    cursor.execute(
+                        "INSERT INTO idempotency (node_id, endpoint, idem_key, response, status_code, created_at) VALUES (%s, %s, %s, %s, %s, %s) ON CONFLICT (node_id, endpoint, idem_key) DO NOTHING",
+                        (idem_node_id, idem_endpoint, idem_key, payload, 200, updated_at),
+                    )
+                else:
+                    cursor.execute(
+                        "INSERT OR IGNORE INTO idempotency (node_id, endpoint, idem_key, response, status_code, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                        (idem_node_id, idem_endpoint, idem_key, payload, 200, updated_at),
+                    )
+            conn.commit()
+            return {"status": "pending_verification", "response": response_payload}
+        if task_status != expected_status:
+            conn.rollback()
+            return {"status": "not_active", "task_status": task_status}
+        if assigned_provider != provider_id:
+            conn.rollback()
+            return {"status": "assigned_to_other", "assigned_provider": assigned_provider}
+
+        if _is_postgres():
+            cursor.execute(
+                "UPDATE tasks SET result_payload = %s, result_uri = %s, status = %s, updated_at = %s WHERE task_id = %s AND status = %s AND provider_id = %s",
+                (result_payload, result_uri, "submitted_result", updated_at, task_id, "assigned", provider_id),
+            )
+        else:
+            cursor.execute(
+                "UPDATE tasks SET result_payload = ?, result_uri = ?, status = ?, updated_at = ? WHERE task_id = ? AND status = ? AND provider_id = ?",
+                (result_payload, result_uri, "submitted_result", updated_at, task_id, "assigned", provider_id),
+            )
+        if cursor.rowcount == 0:
+            conn.rollback()
+            return {"status": "not_active", "task_status": task_status}
+
+        response_payload = {"status": "pending_verification", "task_id": task_id, "verifier_type": verifier_type}
+        if idem_node_id and idem_endpoint and idem_key:
+            payload = json.dumps(response_payload)
+            if _is_postgres():
+                cursor.execute(
+                    "INSERT INTO idempotency (node_id, endpoint, idem_key, response, status_code, created_at) VALUES (%s, %s, %s, %s, %s, %s) ON CONFLICT (node_id, endpoint, idem_key) DO NOTHING",
+                    (idem_node_id, idem_endpoint, idem_key, payload, 200, updated_at),
+                )
+            else:
+                cursor.execute(
+                    "INSERT OR IGNORE INTO idempotency (node_id, endpoint, idem_key, response, status_code, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                    (idem_node_id, idem_endpoint, idem_key, payload, 200, updated_at),
+                )
+        conn.commit()
+        return {"status": "pending_verification", "response": response_payload}
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        _release_conn(conn)
 
 def update_task_status(task_id: str, status: str, updated_at: float):
     conn = _get_conn()
@@ -851,6 +982,7 @@ def complete_task_atomic(
     idem_node_id: Optional[str] = None,
     idem_endpoint: Optional[str] = None,
     idem_key: Optional[str] = None,
+    expected_status: str = "assigned",
 ) -> dict:
     """Complete a task and settle its bounty in one database transaction."""
     conn = _get_conn()
@@ -884,7 +1016,7 @@ def complete_task_atomic(
                 """
                 SELECT task_id, consumer_id, provider_id, payload, bounty, status,
                        target_node, model_requirement, expires_in_seconds, result_payload,
-                       payload_uri, result_uri, created_at, updated_at
+                       payload_uri, result_uri, verifier_type, created_at, updated_at
                 FROM tasks
                 WHERE task_id = %s
                 FOR UPDATE
@@ -896,7 +1028,7 @@ def complete_task_atomic(
                 """
                 SELECT task_id, consumer_id, provider_id, payload, bounty, status,
                        target_node, model_requirement, expires_in_seconds, result_payload,
-                       payload_uri, result_uri, created_at, updated_at
+                       payload_uri, result_uri, verifier_type, created_at, updated_at
                 FROM tasks
                 WHERE task_id = ?
                 """,
@@ -910,12 +1042,12 @@ def complete_task_atomic(
         columns = [
             "task_id", "consumer_id", "provider_id", "payload", "bounty", "status",
             "target_node", "model_requirement", "expires_in_seconds", "result_payload",
-            "payload_uri", "result_uri", "created_at", "updated_at",
+            "payload_uri", "result_uri", "verifier_type", "created_at", "updated_at",
         ]
         task = dict(zip(columns, row))
         task_status = task["status"]
         assigned_provider = task.get("provider_id")
-        if task_status != "assigned":
+        if task_status != expected_status:
             conn.rollback()
             return {"status": "not_active", "task_status": task_status}
         if assigned_provider != provider_id:
@@ -1007,13 +1139,13 @@ def complete_task_atomic(
         if _is_postgres():
             cursor.execute(
                 "UPDATE tasks SET provider_id = %s, result_payload = %s, result_uri = %s, status = %s, updated_at = %s WHERE task_id = %s AND status = %s",
-                (provider_id, result_payload, result_uri, "completed", updated_at, task_id, "assigned"),
+                (provider_id, result_payload, result_uri, "completed", updated_at, task_id, expected_status),
             )
             cursor.execute("SELECT balance FROM ledger WHERE node_id = %s", (provider_id,))
         else:
             cursor.execute(
                 "UPDATE tasks SET provider_id = ?, result_payload = ?, result_uri = ?, status = ?, updated_at = ? WHERE task_id = ? AND status = ?",
-                (provider_id, result_payload, result_uri, "completed", updated_at, task_id, "assigned"),
+                (provider_id, result_payload, result_uri, "completed", updated_at, task_id, expected_status),
             )
             cursor.execute("SELECT balance FROM ledger WHERE node_id = ?", (provider_id,))
         provider_balance_row = cursor.fetchone()
