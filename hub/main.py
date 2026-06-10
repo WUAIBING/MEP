@@ -26,6 +26,7 @@ from models import (
     TaskResult,
     TaskBid,
     TaskCancel,
+    TaskVerificationAccept,
     RegistryUpdate,
     AvailabilityUpdate,
     RegistryHeartbeat,
@@ -478,6 +479,7 @@ async def _load_active_tasks_from_db():
             "status": task["status"],
             "target_node": task["target_node"],
             "model_requirement": task["model_requirement"],
+            "verifier_type": task.get("verifier_type"),
             "expires_in_seconds": task.get("expires_in_seconds"),
             "provider_id": task["provider_id"],
             "payload_uri": task.get("payload_uri"),
@@ -685,6 +687,22 @@ def _task_target_capability(task: TaskCreate) -> Optional[str]:
     if isinstance(task.model_requirement, str) and task.model_requirement.strip():
         return task.model_requirement.strip()
     return None
+
+
+def _task_verifier_type(task: TaskCreate) -> Optional[str]:
+    verifier_type = task.verifier_type
+    if verifier_type is None and isinstance(task.verifier, dict):
+        verifier_type = task.verifier.get("type")
+    if verifier_type is None and isinstance(task.task, dict) and isinstance(task.task.get("verifier"), dict):
+        verifier_type = task.task["verifier"].get("type")
+    if verifier_type is None:
+        return None
+    normalized = str(verifier_type).strip().lower()
+    if not normalized:
+        return None
+    if normalized not in {"manual_acceptance"}:
+        raise HTTPException(status_code=400, detail="Unsupported verifier_type")
+    return normalized
 
 
 async def _coerce_live_availability(node_id: str, availability: Optional[str]) -> Optional[str]:
@@ -1404,6 +1422,7 @@ async def _sweep_assigned_timeouts():
                 "status": "bidding",
                 "target_node": task["target_node"],
                 "model_requirement": task["model_requirement"],
+                "verifier_type": task.get("verifier_type"),
                 "expires_in_seconds": task.get("expires_in_seconds"),
                 "payload_uri": task.get("payload_uri"),
                 "secret_data": task.get("result_payload")
@@ -2024,6 +2043,7 @@ async def submit_task(
         raise HTTPException(status_code=413, detail="Task payload too large")
     target_node = _task_target_node(task)
     target_capability = _task_target_capability(task)
+    verifier_type = _task_verifier_type(task)
     economics = _task_economics(task)
     bounty = float(economics["bounty_seconds"])
     if task.task or task.economics or task.source or task.routing:
@@ -2084,6 +2104,7 @@ async def submit_task(
         "economics": economics,
         "target_node": target_node,
         "model_requirement": target_capability,
+        "verifier_type": verifier_type,
         "expires_in_seconds": task.expires_in_seconds,
         "payload_uri": normalized_payload_uri,
         "secret_data": task.secret_data
@@ -2100,6 +2121,7 @@ async def submit_task(
         result_payload=task.secret_data,
         payload_uri=normalized_payload_uri,
         expires_in_seconds=task.expires_in_seconds,
+        verifier_type=verifier_type,
     )
     async with task_lock:
         active_tasks[task_id] = task_data
@@ -2302,6 +2324,62 @@ async def place_bid(bid: TaskBid, authenticated_node: str = Depends(verify_reque
         "assignment_score": assignment_profile["assignment_score"]
     }
 
+async def _finalize_settled_task(settled: dict, task_id: str, provider_id: str, result_payload: str, result_uri: Optional[str]):
+    task = settled["task"]
+    bounty = task["bounty"]
+    for event in settled.get("ledger_events", []):
+        node_id = event["node_id"]
+        amount = event["amount"]
+        new_balance = db.get_balance(node_id) or 0.0
+        log_audit(event["kind"], node_id, amount, new_balance, task_id)
+
+    log_event("task_completed", f"Task {task_id[:8]} completed by {provider_id}", task_id=task_id, provider_id=provider_id, bounty=bounty)
+
+    async with task_lock:
+        completed_entry = {
+            "id": task["task_id"],
+            "consumer_id": task["consumer_id"],
+            "payload": task["payload"],
+            "bounty": bounty,
+            "status": "completed",
+            "target_node": task.get("target_node"),
+            "model_requirement": task.get("model_requirement"),
+            "verifier_type": task.get("verifier_type"),
+            "provider_id": provider_id,
+            "payload_uri": task.get("payload_uri"),
+            "result": result_payload,
+            "result_uri": result_uri,
+            "completed_at": task["updated_at"],
+        }
+        completed_tasks[task_id] = completed_entry
+        if task_id in active_tasks:
+            del active_tasks[task_id]
+    await _evict_completed_tasks_cache()
+
+    consumer_id = task["consumer_id"]
+    async with node_lock:
+        consumer_ws = connected_nodes.get(consumer_id)
+    if consumer_ws:
+        try:
+            await consumer_ws.send_json({
+                "event": "task_result",
+                "data": {
+                    "task_id": task_id,
+                    "provider_id": provider_id,
+                    "result_payload": result_payload,
+                    "result_uri": result_uri,
+                    "bounty_spent": bounty
+                }
+            })
+        except Exception as exc:
+            log_event("deliver_result_failed", f"Failed to deliver result {task_id[:8]} to {consumer_id}: {exc}", task_id=task_id, consumer_id=consumer_id)
+            async with node_lock:
+                if connected_nodes.get(consumer_id) is consumer_ws:
+                    del connected_nodes[consumer_id]
+
+    return settled["response"]
+
+
 @app.post("/tasks/complete")
 async def complete_task(
     result: TaskResult,
@@ -2318,6 +2396,35 @@ async def complete_task(
     if len(result_payload) > MAX_PAYLOAD_CHARS:
         raise HTTPException(status_code=413, detail="Result payload too large")
     
+    task = db.get_task(result.task_id)
+    if task and task.get("verifier_type") == "manual_acceptance":
+        submitted = db.submit_task_result_for_verification(
+            result.task_id,
+            result.provider_id,
+            result_payload,
+            time.time(),
+            result_uri=normalized_result_uri,
+            idem_node_id=authenticated_node if x_mep_idempotency_key else None,
+            idem_endpoint="/tasks/complete" if x_mep_idempotency_key else None,
+            idem_key=x_mep_idempotency_key,
+        )
+        if submitted["status"] == "idempotent":
+            return submitted["response"]
+        if submitted["status"] in ("not_found", "not_active"):
+            raise HTTPException(status_code=404, detail="Task not found or already claimed")
+        if submitted["status"] == "assigned_to_other":
+            raise HTTPException(status_code=409, detail="Task assigned to another provider")
+        if submitted["status"] != "pending_verification":
+            raise HTTPException(status_code=409, detail="Task result could not be submitted for verification")
+
+        async with task_lock:
+            if result.task_id in active_tasks:
+                active_tasks[result.task_id]["status"] = "submitted_result"
+                active_tasks[result.task_id]["result"] = result_payload
+                active_tasks[result.task_id]["result_uri"] = normalized_result_uri
+        log_event("task_result_submitted", f"Task {result.task_id[:8]} submitted for verification", task_id=result.task_id, provider_id=result.provider_id)
+        return submitted["response"]
+
     settled = db.complete_task_atomic(
         result.task_id,
         result.provider_id,
@@ -2342,59 +2449,55 @@ async def complete_task(
     if settled["status"] != "success":
         raise HTTPException(status_code=409, detail="Task could not be settled")
 
-    task = settled["task"]
-    bounty = task["bounty"]
-    for event in settled.get("ledger_events", []):
-        node_id = event["node_id"]
-        amount = event["amount"]
-        new_balance = db.get_balance(node_id) or 0.0
-        log_audit(event["kind"], node_id, amount, new_balance, result.task_id)
+    return await _finalize_settled_task(settled, result.task_id, result.provider_id, result_payload, normalized_result_uri)
 
-    log_event("task_completed", f"Task {result.task_id[:8]} completed by {result.provider_id}", task_id=result.task_id, provider_id=result.provider_id, bounty=bounty)
+@app.post("/tasks/verify/accept")
+async def accept_verified_task(
+    verification: TaskVerificationAccept,
+    authenticated_node: str = Depends(verify_request),
+    x_mep_idempotency_key: Optional[str] = Header(default=None)
+):
+    task = db.get_task(verification.task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+    if authenticated_node != task["consumer_id"]:
+        raise HTTPException(status_code=403, detail="Only the consumer can accept a submitted result")
+    if task.get("verifier_type") != "manual_acceptance":
+        raise HTTPException(status_code=400, detail="Task is not verifier-gated")
+    if task["status"] != "submitted_result" and not x_mep_idempotency_key:
+        raise HTTPException(status_code=400, detail="Task is not pending verification")
 
-    async with task_lock:
-        completed_entry = {
-            "id": task["task_id"],
-            "consumer_id": task["consumer_id"],
-            "payload": task["payload"],
-            "bounty": bounty,
-            "status": "completed",
-            "target_node": task.get("target_node"),
-            "model_requirement": task.get("model_requirement"),
-            "provider_id": result.provider_id,
-            "payload_uri": task.get("payload_uri"),
-            "result": result_payload,
-            "result_uri": normalized_result_uri,
-            "completed_at": task["updated_at"],
-        }
-        completed_tasks[result.task_id] = completed_entry
-        if result.task_id in active_tasks:
-            del active_tasks[result.task_id]
-    await _evict_completed_tasks_cache()
+    provider_id = task.get("provider_id")
+    if not provider_id:
+        raise HTTPException(status_code=409, detail="Task has no assigned provider")
+    result_payload = task.get("result_payload") or ""
+    result_uri = task.get("result_uri")
+    if not result_payload and not result_uri:
+        raise HTTPException(status_code=409, detail="Task has no submitted result")
 
-    # ROUTE RESULT BACK TO CONSUMER VIA WEBSOCKET
-    consumer_id = task["consumer_id"]
-    async with node_lock:
-        consumer_ws = connected_nodes.get(consumer_id)
-    if consumer_ws:
-        try:
-            await consumer_ws.send_json({
-                "event": "task_result",
-                "data": {
-                    "task_id": result.task_id,
-                    "provider_id": result.provider_id,
-                    "result_payload": result_payload,
-                    "result_uri": normalized_result_uri,
-                    "bounty_spent": bounty
-                }
-            })
-        except Exception as exc:
-            log_event("deliver_result_failed", f"Failed to deliver result {result.task_id[:8]} to {consumer_id}: {exc}", task_id=result.task_id, consumer_id=consumer_id)
-            async with node_lock:
-                if connected_nodes.get(consumer_id) is consumer_ws:
-                    del connected_nodes[consumer_id]
+    settled = db.complete_task_atomic(
+        verification.task_id,
+        provider_id,
+        result_payload,
+        time.time(),
+        result_uri=result_uri,
+        idem_node_id=authenticated_node if x_mep_idempotency_key else None,
+        idem_endpoint="/tasks/verify/accept" if x_mep_idempotency_key else None,
+        idem_key=x_mep_idempotency_key,
+        expected_status="submitted_result",
+    )
+    if settled["status"] == "idempotent":
+        return settled["response"]
+    if settled["status"] in ("not_found", "not_active"):
+        raise HTTPException(status_code=404, detail="Task not found or not pending verification")
+    if settled["status"] == "assigned_to_other":
+        raise HTTPException(status_code=409, detail="Task assigned to another provider")
+    if settled["status"] == "escrow_not_held":
+        raise HTTPException(status_code=409, detail="Escrow is not held for this task")
+    if settled["status"] != "success":
+        raise HTTPException(status_code=409, detail="Task could not be settled")
+    return await _finalize_settled_task(settled, verification.task_id, provider_id, result_payload, result_uri)
 
-    return settled["response"]
 
 @app.get("/tasks/result/{task_id}")
 async def get_task_result(task_id: str, authenticated_node: str = Depends(verify_request)):

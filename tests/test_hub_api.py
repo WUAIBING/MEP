@@ -201,6 +201,53 @@ class TestTaskLifecycle(unittest.TestCase):
         resp = client.get(f"/balance/{provider_id}")
         self.assertGreater(resp.json()["balance_seconds"], 10.0)  # 10 starting + 1 earned
 
+    def test_manual_verification_gates_settlement_until_consumer_accepts(self):
+        consumer_priv, consumer_pub, consumer_id = _make_identity()
+        provider_priv, provider_pub, provider_id = _make_identity()
+        _register(consumer_pub)
+        _register(provider_pub)
+
+        provider_before = client.get(f"/balance/{provider_id}").json()["balance_seconds"]
+        task_payload = json.dumps({
+            "consumer_id": consumer_id,
+            "payload": "Requires review",
+            "bounty": 1.0,
+            "verifier_type": "manual_acceptance",
+        })
+        headers = _auth_headers(consumer_priv, consumer_id, task_payload)
+        submit = client.post("/tasks/submit", content=task_payload, headers=headers)
+        self.assertEqual(submit.status_code, 200, submit.text)
+        task_id = submit.json()["task_id"]
+
+        bid_payload = json.dumps({"task_id": task_id, "provider_id": provider_id})
+        headers = _auth_headers(provider_priv, provider_id, bid_payload)
+        bid = client.post("/tasks/bid", content=bid_payload, headers=headers)
+        self.assertEqual(bid.status_code, 200, bid.text)
+        self.assertEqual(bid.json()["status"], "accepted")
+
+        complete_payload = json.dumps({"task_id": task_id, "provider_id": provider_id, "result_payload": "review me"})
+        headers = _auth_headers(provider_priv, provider_id, complete_payload)
+        complete = client.post("/tasks/complete", content=complete_payload, headers=headers)
+        self.assertEqual(complete.status_code, 200, complete.text)
+        self.assertEqual(complete.json()["status"], "pending_verification")
+        self.assertEqual(client.get(f"/balance/{provider_id}").json()["balance_seconds"], provider_before)
+        task = db.get_task(task_id)
+        self.assertEqual(task["status"], "submitted_result")
+        self.assertEqual(db.get_escrow(task_id)["status"], "held")
+
+        accept_payload = json.dumps({"task_id": task_id})
+        headers = _auth_headers(provider_priv, provider_id, accept_payload)
+        forbidden = client.post("/tasks/verify/accept", content=accept_payload, headers=headers)
+        self.assertEqual(forbidden.status_code, 403, forbidden.text)
+
+        headers = _auth_headers(consumer_priv, consumer_id, accept_payload)
+        accepted = client.post("/tasks/verify/accept", content=accept_payload, headers=headers)
+        self.assertEqual(accepted.status_code, 200, accepted.text)
+        self.assertEqual(accepted.json()["status"], "success")
+        self.assertEqual(client.get(f"/balance/{provider_id}").json()["balance_seconds"], provider_before + 1.0)
+        self.assertEqual(db.get_task(task_id)["status"], "completed")
+        self.assertEqual(db.get_escrow(task_id)["status"], "released")
+
     def test_duplicate_completion_does_not_double_settle(self):
         consumer_priv, consumer_pub, consumer_id = _make_identity()
         provider_priv, provider_pub, provider_id = _make_identity()
