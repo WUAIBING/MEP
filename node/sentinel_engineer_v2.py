@@ -56,6 +56,7 @@ class Config:
     sandbox_dir: str = os.getenv("SE_SANDBOX_DIR", "")  # empty = auto tmpdir
     circuit_breaker_threshold: int = int(os.getenv("SE_CB_THRESHOLD", "3"))
     circuit_breaker_cooldown: int = int(os.getenv("SE_CB_COOLDOWN", "300"))  # seconds
+    allow_code_execution: bool = os.getenv("SE_ALLOW_CODE_EXECUTION", "false").lower() in ("1", "true", "yes")
 
 CONFIG = Config()
 
@@ -358,6 +359,12 @@ class CodeExecutor:
         self._sandbox_base.mkdir(parents=True, exist_ok=True)
 
     def execute(self, code: str, language: str = "python") -> ExecResult:
+        if not CONFIG.allow_code_execution:
+            return ExecResult(
+                "",
+                "Code execution disabled by default. Set SE_ALLOW_CODE_EXECUTION=true only in a sandboxed environment.",
+                126,
+            )
         if language not in self.ALLOWED_LANGUAGES:
             return ExecResult("", f"Unsupported language: {language}", 1)
 
