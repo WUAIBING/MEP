@@ -4,6 +4,7 @@ No running server or Postgres needed; uses SQLite backend automatically.
 """
 import base64
 from contextlib import contextmanager
+from concurrent.futures import ThreadPoolExecutor
 import json
 import os
 import sys
@@ -200,6 +201,93 @@ class TestTaskLifecycle(unittest.TestCase):
         resp = client.get(f"/balance/{provider_id}")
         self.assertGreater(resp.json()["balance_seconds"], 10.0)  # 10 starting + 1 earned
 
+    def test_duplicate_completion_does_not_double_settle(self):
+        consumer_priv, consumer_pub, consumer_id = _make_identity()
+        provider_priv, provider_pub, provider_id = _make_identity()
+        _register(consumer_pub)
+        _register(provider_pub)
+
+        provider_before = client.get(f"/balance/{provider_id}").json()["balance_seconds"]
+        task_payload = json.dumps({"consumer_id": consumer_id, "payload": "once", "bounty": 1.0})
+        headers = _auth_headers(consumer_priv, consumer_id, task_payload)
+        submit = client.post("/tasks/submit", content=task_payload, headers=headers)
+        self.assertEqual(submit.status_code, 200, submit.text)
+        task_id = submit.json()["task_id"]
+
+        bid_payload = json.dumps({"task_id": task_id, "provider_id": provider_id})
+        headers = _auth_headers(provider_priv, provider_id, bid_payload)
+        self.assertEqual(client.post("/tasks/bid", content=bid_payload, headers=headers).status_code, 200)
+
+        complete_payload = json.dumps({"task_id": task_id, "provider_id": provider_id, "result_payload": "done"})
+        headers = _auth_headers(provider_priv, provider_id, complete_payload)
+        first = client.post("/tasks/complete", content=complete_payload, headers=headers)
+        self.assertEqual(first.status_code, 200, first.text)
+
+        headers = _auth_headers(provider_priv, provider_id, complete_payload)
+        second = client.post("/tasks/complete", content=complete_payload, headers=headers)
+        self.assertEqual(second.status_code, 404, second.text)
+
+        provider_after = client.get(f"/balance/{provider_id}").json()["balance_seconds"]
+        self.assertEqual(provider_after, provider_before + 1.0)
+        escrow = db.get_escrow(task_id)
+        self.assertEqual(escrow["status"], "released")
+
+    def test_completion_idempotency_replays_response_without_double_settlement(self):
+        consumer_priv, consumer_pub, consumer_id = _make_identity()
+        provider_priv, provider_pub, provider_id = _make_identity()
+        _register(consumer_pub)
+        _register(provider_pub)
+
+        provider_before = client.get(f"/balance/{provider_id}").json()["balance_seconds"]
+        task_payload = json.dumps({"consumer_id": consumer_id, "payload": "idem", "bounty": 1.0})
+        headers = _auth_headers(consumer_priv, consumer_id, task_payload)
+        submit = client.post("/tasks/submit", content=task_payload, headers=headers)
+        task_id = submit.json()["task_id"]
+
+        bid_payload = json.dumps({"task_id": task_id, "provider_id": provider_id})
+        headers = _auth_headers(provider_priv, provider_id, bid_payload)
+        self.assertEqual(client.post("/tasks/bid", content=bid_payload, headers=headers).status_code, 200)
+
+        complete_payload = json.dumps({"task_id": task_id, "provider_id": provider_id, "result_payload": "done"})
+        headers = _auth_headers(provider_priv, provider_id, complete_payload)
+        headers["X-MEP-Idempotency-Key"] = "complete-once"
+        first = client.post("/tasks/complete", content=complete_payload, headers=headers)
+        self.assertEqual(first.status_code, 200, first.text)
+
+        headers = _auth_headers(provider_priv, provider_id, complete_payload)
+        headers["X-MEP-Idempotency-Key"] = "complete-once"
+        second = client.post("/tasks/complete", content=complete_payload, headers=headers)
+        self.assertEqual(second.status_code, 200, second.text)
+        self.assertEqual(second.json(), first.json())
+
+        provider_after = client.get(f"/balance/{provider_id}").json()["balance_seconds"]
+        self.assertEqual(provider_after, provider_before + 1.0)
+
+    def test_atomic_completion_allows_only_one_concurrent_settlement(self):
+        consumer_priv, consumer_pub, consumer_id = _make_identity()
+        _, provider_pub, provider_id = _make_identity()
+        _register(consumer_pub)
+        _register(provider_pub)
+
+        provider_before = client.get(f"/balance/{provider_id}").json()["balance_seconds"]
+        task_payload = json.dumps({"consumer_id": consumer_id, "payload": "race", "bounty": 1.0})
+        headers = _auth_headers(consumer_priv, consumer_id, task_payload)
+        submit = client.post("/tasks/submit", content=task_payload, headers=headers)
+        task_id = submit.json()["task_id"]
+        self.assertTrue(db.assign_task_if_open(task_id, provider_id, time.time()))
+
+        def settle_once():
+            return db.complete_task_atomic(task_id, provider_id, "done", time.time())
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            results = list(pool.map(lambda _: settle_once(), range(2)))
+
+        statuses = [item["status"] for item in results]
+        self.assertEqual(statuses.count("success"), 1, statuses)
+        self.assertEqual(statuses.count("not_active"), 1, statuses)
+        provider_after = client.get(f"/balance/{provider_id}").json()["balance_seconds"]
+        self.assertEqual(provider_after, provider_before + 1.0)
+
     def test_insufficient_balance_rejected(self):
         consumer_priv, consumer_pub, consumer_id = _make_identity()
         _register(consumer_pub)
@@ -375,6 +463,11 @@ class TestThreeMarketSpecConformance(unittest.TestCase):
 
         bid_data = self._bid(buyer_priv, buyer_id, task_id)
         self.assertEqual(bid_data["secret_data"], "encrypted-premium-data")
+        self.assertEqual(client.get(f"/balance/{buyer_id}").json()["balance_seconds"], buyer_before - 0.5)
+        escrow = db.get_escrow(task_id)
+        self.assertEqual(escrow["status"], "held")
+        self.assertEqual(escrow["consumer_id"], buyer_id)
+
         result = self._complete(buyer_priv, buyer_id, task_id, "data received")
         self.assertEqual(result["earned"], -0.5)
         self.assertEqual(client.get(f"/balance/{seller_id}").json()["balance_seconds"], seller_before + 0.5)
@@ -1174,6 +1267,56 @@ class TestBiddingTimeout(unittest.TestCase):
         resp = client.get(f"/balance/{consumer_id}")
         self.assertEqual(resp.json()["balance_seconds"], initial_balance,
                         "Consumer balance should be restored after refund")
+
+    def test_assigned_data_market_timeout_refunds_buyer_escrow(self):
+        seller_priv, seller_pub, seller_id = _make_identity()
+        buyer_priv, buyer_pub, buyer_id = _make_identity()
+        _register(seller_pub)
+        _register(buyer_pub)
+
+        seller_before = client.get(f"/balance/{seller_id}").json()["balance_seconds"]
+        buyer_before = client.get(f"/balance/{buyer_id}").json()["balance_seconds"]
+        task_payload = json.dumps(
+            {
+                "consumer_id": seller_id,
+                "payload": "Premium dataset",
+                "bounty": -0.5,
+                "secret_data": "encrypted-premium-data",
+            }
+        )
+        headers = _auth_headers(seller_priv, seller_id, task_payload)
+        resp = client.post("/tasks/submit", content=task_payload, headers=headers)
+        self.assertEqual(resp.status_code, 200, f"Submit failed: {resp.text}")
+        task_id = resp.json()["task_id"]
+
+        bid_payload = json.dumps({"task_id": task_id, "provider_id": buyer_id})
+        headers = _auth_headers(buyer_priv, buyer_id, bid_payload)
+        resp = client.post("/tasks/bid", content=bid_payload, headers=headers)
+        self.assertEqual(resp.status_code, 200, f"Bid failed: {resp.text}")
+        self.assertEqual(resp.json()["status"], "accepted")
+        self.assertEqual(client.get(f"/balance/{buyer_id}").json()["balance_seconds"], buyer_before - 0.5)
+
+        old_time = time.time() - 7200
+        conn = db._get_conn()
+        conn.execute(
+            "UPDATE tasks SET updated_at = ? WHERE task_id = ?",
+            (old_time, task_id)
+        )
+        conn.commit()
+        db._release_conn(conn)
+
+        import asyncio
+        from main import _sweep_assigned_timeouts
+        loop = asyncio.new_event_loop()
+        try:
+            loop.run_until_complete(_sweep_assigned_timeouts())
+        finally:
+            loop.close()
+
+        task = db.get_task(task_id)
+        self.assertEqual(task["status"], "expired")
+        self.assertEqual(client.get(f"/balance/{buyer_id}").json()["balance_seconds"], buyer_before)
+        self.assertEqual(client.get(f"/balance/{seller_id}").json()["balance_seconds"], seller_before)
 
 
 class TestConsumerDefinedTimeout(unittest.TestCase):
