@@ -426,6 +426,89 @@ def assign_task_if_open(task_id: str, provider_id: str, updated_at: float) -> bo
     _release_conn(conn)
     return updated > 0
 
+def assign_data_task_with_escrow_if_open(task_id: str, provider_id: str, cost: float, updated_at: float) -> dict:
+    """Atomically assign a data-market task and escrow the buyer's SECONDS.
+
+    Data-market payloads are revealed to the provider in the bid response, so the
+    buyer must be charged/escrowed before the route returns secret_data.
+    """
+    conn = _get_conn()
+    cursor = conn.cursor()
+    try:
+        if not _is_postgres():
+            cursor.execute("BEGIN IMMEDIATE")
+        if _is_postgres():
+            cursor.execute(
+                "SELECT status, provider_id, bounty FROM tasks WHERE task_id = %s FOR UPDATE",
+                (task_id,),
+            )
+        else:
+            cursor.execute(
+                "SELECT status, provider_id, bounty FROM tasks WHERE task_id = ?",
+                (task_id,),
+            )
+        row = cursor.fetchone()
+        if not row:
+            conn.rollback()
+            return {"status": "not_found"}
+        status, assigned_provider, bounty = row[0], row[1], float(row[2])
+        if status != "bidding" or assigned_provider is not None:
+            conn.rollback()
+            return {"status": "already_assigned"}
+        if bounty >= 0:
+            conn.rollback()
+            return {"status": "not_data_market"}
+
+        if _is_postgres():
+            cursor.execute(
+                "UPDATE ledger SET balance = balance - %s WHERE node_id = %s AND balance >= %s",
+                (cost, provider_id, cost),
+            )
+        else:
+            cursor.execute(
+                "UPDATE ledger SET balance = balance - ? WHERE node_id = ? AND balance >= ?",
+                (cost, provider_id, cost),
+            )
+        if cursor.rowcount == 0:
+            conn.rollback()
+            return {"status": "insufficient_balance"}
+
+        if _is_postgres():
+            cursor.execute(
+                """
+                INSERT INTO escrows (task_id, consumer_id, provider_id, amount, status, created_at, updated_at)
+                VALUES (%s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (task_id) DO NOTHING
+                """,
+                (task_id, provider_id, None, cost, "held", updated_at, updated_at),
+            )
+            cursor.execute(
+                "UPDATE tasks SET provider_id = %s, status = 'assigned', updated_at = %s WHERE task_id = %s AND status = 'bidding' AND provider_id IS NULL",
+                (provider_id, updated_at, task_id),
+            )
+        else:
+            cursor.execute(
+                """
+                INSERT OR IGNORE INTO escrows (task_id, consumer_id, provider_id, amount, status, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (task_id, provider_id, None, cost, "held", updated_at, updated_at),
+            )
+            cursor.execute(
+                "UPDATE tasks SET provider_id = ?, status = 'assigned', updated_at = ? WHERE task_id = ? AND status = 'bidding' AND provider_id IS NULL",
+                (provider_id, updated_at, task_id),
+            )
+        if cursor.rowcount == 0:
+            conn.rollback()
+            return {"status": "already_assigned"}
+        conn.commit()
+        return {"status": "accepted"}
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        _release_conn(conn)
+
 def cancel_task_if_open(task_id: str, updated_at: float) -> bool:
     conn = _get_conn()
     cursor = conn.cursor()
@@ -758,6 +841,216 @@ def set_idempotency(node_id: str, endpoint: str, idem_key: str, response: dict, 
         )
     conn.commit()
     _release_conn(conn)
+
+def complete_task_atomic(
+    task_id: str,
+    provider_id: str,
+    result_payload: str,
+    updated_at: float,
+    result_uri: Optional[str] = None,
+    idem_node_id: Optional[str] = None,
+    idem_endpoint: Optional[str] = None,
+    idem_key: Optional[str] = None,
+) -> dict:
+    """Complete a task and settle its bounty in one database transaction."""
+    conn = _get_conn()
+    cursor = conn.cursor()
+    try:
+        if not _is_postgres():
+            cursor.execute("BEGIN IMMEDIATE")
+
+        if idem_node_id and idem_endpoint and idem_key:
+            if _is_postgres():
+                cursor.execute(
+                    "SELECT response, status_code FROM idempotency WHERE node_id = %s AND endpoint = %s AND idem_key = %s",
+                    (idem_node_id, idem_endpoint, idem_key),
+                )
+            else:
+                cursor.execute(
+                    "SELECT response, status_code FROM idempotency WHERE node_id = ? AND endpoint = ? AND idem_key = ?",
+                    (idem_node_id, idem_endpoint, idem_key),
+                )
+            existing = cursor.fetchone()
+            if existing:
+                conn.rollback()
+                return {
+                    "status": "idempotent",
+                    "response": json.loads(existing[0]),
+                    "status_code": existing[1],
+                }
+
+        if _is_postgres():
+            cursor.execute(
+                """
+                SELECT task_id, consumer_id, provider_id, payload, bounty, status,
+                       target_node, model_requirement, expires_in_seconds, result_payload,
+                       payload_uri, result_uri, created_at, updated_at
+                FROM tasks
+                WHERE task_id = %s
+                FOR UPDATE
+                """,
+                (task_id,),
+            )
+        else:
+            cursor.execute(
+                """
+                SELECT task_id, consumer_id, provider_id, payload, bounty, status,
+                       target_node, model_requirement, expires_in_seconds, result_payload,
+                       payload_uri, result_uri, created_at, updated_at
+                FROM tasks
+                WHERE task_id = ?
+                """,
+                (task_id,),
+            )
+        row = cursor.fetchone()
+        if not row:
+            conn.rollback()
+            return {"status": "not_found"}
+
+        columns = [
+            "task_id", "consumer_id", "provider_id", "payload", "bounty", "status",
+            "target_node", "model_requirement", "expires_in_seconds", "result_payload",
+            "payload_uri", "result_uri", "created_at", "updated_at",
+        ]
+        task = dict(zip(columns, row))
+        task_status = task["status"]
+        assigned_provider = task.get("provider_id")
+        if task_status != "assigned":
+            conn.rollback()
+            return {"status": "not_active", "task_status": task_status}
+        if assigned_provider != provider_id:
+            conn.rollback()
+            return {"status": "assigned_to_other", "assigned_provider": assigned_provider}
+
+        bounty = float(task["bounty"])
+        ledger_events: list[dict] = []
+
+        if bounty > 0:
+            if _is_postgres():
+                cursor.execute(
+                    "SELECT amount, status FROM escrows WHERE task_id = %s FOR UPDATE",
+                    (task_id,),
+                )
+            else:
+                cursor.execute(
+                    "SELECT amount, status FROM escrows WHERE task_id = ?",
+                    (task_id,),
+                )
+            escrow = cursor.fetchone()
+            if not escrow or escrow[1] != "held":
+                conn.rollback()
+                return {"status": "escrow_not_held"}
+            amount = float(escrow[0])
+            if _is_postgres():
+                cursor.execute(
+                    "UPDATE escrows SET provider_id = %s, status = %s, updated_at = %s WHERE task_id = %s AND status = %s",
+                    (provider_id, "released", updated_at, task_id, "held"),
+                )
+                cursor.execute("UPDATE ledger SET balance = balance + %s WHERE node_id = %s", (amount, provider_id))
+            else:
+                cursor.execute(
+                    "UPDATE escrows SET provider_id = ?, status = ?, updated_at = ? WHERE task_id = ? AND status = ?",
+                    (provider_id, "released", updated_at, task_id, "held"),
+                )
+                cursor.execute("UPDATE ledger SET balance = balance + ? WHERE node_id = ?", (amount, provider_id))
+            ledger_events.append({"kind": "ESCROW_RELEASE", "node_id": provider_id, "amount": amount})
+        elif bounty < 0:
+            cost = abs(bounty)
+            if _is_postgres():
+                cursor.execute(
+                    "SELECT consumer_id, amount, status FROM escrows WHERE task_id = %s FOR UPDATE",
+                    (task_id,),
+                )
+            else:
+                cursor.execute(
+                    "SELECT consumer_id, amount, status FROM escrows WHERE task_id = ?",
+                    (task_id,),
+                )
+            escrow = cursor.fetchone()
+            if escrow and escrow[2] == "held":
+                amount = float(escrow[1])
+                if _is_postgres():
+                    cursor.execute(
+                        "UPDATE escrows SET provider_id = %s, status = %s, updated_at = %s WHERE task_id = %s AND status = %s",
+                        (provider_id, "released", updated_at, task_id, "held"),
+                    )
+                    cursor.execute("UPDATE ledger SET balance = balance + %s WHERE node_id = %s", (amount, task["consumer_id"]))
+                else:
+                    cursor.execute(
+                        "UPDATE escrows SET provider_id = ?, status = ?, updated_at = ? WHERE task_id = ? AND status = ?",
+                        (provider_id, "released", updated_at, task_id, "held"),
+                    )
+                    cursor.execute("UPDATE ledger SET balance = balance + ? WHERE node_id = ?", (amount, task["consumer_id"]))
+                ledger_events.append({"kind": "SELL_DATA", "node_id": task["consumer_id"], "amount": amount})
+            else:
+                # Compatibility path for data tasks assigned before bid-time escrow existed.
+                if _is_postgres():
+                    cursor.execute(
+                        "UPDATE ledger SET balance = balance - %s WHERE node_id = %s AND balance >= %s",
+                        (cost, provider_id, cost),
+                    )
+                else:
+                    cursor.execute(
+                        "UPDATE ledger SET balance = balance - ? WHERE node_id = ? AND balance >= ?",
+                        (cost, provider_id, cost),
+                    )
+                if cursor.rowcount == 0:
+                    conn.rollback()
+                    return {"status": "insufficient_balance"}
+                if _is_postgres():
+                    cursor.execute("UPDATE ledger SET balance = balance + %s WHERE node_id = %s", (cost, task["consumer_id"]))
+                else:
+                    cursor.execute("UPDATE ledger SET balance = balance + ? WHERE node_id = ?", (cost, task["consumer_id"]))
+                ledger_events.append({"kind": "BUY_DATA", "node_id": provider_id, "amount": -cost})
+                ledger_events.append({"kind": "SELL_DATA", "node_id": task["consumer_id"], "amount": cost})
+
+        if _is_postgres():
+            cursor.execute(
+                "UPDATE tasks SET provider_id = %s, result_payload = %s, result_uri = %s, status = %s, updated_at = %s WHERE task_id = %s AND status = %s",
+                (provider_id, result_payload, result_uri, "completed", updated_at, task_id, "assigned"),
+            )
+            cursor.execute("SELECT balance FROM ledger WHERE node_id = %s", (provider_id,))
+        else:
+            cursor.execute(
+                "UPDATE tasks SET provider_id = ?, result_payload = ?, result_uri = ?, status = ?, updated_at = ? WHERE task_id = ? AND status = ?",
+                (provider_id, result_payload, result_uri, "completed", updated_at, task_id, "assigned"),
+            )
+            cursor.execute("SELECT balance FROM ledger WHERE node_id = ?", (provider_id,))
+        provider_balance_row = cursor.fetchone()
+        provider_balance = float(provider_balance_row[0]) if provider_balance_row else 0.0
+
+        task["status"] = "completed"
+        task["provider_id"] = provider_id
+        task["result_payload"] = result_payload
+        task["result_uri"] = result_uri
+        task["updated_at"] = updated_at
+
+        response_payload = {"status": "success", "earned": bounty, "new_balance": provider_balance}
+        if idem_node_id and idem_endpoint and idem_key:
+            payload = json.dumps(response_payload)
+            if _is_postgres():
+                cursor.execute(
+                    "INSERT INTO idempotency (node_id, endpoint, idem_key, response, status_code, created_at) VALUES (%s, %s, %s, %s, %s, %s) ON CONFLICT (node_id, endpoint, idem_key) DO NOTHING",
+                    (idem_node_id, idem_endpoint, idem_key, payload, 200, updated_at),
+                )
+            else:
+                cursor.execute(
+                    "INSERT OR IGNORE INTO idempotency (node_id, endpoint, idem_key, response, status_code, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                    (idem_node_id, idem_endpoint, idem_key, payload, 200, updated_at),
+                )
+
+        conn.commit()
+        return {
+            "status": "success",
+            "response": response_payload,
+            "task": task,
+            "ledger_events": ledger_events,
+        }
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        _release_conn(conn)
 
 def delete_idempotency_before(cutoff_ts: float) -> int:
     conn = _get_conn()

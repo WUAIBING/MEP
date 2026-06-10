@@ -1388,6 +1388,12 @@ async def _sweep_assigned_timeouts():
         return
     for task in expired_tasks:
         if TIMEOUT_POLICY == "rebroadcast" and not task["target_node"]:
+            if task["bounty"] < 0:
+                refunded = db.refund_escrow(task["task_id"], now)
+                if refunded is not None:
+                    buyer_id = task.get("provider_id") or ""
+                    new_balance = db.get_balance(buyer_id) or 0.0
+                    log_audit("DATA_TIMEOUT_REFUND", buyer_id, refunded, new_balance, task["task_id"])
             if not db.requeue_task_if_assigned(task["task_id"], now):
                 continue
             task_data = {
@@ -1433,6 +1439,12 @@ async def _sweep_assigned_timeouts():
                 db.add_balance(task["consumer_id"], task["bounty"])
             new_balance = db.get_balance(task["consumer_id"])
             log_audit("TIMEOUT_REFUND", task["consumer_id"], task["bounty"], new_balance, task["task_id"])
+        elif task["bounty"] < 0:
+            refunded = db.refund_escrow(task["task_id"], now)
+            if refunded is not None:
+                buyer_id = task.get("provider_id") or ""
+                new_balance = db.get_balance(buyer_id) or 0.0
+                log_audit("DATA_TIMEOUT_REFUND", buyer_id, refunded, new_balance, task["task_id"])
         async with task_lock:
             if task["task_id"] in active_tasks:
                 del active_tasks[task["task_id"]]
@@ -2258,7 +2270,18 @@ async def place_bid(bid: TaskBid, authenticated_node: str = Depends(verify_reque
         if assignment_profile["risk_reasons"]:
             risk_reasons = ", ".join(assignment_profile["risk_reasons"])
             return {"status": "rejected", "detail": f"Provider rejected by risk control: {risk_reasons}"}
-        if not db.assign_task_if_open(bid.task_id, bid.provider_id, time.time()):
+        bounty = task["bounty"]
+        now = time.time()
+        if bounty < 0:
+            cost = abs(float(bounty))
+            assignment = db.assign_data_task_with_escrow_if_open(bid.task_id, bid.provider_id, cost, now)
+            if assignment["status"] == "insufficient_balance":
+                return {"status": "rejected", "detail": "Provider lacks SECONDS to buy this data"}
+            if assignment["status"] != "accepted":
+                return {"status": "rejected", "detail": "Task already assigned to another node"}
+            new_balance = db.get_balance(bid.provider_id) or 0.0
+            log_audit("BUY_DATA_ESCROW", bid.provider_id, -cost, new_balance, bid.task_id)
+        elif not db.assign_task_if_open(bid.task_id, bid.provider_id, now):
             return {"status": "rejected", "detail": "Task already assigned to another node"}
         task["status"] = "assigned"
         task["provider_id"] = bid.provider_id
@@ -2266,7 +2289,6 @@ async def place_bid(bid: TaskBid, authenticated_node: str = Depends(verify_reque
         consumer_id = task["consumer_id"]
         model_requirement = task.get("model_requirement")
         payload_uri = task.get("payload_uri")
-        bounty = task["bounty"]
 
     log_event("bid_accepted", f"Task {bid.task_id[:8]} assigned to {bid.provider_id}", task_id=bid.task_id, provider_id=bid.provider_id, bounty=bounty)
 
@@ -2296,75 +2318,58 @@ async def complete_task(
     if len(result_payload) > MAX_PAYLOAD_CHARS:
         raise HTTPException(status_code=413, detail="Result payload too large")
     
-    if x_mep_idempotency_key:
-        existing = db.get_idempotency(authenticated_node, "/tasks/complete", x_mep_idempotency_key)
-        if existing:
-            return existing["response"]
-
-    async with task_lock:
-        task = active_tasks.get(result.task_id)
-    if not task:
-        db_task = db.get_task(result.task_id)
-        if not db_task or db_task["status"] not in ("bidding", "assigned"):
-            raise HTTPException(status_code=404, detail="Task not found or already claimed")
-        task = {
-            "id": db_task["task_id"],
-            "consumer_id": db_task["consumer_id"],
-            "payload": db_task["payload"],
-            "bounty": db_task["bounty"],
-            "status": db_task["status"],
-            "target_node": db_task["target_node"],
-            "model_requirement": db_task["model_requirement"],
-            "provider_id": db_task["provider_id"],
-            "payload_uri": db_task.get("payload_uri"),
-            "secret_data": db_task.get("result_payload")
-        }
-        async with task_lock:
-            active_tasks[result.task_id] = task
-
-    assigned_provider = task.get("provider_id")
-    if assigned_provider and assigned_provider != result.provider_id:
+    settled = db.complete_task_atomic(
+        result.task_id,
+        result.provider_id,
+        result_payload,
+        time.time(),
+        result_uri=normalized_result_uri,
+        idem_node_id=authenticated_node if x_mep_idempotency_key else None,
+        idem_endpoint="/tasks/complete" if x_mep_idempotency_key else None,
+        idem_key=x_mep_idempotency_key,
+    )
+    if settled["status"] == "idempotent":
+        return settled["response"]
+    if settled["status"] in ("not_found", "not_active"):
+        raise HTTPException(status_code=404, detail="Task not found or already claimed")
+    if settled["status"] == "assigned_to_other":
         raise HTTPException(status_code=409, detail="Task assigned to another provider")
+    if settled["status"] == "insufficient_balance":
+        log_event("data_purchase_failed", f"Provider {result.provider_id} lacks SECONDS to buy {result.task_id}", task_id=result.task_id, provider_id=result.provider_id)
+        raise HTTPException(status_code=400, detail="Provider lacks SECONDS to buy this data")
+    if settled["status"] == "escrow_not_held":
+        raise HTTPException(status_code=409, detail="Escrow is not held for this task")
+    if settled["status"] != "success":
+        raise HTTPException(status_code=409, detail="Task could not be settled")
 
-    provider_balance = db.get_balance(result.provider_id)
-    if provider_balance is None:
-        db.set_balance(result.provider_id, 0.0)
-
-    # Transfer SECONDS based on positive or negative bounty
+    task = settled["task"]
     bounty = task["bounty"]
-    if bounty >= 0:
-        released = db.release_escrow(result.task_id, result.provider_id, time.time())
-        if released is None:
-            db.add_balance(result.provider_id, bounty)
-        new_balance = db.get_balance(result.provider_id)
-        log_audit("ESCROW_RELEASE", result.provider_id, bounty, new_balance, result.task_id)
-    else:
-        # Data Market: Provider PAYS to receive this payload/task
-        cost = abs(bounty)
-        success = db.deduct_balance(result.provider_id, cost)
-        if not success:
-            log_event("data_purchase_failed", f"Provider {result.provider_id} lacks SECONDS to buy {result.task_id}", task_id=result.task_id, provider_id=result.provider_id, cost=cost)
-            raise HTTPException(status_code=400, detail="Provider lacks SECONDS to buy this data")
-
-        p_balance = db.get_balance(result.provider_id) or 0.0
-        log_audit("BUY_DATA", result.provider_id, -cost, p_balance, result.task_id)
-
-        db.add_balance(task["consumer_id"], cost) # The sender earns SECONDS
-        c_balance = db.get_balance(task["consumer_id"]) or 0.0
-        log_audit("SELL_DATA", task["consumer_id"], cost, c_balance, result.task_id)
+    for event in settled.get("ledger_events", []):
+        node_id = event["node_id"]
+        amount = event["amount"]
+        new_balance = db.get_balance(node_id) or 0.0
+        log_audit(event["kind"], node_id, amount, new_balance, result.task_id)
 
     log_event("task_completed", f"Task {result.task_id[:8]} completed by {result.provider_id}", task_id=result.task_id, provider_id=result.provider_id, bounty=bounty)
 
-    # Move task to completed
     async with task_lock:
-        task["status"] = "completed"
-        task["provider_id"] = result.provider_id
-        task["result"] = result_payload
-        task["completed_at"] = time.time()
-        completed_tasks[result.task_id] = task
+        completed_entry = {
+            "id": task["task_id"],
+            "consumer_id": task["consumer_id"],
+            "payload": task["payload"],
+            "bounty": bounty,
+            "status": "completed",
+            "target_node": task.get("target_node"),
+            "model_requirement": task.get("model_requirement"),
+            "provider_id": result.provider_id,
+            "payload_uri": task.get("payload_uri"),
+            "result": result_payload,
+            "result_uri": normalized_result_uri,
+            "completed_at": task["updated_at"],
+        }
+        completed_tasks[result.task_id] = completed_entry
         if result.task_id in active_tasks:
             del active_tasks[result.task_id]
-    db.update_task_result(result.task_id, result.provider_id, result_payload, "completed", time.time(), result_uri=normalized_result_uri)
     await _evict_completed_tasks_cache()
 
     # ROUTE RESULT BACK TO CONSUMER VIA WEBSOCKET
@@ -2380,7 +2385,7 @@ async def complete_task(
                     "provider_id": result.provider_id,
                     "result_payload": result_payload,
                     "result_uri": normalized_result_uri,
-                    "bounty_spent": task["bounty"]
+                    "bounty_spent": bounty
                 }
             })
         except Exception as exc:
@@ -2389,10 +2394,7 @@ async def complete_task(
                 if connected_nodes.get(consumer_id) is consumer_ws:
                     del connected_nodes[consumer_id]
 
-    response_payload = {"status": "success", "earned": task["bounty"], "new_balance": db.get_balance(result.provider_id)}
-    if x_mep_idempotency_key:
-        db.set_idempotency(authenticated_node, "/tasks/complete", x_mep_idempotency_key, response_payload, 200, time.time())
-    return response_payload
+    return settled["response"]
 
 @app.get("/tasks/result/{task_id}")
 async def get_task_result(task_id: str, authenticated_node: str = Depends(verify_request)):
