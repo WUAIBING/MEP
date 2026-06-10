@@ -1,10 +1,22 @@
 import os
 import sys
 import tempfile
+import types
 import unittest
 
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(__file__)), "node"))
+
+# The CLI provider can run standalone with optional websocket/aiohttp runtime
+# dependencies. These unit tests only exercise local safety helpers.
+sys.modules.setdefault(
+    "websockets",
+    types.SimpleNamespace(exceptions=types.SimpleNamespace(ConnectionClosed=Exception), connect=None),
+)
+sys.modules.setdefault(
+    "aiohttp",
+    types.SimpleNamespace(ClientSession=None),
+)
 
 from mep_cli_provider import MEPCLIProvider  # noqa: E402
 
