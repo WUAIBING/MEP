@@ -108,6 +108,19 @@ def _ensure_tasks_verifier_type_column(cursor):
         if "verifier_type" not in columns:
             cursor.execute("ALTER TABLE tasks ADD COLUMN verifier_type TEXT")
 
+def _ensure_tasks_rebroadcast_count_column(cursor):
+    if _is_postgres():
+        cursor.execute(
+            "SELECT column_name FROM information_schema.columns WHERE table_name = 'tasks' AND column_name = 'rebroadcast_count'"
+        )
+        if not cursor.fetchone():
+            cursor.execute("ALTER TABLE tasks ADD COLUMN rebroadcast_count INTEGER NOT NULL DEFAULT 0")
+    else:
+        cursor.execute("PRAGMA table_info(tasks)")
+        columns = [row[1] for row in cursor.fetchall()]
+        if "rebroadcast_count" not in columns:
+            cursor.execute("ALTER TABLE tasks ADD COLUMN rebroadcast_count INTEGER NOT NULL DEFAULT 0")
+
 def init_db():
     conn = _get_conn()
     cursor = conn.cursor()
@@ -133,6 +146,7 @@ def init_db():
             payload_uri TEXT,
             result_uri TEXT,
             verifier_type TEXT,
+            rebroadcast_count INTEGER NOT NULL DEFAULT 0,
             created_at REAL NOT NULL,
             updated_at REAL NOT NULL
         )
@@ -140,6 +154,7 @@ def init_db():
     _ensure_tasks_expires_in_seconds_column(cursor)
     _ensure_tasks_envelope_json_column(cursor)
     _ensure_tasks_verifier_type_column(cursor)
+    _ensure_tasks_rebroadcast_count_column(cursor)
     if not _is_postgres():
         try:
             cursor.execute("ALTER TABLE tasks ADD COLUMN payload_uri TEXT")
@@ -1043,12 +1058,12 @@ def requeue_task_if_assigned(task_id: str, updated_at: float) -> bool:
     cursor = conn.cursor()
     if _is_postgres():
         cursor.execute(
-            "UPDATE tasks SET status = 'bidding', provider_id = NULL, updated_at = %s WHERE task_id = %s AND status = 'assigned'",
+            "UPDATE tasks SET status = 'bidding', provider_id = NULL, rebroadcast_count = COALESCE(rebroadcast_count, 0) + 1, updated_at = %s WHERE task_id = %s AND status = 'assigned'",
             (updated_at, task_id)
         )
     else:
         cursor.execute(
-            "UPDATE tasks SET status = 'bidding', provider_id = NULL, updated_at = ? WHERE task_id = ? AND status = 'assigned'",
+            "UPDATE tasks SET status = 'bidding', provider_id = NULL, rebroadcast_count = COALESCE(rebroadcast_count, 0) + 1, updated_at = ? WHERE task_id = ? AND status = 'assigned'",
             (updated_at, task_id)
         )
     updated = cursor.rowcount
