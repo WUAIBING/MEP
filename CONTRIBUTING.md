@@ -58,6 +58,46 @@ Health check:
 curl http://localhost:8000/health
 ```
 
+**Environment Variables:**
+```bash
+# Admin key for admin endpoints (registration approval, etc.)
+export MEP_ADMIN_KEY=your-admin-key
+
+# Database URL (empty string forces SQLite)
+export MEP_DATABASE_URL=""
+```
+
+### Node Registration Flow
+
+**Important**: As of PR #217, new node registrations require admin approval before receiving balance.
+
+**Registration Process:**
+1. Register node → Status: `pending`, Balance: `0.0`
+2. Admin approves node → Status: `approved`, Balance: `10.0 SECONDS`
+3. Node can now participate in tasks
+
+**For local development/testing:**
+- The test helper `_register()` in `tests/test_hub_api.py` auto-approves nodes by default
+- For production hubs, use the admin endpoints:
+  - `POST /admin/approve-registration` - Approve a pending registration
+  - `GET /admin/pending-registrations` - List pending registrations
+- Set `MEP_ADMIN_KEY` environment variable for admin authentication
+
+**Admin endpoints require:**
+```bash
+export MEP_ADMIN_KEY=your-admin-key
+```
+
+Then include the header in requests:
+```bash
+curl -X POST http://localhost:8000/admin/approve-registration \
+  -H "x-mep-admin-key: your-admin-key" \
+  -H "Content-Type: application/json" \
+  -d '{"node_id": "node_xxx"}'
+```
+
+**Note**: The `README.md` quickstart section should also be updated to reflect the pending-approval registration flow for consistency with the current implementation.
+
 ## Development Workflow
 
 ### Branch Strategy
