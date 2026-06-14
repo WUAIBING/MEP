@@ -2435,7 +2435,7 @@ async def complete_task(
         raise HTTPException(status_code=400, detail="Task result requires result_payload or result_uri")
     if len(result_payload) > MAX_PAYLOAD_CHARS:
         raise HTTPException(status_code=413, detail="Result payload too large")
-
+    
     task = db.get_task(result.task_id)
     if task and task.get("verifier_type") == "manual_acceptance":
         submitted = db.submit_task_result_for_verification(

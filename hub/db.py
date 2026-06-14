@@ -1255,7 +1255,7 @@ def upsert_registry(node_id: str, alias: Optional[str], skills: list[str], model
     skills_payload = json.dumps(skills)
     models_payload = json.dumps(models)
     metadata_payload = json.dumps(metadata)
-
+    
     if _is_postgres():
         query = """
             INSERT INTO agent_registry (node_id, alias, skills, models, metadata, availability, updated_at, x25519_public_key)
@@ -1288,7 +1288,7 @@ def upsert_registry(node_id: str, alias: Optional[str], skills: list[str], model
         if x25519_public_key:
             query += ", x25519_public_key=excluded.x25519_public_key"
         cursor.execute(query, tuple(params))
-
+        
     conn.commit()
     _release_conn(conn)
 
@@ -1296,7 +1296,7 @@ def update_registry_availability(node_id: str, availability: str, updated_at: fl
     conn = _get_conn()
     cursor = conn.cursor()
     _ensure_registry_availability_column(cursor)
-
+    
     if _is_postgres():
         # Check if record exists first
         cursor.execute("SELECT 1 FROM agent_registry WHERE node_id = %s", (node_id,))
@@ -1325,7 +1325,7 @@ def update_registry_availability(node_id: str, availability: str, updated_at: fl
                 "INSERT INTO agent_registry (node_id, alias, skills, models, metadata, availability, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
                 (node_id, None, '[]', '[]', '{}', availability, updated_at)
             )
-
+            
     conn.commit()
     _release_conn(conn)
 
