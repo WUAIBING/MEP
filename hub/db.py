@@ -132,6 +132,15 @@ def init_db():
         )
     ''')
     cursor.execute('''
+        CREATE TABLE IF NOT EXISTS pending_registrations (
+            node_id TEXT PRIMARY KEY,
+            pub_pem TEXT NOT NULL,
+            created_at REAL NOT NULL,
+            approved_at REAL,
+            approved_by TEXT
+        )
+    ''')
+    cursor.execute('''
         CREATE TABLE IF NOT EXISTS tasks (
             task_id TEXT PRIMARY KEY,
             consumer_id TEXT NOT NULL,
@@ -246,7 +255,7 @@ def init_db():
     conn.commit()
     _release_conn(conn)
 
-def register_node(node_id: str, pub_pem: str) -> float:
+def register_node(node_id: str, pub_pem: str) -> dict:
     conn = _get_conn()
     cursor = conn.cursor()
     if _is_postgres():
@@ -254,25 +263,68 @@ def register_node(node_id: str, pub_pem: str) -> float:
     else:
         cursor.execute("SELECT balance FROM ledger WHERE node_id = ?", (node_id,))
     row = cursor.fetchone()
-    if not row:
-        if _is_postgres():
-            cursor.execute(
-                "INSERT INTO ledger (node_id, pub_pem, balance) VALUES (%s, %s, %s) ON CONFLICT (node_id) DO NOTHING",
-                (node_id, pub_pem, 10.0)
-            )
-        else:
-            cursor.execute(
-                "INSERT OR IGNORE INTO ledger (node_id, pub_pem, balance) VALUES (?, ?, ?)",
-                (node_id, pub_pem, 10.0)
-            )
-        conn.commit()
+    if row:
+        _release_conn(conn)
+        return {"status": "registered", "balance": row[0]}
     if _is_postgres():
-        cursor.execute("SELECT balance FROM ledger WHERE node_id = %s", (node_id,))
+        cursor.execute(
+            "INSERT INTO pending_registrations (node_id, pub_pem, created_at) VALUES (%s, %s, %s) ON CONFLICT (node_id) DO NOTHING",
+            (node_id, pub_pem, time.time())
+        )
     else:
-        cursor.execute("SELECT balance FROM ledger WHERE node_id = ?", (node_id,))
-    row = cursor.fetchone()
+        cursor.execute(
+            "INSERT OR IGNORE INTO pending_registrations (node_id, pub_pem, created_at) VALUES (?, ?, ?)",
+            (node_id, pub_pem, time.time())
+        )
+    conn.commit()
     _release_conn(conn)
-    return row[0] if row else 10.0
+    return {"status": "pending", "balance": 0.0}
+
+def approve_registration(node_id: str, approved_by: str, initial_balance: float = 10.0) -> bool:
+    conn = _get_conn()
+    cursor = conn.cursor()
+    if _is_postgres():
+        cursor.execute("SELECT pub_pem FROM pending_registrations WHERE node_id = %s", (node_id,))
+    else:
+        cursor.execute("SELECT pub_pem FROM pending_registrations WHERE node_id = ?", (node_id,))
+    row = cursor.fetchone()
+    if not row:
+        _release_conn(conn)
+        return False
+    pub_pem = row[0]
+    now = time.time()
+    if _is_postgres():
+        cursor.execute(
+            "INSERT INTO ledger (node_id, pub_pem, balance) VALUES (%s, %s, %s) ON CONFLICT (node_id) DO UPDATE SET balance = ledger.balance + %s",
+            (node_id, pub_pem, initial_balance, initial_balance)
+        )
+        cursor.execute(
+            "UPDATE pending_registrations SET approved_at = %s, approved_by = %s WHERE node_id = %s",
+            (now, approved_by, node_id)
+        )
+    else:
+        cursor.execute(
+            "INSERT INTO ledger (node_id, pub_pem, balance) VALUES (?, ?, ?) ON CONFLICT(node_id) DO UPDATE SET balance = balance + ?",
+            (node_id, pub_pem, initial_balance, initial_balance)
+        )
+        cursor.execute(
+            "UPDATE pending_registrations SET approved_at = ?, approved_by = ? WHERE node_id = ?",
+            (now, approved_by, node_id)
+        )
+    conn.commit()
+    _release_conn(conn)
+    return True
+
+def get_pending_registrations() -> list:
+    conn = _get_conn()
+    cursor = conn.cursor()
+    if _is_postgres():
+        cursor.execute("SELECT node_id, pub_pem, created_at FROM pending_registrations WHERE approved_at IS NULL ORDER BY created_at DESC")
+    else:
+        cursor.execute("SELECT node_id, pub_pem, created_at FROM pending_registrations WHERE approved_at IS NULL ORDER BY created_at DESC")
+    rows = cursor.fetchall()
+    _release_conn(conn)
+    return [{"node_id": row[0], "pub_pem": row[1], "created_at": row[2]} for row in rows]
 
 def get_pub_pem(node_id: str) -> Optional[str]:
     conn = _get_conn()
@@ -478,7 +530,7 @@ def submit_task_result_for_verification(
             conn.rollback()
             return {"status": "not_found"}
         assigned_provider, task_status, verifier_type = row[0], row[1], row[2]
-        if verifier_type != "manual_acceptance":
+        if verifier_type not in ("manual_acceptance", "automated"):
             conn.rollback()
             return {"status": "not_verifier_gated"}
         if task_status == "submitted_result" and assigned_provider == provider_id:

@@ -705,7 +705,7 @@ def _task_verifier_type(task: TaskCreate) -> Optional[str]:
     normalized = str(verifier_type).strip().lower()
     if not normalized:
         return None
-    if normalized not in {"manual_acceptance"}:
+    if normalized not in {"manual_acceptance", "automated"}:
         raise HTTPException(status_code=400, detail="Unsupported verifier_type")
     return normalized
 
@@ -1658,16 +1658,39 @@ async def register_node(node: NodeRegistration, request: Request):
     validated_pubkey = _validate_registration_pubkey(node.pubkey)
     # Registration derives the Node ID from the validated Ed25519 public key PEM
     node_id = auth.derive_node_id(validated_pubkey)
-    balance = db.register_node(node_id, validated_pubkey)
+    result = db.register_node(node_id, validated_pubkey)
     if node.alias or node.x25519_public_key:
         db.upsert_registry(node_id, node.alias, [], [], {}, "offline", time.time(), node.x25519_public_key)
 
-    log_event("node_registered", f"Node {node_id} registered with starting balance {balance}", node_id=node_id, starting_balance=balance)
-    log_audit("REGISTER", node_id, balance, balance, "START_BONUS")
+    status = result["status"]
+    balance = result["balance"]
+    if status == "registered":
+        log_event("node_registered", f"Node {node_id} already registered with balance {balance}", node_id=node_id, balance=balance)
+    else:
+        log_event("node_pending", f"Node {node_id} registration pending approval", node_id=node_id)
 
     hub_url, ws_url = get_hub_urls(request)
 
-    return {"status": "success", "node_id": node_id, "balance": balance, "hub_url": hub_url, "ws_url": ws_url}
+    return {"status": status, "node_id": node_id, "balance": balance, "hub_url": hub_url, "ws_url": ws_url}
+
+@app.post("/admin/approve-registration")
+async def approve_registration(payload: dict, x_mep_admin_key: Optional[str] = Header(default=None)):
+    _require_admin(x_mep_admin_key)
+    node_id = payload.get("node_id")
+    if not node_id:
+        raise HTTPException(status_code=400, detail="node_id required")
+    approved = db.approve_registration(node_id, "admin")
+    if not approved:
+        raise HTTPException(status_code=404, detail="Pending registration not found")
+    balance = db.get_balance(node_id) or 0.0
+    log_audit("REGISTRATION_APPROVED", node_id, balance, balance, "ADMIN_APPROVAL")
+    return {"status": "approved", "node_id": node_id, "balance": balance}
+
+@app.get("/admin/pending-registrations")
+async def list_pending_registrations(x_mep_admin_key: Optional[str] = Header(default=None)):
+    _require_admin(x_mep_admin_key)
+    pending = db.get_pending_registrations()
+    return {"pending": pending}
 
 @app.post("/registry/update")
 async def update_registry(payload: RegistryUpdate, authenticated_node: str = Depends(verify_request)):
@@ -2452,7 +2475,7 @@ async def complete_task(
         raise HTTPException(status_code=413, detail="Result payload too large")
     
     task = db.get_task(result.task_id)
-    if task and task.get("verifier_type") == "manual_acceptance":
+    if task and task.get("verifier_type") in ("manual_acceptance", "automated"):
         submitted = db.submit_task_result_for_verification(
             result.task_id,
             result.provider_id,
@@ -2540,6 +2563,20 @@ async def reject_task(
         raise HTTPException(status_code=409, detail="Escrow is not held for this task")
     raise HTTPException(status_code=409, detail="Task is not assigned")
 
+def _verify_simple_automated(task, result_payload):
+    """Simple automated verifier: checks result is non-empty and valid JSON."""
+    if not result_payload or not result_payload.strip():
+        return False, "Result payload is empty"
+    try:
+        result = json.loads(result_payload)
+    except json.JSONDecodeError:
+        return False, "Result payload is not valid JSON"
+    if not isinstance(result, dict):
+        return False, "Result must be a JSON object"
+    if "result" not in result and "error" not in result:
+        return False, "Result must contain 'result' or 'error' field"
+    return True, "OK"
+
 @app.post("/tasks/verify/accept")
 async def accept_verified_task(
     verification: TaskVerificationAccept,
@@ -2586,6 +2623,57 @@ async def accept_verified_task(
     if settled["status"] != "success":
         raise HTTPException(status_code=409, detail="Task could not be settled")
     return await _finalize_settled_task(settled, verification.task_id, provider_id, result_payload, result_uri)
+
+
+@app.post("/tasks/verify/automated")
+async def verify_task_automated(
+    verification: TaskVerificationAccept,
+    x_mep_admin_key: Optional[str] = Header(default=None),
+    x_mep_idempotency_key: Optional[str] = Header(default=None)
+):
+    _require_admin(x_mep_admin_key)
+    task = db.get_task(verification.task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+    if task.get("verifier_type") != "automated":
+        raise HTTPException(status_code=400, detail="Task is not configured for automated verification")
+    if task["status"] != "submitted_result":
+        raise HTTPException(status_code=400, detail="Task is not pending verification")
+
+    result_payload = task.get("result_payload") or ""
+    passed, reason = _verify_simple_automated(task, result_payload)
+    if not passed:
+        log_event("automated_verification_failed", f"Task {verification.task_id[:8]} failed automated verification: {reason}", task_id=verification.task_id, reason=reason)
+        raise HTTPException(status_code=400, detail=f"Automated verification failed: {reason}")
+
+    provider_id = task.get("provider_id")
+    if not provider_id:
+        raise HTTPException(status_code=409, detail="Task has no assigned provider")
+    result_uri = task.get("result_uri")
+
+    settled = db.complete_task_atomic(
+        verification.task_id,
+        provider_id,
+        result_payload,
+        time.time(),
+        result_uri=result_uri,
+        idem_node_id="automated_verifier" if x_mep_idempotency_key else None,
+        idem_endpoint="/tasks/verify/automated" if x_mep_idempotency_key else None,
+        idem_key=x_mep_idempotency_key,
+        expected_status="submitted_result",
+    )
+    if settled["status"] == "idempotent":
+        return settled["response"]
+    if settled["status"] in ("not_found", "not_active"):
+        raise HTTPException(status_code=404, detail="Task not found or not pending verification")
+    if settled["status"] == "assigned_to_other":
+        raise HTTPException(status_code=409, detail="Task assigned to another provider")
+    if settled["status"] == "already_completed":
+        raise HTTPException(status_code=409, detail="Task already completed")
+    if settled["status"] == "escrow_not_held":
+        raise HTTPException(status_code=409, detail="Escrow is not held for this task")
+    log_event("automated_verification_passed", f"Task {verification.task_id[:8]} passed automated verification", task_id=verification.task_id)
+    return {"status": "verified", "task_id": verification.task_id, "reason": reason}
 
 
 @app.get("/tasks/result/{task_id}")
