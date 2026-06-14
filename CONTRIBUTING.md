@@ -41,6 +41,17 @@ pip install -r requirements-test.txt
 
 ### Running the Hub Locally
 
+**Environment Variables (set before starting hub):**
+```bash
+# Admin key for admin endpoints (registration approval, etc.)
+export MEP_ADMIN_KEY=your-admin-key
+
+# Database URL (empty string forces SQLite)
+export MEP_DATABASE_URL=""
+```
+
+**Note**: Environment variable changes require a hub restart to take effect.
+
 **Option 1: Docker + Postgres (Recommended for production-like testing)**
 ```bash
 docker-compose up -d --build
@@ -56,15 +67,6 @@ uvicorn main:app --host 0.0.0.0 --port 8000 --reload
 Health check:
 ```bash
 curl http://localhost:8000/health
-```
-
-**Environment Variables:**
-```bash
-# Admin key for admin endpoints (registration approval, etc.)
-export MEP_ADMIN_KEY=your-admin-key
-
-# Database URL (empty string forces SQLite)
-export MEP_DATABASE_URL=""
 ```
 
 ### Node Registration Flow
