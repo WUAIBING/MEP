@@ -2475,7 +2475,7 @@ async def complete_task(
         raise HTTPException(status_code=413, detail="Result payload too large")
     
     task = db.get_task(result.task_id)
-    if task and task.get("verifier_type") == "manual_acceptance":
+    if task and task.get("verifier_type") in ("manual_acceptance", "automated"):
         submitted = db.submit_task_result_for_verification(
             result.task_id,
             result.provider_id,

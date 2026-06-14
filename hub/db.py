@@ -530,7 +530,7 @@ def submit_task_result_for_verification(
             conn.rollback()
             return {"status": "not_found"}
         assigned_provider, task_status, verifier_type = row[0], row[1], row[2]
-        if verifier_type != "manual_acceptance":
+        if verifier_type not in ("manual_acceptance", "automated"):
             conn.rollback()
             return {"status": "not_verifier_gated"}
         if task_status == "submitted_result" and assigned_provider == provider_id:
