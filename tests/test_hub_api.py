@@ -201,6 +201,59 @@ class TestTaskLifecycle(unittest.TestCase):
         resp = client.get(f"/balance/{provider_id}")
         self.assertGreater(resp.json()["balance_seconds"], 10.0)  # 10 starting + 1 earned
 
+    def test_submitted_result_timeout_refunds_manual_verification_escrow(self):
+        main.rate_limits.clear()
+        consumer_priv, consumer_pub, consumer_id = _make_identity()
+        provider_priv, provider_pub, provider_id = _make_identity()
+        _register(consumer_pub)
+        _register(provider_pub)
+
+        consumer_before = client.get(f"/balance/{consumer_id}").json()["balance_seconds"]
+        provider_before = client.get(f"/balance/{provider_id}").json()["balance_seconds"]
+        task_payload = json.dumps({
+            "consumer_id": consumer_id,
+            "payload": "Requires review but never accepted",
+            "bounty": 1.0,
+            "verifier_type": "manual_acceptance",
+        })
+        headers = _auth_headers(consumer_priv, consumer_id, task_payload)
+        submit = client.post("/tasks/submit", content=task_payload, headers=headers)
+        self.assertEqual(submit.status_code, 200, submit.text)
+        task_id = submit.json()["task_id"]
+
+        bid_payload = json.dumps({"task_id": task_id, "provider_id": provider_id})
+        headers = _auth_headers(provider_priv, provider_id, bid_payload)
+        self.assertEqual(client.post("/tasks/bid", content=bid_payload, headers=headers).status_code, 200)
+
+        complete_payload = json.dumps({"task_id": task_id, "provider_id": provider_id, "result_payload": "stale"})
+        headers = _auth_headers(provider_priv, provider_id, complete_payload)
+        complete = client.post("/tasks/complete", content=complete_payload, headers=headers)
+        self.assertEqual(complete.status_code, 200, complete.text)
+        self.assertEqual(complete.json()["status"], "pending_verification")
+        self.assertEqual(db.get_escrow(task_id)["status"], "held")
+
+        old_time = time.time() - main.SUBMITTED_RESULT_TIMEOUT_SECONDS - 1
+        conn = db._get_conn()
+        conn.execute(
+            "UPDATE tasks SET updated_at = ? WHERE task_id = ?",
+            (old_time, task_id)
+        )
+        conn.commit()
+        db._release_conn(conn)
+
+        import asyncio
+        from main import _sweep_submitted_result_timeouts
+        loop = asyncio.new_event_loop()
+        try:
+            loop.run_until_complete(_sweep_submitted_result_timeouts())
+        finally:
+            loop.close()
+
+        self.assertEqual(db.get_task(task_id)["status"], "expired")
+        self.assertEqual(db.get_escrow(task_id)["status"], "refunded")
+        self.assertEqual(client.get(f"/balance/{consumer_id}").json()["balance_seconds"], consumer_before)
+        self.assertEqual(client.get(f"/balance/{provider_id}").json()["balance_seconds"], provider_before)
+
     def test_manual_verification_gates_settlement_until_consumer_accepts(self):
         consumer_priv, consumer_pub, consumer_id = _make_identity()
         provider_priv, provider_pub, provider_id = _make_identity()

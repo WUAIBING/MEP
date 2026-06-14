@@ -409,6 +409,7 @@ def update_task_result(task_id: str, provider_id: str, result_payload: str, stat
     conn.commit()
     _release_conn(conn)
 
+
 def submit_task_result_for_verification(
     task_id: str,
     provider_id: str,
@@ -776,6 +777,24 @@ def expire_task_if_assigned(task_id: str, updated_at: float) -> bool:
     _release_conn(conn)
     return updated > 0
 
+def expire_task_if_submitted_result(task_id: str, updated_at: float) -> bool:
+    conn = _get_conn()
+    cursor = conn.cursor()
+    if _is_postgres():
+        cursor.execute(
+            "UPDATE tasks SET status = 'expired', updated_at = %s WHERE task_id = %s AND status = 'submitted_result'",
+            (updated_at, task_id)
+        )
+    else:
+        cursor.execute(
+            "UPDATE tasks SET status = 'expired', updated_at = ? WHERE task_id = ? AND status = 'submitted_result'",
+            (updated_at, task_id)
+        )
+    updated = cursor.rowcount
+    conn.commit()
+    _release_conn(conn)
+    return updated > 0
+
 def expire_task_if_bidding(task_id: str, updated_at: float) -> bool:
     """Expire a bidding task (no provider accepted)"""
     conn = _get_conn()
@@ -841,6 +860,39 @@ def get_assigned_tasks_for_timeout(now_ts: float, default_timeout: int, min_time
               )
             """,
             (now_ts, default_timeout, min_timeout, max_timeout),
+        )
+    rows = cursor.fetchall()
+    if _is_postgres():
+        result = [_row_to_dict(cursor, row) for row in rows]
+    else:
+        result = [dict(row) for row in rows]
+    _release_conn(conn)
+    return result
+
+def get_submitted_result_tasks_for_timeout(now_ts: float, submitted_result_timeout: int) -> list:
+    conn = _get_conn()
+    if not _is_postgres():
+        conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+    if _is_postgres():
+        cursor.execute(
+            """
+            SELECT *
+            FROM tasks
+            WHERE status = 'submitted_result'
+              AND updated_at < (%s - %s)
+            """,
+            (now_ts, submitted_result_timeout),
+        )
+    else:
+        cursor.execute(
+            """
+            SELECT *
+            FROM tasks
+            WHERE status = 'submitted_result'
+              AND updated_at < (? - ?)
+            """,
+            (now_ts, submitted_result_timeout),
         )
     rows = cursor.fetchall()
     if _is_postgres():
@@ -1203,7 +1255,7 @@ def upsert_registry(node_id: str, alias: Optional[str], skills: list[str], model
     skills_payload = json.dumps(skills)
     models_payload = json.dumps(models)
     metadata_payload = json.dumps(metadata)
-    
+
     if _is_postgres():
         query = """
             INSERT INTO agent_registry (node_id, alias, skills, models, metadata, availability, updated_at, x25519_public_key)
@@ -1236,7 +1288,7 @@ def upsert_registry(node_id: str, alias: Optional[str], skills: list[str], model
         if x25519_public_key:
             query += ", x25519_public_key=excluded.x25519_public_key"
         cursor.execute(query, tuple(params))
-        
+
     conn.commit()
     _release_conn(conn)
 
@@ -1244,7 +1296,7 @@ def update_registry_availability(node_id: str, availability: str, updated_at: fl
     conn = _get_conn()
     cursor = conn.cursor()
     _ensure_registry_availability_column(cursor)
-    
+
     if _is_postgres():
         # Check if record exists first
         cursor.execute("SELECT 1 FROM agent_registry WHERE node_id = %s", (node_id,))
@@ -1273,7 +1325,7 @@ def update_registry_availability(node_id: str, availability: str, updated_at: fl
                 "INSERT INTO agent_registry (node_id, alias, skills, models, metadata, availability, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
                 (node_id, None, '[]', '[]', '{}', availability, updated_at)
             )
-            
+
     conn.commit()
     _release_conn(conn)
 

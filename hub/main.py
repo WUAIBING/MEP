@@ -162,6 +162,7 @@ ASSIGNMENT_TIMEOUT_SECONDS = int(os.getenv("MEP_ASSIGNMENT_TIMEOUT_SECONDS", "36
 TASK_TIMEOUT_DEFAULT_SECONDS = int(os.getenv("MEP_TASK_TIMEOUT_DEFAULT_SECONDS", str(ASSIGNMENT_TIMEOUT_SECONDS)))
 TASK_TIMEOUT_MIN_SECONDS = int(os.getenv("MEP_TASK_TIMEOUT_MIN_SECONDS", "60"))
 TASK_TIMEOUT_MAX_SECONDS = int(os.getenv("MEP_TASK_TIMEOUT_MAX_SECONDS", "86400"))
+SUBMITTED_RESULT_TIMEOUT_SECONDS = int(os.getenv("MEP_SUBMITTED_RESULT_TIMEOUT_SECONDS", "86400"))
 ASSIGNMENT_SWEEP_INTERVAL_SECONDS = int(os.getenv("MEP_ASSIGNMENT_SWEEP_INTERVAL_SECONDS", "60"))
 MAINTENANCE_SWEEP_INTERVAL_SECONDS = int(os.getenv("MEP_MAINTENANCE_SWEEP_INTERVAL_SECONDS", "60"))
 REGISTRY_RECONCILE_LIMIT = int(os.getenv("MEP_REGISTRY_RECONCILE_LIMIT", "1000"))
@@ -204,6 +205,7 @@ ANTI_LOOP_TERMINATION_TOKENS = ("[end]", "[no_relay]", "[ack_only]")
 if TASK_TIMEOUT_MIN_SECONDS > TASK_TIMEOUT_MAX_SECONDS:
     TASK_TIMEOUT_MIN_SECONDS, TASK_TIMEOUT_MAX_SECONDS = TASK_TIMEOUT_MAX_SECONDS, TASK_TIMEOUT_MIN_SECONDS
 TASK_TIMEOUT_DEFAULT_SECONDS = max(TASK_TIMEOUT_MIN_SECONDS, min(TASK_TIMEOUT_DEFAULT_SECONDS, TASK_TIMEOUT_MAX_SECONDS))
+SUBMITTED_RESULT_TIMEOUT_SECONDS = max(TASK_TIMEOUT_MIN_SECONDS, min(SUBMITTED_RESULT_TIMEOUT_SECONDS, TASK_TIMEOUT_MAX_SECONDS))
 
 # ---------------------------------------------------------------------------
 # Node Activity Tracking (for passive degraded detection)
@@ -1496,11 +1498,48 @@ async def _sweep_bidding_timeouts():
                 del active_tasks[task["task_id"]]
         log_event("task_expired_bidding", f"Task {task['task_id'][:8]} expired", task_id=task["task_id"], consumer_id=task["consumer_id"])
 
+async def _sweep_submitted_result_timeouts():
+    """Expire verifier-gated results that were never accepted and refund held escrow."""
+    if SUBMITTED_RESULT_TIMEOUT_SECONDS <= 0:
+        return
+    now = time.time()
+    expired_submissions = db.get_submitted_result_tasks_for_timeout(now, SUBMITTED_RESULT_TIMEOUT_SECONDS)
+    if not expired_submissions:
+        return
+    for task in expired_submissions:
+        if not db.expire_task_if_submitted_result(task["task_id"], now):
+            continue
+        bounty = float(task.get("bounty", 0.0))
+        if bounty > 0:
+            refunded = db.refund_escrow(task["task_id"], now)
+            if refunded is None:
+                db.add_balance(task["consumer_id"], bounty)
+            new_balance = db.get_balance(task["consumer_id"])
+            log_audit("VERIFICATION_TIMEOUT_REFUND", task["consumer_id"], bounty, new_balance, task["task_id"])
+        elif bounty < 0:
+            refunded = db.refund_escrow(task["task_id"], now)
+            if refunded is not None:
+                buyer_id = task.get("provider_id") or ""
+                new_balance = db.get_balance(buyer_id) or 0.0
+                log_audit("DATA_VERIFICATION_TIMEOUT_REFUND", buyer_id, refunded, new_balance, task["task_id"])
+        async with task_lock:
+            if task["task_id"] in active_tasks:
+                del active_tasks[task["task_id"]]
+        log_event(
+            "submitted_result_expired",
+            f"Task {task['task_id'][:8]} expired while awaiting verifier acceptance",
+            task_id=task["task_id"],
+            consumer_id=task["consumer_id"],
+            provider_id=task.get("provider_id"),
+            bounty=bounty,
+        )
+
 async def _assignment_timeout_worker():
     while True:
         try:
             await _sweep_assigned_timeouts()
             await _sweep_bidding_timeouts()
+            await _sweep_submitted_result_timeouts()
         except Exception as exc:
             log_event("timeout_sweep_failed", f"Timeout sweep failed: {exc}")
         await asyncio.sleep(ASSIGNMENT_SWEEP_INTERVAL_SECONDS)
@@ -2324,6 +2363,7 @@ async def place_bid(bid: TaskBid, authenticated_node: str = Depends(verify_reque
         "assignment_score": assignment_profile["assignment_score"]
     }
 
+
 async def _finalize_settled_task(settled: dict, task_id: str, provider_id: str, result_payload: str, result_uri: Optional[str]):
     task = settled["task"]
     bounty = task["bounty"]
@@ -2395,7 +2435,7 @@ async def complete_task(
         raise HTTPException(status_code=400, detail="Task result requires result_payload or result_uri")
     if len(result_payload) > MAX_PAYLOAD_CHARS:
         raise HTTPException(status_code=413, detail="Result payload too large")
-    
+
     task = db.get_task(result.task_id)
     if task and task.get("verifier_type") == "manual_acceptance":
         submitted = db.submit_task_result_for_verification(
@@ -2448,8 +2488,8 @@ async def complete_task(
         raise HTTPException(status_code=409, detail="Escrow is not held for this task")
     if settled["status"] != "success":
         raise HTTPException(status_code=409, detail="Task could not be settled")
-
     return await _finalize_settled_task(settled, result.task_id, result.provider_id, result_payload, normalized_result_uri)
+
 
 @app.post("/tasks/verify/accept")
 async def accept_verified_task(
