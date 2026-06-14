@@ -8,6 +8,7 @@ import uuid
 import time
 import json
 import ipaddress
+import hmac
 from datetime import datetime
 import os
 import ctypes
@@ -521,7 +522,7 @@ def _apply_rate_limit(key: str):
     rate_limits[key] = timestamps
 
 def _require_admin(x_mep_admin_key: Optional[str]):
-    if not ADMIN_KEY or not x_mep_admin_key or x_mep_admin_key != ADMIN_KEY:
+    if not ADMIN_KEY or not x_mep_admin_key or not hmac.compare_digest(x_mep_admin_key, ADMIN_KEY):
         raise HTTPException(status_code=403, detail="Admin key required")
 
 def _normalize_availability(value: Optional[str]) -> Optional[str]:
