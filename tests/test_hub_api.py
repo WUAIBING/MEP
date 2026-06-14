@@ -156,6 +156,9 @@ class TestBalance(unittest.TestCase):
 class TestTaskLifecycle(unittest.TestCase):
     """Full happy-path: register consumer + provider, submit, bid, complete."""
 
+    def setUp(self):
+        main.rate_limits.clear()
+
     def test_submit_bid_complete(self):
         # Setup: two identities
         consumer_priv, consumer_pub, consumer_id = _make_identity()
@@ -300,6 +303,52 @@ class TestTaskLifecycle(unittest.TestCase):
         self.assertEqual(client.get(f"/balance/{provider_id}").json()["balance_seconds"], provider_before + 1.0)
         self.assertEqual(db.get_task(task_id)["status"], "completed")
         self.assertEqual(db.get_escrow(task_id)["status"], "released")
+
+    def test_provider_reject_refunds_escrow_without_payment(self):
+        consumer_priv, consumer_pub, consumer_id = _make_identity()
+        provider_priv, provider_pub, provider_id = _make_identity()
+        _register(consumer_pub)
+        _register(provider_pub)
+
+        consumer_before = client.get(f"/balance/{consumer_id}").json()["balance_seconds"]
+        provider_before = client.get(f"/balance/{provider_id}").json()["balance_seconds"]
+
+        task_payload = json.dumps({
+            "consumer_id": consumer_id,
+            "payload": "Run unsafe code",
+            "bounty": 1.0,
+            "target_node": provider_id,
+        })
+        fake_ws = _FakeWebSocket()
+        main.connected_nodes[provider_id] = fake_ws
+        try:
+            headers = _auth_headers(consumer_priv, consumer_id, task_payload)
+            submit = client.post("/tasks/submit", content=task_payload, headers=headers)
+            self.assertEqual(submit.status_code, 200, submit.text)
+            self.assertEqual(submit.json()["status"], "success")
+            task_id = submit.json()["task_id"]
+        finally:
+            main.connected_nodes.pop(provider_id, None)
+
+        self.assertEqual(fake_ws.sent[0]["event"], "new_task")
+        self.assertEqual(fake_ws.sent[0]["data"]["id"], task_id)
+        self.assertEqual(db.get_task(task_id)["status"], "assigned")
+        self.assertEqual(client.get(f"/balance/{consumer_id}").json()["balance_seconds"], consumer_before - 1.0)
+
+        reject_payload = json.dumps({
+            "task_id": task_id,
+            "provider_id": provider_id,
+            "reason": "execution_disabled",
+        })
+        headers = _auth_headers(provider_priv, provider_id, reject_payload)
+        rejected = client.post("/tasks/reject", content=reject_payload, headers=headers)
+        self.assertEqual(rejected.status_code, 200, rejected.text)
+        self.assertEqual(rejected.json()["status"], "success")
+
+        self.assertEqual(db.get_task(task_id)["status"], "rejected")
+        self.assertEqual(db.get_escrow(task_id)["status"], "refunded")
+        self.assertEqual(client.get(f"/balance/{consumer_id}").json()["balance_seconds"], consumer_before)
+        self.assertEqual(client.get(f"/balance/{provider_id}").json()["balance_seconds"], provider_before)
 
     def test_duplicate_completion_does_not_double_settle(self):
         consumer_priv, consumer_pub, consumer_id = _make_identity()

@@ -26,6 +26,7 @@ from models import (
     TaskResult,
     TaskBid,
     TaskCancel,
+    TaskReject,
     TaskVerificationAccept,
     RegistryUpdate,
     AvailabilityUpdate,
@@ -2490,6 +2491,40 @@ async def complete_task(
         raise HTTPException(status_code=409, detail="Task could not be settled")
     return await _finalize_settled_task(settled, result.task_id, result.provider_id, result_payload, normalized_result_uri)
 
+@app.post("/tasks/reject")
+async def reject_task(
+    rejection: TaskReject,
+    authenticated_node: str = Depends(verify_request),
+):
+    if authenticated_node != rejection.provider_id:
+        raise HTTPException(status_code=403, detail="Cannot reject tasks on behalf of another node")
+
+    rejected = db.reject_task_if_assigned(rejection.task_id, rejection.provider_id, time.time())
+    if rejected["status"] in ("success", "already_rejected"):
+        for event in rejected.get("ledger_events", []):
+            node_id = event["node_id"]
+            amount = event["amount"]
+            new_balance = db.get_balance(node_id) or 0.0
+            log_audit(event["kind"], node_id, amount, new_balance, rejection.task_id)
+        async with task_lock:
+            if rejection.task_id in active_tasks:
+                active_tasks[rejection.task_id]["status"] = "rejected"
+        reason = (rejection.reason or "provider_rejected")[:200]
+        log_event(
+            "task_rejected_by_provider",
+            f"Task {rejection.task_id[:8]} rejected by {rejection.provider_id}: {reason}",
+            task_id=rejection.task_id,
+            provider_id=rejection.provider_id,
+            reason=reason,
+        )
+        return {"status": "success", "task_id": rejection.task_id, "reason": reason}
+    if rejected["status"] == "not_found":
+        raise HTTPException(status_code=404, detail="Task not found")
+    if rejected["status"] == "assigned_to_other":
+        raise HTTPException(status_code=409, detail="Task assigned to another provider")
+    if rejected["status"] == "escrow_not_held":
+        raise HTTPException(status_code=409, detail="Escrow is not held for this task")
+    raise HTTPException(status_code=409, detail="Task is not assigned")
 
 @app.post("/tasks/verify/accept")
 async def accept_verified_task(
