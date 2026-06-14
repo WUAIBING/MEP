@@ -16,6 +16,7 @@ import unittest
 _test_db = os.path.join(tempfile.gettempdir(), "mep_test_hub.db")
 os.environ["MEP_SQLITE_PATH"] = _test_db
 os.environ.setdefault("MEP_DATABASE_URL", "")  # force SQLite
+os.environ.setdefault("MEP_ADMIN_KEY", "test-admin-key")  # for admin endpoint tests
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(__file__)), "hub"))
 
@@ -80,10 +81,16 @@ def _diagnostic_headers(private_key, node_id: str) -> dict:
     }
 
 
-def _register(pub_pem: str) -> dict:
+def _register(pub_pem: str, auto_approve: bool = True) -> dict:
     resp = client.post("/register", json={"pubkey": pub_pem})
     assert resp.status_code == 200, f"Register failed: {resp.text}"
-    return resp.json()
+    data = resp.json()
+    if auto_approve and data["status"] == "pending":
+        node_id = data["node_id"]
+        approve_resp = client.post("/admin/approve-registration", json={"node_id": node_id}, headers={"x-mep-admin-key": "test-admin-key"})
+        assert approve_resp.status_code == 200, f"Approve failed: {approve_resp.text}"
+        data = approve_resp.json()
+    return data
 
 
 @contextmanager
@@ -114,19 +121,20 @@ class TestHealthEndpoint(unittest.TestCase):
 
 class TestRegistration(unittest.TestCase):
 
-    def test_register_new_node(self):
+    def test_register_new_node_pending_approval(self):
         _, pub_pem, _ = _make_identity()
-        data = _register(pub_pem)
-        self.assertEqual(data["status"], "success")
+        data = _register(pub_pem, auto_approve=False)
+        self.assertEqual(data["status"], "pending")
         self.assertTrue(data["node_id"].startswith("node_"))
-        self.assertGreater(data["balance"], 0)
+        self.assertEqual(data["balance"], 0.0)
 
-    def test_duplicate_registration_preserves_balance(self):
+    def test_duplicate_registration_preserves_pending_status(self):
         _, pub_pem, _ = _make_identity()
-        data1 = _register(pub_pem)
-        data2 = _register(pub_pem)
+        data1 = _register(pub_pem, auto_approve=False)
+        data2 = _register(pub_pem, auto_approve=False)
         self.assertEqual(data1["node_id"], data2["node_id"])
-        self.assertEqual(data1["balance"], data2["balance"])
+        self.assertEqual(data1["status"], "pending")
+        self.assertEqual(data2["status"], "pending")
 
     def test_register_persists_x25519_public_key_in_registry(self):
         _, pub_pem, node_id = _make_identity()
@@ -1575,3 +1583,194 @@ class TestConsumerDefinedTimeout(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+
+class TestAutomatedVerifier(unittest.TestCase):
+
+    """Test lean automated verifier prototype."""
+
+
+
+    def test_automated_verifier_accepts_valid_json_result(self):
+
+        consumer_priv, consumer_pub, consumer_id = _make_identity()
+
+        provider_priv, provider_pub, provider_id = _make_identity()
+
+        _register(consumer_pub)
+
+        _register(provider_pub)
+
+
+
+        task_payload = json.dumps({"consumer_id": consumer_id, "payload": "test", "bounty": 1.0, "verifier_type": "automated"})
+
+        headers = _auth_headers(consumer_priv, consumer_id, task_payload)
+
+        submit = client.post("/tasks/submit", content=task_payload, headers=headers)
+
+        self.assertEqual(submit.status_code, 200, submit.text)
+
+        task_id = submit.json()["task_id"]
+
+
+
+        bid_payload = json.dumps({"task_id": task_id, "provider_id": provider_id})
+
+        headers = _auth_headers(provider_priv, provider_id, bid_payload)
+
+        self.assertEqual(client.post("/tasks/bid", content=bid_payload, headers=headers).status_code, 200)
+
+
+
+        result_payload = json.dumps({"result": "success"})
+
+        complete_body = json.dumps({"task_id": task_id, "provider_id": provider_id, "result_payload": result_payload})
+
+        complete_headers = _auth_headers(provider_priv, provider_id, complete_body)
+
+        complete = client.post("/tasks/complete", content=complete_body, headers=complete_headers)
+
+        self.assertEqual(complete.status_code, 200, complete.text)
+
+
+
+        # Admin triggers automated verification
+
+        verify_payload = json.dumps({"task_id": task_id})
+
+        verify_resp = client.post("/tasks/verify/automated", json=json.loads(verify_payload), headers={"x-mep-admin-key": "test-admin-key"})
+
+        self.assertEqual(verify_resp.status_code, 200, f"Verify failed: {verify_resp.text}")
+
+        result = verify_resp.json()
+
+        self.assertEqual(result["status"], "verified")
+
+        self.assertEqual(result["task_id"], task_id)
+
+
+
+        # Task should be completed
+
+        task = db.get_task(task_id)
+
+        self.assertEqual(task["status"], "completed")
+
+
+
+    def test_automated_verifier_rejects_invalid_json(self):
+
+        consumer_priv, consumer_pub, consumer_id = _make_identity()
+
+        provider_priv, provider_pub, provider_id = _make_identity()
+
+        _register(consumer_pub)
+
+        _register(provider_pub)
+
+
+
+        task_payload = json.dumps({"consumer_id": consumer_id, "payload": "test", "bounty": 1.0, "verifier_type": "automated"})
+
+        headers = _auth_headers(consumer_priv, consumer_id, task_payload)
+
+        submit = client.post("/tasks/submit", content=task_payload, headers=headers)
+
+        self.assertEqual(submit.status_code, 200, submit.text)
+
+        task_id = submit.json()["task_id"]
+
+
+
+        bid_payload = json.dumps({"task_id": task_id, "provider_id": provider_id})
+
+        headers = _auth_headers(provider_priv, provider_id, bid_payload)
+
+        self.assertEqual(client.post("/tasks/bid", content=bid_payload, headers=headers).status_code, 200)
+
+
+
+        result_payload = "not valid json"
+
+        complete_body = json.dumps({"task_id": task_id, "provider_id": provider_id, "result_payload": result_payload})
+
+        complete_headers = _auth_headers(provider_priv, provider_id, complete_body)
+
+        complete = client.post("/tasks/complete", content=complete_body, headers=complete_headers)
+
+        self.assertEqual(complete.status_code, 200, complete.text)
+
+
+
+        # Admin triggers automated verification
+
+        verify_payload = json.dumps({"task_id": task_id})
+
+        verify_resp = client.post("/tasks/verify/automated", json=json.loads(verify_payload), headers={"x-mep-admin-key": "test-admin-key"})
+
+        self.assertEqual(verify_resp.status_code, 400, f"Expected rejection: {verify_resp.text}")
+
+
+
+        # Task should still be in submitted_result state
+
+        task = db.get_task(task_id)
+
+        self.assertEqual(task["status"], "submitted_result")
+
+
+
+    def test_automated_verifier_rejects_empty_result(self):
+
+        consumer_priv, consumer_pub, consumer_id = _make_identity()
+
+        provider_priv, provider_pub, provider_id = _make_identity()
+
+        _register(consumer_pub)
+
+        _register(provider_pub)
+
+
+
+        task_payload = json.dumps({"consumer_id": consumer_id, "payload": "test", "bounty": 1.0, "verifier_type": "automated"})
+
+        headers = _auth_headers(consumer_priv, consumer_id, task_payload)
+
+        submit = client.post("/tasks/submit", content=task_payload, headers=headers)
+
+        self.assertEqual(submit.status_code, 200, submit.text)
+
+        task_id = submit.json()["task_id"]
+
+
+
+        bid_payload = json.dumps({"task_id": task_id, "provider_id": provider_id})
+
+        headers = _auth_headers(provider_priv, provider_id, bid_payload)
+
+        self.assertEqual(client.post("/tasks/bid", content=bid_payload, headers=headers).status_code, 200)
+
+
+
+        result_payload = ""
+
+        complete_body = json.dumps({"task_id": task_id, "provider_id": provider_id, "result_payload": result_payload})
+
+        complete_headers = _auth_headers(provider_priv, provider_id, complete_body)
+
+        complete = client.post("/tasks/complete", content=complete_body, headers=complete_headers)
+
+        self.assertEqual(complete.status_code, 200, complete.text)
+
+
+
+        # Admin triggers automated verification
+
+        verify_payload = json.dumps({"task_id": task_id})
+
+        verify_resp = client.post("/tasks/verify/automated", json=json.loads(verify_payload), headers={"x-mep-admin-key": "test-admin-key"})
+
+        self.assertEqual(verify_resp.status_code, 400, f"Expected rejection: {verify_resp.text}")
+
