@@ -164,6 +164,7 @@ TASK_TIMEOUT_DEFAULT_SECONDS = int(os.getenv("MEP_TASK_TIMEOUT_DEFAULT_SECONDS",
 TASK_TIMEOUT_MIN_SECONDS = int(os.getenv("MEP_TASK_TIMEOUT_MIN_SECONDS", "60"))
 TASK_TIMEOUT_MAX_SECONDS = int(os.getenv("MEP_TASK_TIMEOUT_MAX_SECONDS", "86400"))
 SUBMITTED_RESULT_TIMEOUT_SECONDS = int(os.getenv("MEP_SUBMITTED_RESULT_TIMEOUT_SECONDS", "86400"))
+MAX_REBROADCAST_COUNT = int(os.getenv("MEP_MAX_REBROADCAST_COUNT", "3"))
 ASSIGNMENT_SWEEP_INTERVAL_SECONDS = int(os.getenv("MEP_ASSIGNMENT_SWEEP_INTERVAL_SECONDS", "60"))
 MAINTENANCE_SWEEP_INTERVAL_SECONDS = int(os.getenv("MEP_MAINTENANCE_SWEEP_INTERVAL_SECONDS", "60"))
 REGISTRY_RECONCILE_LIMIT = int(os.getenv("MEP_REGISTRY_RECONCILE_LIMIT", "1000"))
@@ -207,6 +208,7 @@ if TASK_TIMEOUT_MIN_SECONDS > TASK_TIMEOUT_MAX_SECONDS:
     TASK_TIMEOUT_MIN_SECONDS, TASK_TIMEOUT_MAX_SECONDS = TASK_TIMEOUT_MAX_SECONDS, TASK_TIMEOUT_MIN_SECONDS
 TASK_TIMEOUT_DEFAULT_SECONDS = max(TASK_TIMEOUT_MIN_SECONDS, min(TASK_TIMEOUT_DEFAULT_SECONDS, TASK_TIMEOUT_MAX_SECONDS))
 SUBMITTED_RESULT_TIMEOUT_SECONDS = max(TASK_TIMEOUT_MIN_SECONDS, min(SUBMITTED_RESULT_TIMEOUT_SECONDS, TASK_TIMEOUT_MAX_SECONDS))
+MAX_REBROADCAST_COUNT = max(0, MAX_REBROADCAST_COUNT)
 
 # ---------------------------------------------------------------------------
 # Node Activity Tracking (for passive degraded detection)
@@ -1409,50 +1411,62 @@ async def _sweep_assigned_timeouts():
         return
     for task in expired_tasks:
         if TIMEOUT_POLICY == "rebroadcast" and not task["target_node"]:
-            if task["bounty"] < 0:
-                refunded = db.refund_escrow(task["task_id"], now)
-                if refunded is not None:
-                    buyer_id = task.get("provider_id") or ""
-                    new_balance = db.get_balance(buyer_id) or 0.0
-                    log_audit("DATA_TIMEOUT_REFUND", buyer_id, refunded, new_balance, task["task_id"])
-            if not db.requeue_task_if_assigned(task["task_id"], now):
+            rebroadcast_count = int(task.get("rebroadcast_count") or 0)
+            if MAX_REBROADCAST_COUNT > 0 and rebroadcast_count >= MAX_REBROADCAST_COUNT:
+                log_event(
+                    "task_rebroadcast_limit",
+                    f"Task {task['task_id'][:8]} reached rebroadcast limit",
+                    task_id=task["task_id"],
+                    consumer_id=task["consumer_id"],
+                    bounty=task["bounty"],
+                    rebroadcast_count=rebroadcast_count,
+                    max_rebroadcast_count=MAX_REBROADCAST_COUNT,
+                )
+            else:
+                if task["bounty"] < 0:
+                    refunded = db.refund_escrow(task["task_id"], now)
+                    if refunded is not None:
+                        buyer_id = task.get("provider_id") or ""
+                        new_balance = db.get_balance(buyer_id) or 0.0
+                        log_audit("DATA_TIMEOUT_REFUND", buyer_id, refunded, new_balance, task["task_id"])
+                if not db.requeue_task_if_assigned(task["task_id"], now):
+                    continue
+                task_data = {
+                    "id": task["task_id"],
+                    "consumer_id": task["consumer_id"],
+                    "payload": task["payload"],
+                    "bounty": task["bounty"],
+                    "status": "bidding",
+                    "target_node": task["target_node"],
+                    "model_requirement": task["model_requirement"],
+                    "verifier_type": task.get("verifier_type"),
+                    "expires_in_seconds": task.get("expires_in_seconds"),
+                    "payload_uri": task.get("payload_uri"),
+                    "secret_data": task.get("result_payload")
+                }
+                async with task_lock:
+                    active_tasks[task["task_id"]] = task_data
+                model_requirement = _normalize_model_requirement(task["model_requirement"])
+                rfc_data = {
+                    "id": task["task_id"],
+                    "consumer_id": task["consumer_id"],
+                    "bounty": task["bounty"],
+                    "model_requirement": model_requirement,
+                    "payload_uri": task.get("payload_uri")
+                }
+                async with node_lock:
+                    broadcast_nodes = list(connected_nodes.items())
+                candidate_nodes = _select_rfc_recipients(task["consumer_id"], model_requirement, broadcast_nodes)
+                for node_id, ws in candidate_nodes:
+                    try:
+                        await ws.send_json({"event": "rfc", "data": rfc_data})
+                    except Exception as exc:
+                        log_event("broadcast_error", f"Failed to send RFC to {node_id}: {exc}", node_id=node_id, task_id=task["task_id"])
+                        async with node_lock:
+                            if connected_nodes.get(node_id) is ws:
+                                del connected_nodes[node_id]
+                log_event("task_requeued_timeout", f"Task {task['task_id'][:8]} requeued after timeout", task_id=task["task_id"], consumer_id=task["consumer_id"], bounty=task["bounty"], rebroadcast_count=rebroadcast_count + 1)
                 continue
-            task_data = {
-                "id": task["task_id"],
-                "consumer_id": task["consumer_id"],
-                "payload": task["payload"],
-                "bounty": task["bounty"],
-                "status": "bidding",
-                "target_node": task["target_node"],
-                "model_requirement": task["model_requirement"],
-                "verifier_type": task.get("verifier_type"),
-                "expires_in_seconds": task.get("expires_in_seconds"),
-                "payload_uri": task.get("payload_uri"),
-                "secret_data": task.get("result_payload")
-            }
-            async with task_lock:
-                active_tasks[task["task_id"]] = task_data
-            model_requirement = _normalize_model_requirement(task["model_requirement"])
-            rfc_data = {
-                "id": task["task_id"],
-                "consumer_id": task["consumer_id"],
-                "bounty": task["bounty"],
-                "model_requirement": model_requirement,
-                "payload_uri": task.get("payload_uri")
-            }
-            async with node_lock:
-                broadcast_nodes = list(connected_nodes.items())
-            candidate_nodes = _select_rfc_recipients(task["consumer_id"], model_requirement, broadcast_nodes)
-            for node_id, ws in candidate_nodes:
-                try:
-                    await ws.send_json({"event": "rfc", "data": rfc_data})
-                except Exception as exc:
-                    log_event("broadcast_error", f"Failed to send RFC to {node_id}: {exc}", node_id=node_id, task_id=task["task_id"])
-                    async with node_lock:
-                        if connected_nodes.get(node_id) is ws:
-                            del connected_nodes[node_id]
-            log_event("task_requeued_timeout", f"Task {task['task_id'][:8]} requeued after timeout", task_id=task["task_id"], consumer_id=task["consumer_id"], bounty=task["bounty"])
-            continue
         if not db.expire_task_if_assigned(task["task_id"], now):
             continue
         if task["bounty"] > 0:

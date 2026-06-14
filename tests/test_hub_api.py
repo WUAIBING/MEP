@@ -1467,6 +1467,63 @@ class TestBiddingTimeout(unittest.TestCase):
         self.assertEqual(client.get(f"/balance/{buyer_id}").json()["balance_seconds"], buyer_before)
         self.assertEqual(client.get(f"/balance/{seller_id}").json()["balance_seconds"], seller_before)
 
+    def test_rebroadcast_limit_expires_after_max_rebroadcasts(self):
+        """When TIMEOUT_POLICY=rebroadcast, task should requeue up to MAX_REBROADCAST_COUNT then expire and refund."""
+        old_policy = main.TIMEOUT_POLICY
+        old_max = main.MAX_REBROADCAST_COUNT
+        main.TIMEOUT_POLICY = "rebroadcast"
+        main.MAX_REBROADCAST_COUNT = 2
+        try:
+            consumer_priv, consumer_pub, consumer_id = _make_identity()
+            provider_priv, provider_pub, provider_id = _make_identity()
+            _register(consumer_pub)
+            _register(provider_pub)
+
+            consumer_before = client.get(f"/balance/{consumer_id}").json()["balance_seconds"]
+
+            task_payload = json.dumps({"consumer_id": consumer_id, "payload": "rebroadcast me", "bounty": 1.0})
+            headers = _auth_headers(consumer_priv, consumer_id, task_payload)
+            submit = client.post("/tasks/submit", content=task_payload, headers=headers)
+            self.assertEqual(submit.status_code, 200, submit.text)
+            task_id = submit.json()["task_id"]
+
+            bid_payload = json.dumps({"task_id": task_id, "provider_id": provider_id})
+            headers = _auth_headers(provider_priv, provider_id, bid_payload)
+            self.assertEqual(client.post("/tasks/bid", content=bid_payload, headers=headers).status_code, 200)
+            self.assertEqual(client.get(f"/balance/{consumer_id}").json()["balance_seconds"], consumer_before - 1.0)
+
+            import asyncio
+            from main import _sweep_assigned_timeouts
+
+            for i in range(3):
+                old_time = time.time() - 7200
+                conn = db._get_conn()
+                conn.execute("UPDATE tasks SET updated_at = ? WHERE task_id = ?", (old_time, task_id))
+                conn.commit()
+                db._release_conn(conn)
+
+                loop = asyncio.new_event_loop()
+                try:
+                    loop.run_until_complete(_sweep_assigned_timeouts())
+                finally:
+                    loop.close()
+
+                task = db.get_task(task_id)
+                if i < 2:
+                    self.assertEqual(task["status"], "bidding", f"Expected bidding after requeue {i+1}, got {task['status']}")
+                    self.assertEqual(task.get("rebroadcast_count", 0), i + 1)
+                    # Re-bid so next sweep can requeue again
+                    bid_payload = json.dumps({"task_id": task_id, "provider_id": provider_id})
+                    headers = _auth_headers(provider_priv, provider_id, bid_payload)
+                    self.assertEqual(client.post("/tasks/bid", content=bid_payload, headers=headers).status_code, 200)
+                else:
+                    self.assertEqual(task["status"], "expired", f"Expected expired after hitting limit on iteration {i+1}, got {task['status']}")
+                    self.assertEqual(task.get("rebroadcast_count", 0), 2)
+
+            self.assertEqual(client.get(f"/balance/{consumer_id}").json()["balance_seconds"], consumer_before)
+        finally:
+            main.TIMEOUT_POLICY = old_policy
+            main.MAX_REBROADCAST_COUNT = old_max
 
 class TestConsumerDefinedTimeout(unittest.TestCase):
     """Per-task consumer timeout should override global default within bounds."""
