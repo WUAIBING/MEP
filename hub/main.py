@@ -41,7 +41,7 @@ from models import (
     BrainstormSessionPost,
 )
 
-app = FastAPI(title="MEP Hub", description="The Time Exchange Clearinghouse", version="0.1.2")
+app = FastAPI(title="MEP Hub", description="The Time Exchange Clearinghouse", version="0.1.2", docs_url="/docs", redoc_url="/redoc")
 
 # In-memory storage for active tasks
 active_tasks: Dict[str, dict] = {}
