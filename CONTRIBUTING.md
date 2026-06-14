@@ -41,6 +41,17 @@ pip install -r requirements-test.txt
 
 ### Running the Hub Locally
 
+**Environment Variables (set before starting hub):**
+```bash
+# Admin key for admin endpoints (registration approval, etc.)
+export MEP_ADMIN_KEY=your-admin-key
+
+# Database URL (use explicit SQLite path)
+export MEP_DATABASE_URL="sqlite:///mep.db"
+```
+
+**Note**: Environment variable changes require a hub restart to take effect.
+
 **Option 1: Docker + Postgres (Recommended for production-like testing)**
 ```bash
 docker-compose up -d --build
@@ -57,6 +68,32 @@ Health check:
 ```bash
 curl http://localhost:8000/health
 ```
+
+### Node Registration Flow
+
+**Important**: As of PR #217, new node registrations require admin approval before receiving balance.
+
+**Registration Process:**
+1. Register node → Status: `pending`, Balance: `0.0`
+2. Admin approves node → Status: `approved`, Balance: `0.0`
+3. Node can now participate in tasks
+
+**For local development/testing:**
+- The test helper `_register()` in `tests/test_hub_api.py` auto-approves nodes by default
+- For production hubs, use the admin endpoints:
+  - `POST /admin/approve-registration` - Approve a pending registration
+  - `GET /admin/pending-registrations` - List pending registrations
+- Use the `MEP_ADMIN_KEY` set above for admin authentication
+
+**Admin endpoints require the admin key in headers:**
+```bash
+curl -X POST http://localhost:8000/admin/approve-registration \
+  -H "x-mep-admin-key: your-admin-key" \
+  -H "Content-Type: application/json" \
+  -d '{"node_id": "node_xxx"}'
+```
+
+**Note**: The `README.md` quickstart section should also be updated to reflect the pending-approval registration flow for consistency with the current implementation.
 
 ## Development Workflow
 
