@@ -46,8 +46,8 @@ pip install -r requirements-test.txt
 # Admin key for admin endpoints (registration approval, etc.)
 export MEP_ADMIN_KEY=your-admin-key
 
-# Database URL (empty string forces SQLite)
-export MEP_DATABASE_URL=""
+# Database URL (use explicit SQLite path)
+export MEP_DATABASE_URL="sqlite:///mep.db"
 ```
 
 **Note**: Environment variable changes require a hub restart to take effect.
@@ -75,7 +75,7 @@ curl http://localhost:8000/health
 
 **Registration Process:**
 1. Register node → Status: `pending`, Balance: `0.0`
-2. Admin approves node → Status: `approved`, Balance: `10.0 SECONDS`
+2. Admin approves node → Status: `approved`, Balance: `0.0`
 3. Node can now participate in tasks
 
 **For local development/testing:**
@@ -83,14 +83,9 @@ curl http://localhost:8000/health
 - For production hubs, use the admin endpoints:
   - `POST /admin/approve-registration` - Approve a pending registration
   - `GET /admin/pending-registrations` - List pending registrations
-- Set `MEP_ADMIN_KEY` environment variable for admin authentication
+- Use the `MEP_ADMIN_KEY` set above for admin authentication
 
-**Admin endpoints require:**
-```bash
-export MEP_ADMIN_KEY=your-admin-key
-```
-
-Then include the header in requests:
+**Admin endpoints require the admin key in headers:**
 ```bash
 curl -X POST http://localhost:8000/admin/approve-registration \
   -H "x-mep-admin-key: your-admin-key" \
