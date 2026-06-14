@@ -273,6 +273,23 @@ class MEPCLIProvider:
             return [arg.replace("{payload}", payload) for arg in argv]
         return [*argv, payload]
 
+    async def _reject_task(self, task_id: str, reason: str):
+        payload_str = json.dumps({
+            "task_id": task_id,
+            "provider_id": self.node_id,
+            "reason": reason,
+        })
+        headers = self.identity.get_auth_headers(payload_str)
+        headers["Content-Type"] = "application/json"
+        resp = await self._post_with_retry(f"{HUB_URL}/tasks/reject", payload_str=payload_str, headers=headers)
+        if resp is None:
+            print(f"[CLI Provider] Failed to reject task {task_id[:8]}")
+            return
+        if resp.status_code != 200:
+            print(f"[CLI Provider] Task reject failed for {task_id[:8]}: HTTP {resp.status_code} {resp.text}")
+            return
+        print(f"[CLI Provider] Rejected task {task_id[:8]}: {reason}")
+
     async def process_task(self, task_data: dict, secret_data: Optional[str] = None):
         """Execute the task using a local CLI agent."""
         task_id = task_data["id"]
@@ -288,6 +305,8 @@ class MEPCLIProvider:
         if not self.allow_execution:
             print(f"[CLI Provider] Execution disabled; skipping task {task_id[:8]}. "
                   "Set MEP_CLI_ALLOW_EXECUTION=true only in a sandboxed environment.")
+            if bounty != 0:
+                await self._reject_task(task_id, "execution_disabled")
             return
         
         # If this is a Data Market purchase, save the secret data!

@@ -1,5 +1,6 @@
 import os
 import sys
+import json
 import tempfile
 import types
 import unittest
@@ -33,19 +34,20 @@ class TestMEPCLIProviderSafety(unittest.IsolatedAsyncioTestCase):
         argv = MEPCLIProvider._build_agent_argv("agent --task {payload}", payload)
         self.assertEqual(argv, ["agent", "--task", payload])
 
-    async def test_process_task_skips_executable_task_when_disabled(self):
+    async def test_process_task_rejects_executable_task_when_disabled(self):
         provider = MEPCLIProvider.__new__(MEPCLIProvider)
         provider.workspace_dir = tempfile.mkdtemp()
         provider.allow_execution = False
         provider.upload_code = False
         provider.max_code_chars = 12000
         provider.node_id = "node_test"
+        provider.identity = types.SimpleNamespace(get_auth_headers=lambda payload: {"X-Test-Payload": payload})
 
         calls = []
 
         async def fake_post(*args, **kwargs):
             calls.append((args, kwargs))
-            return None
+            return types.SimpleNamespace(status_code=200, text="ok")
 
         provider._post_with_retry = fake_post
         await provider.process_task(
@@ -56,7 +58,13 @@ class TestMEPCLIProviderSafety(unittest.IsolatedAsyncioTestCase):
                 "consumer_id": "node_consumer",
             }
         )
-        self.assertEqual(calls, [])
+        self.assertEqual(len(calls), 1)
+        url = calls[0][0][0]
+        payload = json.loads(calls[0][1]["payload_str"])
+        self.assertTrue(url.endswith("/tasks/reject"))
+        self.assertEqual(payload["task_id"], "task_exec_disabled")
+        self.assertEqual(payload["provider_id"], "node_test")
+        self.assertEqual(payload["reason"], "execution_disabled")
 
 
 if __name__ == "__main__":

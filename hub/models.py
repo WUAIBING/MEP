@@ -47,6 +47,11 @@ class TaskResult(BaseModel):
 class TaskCancel(BaseModel):
     task_id: str
 
+class TaskReject(BaseModel):
+    task_id: str
+    provider_id: str
+    reason: Optional[str] = None
+
 class TaskVerificationAccept(BaseModel):
     task_id: str
 

@@ -523,6 +523,105 @@ def submit_task_result_for_verification(
     finally:
         _release_conn(conn)
 
+def reject_task_if_assigned(task_id: str, provider_id: str, updated_at: float) -> dict:
+    """Reject an assigned task without settling payment to the provider."""
+    conn = _get_conn()
+    cursor = conn.cursor()
+    try:
+        if not _is_postgres():
+            cursor.execute("BEGIN IMMEDIATE")
+
+        if _is_postgres():
+            cursor.execute(
+                "SELECT consumer_id, provider_id, bounty, status FROM tasks WHERE task_id = %s FOR UPDATE",
+                (task_id,),
+            )
+        else:
+            cursor.execute(
+                "SELECT consumer_id, provider_id, bounty, status FROM tasks WHERE task_id = ?",
+                (task_id,),
+            )
+        row = cursor.fetchone()
+        if not row:
+            conn.rollback()
+            return {"status": "not_found"}
+
+        consumer_id, assigned_provider, bounty, task_status = row[0], row[1], float(row[2]), row[3]
+        if task_status == "rejected" and assigned_provider == provider_id:
+            conn.commit()
+            return {"status": "already_rejected", "ledger_events": []}
+        if task_status != "assigned":
+            conn.rollback()
+            return {"status": "not_active", "task_status": task_status}
+        if assigned_provider != provider_id:
+            conn.rollback()
+            return {"status": "assigned_to_other", "assigned_provider": assigned_provider}
+
+        ledger_events: list[dict] = []
+        if bounty != 0:
+            if _is_postgres():
+                cursor.execute(
+                    "SELECT consumer_id, amount, status FROM escrows WHERE task_id = %s FOR UPDATE",
+                    (task_id,),
+                )
+            else:
+                cursor.execute(
+                    "SELECT consumer_id, amount, status FROM escrows WHERE task_id = ?",
+                    (task_id,),
+                )
+            escrow = cursor.fetchone()
+            if bounty > 0 and (not escrow or escrow[2] != "held"):
+                conn.rollback()
+                return {"status": "escrow_not_held"}
+            if escrow and escrow[2] == "held":
+                escrow_consumer_id = escrow[0]
+                amount = float(escrow[1])
+                if _is_postgres():
+                    cursor.execute(
+                        "UPDATE escrows SET status = %s, updated_at = %s WHERE task_id = %s AND status = %s",
+                        ("refunded", updated_at, task_id, "held"),
+                    )
+                    cursor.execute("UPDATE ledger SET balance = balance + %s WHERE node_id = %s", (amount, escrow_consumer_id))
+                else:
+                    cursor.execute(
+                        "UPDATE escrows SET status = ?, updated_at = ? WHERE task_id = ? AND status = ?",
+                        ("refunded", updated_at, task_id, "held"),
+                    )
+                    cursor.execute("UPDATE ledger SET balance = balance + ? WHERE node_id = ?", (amount, escrow_consumer_id))
+                ledger_events.append({"kind": "TASK_REJECT_REFUND", "node_id": escrow_consumer_id, "amount": amount})
+
+        if _is_postgres():
+            cursor.execute(
+                "UPDATE tasks SET status = %s, updated_at = %s WHERE task_id = %s AND status = %s AND provider_id = %s",
+                ("rejected", updated_at, task_id, "assigned", provider_id),
+            )
+        else:
+            cursor.execute(
+                "UPDATE tasks SET status = ?, updated_at = ? WHERE task_id = ? AND status = ? AND provider_id = ?",
+                ("rejected", updated_at, task_id, "assigned", provider_id),
+            )
+        if cursor.rowcount == 0:
+            conn.rollback()
+            return {"status": "not_active"}
+
+        conn.commit()
+        return {
+            "status": "success",
+            "task": {
+                "task_id": task_id,
+                "consumer_id": consumer_id,
+                "provider_id": provider_id,
+                "bounty": bounty,
+                "status": "rejected",
+            },
+            "ledger_events": ledger_events,
+        }
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        _release_conn(conn)
+
 def update_task_status(task_id: str, status: str, updated_at: float):
     conn = _get_conn()
     cursor = conn.cursor()
