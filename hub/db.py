@@ -2,7 +2,15 @@ import sqlite3
 import os
 import json
 import time
+from decimal import Decimal, InvalidOperation
 from typing import Optional
+
+from nanoseconds import (
+    NS_PER_SECOND,
+    NanosecondsError,
+    legacy_seconds_to_ns,
+    ns_to_legacy_seconds,
+)
 
 try:
     import psycopg2
@@ -43,6 +51,322 @@ def _row_to_dict(cursor, row):
         return None
     columns = [desc[0] for desc in cursor.description]
     return dict(zip(columns, row))
+
+
+FINANCIAL_NS_BACKFILL_REPORT: list[dict] = []
+
+
+def _sql_placeholder() -> str:
+    return "%s" if _is_postgres() else "?"
+
+
+def _column_exists(cursor, table_name: str, column_name: str) -> bool:
+    if _is_postgres():
+        cursor.execute(
+            "SELECT column_name FROM information_schema.columns WHERE table_name = %s AND column_name = %s",
+            (table_name, column_name),
+        )
+        return bool(cursor.fetchone())
+    cursor.execute(f"PRAGMA table_info({table_name})")
+    return column_name in [row[1] for row in cursor.fetchall()]
+
+
+def _ensure_integer_ns_column(cursor, table_name: str, column_name: str):
+    if _column_exists(cursor, table_name, column_name):
+        return
+    if _is_postgres():
+        cursor.execute(f"ALTER TABLE {table_name} ADD COLUMN {column_name} BIGINT")
+    else:
+        cursor.execute(f"ALTER TABLE {table_name} ADD COLUMN {column_name} INTEGER")
+
+
+def _ensure_ledger_balance_ns_column(cursor):
+    _ensure_integer_ns_column(cursor, "ledger", "balance_ns")
+
+
+def _ensure_tasks_bounty_ns_column(cursor):
+    _ensure_integer_ns_column(cursor, "tasks", "bounty_ns")
+
+
+def _ensure_escrows_amount_ns_column(cursor):
+    _ensure_integer_ns_column(cursor, "escrows", "amount_ns")
+
+
+def _assert_financial_ns_column_affinity(cursor):
+    """Assert schema-level integer affinity for additive ns columns."""
+
+    expected = [
+        ("ledger", "balance_ns"),
+        ("tasks", "bounty_ns"),
+        ("escrows", "amount_ns"),
+    ]
+    if _is_postgres():
+        for table_name, column_name in expected:
+            cursor.execute(
+                """
+                SELECT data_type
+                FROM information_schema.columns
+                WHERE table_name = %s AND column_name = %s
+                """,
+                (table_name, column_name),
+            )
+            row = cursor.fetchone()
+            if not row or row[0] not in ("bigint", "integer"):
+                raise RuntimeError(f"{table_name}.{column_name} must be integer-backed")
+        return
+
+    for table_name, column_name in expected:
+        cursor.execute(f"PRAGMA table_info({table_name})")
+        columns = {row[1]: row[2].upper() for row in cursor.fetchall()}
+        if "INT" not in columns.get(column_name, ""):
+            raise RuntimeError(f"{table_name}.{column_name} must have INTEGER affinity")
+
+
+def _legacy_seconds_to_ns_exact(value, column_name: str, *, allow_negative: bool) -> int:
+    ns = legacy_seconds_to_ns(value, column_name)
+    if ns < 0 and not allow_negative:
+        raise NanosecondsError(f"{column_name} cannot be negative")
+    return ns
+
+
+def _financial_pair(value, column_name: str, *, allow_negative: bool) -> tuple[int, float]:
+    ns = _legacy_seconds_to_ns_exact(value, column_name, allow_negative=allow_negative)
+    return ns, ns_to_legacy_seconds(ns)
+
+
+def _cursor_add_balance(cursor, node_id: str, amount: float) -> int:
+    amount_ns, amount = _financial_pair(amount, "amount", allow_negative=True)
+    if _is_postgres():
+        cursor.execute(
+            """
+            UPDATE ledger
+            SET balance = balance + %s,
+                balance_ns = CASE WHEN balance_ns IS NULL THEN NULL ELSE balance_ns + %s END
+            WHERE node_id = %s
+            """,
+            (amount, amount_ns, node_id),
+        )
+    else:
+        cursor.execute(
+            """
+            UPDATE ledger
+            SET balance = balance + ?,
+                balance_ns = CASE WHEN balance_ns IS NULL THEN NULL ELSE balance_ns + ? END
+            WHERE node_id = ?
+            """,
+            (amount, amount_ns, node_id),
+        )
+    return int(cursor.rowcount or 0)
+
+
+def _cursor_deduct_balance(cursor, node_id: str, amount: float) -> int:
+    amount_ns, amount = _financial_pair(amount, "amount", allow_negative=False)
+    if _is_postgres():
+        cursor.execute(
+            """
+            UPDATE ledger
+            SET balance = balance - %s,
+                balance_ns = CASE WHEN balance_ns IS NULL THEN NULL ELSE balance_ns - %s END
+            WHERE node_id = %s AND balance >= %s AND (balance_ns IS NULL OR balance_ns >= %s)
+            """,
+            (amount, amount_ns, node_id, amount, amount_ns),
+        )
+    else:
+        cursor.execute(
+            """
+            UPDATE ledger
+            SET balance = balance - ?,
+                balance_ns = CASE WHEN balance_ns IS NULL THEN NULL ELSE balance_ns - ? END
+            WHERE node_id = ? AND balance >= ? AND (balance_ns IS NULL OR balance_ns >= ?)
+            """,
+            (amount, amount_ns, node_id, amount, amount_ns),
+        )
+    return int(cursor.rowcount or 0)
+
+
+def _cursor_insert_held_escrow(
+    cursor,
+    task_id: str,
+    consumer_id: str,
+    provider_id: Optional[str],
+    amount: float,
+    created_at: float,
+    updated_at: float,
+) -> int:
+    amount_ns, amount = _financial_pair(amount, "amount", allow_negative=False)
+    if _is_postgres():
+        cursor.execute(
+            """
+            INSERT INTO escrows (task_id, consumer_id, provider_id, amount, amount_ns, status, created_at, updated_at)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT (task_id) DO NOTHING
+            """,
+            (task_id, consumer_id, provider_id, amount, amount_ns, "held", created_at, updated_at),
+        )
+    else:
+        cursor.execute(
+            """
+            INSERT OR IGNORE INTO escrows (task_id, consumer_id, provider_id, amount, amount_ns, status, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (task_id, consumer_id, provider_id, amount, amount_ns, "held", created_at, updated_at),
+        )
+    return int(cursor.rowcount or 0)
+
+
+def _coerce_ns_from_row(legacy_value, ns_value, column_name: str, *, allow_negative: bool) -> int:
+    if ns_value is not None:
+        if isinstance(ns_value, bool):
+            raise NanosecondsError(f"{column_name}_ns must be an integer")
+        ns_int = int(ns_value)
+        if ns_int != ns_value:
+            raise NanosecondsError(f"{column_name}_ns must be a whole integer")
+        if ns_int < 0 and not allow_negative:
+            raise NanosecondsError(f"{column_name}_ns cannot be negative")
+        return ns_int
+    return _legacy_seconds_to_ns_exact(legacy_value, column_name, allow_negative=allow_negative)
+
+
+def _audit_financial_value(
+    table_name: str,
+    row_id,
+    column_name: str,
+    legacy_value,
+    ns_actual,
+    *,
+    allow_negative: bool,
+) -> dict:
+    row = {
+        "table": table_name,
+        "row_id": str(row_id),
+        "column": column_name,
+        "float_value": str(legacy_value),
+        "ns_expected": "",
+        "ns_actual": "" if ns_actual is None else str(ns_actual),
+        "status": "exact",
+    }
+    try:
+        decimal_value = Decimal(str(legacy_value))
+    except (InvalidOperation, ValueError):
+        row["status"] = "nonsense"
+        return row
+    if not decimal_value.is_finite() or (decimal_value < 0 and not allow_negative):
+        row["status"] = "nonsense"
+        return row
+    ns_decimal = decimal_value * Decimal(NS_PER_SECOND)
+    integral = ns_decimal.to_integral_value()
+    row["ns_expected"] = str(int(integral)) if ns_decimal == integral else format(ns_decimal, "f")
+    if ns_decimal != integral:
+        row["status"] = "rounded"
+    return row
+
+
+_FINANCIAL_NS_BACKFILL_CONFIG = [
+    ("ledger", "node_id", "balance", "balance_ns", False),
+    ("tasks", "task_id", "bounty", "bounty_ns", True),
+    ("escrows", "task_id", "amount", "amount_ns", False),
+]
+
+
+def audit_financial_ns_backfill() -> list[dict]:
+    """Return a structured report for legacy REAL -> integer ns conversion."""
+
+    conn = _get_conn()
+    cursor = conn.cursor()
+    report: list[dict] = []
+    try:
+        for table_name, id_column, real_column, ns_column, allow_negative in _FINANCIAL_NS_BACKFILL_CONFIG:
+            placeholder = ""  # Keeps f-string query construction explicit below.
+            del placeholder
+            cursor.execute(f"SELECT {id_column}, {real_column}, {ns_column} FROM {table_name}")
+            for row_id, legacy_value, ns_actual in cursor.fetchall():
+                report.append(
+                    _audit_financial_value(
+                        table_name,
+                        row_id,
+                        real_column,
+                        legacy_value,
+                        ns_actual,
+                        allow_negative=allow_negative,
+                    )
+                )
+        return report
+    finally:
+        _release_conn(conn)
+
+
+def backfill_financial_ns_columns() -> list[dict]:
+    """Populate additive ns columns for exact legacy values and report all rows."""
+
+    conn = _get_conn()
+    cursor = conn.cursor()
+    report: list[dict] = []
+    try:
+        for table_name, id_column, real_column, ns_column, allow_negative in _FINANCIAL_NS_BACKFILL_CONFIG:
+            cursor.execute(f"SELECT {id_column}, {real_column}, {ns_column} FROM {table_name}")
+            rows = cursor.fetchall()
+            for row_id, legacy_value, ns_actual in rows:
+                audit_row = _audit_financial_value(
+                    table_name,
+                    row_id,
+                    real_column,
+                    legacy_value,
+                    ns_actual,
+                    allow_negative=allow_negative,
+                )
+                report.append(audit_row)
+                if audit_row["status"] != "exact":
+                    continue
+                expected_ns = int(audit_row["ns_expected"])
+                if ns_actual is not None and int(ns_actual) == expected_ns:
+                    continue
+                placeholder = _sql_placeholder()
+                cursor.execute(
+                    f"UPDATE {table_name} SET {ns_column} = {placeholder} WHERE {id_column} = {placeholder}",
+                    (expected_ns, row_id),
+                )
+        conn.commit()
+        return report
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        _release_conn(conn)
+
+
+def validate_financial_ns_storage() -> list[dict]:
+    """Report SQLite rows whose ns columns are not stored as whole integers."""
+
+    if _is_postgres():
+        return []
+    conn = _get_conn()
+    cursor = conn.cursor()
+    issues: list[dict] = []
+    try:
+        for table_name, id_column, _real_column, ns_column, _allow_negative in _FINANCIAL_NS_BACKFILL_CONFIG:
+            cursor.execute(
+                f"""
+                SELECT {id_column}, {ns_column}, typeof({ns_column})
+                FROM {table_name}
+                WHERE {ns_column} IS NOT NULL AND typeof({ns_column}) != 'integer'
+                """
+            )
+            for row_id, ns_actual, storage_type in cursor.fetchall():
+                issues.append(
+                    {
+                        "table": table_name,
+                        "row_id": str(row_id),
+                        "column": ns_column,
+                        "float_value": "",
+                        "ns_expected": "",
+                        "ns_actual": str(ns_actual),
+                        "status": "nonsense",
+                        "storage_type": storage_type,
+                    }
+                )
+        return issues
+    finally:
+        _release_conn(conn)
 
 def _ensure_registry_availability_column(cursor):
     if _is_postgres():
@@ -128,9 +452,11 @@ def init_db():
         CREATE TABLE IF NOT EXISTS ledger (
             node_id TEXT PRIMARY KEY,
             pub_pem TEXT NOT NULL,
-            balance REAL NOT NULL
+            balance REAL NOT NULL,
+            balance_ns INTEGER
         )
     ''')
+    _ensure_ledger_balance_ns_column(cursor)
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS pending_registrations (
             node_id TEXT PRIMARY KEY,
@@ -156,6 +482,7 @@ def init_db():
             result_uri TEXT,
             verifier_type TEXT,
             rebroadcast_count INTEGER NOT NULL DEFAULT 0,
+            bounty_ns INTEGER,
             created_at REAL NOT NULL,
             updated_at REAL NOT NULL
         )
@@ -164,6 +491,7 @@ def init_db():
     _ensure_tasks_envelope_json_column(cursor)
     _ensure_tasks_verifier_type_column(cursor)
     _ensure_tasks_rebroadcast_count_column(cursor)
+    _ensure_tasks_bounty_ns_column(cursor)
     if not _is_postgres():
         try:
             cursor.execute("ALTER TABLE tasks ADD COLUMN payload_uri TEXT")
@@ -220,11 +548,14 @@ def init_db():
             consumer_id TEXT NOT NULL,
             provider_id TEXT,
             amount REAL NOT NULL,
+            amount_ns INTEGER,
             status TEXT NOT NULL,
             created_at REAL NOT NULL,
             updated_at REAL NOT NULL
         )
     ''')
+    _ensure_escrows_amount_ns_column(cursor)
+    _assert_financial_ns_column_affinity(cursor)
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS disputes (
             dispute_id TEXT PRIMARY KEY,
@@ -254,6 +585,9 @@ def init_db():
     ''')
     conn.commit()
     _release_conn(conn)
+    global FINANCIAL_NS_BACKFILL_REPORT
+    FINANCIAL_NS_BACKFILL_REPORT = backfill_financial_ns_columns()
+    FINANCIAL_NS_BACKFILL_REPORT.extend(validate_financial_ns_storage())
 
 def register_node(node_id: str, pub_pem: str) -> dict:
     conn = _get_conn()
@@ -281,6 +615,7 @@ def register_node(node_id: str, pub_pem: str) -> dict:
     return {"status": "pending", "balance": 0.0}
 
 def approve_registration(node_id: str, approved_by: str, initial_balance: float = 10.0) -> bool:
+    initial_balance_ns, initial_balance = _financial_pair(initial_balance, "balance", allow_negative=False)
     conn = _get_conn()
     cursor = conn.cursor()
     if _is_postgres():
@@ -295,8 +630,17 @@ def approve_registration(node_id: str, approved_by: str, initial_balance: float 
     now = time.time()
     if _is_postgres():
         cursor.execute(
-            "INSERT INTO ledger (node_id, pub_pem, balance) VALUES (%s, %s, %s) ON CONFLICT (node_id) DO UPDATE SET balance = ledger.balance + %s",
-            (node_id, pub_pem, initial_balance, initial_balance)
+            """
+            INSERT INTO ledger (node_id, pub_pem, balance, balance_ns)
+            VALUES (%s, %s, %s, %s)
+            ON CONFLICT (node_id) DO UPDATE SET
+                balance = ledger.balance + EXCLUDED.balance,
+                balance_ns = CASE
+                    WHEN ledger.balance_ns IS NULL THEN NULL
+                    ELSE ledger.balance_ns + EXCLUDED.balance_ns
+                END
+            """,
+            (node_id, pub_pem, initial_balance, initial_balance_ns)
         )
         cursor.execute(
             "UPDATE pending_registrations SET approved_at = %s, approved_by = %s WHERE node_id = %s",
@@ -304,8 +648,17 @@ def approve_registration(node_id: str, approved_by: str, initial_balance: float 
         )
     else:
         cursor.execute(
-            "INSERT INTO ledger (node_id, pub_pem, balance) VALUES (?, ?, ?) ON CONFLICT(node_id) DO UPDATE SET balance = balance + ?",
-            (node_id, pub_pem, initial_balance, initial_balance)
+            """
+            INSERT INTO ledger (node_id, pub_pem, balance, balance_ns)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(node_id) DO UPDATE SET
+                balance = balance + excluded.balance,
+                balance_ns = CASE
+                    WHEN balance_ns IS NULL THEN NULL
+                    ELSE balance_ns + excluded.balance_ns
+                END
+            """,
+            (node_id, pub_pem, initial_balance, initial_balance_ns)
         )
         cursor.execute(
             "UPDATE pending_registrations SET approved_at = ?, approved_by = ? WHERE node_id = ?",
@@ -360,37 +713,66 @@ def get_node_count() -> int:
     return int(row[0]) if row else 0
 
 def set_balance(node_id: str, balance: float):
+    balance_ns, balance = _financial_pair(balance, "balance", allow_negative=False)
     conn = _get_conn()
     cursor = conn.cursor()
     if _is_postgres():
-        cursor.execute("UPDATE ledger SET balance = %s WHERE node_id = %s", (balance, node_id))
+        cursor.execute("UPDATE ledger SET balance = %s, balance_ns = %s WHERE node_id = %s", (balance, balance_ns, node_id))
     else:
-        cursor.execute("UPDATE ledger SET balance = ? WHERE node_id = ?", (balance, node_id))
+        cursor.execute("UPDATE ledger SET balance = ?, balance_ns = ? WHERE node_id = ?", (balance, balance_ns, node_id))
     conn.commit()
     _release_conn(conn)
 
 def add_balance(node_id: str, amount: float):
+    amount_ns, amount = _financial_pair(amount, "amount", allow_negative=True)
     conn = _get_conn()
     cursor = conn.cursor()
     if _is_postgres():
-        cursor.execute("UPDATE ledger SET balance = balance + %s WHERE node_id = %s", (amount, node_id))
+        cursor.execute(
+            """
+            UPDATE ledger
+            SET balance = balance + %s,
+                balance_ns = CASE WHEN balance_ns IS NULL THEN NULL ELSE balance_ns + %s END
+            WHERE node_id = %s
+            """,
+            (amount, amount_ns, node_id)
+        )
     else:
-        cursor.execute("UPDATE ledger SET balance = balance + ? WHERE node_id = ?", (amount, node_id))
+        cursor.execute(
+            """
+            UPDATE ledger
+            SET balance = balance + ?,
+                balance_ns = CASE WHEN balance_ns IS NULL THEN NULL ELSE balance_ns + ? END
+            WHERE node_id = ?
+            """,
+            (amount, amount_ns, node_id)
+        )
     conn.commit()
     _release_conn(conn)
 
 def deduct_balance(node_id: str, amount: float) -> bool:
+    amount_ns, amount = _financial_pair(amount, "amount", allow_negative=False)
     conn = _get_conn()
     cursor = conn.cursor()
     if _is_postgres():
         cursor.execute(
-            "UPDATE ledger SET balance = balance - %s WHERE node_id = %s AND balance >= %s",
-            (amount, node_id, amount)
+            """
+            UPDATE ledger
+            SET balance = balance - %s,
+                balance_ns = CASE WHEN balance_ns IS NULL THEN NULL ELSE balance_ns - %s END
+            WHERE node_id = %s AND balance >= %s AND (balance_ns IS NULL OR balance_ns >= %s)
+            """,
+            (amount, amount_ns, node_id, amount, amount_ns)
         )
     else:
         cursor.execute(
-            "UPDATE ledger SET balance = balance - ? WHERE node_id = ? AND balance >= ?",
-            (amount, node_id, amount)
+            """
+            UPDATE ledger
+            SET balance = balance - ?,
+                balance_ns = CASE WHEN balance_ns IS NULL THEN NULL ELSE balance_ns - ? END
+            WHERE node_id = ? AND balance >= ? AND (balance_ns IS NULL OR balance_ns >= ?)
+            """,
+            (amount, amount_ns, node_id, amount, amount_ns)
         )
     updated = cursor.rowcount
     conn.commit()
@@ -411,17 +793,18 @@ def create_task(
     expires_in_seconds: Optional[int] = None,
     verifier_type: Optional[str] = None,
 ):
+    bounty_ns, bounty = _financial_pair(bounty, "bounty", allow_negative=True)
     conn = _get_conn()
     cursor = conn.cursor()
     if _is_postgres():
         cursor.execute(
-            "INSERT INTO tasks (task_id, consumer_id, provider_id, payload, bounty, status, target_node, model_requirement, expires_in_seconds, result_payload, payload_uri, verifier_type, created_at, updated_at) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
-            (task_id, consumer_id, None, payload, bounty, status, target_node, model_requirement, expires_in_seconds, result_payload, payload_uri, verifier_type, created_at, created_at)
+            "INSERT INTO tasks (task_id, consumer_id, provider_id, payload, bounty, bounty_ns, status, target_node, model_requirement, expires_in_seconds, result_payload, payload_uri, verifier_type, created_at, updated_at) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
+            (task_id, consumer_id, None, payload, bounty, bounty_ns, status, target_node, model_requirement, expires_in_seconds, result_payload, payload_uri, verifier_type, created_at, created_at)
         )
     else:
         cursor.execute(
-            "INSERT INTO tasks (task_id, consumer_id, provider_id, payload, bounty, status, target_node, model_requirement, expires_in_seconds, result_payload, payload_uri, verifier_type, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (task_id, consumer_id, None, payload, bounty, status, target_node, model_requirement, expires_in_seconds, result_payload, payload_uri, verifier_type, created_at, created_at)
+            "INSERT INTO tasks (task_id, consumer_id, provider_id, payload, bounty, bounty_ns, status, target_node, model_requirement, expires_in_seconds, result_payload, payload_uri, verifier_type, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (task_id, consumer_id, None, payload, bounty, bounty_ns, status, target_node, model_requirement, expires_in_seconds, result_payload, payload_uri, verifier_type, created_at, created_at)
         )
     conn.commit()
     _release_conn(conn)
@@ -649,13 +1032,13 @@ def reject_task_if_assigned(task_id: str, provider_id: str, updated_at: float) -
                         "UPDATE escrows SET status = %s, updated_at = %s WHERE task_id = %s AND status = %s",
                         ("refunded", updated_at, task_id, "held"),
                     )
-                    cursor.execute("UPDATE ledger SET balance = balance + %s WHERE node_id = %s", (amount, escrow_consumer_id))
+                    _cursor_add_balance(cursor, escrow_consumer_id, amount)
                 else:
                     cursor.execute(
                         "UPDATE escrows SET status = ?, updated_at = ? WHERE task_id = ? AND status = ?",
                         ("refunded", updated_at, task_id, "held"),
                     )
-                    cursor.execute("UPDATE ledger SET balance = balance + ? WHERE node_id = ?", (amount, escrow_consumer_id))
+                    _cursor_add_balance(cursor, escrow_consumer_id, amount)
                 ledger_events.append({"kind": "TASK_REJECT_REFUND", "node_id": escrow_consumer_id, "amount": amount})
 
         if _is_postgres():
@@ -757,41 +1140,18 @@ def assign_data_task_with_escrow_if_open(task_id: str, provider_id: str, cost: f
             conn.rollback()
             return {"status": "not_data_market"}
 
-        if _is_postgres():
-            cursor.execute(
-                "UPDATE ledger SET balance = balance - %s WHERE node_id = %s AND balance >= %s",
-                (cost, provider_id, cost),
-            )
-        else:
-            cursor.execute(
-                "UPDATE ledger SET balance = balance - ? WHERE node_id = ? AND balance >= ?",
-                (cost, provider_id, cost),
-            )
-        if cursor.rowcount == 0:
+        if _cursor_deduct_balance(cursor, provider_id, cost) == 0:
             conn.rollback()
             return {"status": "insufficient_balance"}
 
         if _is_postgres():
-            cursor.execute(
-                """
-                INSERT INTO escrows (task_id, consumer_id, provider_id, amount, status, created_at, updated_at)
-                VALUES (%s, %s, %s, %s, %s, %s, %s)
-                ON CONFLICT (task_id) DO NOTHING
-                """,
-                (task_id, provider_id, None, cost, "held", updated_at, updated_at),
-            )
+            _cursor_insert_held_escrow(cursor, task_id, provider_id, None, cost, updated_at, updated_at)
             cursor.execute(
                 "UPDATE tasks SET provider_id = %s, status = 'assigned', updated_at = %s WHERE task_id = %s AND status = 'bidding' AND provider_id IS NULL",
                 (provider_id, updated_at, task_id),
             )
         else:
-            cursor.execute(
-                """
-                INSERT OR IGNORE INTO escrows (task_id, consumer_id, provider_id, amount, status, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-                """,
-                (task_id, provider_id, None, cost, "held", updated_at, updated_at),
-            )
+            _cursor_insert_held_escrow(cursor, task_id, provider_id, None, cost, updated_at, updated_at)
             cursor.execute(
                 "UPDATE tasks SET provider_id = ?, status = 'assigned', updated_at = ? WHERE task_id = ? AND status = 'bidding' AND provider_id IS NULL",
                 (provider_id, updated_at, task_id),
@@ -1296,13 +1656,13 @@ def complete_task_atomic(
                     "UPDATE escrows SET provider_id = %s, status = %s, updated_at = %s WHERE task_id = %s AND status = %s",
                     (provider_id, "released", updated_at, task_id, "held"),
                 )
-                cursor.execute("UPDATE ledger SET balance = balance + %s WHERE node_id = %s", (amount, provider_id))
+                _cursor_add_balance(cursor, provider_id, amount)
             else:
                 cursor.execute(
                     "UPDATE escrows SET provider_id = ?, status = ?, updated_at = ? WHERE task_id = ? AND status = ?",
                     (provider_id, "released", updated_at, task_id, "held"),
                 )
-                cursor.execute("UPDATE ledger SET balance = balance + ? WHERE node_id = ?", (amount, provider_id))
+                _cursor_add_balance(cursor, provider_id, amount)
             ledger_events.append({"kind": "ESCROW_RELEASE", "node_id": provider_id, "amount": amount})
         elif bounty < 0:
             cost = abs(bounty)
@@ -1324,33 +1684,20 @@ def complete_task_atomic(
                         "UPDATE escrows SET provider_id = %s, status = %s, updated_at = %s WHERE task_id = %s AND status = %s",
                         (provider_id, "released", updated_at, task_id, "held"),
                     )
-                    cursor.execute("UPDATE ledger SET balance = balance + %s WHERE node_id = %s", (amount, task["consumer_id"]))
+                    _cursor_add_balance(cursor, task["consumer_id"], amount)
                 else:
                     cursor.execute(
                         "UPDATE escrows SET provider_id = ?, status = ?, updated_at = ? WHERE task_id = ? AND status = ?",
                         (provider_id, "released", updated_at, task_id, "held"),
                     )
-                    cursor.execute("UPDATE ledger SET balance = balance + ? WHERE node_id = ?", (amount, task["consumer_id"]))
+                    _cursor_add_balance(cursor, task["consumer_id"], amount)
                 ledger_events.append({"kind": "SELL_DATA", "node_id": task["consumer_id"], "amount": amount})
             else:
                 # Compatibility path for data tasks assigned before bid-time escrow existed.
-                if _is_postgres():
-                    cursor.execute(
-                        "UPDATE ledger SET balance = balance - %s WHERE node_id = %s AND balance >= %s",
-                        (cost, provider_id, cost),
-                    )
-                else:
-                    cursor.execute(
-                        "UPDATE ledger SET balance = balance - ? WHERE node_id = ? AND balance >= ?",
-                        (cost, provider_id, cost),
-                    )
-                if cursor.rowcount == 0:
+                if _cursor_deduct_balance(cursor, provider_id, cost) == 0:
                     conn.rollback()
                     return {"status": "insufficient_balance"}
-                if _is_postgres():
-                    cursor.execute("UPDATE ledger SET balance = balance + %s WHERE node_id = %s", (cost, task["consumer_id"]))
-                else:
-                    cursor.execute("UPDATE ledger SET balance = balance + ? WHERE node_id = ?", (cost, task["consumer_id"]))
+                _cursor_add_balance(cursor, task["consumer_id"], cost)
                 ledger_events.append({"kind": "BUY_DATA", "node_id": provider_id, "amount": -cost})
                 ledger_events.append({"kind": "SELL_DATA", "node_id": task["consumer_id"], "amount": cost})
 
@@ -1646,16 +1993,7 @@ def submit_review(task_id: str, consumer_id: str, provider_id: str, rating: int,
 def create_escrow(task_id: str, consumer_id: str, amount: float, created_at: float):
     conn = _get_conn()
     cursor = conn.cursor()
-    if _is_postgres():
-        cursor.execute(
-            "INSERT INTO escrows (task_id, consumer_id, provider_id, amount, status, created_at, updated_at) VALUES (%s, %s, %s, %s, %s, %s, %s) ON CONFLICT (task_id) DO NOTHING",
-            (task_id, consumer_id, None, amount, "held", created_at, created_at)
-        )
-    else:
-        cursor.execute(
-            "INSERT OR IGNORE INTO escrows (task_id, consumer_id, provider_id, amount, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (task_id, consumer_id, None, amount, "held", created_at, created_at)
-        )
+    _cursor_insert_held_escrow(cursor, task_id, consumer_id, None, amount, created_at, created_at)
     conn.commit()
     _release_conn(conn)
 
@@ -1696,13 +2034,13 @@ def release_escrow(task_id: str, provider_id: str, updated_at: float) -> Optiona
             "UPDATE escrows SET provider_id = %s, status = %s, updated_at = %s WHERE task_id = %s",
             (provider_id, "released", updated_at, task_id)
         )
-        cursor.execute("UPDATE ledger SET balance = balance + %s WHERE node_id = %s", (amount, provider_id))
+        _cursor_add_balance(cursor, provider_id, amount)
     else:
         cursor.execute(
             "UPDATE escrows SET provider_id = ?, status = ?, updated_at = ? WHERE task_id = ?",
             (provider_id, "released", updated_at, task_id)
         )
-        cursor.execute("UPDATE ledger SET balance = balance + ? WHERE node_id = ?", (amount, provider_id))
+        _cursor_add_balance(cursor, provider_id, amount)
     conn.commit()
     _release_conn(conn)
     return amount
@@ -1725,13 +2063,13 @@ def refund_escrow(task_id: str, updated_at: float) -> Optional[float]:
             "UPDATE escrows SET status = %s, updated_at = %s WHERE task_id = %s",
             ("refunded", updated_at, task_id)
         )
-        cursor.execute("UPDATE ledger SET balance = balance + %s WHERE node_id = %s", (amount, consumer_id))
+        _cursor_add_balance(cursor, consumer_id, amount)
     else:
         cursor.execute(
             "UPDATE escrows SET status = ?, updated_at = ? WHERE task_id = ?",
             ("refunded", updated_at, task_id)
         )
-        cursor.execute("UPDATE ledger SET balance = balance + ? WHERE node_id = ?", (amount, consumer_id))
+        _cursor_add_balance(cursor, consumer_id, amount)
     conn.commit()
     _release_conn(conn)
     return amount
@@ -1750,17 +2088,7 @@ def chargeback_escrow(task_id: str, updated_at: float) -> dict:
     consumer_id = row[0]
     provider_id = row[1]
     amount = float(row[2])
-    if _is_postgres():
-        cursor.execute(
-            "UPDATE ledger SET balance = balance - %s WHERE node_id = %s AND balance >= %s",
-            (amount, provider_id, amount)
-        )
-    else:
-        cursor.execute(
-            "UPDATE ledger SET balance = balance - ? WHERE node_id = ? AND balance >= ?",
-            (amount, provider_id, amount)
-        )
-    if cursor.rowcount == 0:
+    if _cursor_deduct_balance(cursor, provider_id, amount) == 0:
         _release_conn(conn)
         return {"status": "insufficient"}
     if _is_postgres():
@@ -1768,13 +2096,13 @@ def chargeback_escrow(task_id: str, updated_at: float) -> dict:
             "UPDATE escrows SET status = %s, updated_at = %s WHERE task_id = %s",
             ("chargeback", updated_at, task_id)
         )
-        cursor.execute("UPDATE ledger SET balance = balance + %s WHERE node_id = %s", (amount, consumer_id))
+        _cursor_add_balance(cursor, consumer_id, amount)
     else:
         cursor.execute(
             "UPDATE escrows SET status = ?, updated_at = ? WHERE task_id = ?",
             ("chargeback", updated_at, task_id)
         )
-        cursor.execute("UPDATE ledger SET balance = balance + ? WHERE node_id = ?", (amount, consumer_id))
+        _cursor_add_balance(cursor, consumer_id, amount)
     conn.commit()
     _release_conn(conn)
     return {"status": "success", "amount": amount, "consumer_id": consumer_id, "provider_id": provider_id}
