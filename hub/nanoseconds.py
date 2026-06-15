@@ -7,7 +7,7 @@ legacy-boundary adapters only; internal money arithmetic should use integer ns.
 from __future__ import annotations
 
 import re
-from decimal import Decimal, InvalidOperation, ROUND_HALF_EVEN
+from decimal import Decimal, InvalidOperation
 from typing import Any
 
 NS_PER_SECOND = 1_000_000_000
@@ -73,7 +73,9 @@ def legacy_seconds_to_ns(seconds: float | int | str | Decimal, field_name: str =
         raise NanosecondsError(f"{label} must be convertible to Decimal seconds") from exc
 
     ns_value = decimal_seconds * Decimal(NS_PER_SECOND)
-    integral = ns_value.to_integral_value(rounding=ROUND_HALF_EVEN)
+    integral = ns_value.to_integral_value()
+    if ns_value != integral:
+        raise NanosecondsError(f"{label} must be exactly representable in nanoseconds")
     return int(integral)
 
 

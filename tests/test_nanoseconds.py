@@ -48,6 +48,11 @@ def test_legacy_seconds_adapters_are_boundary_only():
     assert ns_to_seconds_decimal_string(1_000_000) == "0.001"
 
 
+def test_legacy_seconds_to_ns_rejects_non_exact_precision():
+    with pytest.raises(NanosecondsError):
+        legacy_seconds_to_ns("0.0000000015")
+
+
 def test_v2_schema_models_validate_ns_strings():
     balance = V2BalanceResponse(node_id="node_abc", balance_ns="10000000000")
     assert balance.balance_ns == "10000000000"
@@ -57,3 +62,11 @@ def test_v2_schema_models_validate_ns_strings():
 
     with pytest.raises(ValueError):
         V2BalanceResponse(node_id="node_abc", balance_ns="01")
+
+
+def test_v2_task_economics_rejects_unknown_market_and_payment_direction():
+    with pytest.raises(ValueError):
+        V2TaskEconomics(bounty_ns="1", market="foo")
+
+    with pytest.raises(ValueError):
+        V2TaskEconomics(bounty_ns="1", payment_direction="foo")

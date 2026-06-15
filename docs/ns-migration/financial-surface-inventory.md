@@ -12,7 +12,7 @@ it locks the scope for later PRs.
 | `POST /admin/approve-registration` | response `balance`; registration credit writes ledger balance | v2/admin equivalent or documented admin schema using `balance_ns` | in scope |
 | `GET /balance/{node_id}` | response `balance_seconds` | `GET /v2/balance/{node_id}` with `balance_ns` | in scope |
 | `POST /tasks/submit` | request `bounty`, `bounty_ns`, `economics.bounty_seconds`; response task id only; internal escrow/balance writes | `POST /v2/tasks/submit` with `economics.bounty_ns`, `currency`, `payment_direction`, `market` | in scope |
-| `POST /tasks/bid` | response may include task `bounty` through payload/envelope | `POST /v2/tasks/bid` or v2 task assignment response with `bounty_ns` | in scope |
+| `POST /tasks/bid` | response may include task `bounty` through payload/envelope | `POST /v2/tasks/bid` or v2 task assignment response with `bounty_ns` | proposed; depends on future v2 bidding route design |
 | `POST /tasks/complete` | response includes settlement output such as `earned` in existing tests/flows | `POST /v2/tasks/complete` with `earned_ns` or registry-approved equivalent | proposed field pending |
 | `POST /tasks/reject` | can trigger refund ledger events | legacy adapter over ns-first rejection/refund logic | in scope |
 | `POST /tasks/verify/accept` | can trigger settlement | v2 verify/accept response with ns settlement fields where exposed | in scope |
@@ -29,6 +29,9 @@ it locks the scope for later PRs.
 
 - Timestamp fields such as `created_at`, `updated_at`, `approved_at`, and
   dispute timestamps.
+- Duration fields such as `expires_in_seconds`; these are not financial ledger
+  values and should be revisited separately if v2 later standardizes duration
+  units.
 - Arbitrary provider/user `result_payload` content. Only hub-owned financial
   fields in task/result envelopes are in scope.
 - Reputation `score`, which is non-financial despite using a numeric value.

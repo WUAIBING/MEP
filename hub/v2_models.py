@@ -12,14 +12,16 @@ from nanoseconds import validate_ns_string
 
 
 Currency = Literal["MEP_NS"]
+Market = Literal["chat", "compute", "data"]
 NsString = str
+PaymentDirection = Literal["sender_to_receiver", "receiver_to_sender", "none"]
 
 
 class V2TaskEconomics(BaseModel):
     bounty_ns: NsString = Field(..., description="Signed bounty in MEP nanoseconds")
     currency: Currency = "MEP_NS"
-    payment_direction: Optional[str] = None
-    market: Optional[str] = None
+    payment_direction: Optional[PaymentDirection] = None
+    market: Optional[Market] = None
 
     @field_validator("bounty_ns")
     @classmethod
