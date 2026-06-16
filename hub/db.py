@@ -141,20 +141,20 @@ def _cursor_add_balance(cursor, node_id: str, amount: float) -> int:
             """
             UPDATE ledger
             SET balance = balance + %s,
-                balance_ns = CASE WHEN balance_ns IS NULL THEN NULL ELSE balance_ns + %s END
+                balance_ns = CASE WHEN balance_ns IS NULL THEN CAST((balance + %s) * 1000000000 AS BIGINT) ELSE balance_ns + %s END
             WHERE node_id = %s
             """,
-            (amount, amount_ns, node_id),
+            (amount, amount, amount_ns, node_id),
         )
     else:
         cursor.execute(
             """
             UPDATE ledger
             SET balance = balance + ?,
-                balance_ns = CASE WHEN balance_ns IS NULL THEN NULL ELSE balance_ns + ? END
+                balance_ns = CASE WHEN balance_ns IS NULL THEN CAST((balance + ?) * 1000000000 AS INTEGER) ELSE balance_ns + ? END
             WHERE node_id = ?
             """,
-            (amount, amount_ns, node_id),
+            (amount, amount, amount_ns, node_id),
         )
     return int(cursor.rowcount or 0)
 
@@ -166,20 +166,20 @@ def _cursor_deduct_balance(cursor, node_id: str, amount: float) -> int:
             """
             UPDATE ledger
             SET balance = balance - %s,
-                balance_ns = CASE WHEN balance_ns IS NULL THEN NULL ELSE balance_ns - %s END
+                balance_ns = CASE WHEN balance_ns IS NULL THEN CAST((balance - %s) * 1000000000 AS BIGINT) ELSE balance_ns - %s END
             WHERE node_id = %s AND balance >= %s AND (balance_ns IS NULL OR balance_ns >= %s)
             """,
-            (amount, amount_ns, node_id, amount, amount_ns),
+            (amount, amount, amount_ns, node_id, amount, amount_ns),
         )
     else:
         cursor.execute(
             """
             UPDATE ledger
             SET balance = balance - ?,
-                balance_ns = CASE WHEN balance_ns IS NULL THEN NULL ELSE balance_ns - ? END
+                balance_ns = CASE WHEN balance_ns IS NULL THEN CAST((balance - ?) * 1000000000 AS INTEGER) ELSE balance_ns - ? END
             WHERE node_id = ? AND balance >= ? AND (balance_ns IS NULL OR balance_ns >= ?)
             """,
-            (amount, amount_ns, node_id, amount, amount_ns),
+            (amount, amount, amount_ns, node_id, amount, amount_ns),
         )
     return int(cursor.rowcount or 0)
 
