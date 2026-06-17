@@ -176,6 +176,7 @@ class TestGitHubToMEPBridge(unittest.TestCase):
         self.assertEqual(len(self.submission.calls), 1)
         bridge_metadata = self.submission.calls[0]["envelope"]["task"]["inputs"]["bridge_metadata"]
         self.assertEqual(set(bridge_metadata["coalesced_delivery_ids"]), {"delivery-a", "delivery-b"})
+        self.assertEqual(self.submission.calls[0]["intent_type"], "analysis.request")
         github_inputs = self.submission.calls[0]["envelope"]["task"]["inputs"]["github"]
         self.assertEqual(github_inputs["source_action"], "edited")
 

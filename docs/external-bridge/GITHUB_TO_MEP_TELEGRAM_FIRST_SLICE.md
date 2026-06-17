@@ -175,15 +175,21 @@ Examples:
 
 - `@Hub-Sentinel review this PR`
 - `@Hub-Sentinel analyze this issue`
+- `@Hub-Sentinel check this PR`
+- `@Hub-Sentinel comment on this PR`
 - `@Hub-Sentinel approve`
-- `@Hub-Sentinel request changes`
+- `@Hub-Sentinel triage this issue`
 
 Recommended first-slice verb mapping:
 
 - `review` -> `code.review.request`
 - `analyze` -> `analysis.request`
+- `check` -> `code.review.request`
+- `comment` -> `code.review.comment`
 - `approve` -> `code.review.request` with requested outcome hint
-- `request changes` -> `code.review.request` with requested outcome hint
+- `triage` -> `issue.triage.request`
+
+For this first implementation, keep imperative verbs single-word. Phrases such as `request changes` remain a follow-up extension unless the parser is explicitly widened.
 
 If a repo-level policy triggers all PR open/sync events automatically, that policy should be explicit in routing configuration rather than inferred from free text.
 
@@ -593,6 +599,7 @@ MEP_BRIDGE_STATUS_SECRET=replace-me
 MEP_BRIDGE_DEDUP_TTL_HOURS=72
 MEP_BRIDGE_COALESCE_WINDOW_SECONDS=10
 MEP_BRIDGE_COALESCE_MAX_BUFFER_SIZE=50
+# reserved follow-up config: documented staleness policy is approved, but bridge-side enforcement is not implemented in this PR
 MEP_BRIDGE_STALE_DM_SOFT_TTL_SECONDS=7200
 MEP_BRIDGE_STALE_DM_HARD_TTL_SECONDS=86400
 
@@ -627,7 +634,7 @@ MEP_CALL_AUTO_ACCEPT=true
 1. Open the GitHub repository.
 2. Go to `Settings -> Webhooks`.
 3. Click `Add webhook`.
-4. Set the payload URL to the bridge endpoint.
+4. Set the payload URL to `${MEP_BRIDGE_PUBLIC_BASE_URL}/github/webhook`.
 5. Set content type to `application/json`.
 6. Set the shared secret to the configured `GITHUB_WEBHOOK_SECRET`.
 7. Select events:
@@ -715,6 +722,8 @@ Recommended first-slice policy:
 - if the queued item is older than 24 hours, do not auto-process; notify the operator and require a fresh trigger or explicit policy override
 
 This prevents a reconnecting bot from acting on stale review requests.
+
+Note: this policy is part of the approved design, but the current PR implements the bridge-side core only. TTL enforcement remains a follow-up change on top of the shipped bridge persistence and status plumbing.
 
 ## Failure Handling
 

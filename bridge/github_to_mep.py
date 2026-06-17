@@ -24,7 +24,7 @@ from node.task_envelope import build_task_envelope
 SUPPORTED_GITHUB_EVENTS = {"issue_comment", "pull_request", "pull_request_review_comment"}
 DEFAULT_TRIGGER_VERBS = {
     "review": "code.review.request",
-    "analyze": "code.review.request",
+    "analyze": "analysis.request",
     "check": "code.review.request",
     "comment": "code.review.comment",
     "approve": "code.review.approve",
