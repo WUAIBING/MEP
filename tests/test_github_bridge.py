@@ -64,7 +64,7 @@ def _build_config(tmp_dir: str) -> BridgeConfig:
         status_secret="status-secret",
         status_token_lifetime_seconds=1800,
         dedup_ttl_hours=72,
-        coalesce_window_seconds=0.02,
+        coalesce_window_seconds=60.0,
         coalesce_max_buffer_size=50,
         allowed_repos={"WUAIBING/MEP"},
         maintainer_only=True,
