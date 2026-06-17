@@ -72,6 +72,10 @@ Telegram is the visibility and status surface.
 
 MEP is the execution plane.
 
+The bridge webhook endpoint is the canonical production ingress for GitHub.
+
+Any older hub-side GitHub webhook path should be treated as a temporary stopgap used to prove WS notification flow, not as the long-term integration boundary.
+
 So the correct flow is:
 
 `GitHub webhook -> bridge -> MEP task/DM -> bot runtime -> optional call.* -> GitHub action/result -> Telegram status`
@@ -644,6 +648,12 @@ MEP_CALL_AUTO_ACCEPT=true
    - optionally `Issues`
 8. Save the webhook.
 9. Use GitHub's redelivery test to confirm the bridge returns success.
+
+### Production Routing Note
+
+- production-correct target: `${MEP_BRIDGE_PUBLIC_BASE_URL}/github/webhook`
+- do not use a legacy hub-side GitHub webhook path as the long-term integration target once the bridge is deployed
+- if a hub-side path still exists in an older deployment, treat it as compatibility or migration-only behavior and move GitHub to the bridge endpoint after rollout
 
 ### Validation Expectations
 
