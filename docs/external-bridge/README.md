@@ -24,6 +24,7 @@ Do not use an older hub-side GitHub webhook path as the long-term target after t
 - normalizes GitHub events into bridge-owned correlation state
 - creates targeted `mep.interbot.v1` DM tasks for MEP Hub
 - supports delivery dedup and same-thread coalescence
+- ignores bot-authored GitHub trigger comments by default to prevent bot-to-bot ping-pong loops
 - emits Telegram status updates
 - accepts authenticated `/bridge/status` callbacks from runtime follow-up work
 
@@ -57,6 +58,7 @@ Current parser limitation:
 
 - first-slice imperative verbs are single-word only
 - phrases like `request changes` are not yet implemented as parser-native actionable commands
+- bot-authored GitHub comments are output-only by default unless their login is explicitly trusted
 
 ## Quick Start
 
@@ -100,6 +102,8 @@ Current parser limitation:
 | `MEP_BRIDGE_COALESCE_MAX_BUFFER_SIZE` | `50` | Max buffered contexts before oldest is flushed |
 | `MEP_BRIDGE_MAINTAINER_ONLY` | `true` | Restrict actionable triggers to maintainer-like associations |
 | `MEP_BRIDGE_ALLOWED_ASSOCIATIONS` | `OWNER,MEMBER,COLLABORATOR` | Allowed GitHub author associations when maintainer-only is enabled |
+| `MEP_BRIDGE_HUMAN_ONLY_TRIGGERS` | `true` | Ignore bot-authored trigger comments unless explicitly trusted |
+| `MEP_BRIDGE_TRUSTED_BOT_LOGINS` | `` | Comma-separated bot logins allowed to trigger automation |
 | `MEP_BRIDGE_STATUS_TOKEN_LIFETIME_SECONDS` | `1800` | Lifetime for signed `/bridge/status` tokens |
 | `MEP_BRIDGE_TELEGRAM_COMPACT` | `true` | Edit a compact Telegram status message instead of emitting many messages |
 
@@ -179,6 +183,8 @@ Status tokens are short-lived HMAC-SHA256 signed tokens with claims:
 - `target_node_id`
 - `exp`
 
+Bridge-generated GitHub output comments should be marked with hidden provenance such as `<!-- mep-bridge:output ... -->`. The bridge suppresses trigger processing for comments containing that marker so bot result messages do not recursively reopen automation.
+
 ## Testing
 
 Run the focused bridge tests:
@@ -197,6 +203,7 @@ python -m pytest tests/test_github_bridge.py -q
 | Bot does not act | verify `MEP_BRIDGE_TARGET_NODE_ID` is correct and the target bot is online |
 | Duplicate reviews | verify bridge SQLite path is writable and dedup TTL is configured |
 | Too many same-thread events | verify coalescence settings and inspect buffered GitHub actions |
+| Bots retrigger each other | keep `MEP_BRIDGE_HUMAN_ONLY_TRIGGERS=true` and do not allowlist result-posting bot accounts |
 
 ## Related Docs
 

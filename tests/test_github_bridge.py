@@ -69,6 +69,8 @@ def _build_config(tmp_dir: str) -> BridgeConfig:
         allowed_repos={"WUAIBING/MEP"},
         maintainer_only=True,
         allowed_associations={"OWNER", "MEMBER", "COLLABORATOR"},
+        human_only_triggers=True,
+        trusted_bot_logins=set(),
         bridge_source_alias="GitHub Bridge",
         telegram_bot_token=None,
         telegram_chat_id=None,
@@ -81,7 +83,14 @@ def _sign_payload(secret: str, body: bytes) -> str:
     return f"sha256={digest}"
 
 
-def _issue_comment_payload(comment_body: str, *, action: str = "created", delivery_number: int = 226) -> dict:
+def _issue_comment_payload(
+    comment_body: str,
+    *,
+    action: str = "created",
+    delivery_number: int = 226,
+    sender_login: str = "alice",
+    sender_type: str = "User",
+) -> dict:
     return {
         "action": action,
         "repository": {"full_name": "WUAIBING/MEP"},
@@ -97,7 +106,7 @@ def _issue_comment_payload(comment_body: str, *, action: str = "created", delive
             "html_url": f"https://github.com/WUAIBING/MEP/pull/{delivery_number}#discussion_r1",
             "author_association": "MEMBER",
         },
-        "sender": {"login": "alice"},
+        "sender": {"login": sender_login, "type": sender_type},
     }
 
 
@@ -218,6 +227,43 @@ class TestGitHubToMEPBridge(unittest.TestCase):
         payload["comment"]["author_association"] = "CONTRIBUTOR"
         payload["issue"]["author_association"] = "CONTRIBUTOR"
         response = self._post_webhook(payload, delivery_id="delivery-policy")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["status"], "ignored")
+        time.sleep(0.05)
+        self.assertEqual(len(self.submission.calls), 0)
+
+    def test_bot_sender_is_ignored_by_default_to_prevent_ping_pong_loops(self):
+        payload = _issue_comment_payload(
+            "@Hub-Sentinel review this PR",
+            sender_login="hub-sentinel[bot]",
+            sender_type="Bot",
+        )
+        response = self._post_webhook(payload, delivery_id="delivery-bot")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["status"], "ignored")
+        time.sleep(0.05)
+        self.assertEqual(len(self.submission.calls), 0)
+
+    def test_trusted_bot_sender_can_trigger_when_explicitly_allowlisted(self):
+        self.config.trusted_bot_logins = {"hub-sentinel[bot]"}
+        payload = _issue_comment_payload(
+            "@Hub-Sentinel review this PR",
+            sender_login="hub-sentinel[bot]",
+            sender_type="Bot",
+        )
+        response = self._post_webhook(payload, delivery_id="delivery-trusted-bot")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["status"], "buffered")
+        self._flush_context(response.json()["context_id"])
+        self.assertEqual(len(self.submission.calls), 1)
+
+    def test_bridge_output_marker_is_ignored_even_if_trigger_text_is_present(self):
+        payload = _issue_comment_payload(
+            "<!-- mep-bridge:output bridge_id=br-123 -->\n@Hub-Sentinel review this PR",
+            sender_login="hub-sentinel[bot]",
+            sender_type="Bot",
+        )
+        response = self._post_webhook(payload, delivery_id="delivery-output-marker")
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()["status"], "ignored")
         time.sleep(0.05)

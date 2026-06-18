@@ -31,6 +31,7 @@ DEFAULT_TRIGGER_VERBS = {
     "triage": "issue.triage.request",
 }
 DEFAULT_ALLOWED_ASSOCIATIONS = {"OWNER", "MEMBER", "COLLABORATOR"}
+BRIDGE_OUTPUT_MARKER = "<!-- mep-bridge:output"
 
 
 def _env_bool(name: str, default: bool) -> bool:
@@ -71,6 +72,8 @@ class BridgeConfig:
     allowed_repos: set[str]
     maintainer_only: bool
     allowed_associations: set[str]
+    human_only_triggers: bool
+    trusted_bot_logins: set[str]
     bridge_source_alias: str
     telegram_bot_token: Optional[str]
     telegram_chat_id: Optional[str]
@@ -86,6 +89,9 @@ class BridgeConfig:
         allowed_associations = set(
             item.upper() for item in _split_csv(os.getenv("MEP_BRIDGE_ALLOWED_ASSOCIATIONS", "OWNER,MEMBER,COLLABORATOR"))
         ) or set(DEFAULT_ALLOWED_ASSOCIATIONS)
+        trusted_bot_logins = set(
+            item.lower() for item in _split_csv(os.getenv("MEP_BRIDGE_TRUSTED_BOT_LOGINS", ""))
+        )
         return cls(
             hub_url=os.getenv("MEP_HUB_URL", "").rstrip("/"),
             key_path=os.getenv(
@@ -115,6 +121,8 @@ class BridgeConfig:
             allowed_repos=allowed_repos,
             maintainer_only=_env_bool("MEP_BRIDGE_MAINTAINER_ONLY", True),
             allowed_associations=allowed_associations,
+            human_only_triggers=_env_bool("MEP_BRIDGE_HUMAN_ONLY_TRIGGERS", True),
+            trusted_bot_logins=trusted_bot_logins,
             bridge_source_alias=os.getenv("MEP_BRIDGE_SOURCE_ALIAS", "GitHub Bridge").strip() or "GitHub Bridge",
             telegram_bot_token=(os.getenv("TELEGRAM_BOT_TOKEN") or "").strip() or None,
             telegram_chat_id=(os.getenv("TELEGRAM_CHAT_ID") or "").strip() or None,
@@ -726,7 +734,17 @@ class GitHubToMEPBridgeService:
             trigger_text = str(subject.get("body") or "")
         if not author_association:
             author_association = str(subject.get("author_association") or "")
-        actor_login = str((payload.get("sender") or {}).get("login") or "unknown")
+        sender = payload.get("sender") if isinstance(payload.get("sender"), dict) else {}
+        actor_login = str(sender.get("login") or "unknown")
+        actor_type = str(sender.get("type") or "")
+
+        if self._contains_bridge_output_marker(trigger_text):
+            return None
+
+        if self._is_bot_sender(actor_login, actor_type):
+            actor_login_key = actor_login.strip().lower()
+            if self.config.human_only_triggers and actor_login_key not in self.config.trusted_bot_logins:
+                return None
 
         if self.config.maintainer_only:
             if author_association.upper() not in self.config.allowed_associations:
@@ -786,6 +804,14 @@ class GitHubToMEPBridgeService:
             if intent_type:
                 return verb, intent_type
         return None
+
+    def _contains_bridge_output_marker(self, text: str) -> bool:
+        return isinstance(text, str) and BRIDGE_OUTPUT_MARKER in text.lower()
+
+    def _is_bot_sender(self, actor_login: str, actor_type: str) -> bool:
+        login = actor_login.strip().lower()
+        sender_type = actor_type.strip().lower()
+        return sender_type == "bot" or login.endswith("[bot]")
 
     def _build_instructions(
         self,
