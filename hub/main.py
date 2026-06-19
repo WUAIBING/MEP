@@ -41,6 +41,19 @@ from models import (
     BrainstormSessionPost,
 )
 
+from v2_models import (
+    V2BalanceResponse,
+    V2RegistrationResponse,
+    V2TaskSubmitRequest,
+    V2TaskResponse,
+    V2EscrowResponse,
+    V2EscrowListResponse,
+    V2LedgerEntryResponse,
+    V2TaskListResponse,
+)
+
+from nanoseconds import legacy_seconds_to_ns, ns_to_legacy_seconds
+
 app = FastAPI(title="MEP Hub", description="The Time Exchange Clearinghouse", version="0.1.2", docs_url="/docs", redoc_url="/redoc")
 
 # In-memory storage for active tasks
@@ -1674,6 +1687,37 @@ async def register_node(node: NodeRegistration, request: Request):
 
     return {"status": status, "node_id": node_id, "balance": balance, "hub_url": hub_url, "ws_url": ws_url}
 
+@app.post("/v2/register")
+async def register_node_v2(node: NodeRegistration, request: Request):
+    client_host = _request_client_ip(request)
+    if not _is_allowed_ip(client_host):
+        raise HTTPException(status_code=403, detail="Client IP not allowed")
+    _apply_rate_limit(f"{client_host or 'unknown'}:/register")
+    validated_pubkey = _validate_registration_pubkey(node.pubkey)
+    # Registration derives the Node ID from the validated Ed25519 public key PEM
+    node_id = auth.derive_node_id(validated_pubkey)
+    result = db.register_node(node_id, validated_pubkey)
+    if node.alias or node.x25519_public_key:
+        db.upsert_registry(node_id, node.alias, [], [], {}, "offline", time.time(), node.x25519_public_key)
+
+    status = result["status"]
+    balance = result["balance"]
+    if status == "registered":
+        log_event("node_registered", f"Node {node_id} already registered with balance {balance}", node_id=node_id, balance=balance)
+    else:
+        log_event("node_pending", f"Node {node_id} registration pending approval", node_id=node_id)
+
+    hub_url, ws_url = get_hub_urls(request)
+    balance_ns = legacy_seconds_to_ns(balance, "balance")
+
+    return V2RegistrationResponse(
+        status=status,
+        node_id=node_id,
+        balance_ns=str(balance_ns),
+        hub_url=hub_url,
+        ws_url=ws_url
+    )
+
 @app.post("/admin/approve-registration")
 async def approve_registration(payload: dict, x_mep_admin_key: Optional[str] = Header(default=None)):
     _require_admin(x_mep_admin_key)
@@ -2103,6 +2147,14 @@ async def get_balance(node_id: str):
         raise HTTPException(status_code=404, detail="Node not found")
     return {"node_id": node_id, "balance_seconds": balance}
 
+@app.get("/v2/balance/{node_id}")
+async def get_balance_v2(node_id: str):
+    balance = db.get_balance(node_id)
+    if balance is None:
+        raise HTTPException(status_code=404, detail="Node not found")
+    balance_ns = legacy_seconds_to_ns(balance, "balance")
+    return V2BalanceResponse(node_id=node_id, balance_ns=str(balance_ns))
+
 @app.post("/tasks/submit")
 async def submit_task(
     task: TaskCreate,
@@ -2297,6 +2349,35 @@ async def submit_task(
     if x_mep_idempotency_key:
         db.set_idempotency(authenticated_node, "/tasks/submit", x_mep_idempotency_key, response_payload, 200, time.time())
     return response_payload
+
+@app.post("/v2/tasks/submit")
+async def submit_task_v2(
+    task: V2TaskSubmitRequest,
+    authenticated_node: str = Depends(verify_request),
+    x_mep_idempotency_key: Optional[str] = Header(default=None)
+):
+    # Convert v2 economics to legacy format for internal processing
+    bounty_ns = int(task.economics.bounty_ns)
+    bounty = ns_to_legacy_seconds(bounty_ns, "bounty_ns")
+    
+    # Build legacy TaskCreate from v2 request
+    legacy_task = TaskCreate(
+        consumer_id=task.consumer_id,
+        source=task.source,
+        intent=task.intent,
+        task=task.task,
+        economics={"bounty_seconds": bounty},
+        payload=task.payload,
+        target_node=task.target_node,
+        routing=task.routing,
+        verifier=task.verifier,
+        expires_in_seconds=task.expires_in_seconds,
+        secret_data=task.secret_data,
+        payload_uri=task.payload_uri
+    )
+    
+    # Call the internal task submission logic
+    return await submit_task(legacy_task, authenticated_node, x_mep_idempotency_key)
 
 @app.post("/tasks/cancel")
 async def cancel_task(
@@ -2693,6 +2774,24 @@ async def get_task_result(task_id: str, authenticated_node: str = Depends(verify
         "result_uri": task.get("result_uri")
     }
 
+@app.get("/v2/tasks/{task_id}/result")
+async def get_task_result_v2(task_id: str, authenticated_node: str = Depends(verify_request)):
+    task = db.get_task(task_id)
+    if not task or task["status"] != "completed":
+        raise HTTPException(status_code=404, detail="Task not found or not completed")
+    if authenticated_node not in (task["consumer_id"], task["provider_id"]):
+        raise HTTPException(status_code=403, detail="Not authorized to view this result")
+    
+    bounty_ns = legacy_seconds_to_ns(task["bounty"], "bounty_ns")
+    
+    return V2TaskResponse(
+        task_id=task["task_id"],
+        consumer_id=task["consumer_id"],
+        provider_id=task["provider_id"],
+        bounty_ns=str(bounty_ns),
+        result_uri=task.get("result_uri")
+    )
+
 @app.post("/disputes/open")
 async def open_dispute(payload: DisputeOpen, authenticated_node: str = Depends(verify_request)):
     task = db.get_task(payload.task_id)
@@ -3060,6 +3159,93 @@ async def ledger_entries(limit: int = 50, authenticated_node: str = Depends(veri
     safe_limit = max(1, min(limit, 200))
     entries = _read_audit_entries_for_node(authenticated_node, safe_limit)
     return {"node_id": authenticated_node, "entries": entries, "count": len(entries)}
+
+@app.get("/v2/ledger/{node_id}")
+async def ledger_entries_v2(node_id: str, limit: int = 50, authenticated_node: str = Depends(verify_request)):
+    if authenticated_node != node_id:
+        raise HTTPException(status_code=403, detail="Not authorized to view this ledger")
+    
+    safe_limit = max(1, min(limit, 200))
+    entries = _read_audit_entries_for_node(node_id, safe_limit)
+    
+    # Parse audit entries and convert to structured v2 format
+    v2_entries = []
+    for entry in entries:
+        # Parse audit log format: "TIMESTAMP | Node: node_id | Action: action | Amount: amount | Balance: balance"
+        try:
+            parts = [part.strip() for part in entry.split("|")]
+            entry_dict = {}
+            for part in parts:
+                if ":" in part:
+                    key, value = part.split(":", 1)
+                    entry_dict[key.strip().lower()] = value.strip()
+            
+            # Convert financial values to ns
+            amount_ns = None
+            balance_ns = None
+            if "amount" in entry_dict:
+                try:
+                    amount = float(entry_dict["amount"])
+                    amount_ns = legacy_seconds_to_ns(amount, "amount")
+                except (ValueError, KeyError):
+                    pass
+            if "balance" in entry_dict:
+                try:
+                    balance = float(entry_dict["balance"])
+                    balance_ns = legacy_seconds_to_ns(balance, "balance")
+                except (ValueError, KeyError):
+                    pass
+            
+            v2_entries.append(V2LedgerEntryResponse(
+                node_id=node_id,
+                amount_ns=str(amount_ns) if amount_ns is not None else None,
+                balance_ns=str(balance_ns) if balance_ns is not None else None,
+                kind=entry_dict.get("action", "unknown"),
+                reference_id=entry_dict.get("reference")
+            ))
+        except Exception:
+            # Skip malformed entries
+            continue
+    
+    return V2LedgerEntryResponse(
+        node_id=node_id,
+        entries=v2_entries[:safe_limit]
+    )
+
+@app.get("/v2/escrows/{task_id}")
+async def get_escrow_v2(task_id: str, authenticated_node: str = Depends(verify_request)):
+    escrow = db.get_escrow(task_id)
+    if not escrow:
+        raise HTTPException(status_code=404, detail="Escrow not found")
+    if authenticated_node not in (escrow["consumer_id"], escrow.get("provider_id")):
+        raise HTTPException(status_code=403, detail="Not authorized to view this escrow")
+    
+    amount_ns = legacy_seconds_to_ns(escrow["amount"], "amount")
+    
+    return V2EscrowResponse(
+        task_id=task_id,
+        consumer_id=escrow["consumer_id"],
+        provider_id=escrow.get("provider_id"),
+        amount_ns=str(amount_ns),
+        status=escrow["status"]
+    )
+
+@app.get("/v2/escrows")
+async def list_escrows_v2(authenticated_node: str = Depends(verify_request)):
+    escrows = db.get_escrows_by_node(authenticated_node)
+    
+    v2_escrows = []
+    for escrow in escrows:
+        amount_ns = legacy_seconds_to_ns(escrow["amount"], "amount")
+        v2_escrows.append(V2EscrowResponse(
+            task_id=escrow["task_id"],
+            consumer_id=escrow["consumer_id"],
+            provider_id=escrow.get("provider_id"),
+            amount_ns=str(amount_ns),
+            status=escrow["status"]
+        ))
+    
+    return V2EscrowListResponse(escrows=v2_escrows)
 
 @app.get("/events/recent")
 async def recent_events(limit: int = 50, x_mep_admin_key: Optional[str] = Header(default=None)):
