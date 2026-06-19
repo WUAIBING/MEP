@@ -1,9 +1,10 @@
 """Tests for v2 financial API endpoints."""
 
-import pytest
 import os
 import sys
 import tempfile
+
+import pytest
 
 # Point hub DB at a temp file so tests don't pollute anything
 _test_db = os.path.join(tempfile.gettempdir(), "mep_test_v2_hub.db")
@@ -13,18 +14,15 @@ os.environ.setdefault("MEP_ADMIN_KEY", "test-admin-key")
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(__file__)), "hub"))
 
-from hub.v2_models import (
+from hub.v2_models import (  # noqa: E402
     V2BalanceResponse,
-    V2RegistrationResponse,
     V2TaskEconomics,
     V2TaskResponse,
     V2EscrowResponse,
     V2LedgerEntryResponse,
-    V2EscrowListResponse,
-    V2TaskListResponse,
+    V2LedgerListResponse,
 )
-from hub.nanoseconds import validate_ns_string, legacy_seconds_to_ns, ns_to_legacy_seconds
-import pytest
+from hub.nanoseconds import validate_ns_string, legacy_seconds_to_ns, ns_to_legacy_seconds  # noqa: E402
 
 class TestV2Models:
     """Test v2 model validation and ns string encoding."""
@@ -86,6 +84,35 @@ class TestV2Models:
         assert entry.amount_ns == "10000000000"
         assert entry.balance_ns == "90000000000"
         assert entry.currency == "MEP_NS"
+
+    def test_v2_task_response_valid(self):
+        """Test V2TaskResponse validates completed task payloads."""
+        response = V2TaskResponse(
+            task_id="task-123",
+            consumer_id="consumer-1",
+            provider_id="provider-1",
+            status="completed",
+            bounty_ns="50000000000",
+            result_uri="https://example.com/result.json",
+        )
+        assert response.status == "completed"
+        assert response.bounty_ns == "50000000000"
+
+    def test_v2_ledger_list_response_valid(self):
+        """Test V2LedgerListResponse wraps multiple ledger entries."""
+        response = V2LedgerListResponse(
+            node_id="node-1",
+            entries=[
+                V2LedgerEntryResponse(
+                    node_id="node-1",
+                    amount_ns="-1000000000",
+                    balance_ns="9000000000",
+                    kind="ESCROW",
+                )
+            ],
+        )
+        assert response.node_id == "node-1"
+        assert len(response.entries) == 1
 
 class TestNsStringValidation:
     """Test ns string validation logic."""

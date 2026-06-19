@@ -49,7 +49,7 @@ from v2_models import (
     V2EscrowResponse,
     V2EscrowListResponse,
     V2LedgerEntryResponse,
-    V2TaskListResponse,
+    V2LedgerListResponse,
 )
 
 from nanoseconds import legacy_seconds_to_ns, ns_to_legacy_seconds
@@ -2358,7 +2358,7 @@ async def submit_task_v2(
 ):
     # Convert v2 economics to legacy format for internal processing
     bounty_ns = int(task.economics.bounty_ns)
-    bounty = ns_to_legacy_seconds(bounty_ns, "bounty_ns")
+    bounty = ns_to_legacy_seconds(bounty_ns)
     
     # Build legacy TaskCreate from v2 request
     legacy_task = TaskCreate(
@@ -2788,6 +2788,7 @@ async def get_task_result_v2(task_id: str, authenticated_node: str = Depends(ver
         task_id=task["task_id"],
         consumer_id=task["consumer_id"],
         provider_id=task["provider_id"],
+        status=task["status"],
         bounty_ns=str(bounty_ns),
         result_uri=task.get("result_uri")
     )
@@ -3207,7 +3208,7 @@ async def ledger_entries_v2(node_id: str, limit: int = 50, authenticated_node: s
             # Skip malformed entries
             continue
     
-    return V2LedgerEntryResponse(
+    return V2LedgerListResponse(
         node_id=node_id,
         entries=v2_entries[:safe_limit]
     )

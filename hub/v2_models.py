@@ -125,6 +125,11 @@ class V2LedgerEntryResponse(BaseModel):
         return value
 
 
+class V2LedgerListResponse(BaseModel):
+    node_id: str
+    entries: List[V2LedgerEntryResponse]
+
+
 class V2EscrowListResponse(BaseModel):
     escrows: List[V2EscrowResponse]
 
