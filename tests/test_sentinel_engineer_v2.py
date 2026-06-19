@@ -121,7 +121,18 @@ class TestCodeExecutor(unittest.TestCase):
     """Test sandboxed code execution."""
 
     def setUp(self):
+        self.old_allow_code_execution = CONFIG.allow_code_execution
+        CONFIG.allow_code_execution = True
         self.executor = CodeExecutor()
+
+    def tearDown(self):
+        CONFIG.allow_code_execution = self.old_allow_code_execution
+
+    def test_execution_disabled_by_default_guard(self):
+        CONFIG.allow_code_execution = False
+        result = self.executor.execute('print("blocked")', "python")
+        self.assertEqual(result.returncode, 126)
+        self.assertIn("disabled", result.stderr)
 
     def test_python_hello(self):
         result = self.executor.execute('print("hello")', "python")

@@ -8,6 +8,7 @@ import uuid
 import time
 import json
 import ipaddress
+import hmac
 from datetime import datetime
 import os
 import ctypes
@@ -26,6 +27,8 @@ from models import (
     TaskResult,
     TaskBid,
     TaskCancel,
+    TaskReject,
+    TaskVerificationAccept,
     RegistryUpdate,
     AvailabilityUpdate,
     RegistryHeartbeat,
@@ -38,7 +41,7 @@ from models import (
     BrainstormSessionPost,
 )
 
-app = FastAPI(title="MEP Hub", description="The Time Exchange Clearinghouse", version="0.1.2")
+app = FastAPI(title="MEP Hub", description="The Time Exchange Clearinghouse", version="0.1.2", docs_url="/docs", redoc_url="/redoc")
 
 # In-memory storage for active tasks
 active_tasks: Dict[str, dict] = {}
@@ -161,6 +164,8 @@ ASSIGNMENT_TIMEOUT_SECONDS = int(os.getenv("MEP_ASSIGNMENT_TIMEOUT_SECONDS", "36
 TASK_TIMEOUT_DEFAULT_SECONDS = int(os.getenv("MEP_TASK_TIMEOUT_DEFAULT_SECONDS", str(ASSIGNMENT_TIMEOUT_SECONDS)))
 TASK_TIMEOUT_MIN_SECONDS = int(os.getenv("MEP_TASK_TIMEOUT_MIN_SECONDS", "60"))
 TASK_TIMEOUT_MAX_SECONDS = int(os.getenv("MEP_TASK_TIMEOUT_MAX_SECONDS", "86400"))
+SUBMITTED_RESULT_TIMEOUT_SECONDS = int(os.getenv("MEP_SUBMITTED_RESULT_TIMEOUT_SECONDS", "86400"))
+MAX_REBROADCAST_COUNT = int(os.getenv("MEP_MAX_REBROADCAST_COUNT", "3"))
 ASSIGNMENT_SWEEP_INTERVAL_SECONDS = int(os.getenv("MEP_ASSIGNMENT_SWEEP_INTERVAL_SECONDS", "60"))
 MAINTENANCE_SWEEP_INTERVAL_SECONDS = int(os.getenv("MEP_MAINTENANCE_SWEEP_INTERVAL_SECONDS", "60"))
 REGISTRY_RECONCILE_LIMIT = int(os.getenv("MEP_REGISTRY_RECONCILE_LIMIT", "1000"))
@@ -203,6 +208,8 @@ ANTI_LOOP_TERMINATION_TOKENS = ("[end]", "[no_relay]", "[ack_only]")
 if TASK_TIMEOUT_MIN_SECONDS > TASK_TIMEOUT_MAX_SECONDS:
     TASK_TIMEOUT_MIN_SECONDS, TASK_TIMEOUT_MAX_SECONDS = TASK_TIMEOUT_MAX_SECONDS, TASK_TIMEOUT_MIN_SECONDS
 TASK_TIMEOUT_DEFAULT_SECONDS = max(TASK_TIMEOUT_MIN_SECONDS, min(TASK_TIMEOUT_DEFAULT_SECONDS, TASK_TIMEOUT_MAX_SECONDS))
+SUBMITTED_RESULT_TIMEOUT_SECONDS = max(TASK_TIMEOUT_MIN_SECONDS, min(SUBMITTED_RESULT_TIMEOUT_SECONDS, TASK_TIMEOUT_MAX_SECONDS))
+MAX_REBROADCAST_COUNT = max(0, MAX_REBROADCAST_COUNT)
 
 # ---------------------------------------------------------------------------
 # Node Activity Tracking (for passive degraded detection)
@@ -478,6 +485,7 @@ async def _load_active_tasks_from_db():
             "status": task["status"],
             "target_node": task["target_node"],
             "model_requirement": task["model_requirement"],
+            "verifier_type": task.get("verifier_type"),
             "expires_in_seconds": task.get("expires_in_seconds"),
             "provider_id": task["provider_id"],
             "payload_uri": task.get("payload_uri"),
@@ -514,7 +522,7 @@ def _apply_rate_limit(key: str):
     rate_limits[key] = timestamps
 
 def _require_admin(x_mep_admin_key: Optional[str]):
-    if not ADMIN_KEY or not x_mep_admin_key or x_mep_admin_key != ADMIN_KEY:
+    if not ADMIN_KEY or not x_mep_admin_key or not hmac.compare_digest(x_mep_admin_key, ADMIN_KEY):
         raise HTTPException(status_code=403, detail="Admin key required")
 
 def _normalize_availability(value: Optional[str]) -> Optional[str]:
@@ -685,6 +693,22 @@ def _task_target_capability(task: TaskCreate) -> Optional[str]:
     if isinstance(task.model_requirement, str) and task.model_requirement.strip():
         return task.model_requirement.strip()
     return None
+
+
+def _task_verifier_type(task: TaskCreate) -> Optional[str]:
+    verifier_type = task.verifier_type
+    if verifier_type is None and isinstance(task.verifier, dict):
+        verifier_type = task.verifier.get("type")
+    if verifier_type is None and isinstance(task.task, dict) and isinstance(task.task.get("verifier"), dict):
+        verifier_type = task.task["verifier"].get("type")
+    if verifier_type is None:
+        return None
+    normalized = str(verifier_type).strip().lower()
+    if not normalized:
+        return None
+    if normalized not in {"manual_acceptance", "automated"}:
+        raise HTTPException(status_code=400, detail="Unsupported verifier_type")
+    return normalized
 
 
 async def _coerce_live_availability(node_id: str, availability: Optional[str]) -> Optional[str]:
@@ -1388,43 +1412,62 @@ async def _sweep_assigned_timeouts():
         return
     for task in expired_tasks:
         if TIMEOUT_POLICY == "rebroadcast" and not task["target_node"]:
-            if not db.requeue_task_if_assigned(task["task_id"], now):
+            rebroadcast_count = int(task.get("rebroadcast_count") or 0)
+            if MAX_REBROADCAST_COUNT > 0 and rebroadcast_count >= MAX_REBROADCAST_COUNT:
+                log_event(
+                    "task_rebroadcast_limit",
+                    f"Task {task['task_id'][:8]} reached rebroadcast limit",
+                    task_id=task["task_id"],
+                    consumer_id=task["consumer_id"],
+                    bounty=task["bounty"],
+                    rebroadcast_count=rebroadcast_count,
+                    max_rebroadcast_count=MAX_REBROADCAST_COUNT,
+                )
+            else:
+                if task["bounty"] < 0:
+                    refunded = db.refund_escrow(task["task_id"], now)
+                    if refunded is not None:
+                        buyer_id = task.get("provider_id") or ""
+                        new_balance = db.get_balance(buyer_id) or 0.0
+                        log_audit("DATA_TIMEOUT_REFUND", buyer_id, refunded, new_balance, task["task_id"])
+                if not db.requeue_task_if_assigned(task["task_id"], now):
+                    continue
+                task_data = {
+                    "id": task["task_id"],
+                    "consumer_id": task["consumer_id"],
+                    "payload": task["payload"],
+                    "bounty": task["bounty"],
+                    "status": "bidding",
+                    "target_node": task["target_node"],
+                    "model_requirement": task["model_requirement"],
+                    "verifier_type": task.get("verifier_type"),
+                    "expires_in_seconds": task.get("expires_in_seconds"),
+                    "payload_uri": task.get("payload_uri"),
+                    "secret_data": task.get("result_payload")
+                }
+                async with task_lock:
+                    active_tasks[task["task_id"]] = task_data
+                model_requirement = _normalize_model_requirement(task["model_requirement"])
+                rfc_data = {
+                    "id": task["task_id"],
+                    "consumer_id": task["consumer_id"],
+                    "bounty": task["bounty"],
+                    "model_requirement": model_requirement,
+                    "payload_uri": task.get("payload_uri")
+                }
+                async with node_lock:
+                    broadcast_nodes = list(connected_nodes.items())
+                candidate_nodes = _select_rfc_recipients(task["consumer_id"], model_requirement, broadcast_nodes)
+                for node_id, ws in candidate_nodes:
+                    try:
+                        await ws.send_json({"event": "rfc", "data": rfc_data})
+                    except Exception as exc:
+                        log_event("broadcast_error", f"Failed to send RFC to {node_id}: {exc}", node_id=node_id, task_id=task["task_id"])
+                        async with node_lock:
+                            if connected_nodes.get(node_id) is ws:
+                                del connected_nodes[node_id]
+                log_event("task_requeued_timeout", f"Task {task['task_id'][:8]} requeued after timeout", task_id=task["task_id"], consumer_id=task["consumer_id"], bounty=task["bounty"], rebroadcast_count=rebroadcast_count + 1)
                 continue
-            task_data = {
-                "id": task["task_id"],
-                "consumer_id": task["consumer_id"],
-                "payload": task["payload"],
-                "bounty": task["bounty"],
-                "status": "bidding",
-                "target_node": task["target_node"],
-                "model_requirement": task["model_requirement"],
-                "expires_in_seconds": task.get("expires_in_seconds"),
-                "payload_uri": task.get("payload_uri"),
-                "secret_data": task.get("result_payload")
-            }
-            async with task_lock:
-                active_tasks[task["task_id"]] = task_data
-            model_requirement = _normalize_model_requirement(task["model_requirement"])
-            rfc_data = {
-                "id": task["task_id"],
-                "consumer_id": task["consumer_id"],
-                "bounty": task["bounty"],
-                "model_requirement": model_requirement,
-                "payload_uri": task.get("payload_uri")
-            }
-            async with node_lock:
-                broadcast_nodes = list(connected_nodes.items())
-            candidate_nodes = _select_rfc_recipients(task["consumer_id"], model_requirement, broadcast_nodes)
-            for node_id, ws in candidate_nodes:
-                try:
-                    await ws.send_json({"event": "rfc", "data": rfc_data})
-                except Exception as exc:
-                    log_event("broadcast_error", f"Failed to send RFC to {node_id}: {exc}", node_id=node_id, task_id=task["task_id"])
-                    async with node_lock:
-                        if connected_nodes.get(node_id) is ws:
-                            del connected_nodes[node_id]
-            log_event("task_requeued_timeout", f"Task {task['task_id'][:8]} requeued after timeout", task_id=task["task_id"], consumer_id=task["consumer_id"], bounty=task["bounty"])
-            continue
         if not db.expire_task_if_assigned(task["task_id"], now):
             continue
         if task["bounty"] > 0:
@@ -1433,6 +1476,12 @@ async def _sweep_assigned_timeouts():
                 db.add_balance(task["consumer_id"], task["bounty"])
             new_balance = db.get_balance(task["consumer_id"])
             log_audit("TIMEOUT_REFUND", task["consumer_id"], task["bounty"], new_balance, task["task_id"])
+        elif task["bounty"] < 0:
+            refunded = db.refund_escrow(task["task_id"], now)
+            if refunded is not None:
+                buyer_id = task.get("provider_id") or ""
+                new_balance = db.get_balance(buyer_id) or 0.0
+                log_audit("DATA_TIMEOUT_REFUND", buyer_id, refunded, new_balance, task["task_id"])
         async with task_lock:
             if task["task_id"] in active_tasks:
                 del active_tasks[task["task_id"]]
@@ -1465,11 +1514,48 @@ async def _sweep_bidding_timeouts():
                 del active_tasks[task["task_id"]]
         log_event("task_expired_bidding", f"Task {task['task_id'][:8]} expired", task_id=task["task_id"], consumer_id=task["consumer_id"])
 
+async def _sweep_submitted_result_timeouts():
+    """Expire verifier-gated results that were never accepted and refund held escrow."""
+    if SUBMITTED_RESULT_TIMEOUT_SECONDS <= 0:
+        return
+    now = time.time()
+    expired_submissions = db.get_submitted_result_tasks_for_timeout(now, SUBMITTED_RESULT_TIMEOUT_SECONDS)
+    if not expired_submissions:
+        return
+    for task in expired_submissions:
+        if not db.expire_task_if_submitted_result(task["task_id"], now):
+            continue
+        bounty = float(task.get("bounty", 0.0))
+        if bounty > 0:
+            refunded = db.refund_escrow(task["task_id"], now)
+            if refunded is None:
+                db.add_balance(task["consumer_id"], bounty)
+            new_balance = db.get_balance(task["consumer_id"])
+            log_audit("VERIFICATION_TIMEOUT_REFUND", task["consumer_id"], bounty, new_balance, task["task_id"])
+        elif bounty < 0:
+            refunded = db.refund_escrow(task["task_id"], now)
+            if refunded is not None:
+                buyer_id = task.get("provider_id") or ""
+                new_balance = db.get_balance(buyer_id) or 0.0
+                log_audit("DATA_VERIFICATION_TIMEOUT_REFUND", buyer_id, refunded, new_balance, task["task_id"])
+        async with task_lock:
+            if task["task_id"] in active_tasks:
+                del active_tasks[task["task_id"]]
+        log_event(
+            "submitted_result_expired",
+            f"Task {task['task_id'][:8]} expired while awaiting verifier acceptance",
+            task_id=task["task_id"],
+            consumer_id=task["consumer_id"],
+            provider_id=task.get("provider_id"),
+            bounty=bounty,
+        )
+
 async def _assignment_timeout_worker():
     while True:
         try:
             await _sweep_assigned_timeouts()
             await _sweep_bidding_timeouts()
+            await _sweep_submitted_result_timeouts()
         except Exception as exc:
             log_event("timeout_sweep_failed", f"Timeout sweep failed: {exc}")
         await asyncio.sleep(ASSIGNMENT_SWEEP_INTERVAL_SECONDS)
@@ -1573,16 +1659,39 @@ async def register_node(node: NodeRegistration, request: Request):
     validated_pubkey = _validate_registration_pubkey(node.pubkey)
     # Registration derives the Node ID from the validated Ed25519 public key PEM
     node_id = auth.derive_node_id(validated_pubkey)
-    balance = db.register_node(node_id, validated_pubkey)
+    result = db.register_node(node_id, validated_pubkey)
     if node.alias or node.x25519_public_key:
         db.upsert_registry(node_id, node.alias, [], [], {}, "offline", time.time(), node.x25519_public_key)
 
-    log_event("node_registered", f"Node {node_id} registered with starting balance {balance}", node_id=node_id, starting_balance=balance)
-    log_audit("REGISTER", node_id, balance, balance, "START_BONUS")
+    status = result["status"]
+    balance = result["balance"]
+    if status == "registered":
+        log_event("node_registered", f"Node {node_id} already registered with balance {balance}", node_id=node_id, balance=balance)
+    else:
+        log_event("node_pending", f"Node {node_id} registration pending approval", node_id=node_id)
 
     hub_url, ws_url = get_hub_urls(request)
 
-    return {"status": "success", "node_id": node_id, "balance": balance, "hub_url": hub_url, "ws_url": ws_url}
+    return {"status": status, "node_id": node_id, "balance": balance, "hub_url": hub_url, "ws_url": ws_url}
+
+@app.post("/admin/approve-registration")
+async def approve_registration(payload: dict, x_mep_admin_key: Optional[str] = Header(default=None)):
+    _require_admin(x_mep_admin_key)
+    node_id = payload.get("node_id")
+    if not node_id:
+        raise HTTPException(status_code=400, detail="node_id required")
+    approved = db.approve_registration(node_id, "admin")
+    if not approved:
+        raise HTTPException(status_code=404, detail="Pending registration not found")
+    balance = db.get_balance(node_id) or 0.0
+    log_audit("REGISTRATION_APPROVED", node_id, balance, balance, "ADMIN_APPROVAL")
+    return {"status": "approved", "node_id": node_id, "balance": balance}
+
+@app.get("/admin/pending-registrations")
+async def list_pending_registrations(x_mep_admin_key: Optional[str] = Header(default=None)):
+    _require_admin(x_mep_admin_key)
+    pending = db.get_pending_registrations()
+    return {"pending": pending}
 
 @app.post("/registry/update")
 async def update_registry(payload: RegistryUpdate, authenticated_node: str = Depends(verify_request)):
@@ -2012,6 +2121,7 @@ async def submit_task(
         raise HTTPException(status_code=413, detail="Task payload too large")
     target_node = _task_target_node(task)
     target_capability = _task_target_capability(task)
+    verifier_type = _task_verifier_type(task)
     economics = _task_economics(task)
     bounty = float(economics["bounty_seconds"])
     if task.task or task.economics or task.source or task.routing:
@@ -2072,6 +2182,7 @@ async def submit_task(
         "economics": economics,
         "target_node": target_node,
         "model_requirement": target_capability,
+        "verifier_type": verifier_type,
         "expires_in_seconds": task.expires_in_seconds,
         "payload_uri": normalized_payload_uri,
         "secret_data": task.secret_data
@@ -2088,6 +2199,7 @@ async def submit_task(
         result_payload=task.secret_data,
         payload_uri=normalized_payload_uri,
         expires_in_seconds=task.expires_in_seconds,
+        verifier_type=verifier_type,
     )
     async with task_lock:
         active_tasks[task_id] = task_data
@@ -2258,7 +2370,18 @@ async def place_bid(bid: TaskBid, authenticated_node: str = Depends(verify_reque
         if assignment_profile["risk_reasons"]:
             risk_reasons = ", ".join(assignment_profile["risk_reasons"])
             return {"status": "rejected", "detail": f"Provider rejected by risk control: {risk_reasons}"}
-        if not db.assign_task_if_open(bid.task_id, bid.provider_id, time.time()):
+        bounty = task["bounty"]
+        now = time.time()
+        if bounty < 0:
+            cost = abs(float(bounty))
+            assignment = db.assign_data_task_with_escrow_if_open(bid.task_id, bid.provider_id, cost, now)
+            if assignment["status"] == "insufficient_balance":
+                return {"status": "rejected", "detail": "Provider lacks SECONDS to buy this data"}
+            if assignment["status"] != "accepted":
+                return {"status": "rejected", "detail": "Task already assigned to another node"}
+            new_balance = db.get_balance(bid.provider_id) or 0.0
+            log_audit("BUY_DATA_ESCROW", bid.provider_id, -cost, new_balance, bid.task_id)
+        elif not db.assign_task_if_open(bid.task_id, bid.provider_id, now):
             return {"status": "rejected", "detail": "Task already assigned to another node"}
         task["status"] = "assigned"
         task["provider_id"] = bid.provider_id
@@ -2266,7 +2389,6 @@ async def place_bid(bid: TaskBid, authenticated_node: str = Depends(verify_reque
         consumer_id = task["consumer_id"]
         model_requirement = task.get("model_requirement")
         payload_uri = task.get("payload_uri")
-        bounty = task["bounty"]
 
     log_event("bid_accepted", f"Task {bid.task_id[:8]} assigned to {bid.provider_id}", task_id=bid.task_id, provider_id=bid.provider_id, bounty=bounty)
 
@@ -2279,6 +2401,63 @@ async def place_bid(bid: TaskBid, authenticated_node: str = Depends(verify_reque
         "secret_data": task.get("secret_data", task.get("result_payload")),
         "assignment_score": assignment_profile["assignment_score"]
     }
+
+
+async def _finalize_settled_task(settled: dict, task_id: str, provider_id: str, result_payload: str, result_uri: Optional[str]):
+    task = settled["task"]
+    bounty = task["bounty"]
+    for event in settled.get("ledger_events", []):
+        node_id = event["node_id"]
+        amount = event["amount"]
+        new_balance = db.get_balance(node_id) or 0.0
+        log_audit(event["kind"], node_id, amount, new_balance, task_id)
+
+    log_event("task_completed", f"Task {task_id[:8]} completed by {provider_id}", task_id=task_id, provider_id=provider_id, bounty=bounty)
+
+    async with task_lock:
+        completed_entry = {
+            "id": task["task_id"],
+            "consumer_id": task["consumer_id"],
+            "payload": task["payload"],
+            "bounty": bounty,
+            "status": "completed",
+            "target_node": task.get("target_node"),
+            "model_requirement": task.get("model_requirement"),
+            "verifier_type": task.get("verifier_type"),
+            "provider_id": provider_id,
+            "payload_uri": task.get("payload_uri"),
+            "result": result_payload,
+            "result_uri": result_uri,
+            "completed_at": task["updated_at"],
+        }
+        completed_tasks[task_id] = completed_entry
+        if task_id in active_tasks:
+            del active_tasks[task_id]
+    await _evict_completed_tasks_cache()
+
+    consumer_id = task["consumer_id"]
+    async with node_lock:
+        consumer_ws = connected_nodes.get(consumer_id)
+    if consumer_ws:
+        try:
+            await consumer_ws.send_json({
+                "event": "task_result",
+                "data": {
+                    "task_id": task_id,
+                    "provider_id": provider_id,
+                    "result_payload": result_payload,
+                    "result_uri": result_uri,
+                    "bounty_spent": bounty
+                }
+            })
+        except Exception as exc:
+            log_event("deliver_result_failed", f"Failed to deliver result {task_id[:8]} to {consumer_id}: {exc}", task_id=task_id, consumer_id=consumer_id)
+            async with node_lock:
+                if connected_nodes.get(consumer_id) is consumer_ws:
+                    del connected_nodes[consumer_id]
+
+    return settled["response"]
+
 
 @app.post("/tasks/complete")
 async def complete_task(
@@ -2296,103 +2475,207 @@ async def complete_task(
     if len(result_payload) > MAX_PAYLOAD_CHARS:
         raise HTTPException(status_code=413, detail="Result payload too large")
     
-    if x_mep_idempotency_key:
-        existing = db.get_idempotency(authenticated_node, "/tasks/complete", x_mep_idempotency_key)
-        if existing:
-            return existing["response"]
-
-    async with task_lock:
-        task = active_tasks.get(result.task_id)
-    if not task:
-        db_task = db.get_task(result.task_id)
-        if not db_task or db_task["status"] not in ("bidding", "assigned"):
+    task = db.get_task(result.task_id)
+    if task and task.get("verifier_type") in ("manual_acceptance", "automated"):
+        submitted = db.submit_task_result_for_verification(
+            result.task_id,
+            result.provider_id,
+            result_payload,
+            time.time(),
+            result_uri=normalized_result_uri,
+            idem_node_id=authenticated_node if x_mep_idempotency_key else None,
+            idem_endpoint="/tasks/complete" if x_mep_idempotency_key else None,
+            idem_key=x_mep_idempotency_key,
+        )
+        if submitted["status"] == "idempotent":
+            return submitted["response"]
+        if submitted["status"] in ("not_found", "not_active"):
             raise HTTPException(status_code=404, detail="Task not found or already claimed")
-        task = {
-            "id": db_task["task_id"],
-            "consumer_id": db_task["consumer_id"],
-            "payload": db_task["payload"],
-            "bounty": db_task["bounty"],
-            "status": db_task["status"],
-            "target_node": db_task["target_node"],
-            "model_requirement": db_task["model_requirement"],
-            "provider_id": db_task["provider_id"],
-            "payload_uri": db_task.get("payload_uri"),
-            "secret_data": db_task.get("result_payload")
-        }
+        if submitted["status"] == "assigned_to_other":
+            raise HTTPException(status_code=409, detail="Task assigned to another provider")
+        if submitted["status"] != "pending_verification":
+            raise HTTPException(status_code=409, detail="Task result could not be submitted for verification")
+
         async with task_lock:
-            active_tasks[result.task_id] = task
+            if result.task_id in active_tasks:
+                active_tasks[result.task_id]["status"] = "submitted_result"
+                active_tasks[result.task_id]["result"] = result_payload
+                active_tasks[result.task_id]["result_uri"] = normalized_result_uri
+        log_event("task_result_submitted", f"Task {result.task_id[:8]} submitted for verification", task_id=result.task_id, provider_id=result.provider_id)
+        return submitted["response"]
 
-    assigned_provider = task.get("provider_id")
-    if assigned_provider and assigned_provider != result.provider_id:
+    settled = db.complete_task_atomic(
+        result.task_id,
+        result.provider_id,
+        result_payload,
+        time.time(),
+        result_uri=normalized_result_uri,
+        idem_node_id=authenticated_node if x_mep_idempotency_key else None,
+        idem_endpoint="/tasks/complete" if x_mep_idempotency_key else None,
+        idem_key=x_mep_idempotency_key,
+    )
+    if settled["status"] == "idempotent":
+        return settled["response"]
+    if settled["status"] in ("not_found", "not_active"):
+        raise HTTPException(status_code=404, detail="Task not found or already claimed")
+    if settled["status"] == "assigned_to_other":
         raise HTTPException(status_code=409, detail="Task assigned to another provider")
+    if settled["status"] == "insufficient_balance":
+        log_event("data_purchase_failed", f"Provider {result.provider_id} lacks SECONDS to buy {result.task_id}", task_id=result.task_id, provider_id=result.provider_id)
+        raise HTTPException(status_code=400, detail="Provider lacks SECONDS to buy this data")
+    if settled["status"] == "escrow_not_held":
+        raise HTTPException(status_code=409, detail="Escrow is not held for this task")
+    if settled["status"] != "success":
+        raise HTTPException(status_code=409, detail="Task could not be settled")
+    return await _finalize_settled_task(settled, result.task_id, result.provider_id, result_payload, normalized_result_uri)
 
-    provider_balance = db.get_balance(result.provider_id)
-    if provider_balance is None:
-        db.set_balance(result.provider_id, 0.0)
+@app.post("/tasks/reject")
+async def reject_task(
+    rejection: TaskReject,
+    authenticated_node: str = Depends(verify_request),
+):
+    if authenticated_node != rejection.provider_id:
+        raise HTTPException(status_code=403, detail="Cannot reject tasks on behalf of another node")
 
-    # Transfer SECONDS based on positive or negative bounty
-    bounty = task["bounty"]
-    if bounty >= 0:
-        released = db.release_escrow(result.task_id, result.provider_id, time.time())
-        if released is None:
-            db.add_balance(result.provider_id, bounty)
-        new_balance = db.get_balance(result.provider_id)
-        log_audit("ESCROW_RELEASE", result.provider_id, bounty, new_balance, result.task_id)
-    else:
-        # Data Market: Provider PAYS to receive this payload/task
-        cost = abs(bounty)
-        success = db.deduct_balance(result.provider_id, cost)
-        if not success:
-            log_event("data_purchase_failed", f"Provider {result.provider_id} lacks SECONDS to buy {result.task_id}", task_id=result.task_id, provider_id=result.provider_id, cost=cost)
-            raise HTTPException(status_code=400, detail="Provider lacks SECONDS to buy this data")
+    rejected = db.reject_task_if_assigned(rejection.task_id, rejection.provider_id, time.time())
+    if rejected["status"] in ("success", "already_rejected"):
+        for event in rejected.get("ledger_events", []):
+            node_id = event["node_id"]
+            amount = event["amount"]
+            new_balance = db.get_balance(node_id) or 0.0
+            log_audit(event["kind"], node_id, amount, new_balance, rejection.task_id)
+        async with task_lock:
+            if rejection.task_id in active_tasks:
+                active_tasks[rejection.task_id]["status"] = "rejected"
+        reason = (rejection.reason or "provider_rejected")[:200]
+        log_event(
+            "task_rejected_by_provider",
+            f"Task {rejection.task_id[:8]} rejected by {rejection.provider_id}: {reason}",
+            task_id=rejection.task_id,
+            provider_id=rejection.provider_id,
+            reason=reason,
+        )
+        return {"status": "success", "task_id": rejection.task_id, "reason": reason}
+    if rejected["status"] == "not_found":
+        raise HTTPException(status_code=404, detail="Task not found")
+    if rejected["status"] == "assigned_to_other":
+        raise HTTPException(status_code=409, detail="Task assigned to another provider")
+    if rejected["status"] == "escrow_not_held":
+        raise HTTPException(status_code=409, detail="Escrow is not held for this task")
+    raise HTTPException(status_code=409, detail="Task is not assigned")
 
-        p_balance = db.get_balance(result.provider_id) or 0.0
-        log_audit("BUY_DATA", result.provider_id, -cost, p_balance, result.task_id)
+def _verify_simple_automated(task, result_payload):
+    """Simple automated verifier: checks result is non-empty and valid JSON."""
+    if not result_payload or not result_payload.strip():
+        return False, "Result payload is empty"
+    try:
+        result = json.loads(result_payload)
+    except json.JSONDecodeError:
+        return False, "Result payload is not valid JSON"
+    if not isinstance(result, dict):
+        return False, "Result must be a JSON object"
+    if "result" not in result and "error" not in result:
+        return False, "Result must contain 'result' or 'error' field"
+    return True, "OK"
 
-        db.add_balance(task["consumer_id"], cost) # The sender earns SECONDS
-        c_balance = db.get_balance(task["consumer_id"]) or 0.0
-        log_audit("SELL_DATA", task["consumer_id"], cost, c_balance, result.task_id)
+@app.post("/tasks/verify/accept")
+async def accept_verified_task(
+    verification: TaskVerificationAccept,
+    authenticated_node: str = Depends(verify_request),
+    x_mep_idempotency_key: Optional[str] = Header(default=None)
+):
+    task = db.get_task(verification.task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+    if authenticated_node != task["consumer_id"]:
+        raise HTTPException(status_code=403, detail="Only the consumer can accept a submitted result")
+    if task.get("verifier_type") != "manual_acceptance":
+        raise HTTPException(status_code=400, detail="Task is not verifier-gated")
+    if task["status"] != "submitted_result" and not x_mep_idempotency_key:
+        raise HTTPException(status_code=400, detail="Task is not pending verification")
 
-    log_event("task_completed", f"Task {result.task_id[:8]} completed by {result.provider_id}", task_id=result.task_id, provider_id=result.provider_id, bounty=bounty)
+    provider_id = task.get("provider_id")
+    if not provider_id:
+        raise HTTPException(status_code=409, detail="Task has no assigned provider")
+    result_payload = task.get("result_payload") or ""
+    result_uri = task.get("result_uri")
+    if not result_payload and not result_uri:
+        raise HTTPException(status_code=409, detail="Task has no submitted result")
 
-    # Move task to completed
-    async with task_lock:
-        task["status"] = "completed"
-        task["provider_id"] = result.provider_id
-        task["result"] = result_payload
-        task["completed_at"] = time.time()
-        completed_tasks[result.task_id] = task
-        if result.task_id in active_tasks:
-            del active_tasks[result.task_id]
-    db.update_task_result(result.task_id, result.provider_id, result_payload, "completed", time.time(), result_uri=normalized_result_uri)
-    await _evict_completed_tasks_cache()
+    settled = db.complete_task_atomic(
+        verification.task_id,
+        provider_id,
+        result_payload,
+        time.time(),
+        result_uri=result_uri,
+        idem_node_id=authenticated_node if x_mep_idempotency_key else None,
+        idem_endpoint="/tasks/verify/accept" if x_mep_idempotency_key else None,
+        idem_key=x_mep_idempotency_key,
+        expected_status="submitted_result",
+    )
+    if settled["status"] == "idempotent":
+        return settled["response"]
+    if settled["status"] in ("not_found", "not_active"):
+        raise HTTPException(status_code=404, detail="Task not found or not pending verification")
+    if settled["status"] == "assigned_to_other":
+        raise HTTPException(status_code=409, detail="Task assigned to another provider")
+    if settled["status"] == "escrow_not_held":
+        raise HTTPException(status_code=409, detail="Escrow is not held for this task")
+    if settled["status"] != "success":
+        raise HTTPException(status_code=409, detail="Task could not be settled")
+    return await _finalize_settled_task(settled, verification.task_id, provider_id, result_payload, result_uri)
 
-    # ROUTE RESULT BACK TO CONSUMER VIA WEBSOCKET
-    consumer_id = task["consumer_id"]
-    async with node_lock:
-        consumer_ws = connected_nodes.get(consumer_id)
-    if consumer_ws:
-        try:
-            await consumer_ws.send_json({
-                "event": "task_result",
-                "data": {
-                    "task_id": result.task_id,
-                    "provider_id": result.provider_id,
-                    "result_payload": result_payload,
-                    "result_uri": normalized_result_uri,
-                    "bounty_spent": task["bounty"]
-                }
-            })
-        except Exception as exc:
-            log_event("deliver_result_failed", f"Failed to deliver result {result.task_id[:8]} to {consumer_id}: {exc}", task_id=result.task_id, consumer_id=consumer_id)
-            async with node_lock:
-                if connected_nodes.get(consumer_id) is consumer_ws:
-                    del connected_nodes[consumer_id]
 
-    response_payload = {"status": "success", "earned": task["bounty"], "new_balance": db.get_balance(result.provider_id)}
-    if x_mep_idempotency_key:
-        db.set_idempotency(authenticated_node, "/tasks/complete", x_mep_idempotency_key, response_payload, 200, time.time())
-    return response_payload
+@app.post("/tasks/verify/automated")
+async def verify_task_automated(
+    verification: TaskVerificationAccept,
+    x_mep_admin_key: Optional[str] = Header(default=None),
+    x_mep_idempotency_key: Optional[str] = Header(default=None)
+):
+    _require_admin(x_mep_admin_key)
+    task = db.get_task(verification.task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+    if task.get("verifier_type") != "automated":
+        raise HTTPException(status_code=400, detail="Task is not configured for automated verification")
+    if task["status"] != "submitted_result":
+        raise HTTPException(status_code=400, detail="Task is not pending verification")
+
+    result_payload = task.get("result_payload") or ""
+    passed, reason = _verify_simple_automated(task, result_payload)
+    if not passed:
+        log_event("automated_verification_failed", f"Task {verification.task_id[:8]} failed automated verification: {reason}", task_id=verification.task_id, reason=reason)
+        raise HTTPException(status_code=400, detail=f"Automated verification failed: {reason}")
+
+    provider_id = task.get("provider_id")
+    if not provider_id:
+        raise HTTPException(status_code=409, detail="Task has no assigned provider")
+    result_uri = task.get("result_uri")
+
+    settled = db.complete_task_atomic(
+        verification.task_id,
+        provider_id,
+        result_payload,
+        time.time(),
+        result_uri=result_uri,
+        idem_node_id="automated_verifier" if x_mep_idempotency_key else None,
+        idem_endpoint="/tasks/verify/automated" if x_mep_idempotency_key else None,
+        idem_key=x_mep_idempotency_key,
+        expected_status="submitted_result",
+    )
+    if settled["status"] == "idempotent":
+        return settled["response"]
+    if settled["status"] in ("not_found", "not_active"):
+        raise HTTPException(status_code=404, detail="Task not found or not pending verification")
+    if settled["status"] == "assigned_to_other":
+        raise HTTPException(status_code=409, detail="Task assigned to another provider")
+    if settled["status"] == "already_completed":
+        raise HTTPException(status_code=409, detail="Task already completed")
+    if settled["status"] == "escrow_not_held":
+        raise HTTPException(status_code=409, detail="Escrow is not held for this task")
+    log_event("automated_verification_passed", f"Task {verification.task_id[:8]} passed automated verification", task_id=verification.task_id)
+    return {"status": "verified", "task_id": verification.task_id, "reason": reason}
+
 
 @app.get("/tasks/result/{task_id}")
 async def get_task_result(task_id: str, authenticated_node: str = Depends(verify_request)):
