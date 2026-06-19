@@ -161,6 +161,90 @@ class TestBalance(unittest.TestCase):
         self.assertEqual(resp.status_code, 404)
 
 
+class TestV2Endpoints(unittest.TestCase):
+
+    def setUp(self):
+        main.rate_limits.clear()
+
+    def test_v2_submit_converts_ns_bounty_and_returns_task_id(self):
+        consumer_priv, consumer_pub, consumer_id = _make_identity()
+        _register(consumer_pub)
+
+        task_payload = json.dumps({
+            "consumer_id": consumer_id,
+            "payload": "What is 2+2?",
+            "economics": {
+                "bounty_ns": "1000000000",
+                "currency": "MEP_NS",
+            },
+        })
+        headers = _auth_headers(consumer_priv, consumer_id, task_payload)
+        resp = client.post("/v2/tasks/submit", content=task_payload, headers=headers)
+
+        self.assertEqual(resp.status_code, 200, f"V2 submit failed: {resp.text}")
+        data = resp.json()
+        self.assertEqual(data["status"], "success")
+        self.assertIn("task_id", data)
+        self.assertEqual(db.get_task(data["task_id"])["bounty"], 1.0)
+
+    def test_v2_task_result_includes_status_and_bounty_ns(self):
+        consumer_priv, consumer_pub, consumer_id = _make_identity()
+        provider_priv, provider_pub, provider_id = _make_identity()
+        _register(consumer_pub)
+        _register(provider_pub)
+
+        task_payload = json.dumps({
+            "consumer_id": consumer_id,
+            "payload": "What is 2+2?",
+            "economics": {
+                "bounty_ns": "1000000000",
+                "currency": "MEP_NS",
+            },
+        })
+        headers = _auth_headers(consumer_priv, consumer_id, task_payload)
+        submit = client.post("/v2/tasks/submit", content=task_payload, headers=headers)
+        self.assertEqual(submit.status_code, 200, submit.text)
+        task_id = submit.json()["task_id"]
+
+        bid_payload = json.dumps({"task_id": task_id, "provider_id": provider_id})
+        headers = _auth_headers(provider_priv, provider_id, bid_payload)
+        bid = client.post("/tasks/bid", content=bid_payload, headers=headers)
+        self.assertEqual(bid.status_code, 200, bid.text)
+
+        complete_payload = json.dumps({
+            "task_id": task_id,
+            "provider_id": provider_id,
+            "result_payload": "4",
+        })
+        headers = _auth_headers(provider_priv, provider_id, complete_payload)
+        complete = client.post("/tasks/complete", content=complete_payload, headers=headers)
+        self.assertEqual(complete.status_code, 200, complete.text)
+
+        headers = _auth_headers(consumer_priv, consumer_id, "")
+        result = client.get(f"/v2/tasks/{task_id}/result", headers=headers)
+        self.assertEqual(result.status_code, 200, result.text)
+        data = result.json()
+        self.assertEqual(data["status"], "completed")
+        self.assertEqual(data["bounty_ns"], "1000000000")
+        self.assertEqual(data["consumer_id"], consumer_id)
+        self.assertEqual(data["provider_id"], provider_id)
+
+    def test_v2_ledger_returns_entry_list_wrapper(self):
+        consumer_priv, consumer_pub, consumer_id = _make_identity()
+        _register(consumer_pub)
+
+        headers = _auth_headers(consumer_priv, consumer_id, "")
+        resp = client.get(f"/v2/ledger/{consumer_id}", headers=headers)
+
+        self.assertEqual(resp.status_code, 200, resp.text)
+        data = resp.json()
+        self.assertEqual(data["node_id"], consumer_id)
+        self.assertIn("entries", data)
+        self.assertGreaterEqual(len(data["entries"]), 1)
+        self.assertEqual(data["entries"][0]["node_id"], consumer_id)
+        self.assertIn("amount_ns", data["entries"][0])
+
+
 class TestTaskLifecycle(unittest.TestCase):
     """Full happy-path: register consumer + provider, submit, bid, complete."""
 
