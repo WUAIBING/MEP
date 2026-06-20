@@ -173,6 +173,16 @@ class BridgeStatusUpdate(BaseModel):
     detail: Optional[str] = None
 
 
+class BridgeRegistrationPendingApprovalError(RuntimeError):
+    def __init__(self, node_id: str):
+        super().__init__(
+            "Bridge node "
+            f"{node_id} is pending admin approval on the hub. "
+            "Approve the registration before using the bridge."
+        )
+        self.node_id = node_id
+
+
 class BridgeStore:
     def __init__(self, db_path: str):
         self.db_path = db_path
@@ -411,6 +421,15 @@ class DefaultMEPSubmissionClient:
             timeout=10,
         )
         response.raise_for_status()
+        payload: dict[str, Any] = {}
+        try:
+            decoded = response.json()
+        except ValueError:
+            decoded = None
+        if isinstance(decoded, dict):
+            payload = decoded
+        if str(payload.get("status") or "").strip().lower() == "pending":
+            raise BridgeRegistrationPendingApprovalError(self.node_id)
         self._registered = True
 
     def submit_structured_dm(self, envelope: dict[str, Any], target_node_id: str, intent_type: str) -> dict[str, Any]:

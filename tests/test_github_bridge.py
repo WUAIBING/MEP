@@ -13,7 +13,14 @@ from fastapi.testclient import TestClient
 ROOT = os.path.dirname(os.path.dirname(__file__))
 sys.path.insert(0, ROOT)
 
-from bridge.github_to_mep import BridgeConfig, BridgeStore, GitHubToMEPBridgeService, create_app  # noqa: E402
+from bridge.github_to_mep import (  # noqa: E402
+    BridgeConfig,
+    BridgeRegistrationPendingApprovalError,
+    BridgeStore,
+    DefaultMEPSubmissionClient,
+    GitHubToMEPBridgeService,
+    create_app,
+)
 
 
 class _FakeSubmissionClient:
@@ -49,6 +56,31 @@ class _FakeNotifier:
             next_id = str(message_id)
         self.calls.append({"text": text, "message_id": next_id, "editing": message_id is not None})
         return next_id
+
+
+class _FakeResponse:
+    def __init__(self, payload: dict, *, status_code: int = 200):
+        self._payload = payload
+        self.status_code = status_code
+
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            raise RuntimeError(f"http_{self.status_code}")
+
+    def json(self):
+        return self._payload
+
+
+class _FakeRequestsSession:
+    def __init__(self, responses):
+        self.responses = list(responses)
+        self.posts = []
+
+    def post(self, url, **kwargs):
+        self.posts.append({"url": url, **kwargs})
+        if not self.responses:
+            raise AssertionError("No fake responses remaining")
+        return self.responses.pop(0)
 
 
 def _build_config(tmp_dir: str) -> BridgeConfig:
@@ -268,6 +300,27 @@ class TestGitHubToMEPBridge(unittest.TestCase):
         self.assertEqual(response.json()["status"], "ignored")
         time.sleep(0.05)
         self.assertEqual(len(self.submission.calls), 0)
+
+    def test_pending_registration_raises_clear_operator_error(self):
+        client = DefaultMEPSubmissionClient(self.config)
+        client.session = _FakeRequestsSession(
+            [
+                _FakeResponse(
+                    {
+                        "status": "pending",
+                        "node_id": client.node_id,
+                    }
+                )
+            ]
+        )
+
+        with self.assertRaises(BridgeRegistrationPendingApprovalError) as ctx:
+            client.ensure_registered()
+
+        self.assertIn(client.node_id, str(ctx.exception))
+        self.assertIn("pending admin approval", str(ctx.exception))
+        self.assertEqual(len(client.session.posts), 1)
+        self.assertTrue(client.session.posts[0]["url"].endswith("/register"))
 
 
 if __name__ == "__main__":
