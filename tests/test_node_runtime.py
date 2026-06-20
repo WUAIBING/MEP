@@ -78,6 +78,11 @@ class _FakeRuntime:
         return 0
 
 
+class _FakeCompletedProcess:
+    def __init__(self, stdout=""):
+        self.stdout = stdout
+
+
 class TestMockAdapter(unittest.TestCase):
     def test_mock_adapter_labels_compute_chat_and_data_markets(self):
         adapter = mep_runtime.MockAdapter()
@@ -309,6 +314,73 @@ class TestRuntimeBidPolicy(unittest.TestCase):
         node = _runtime_node()
 
         self.assertFalse(node.should_bid({"id": "task_bad", "bounty": "not-a-number"}))
+
+
+class TestRuntimeReviewPrompts(unittest.TestCase):
+    @staticmethod
+    def _bridge_review_task_data(intent_type: str = "code.review.request") -> dict:
+        return {
+            "id": "task_bridge_review",
+            "bounty": 0.0,
+            "payload": json.dumps(
+                {
+                    "spec_version": "mep.interbot.v1",
+                    "message_id": "msg-bridge-review",
+                    "trace_id": "trace-bridge-review",
+                    "source": {"node_id": "node_bridge"},
+                    "target": {"node_id": "node_runtime"},
+                    "conversation": {"context_id": "ctx-bridge-review"},
+                    "intent": {"type": intent_type, "priority": "high"},
+                    "task": {
+                        "instructions": "Review this PR and provide a concise decision.",
+                        "inputs": {
+                            "bridge_metadata": {
+                                "source_type": "github",
+                                "bridge_id": "br-review-123",
+                                "status_endpoint": "https://bridge.example.test/bridge/status",
+                                "status_token": "bridge-status-token",
+                            }
+                        },
+                    },
+                    "economics": {"bounty_seconds": 0.0, "currency": "SECONDS"},
+                    "delivery": {"reply_mode": "new_dm", "settlement_mode": "task_result"},
+                }
+            ),
+        }
+
+    def test_bridge_review_tasks_request_reviewer_prompt(self):
+        self.assertTrue(mep_runtime._task_requires_review_prompt(self._bridge_review_task_data()))  # noqa: SLF001
+        self.assertFalse(
+            mep_runtime._task_requires_review_prompt(  # noqa: SLF001
+                {"id": "task_generic", "bounty": 0.0, "payload": "hello"}
+            )
+        )
+
+    def test_ai_adapter_uses_reviewer_prompt_for_bridge_review_tasks(self):
+        adapter = mep_runtime.AIAdapter(model="tinyllama")
+        task_data = self._bridge_review_task_data()
+        with patch("subprocess.run", return_value=_FakeCompletedProcess(stdout="review output")) as run_mock:
+            reply = adapter.generate_reply("Review this PR", task_data)
+
+        self.assertEqual(reply, "review output")
+        prompt = run_mock.call_args.args[0][3]
+        self.assertIn("You are a code reviewer for the MEP", prompt)
+        self.assertIn("approve, request_changes, or comment", prompt)
+
+    def test_deepseek_adapter_uses_reviewer_prompt_for_bridge_review_tasks(self):
+        adapter = mep_runtime.DeepSeekAdapter(api_key="secret-key", model="deepseek-chat")
+        task_data = self._bridge_review_task_data()
+        fake_response = _FakeResponse(
+            200,
+            {"choices": [{"message": {"content": "**Request Changes** file reference"}}]},
+        )
+        with patch("node.mep_runtime.requests.post", return_value=fake_response) as post_mock:
+            reply = adapter.generate_reply("Review this PR", task_data)
+
+        self.assertEqual(reply, "**Request Changes** file reference")
+        system_prompt = post_mock.call_args.kwargs["json"]["messages"][0]["content"]
+        self.assertIn("You are a code reviewer for the MEP", system_prompt)
+        self.assertIn("approve, request_changes, or comment", system_prompt)
 
 
 class TestRuntimeWebSocketLoop(unittest.TestCase):
