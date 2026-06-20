@@ -334,8 +334,78 @@ class MockAdapter:
         )
 
 
+@dataclass
+class AIAdapter:
+    """Real AI adapter using Ollama for provider task processing."""
+
+    model: str = "tinyllama"
+
+    def generate_reply(self, payload: str, task_data: dict[str, Any]) -> str:
+        import subprocess
+
+        try:
+            prompt = (
+                "You are a helpful MEP bot. Respond to this task concisely (max 300 chars).\n\n"
+                f"Task: {payload}\n\nReply:"
+            )
+            result = subprocess.run(
+                ["ollama", "run", self.model, prompt],
+                capture_output=True,
+                text=True,
+                timeout=45,
+            )
+            reply = (result.stdout or "").strip()
+            if not reply:
+                return f"[AI adapter] empty response from {self.model}"
+            return reply
+        except subprocess.TimeoutExpired:
+            return f"[AI adapter] {self.model} timed out"
+        except Exception as exc:  # noqa: BLE001
+            return f"[AI adapter] error: {exc}"
+
+
+@dataclass
+class DeepSeekAdapter:
+    """Real AI adapter using DeepSeek API for provider task processing."""
+
+    api_key: str = ""
+    model: str = "deepseek-chat"
+
+    def generate_reply(self, payload: str, task_data: dict[str, Any]) -> str:
+        try:
+            resp = requests.post(
+                "https://api.deepseek.com/v1/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {self.api_key}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "model": self.model,
+                    "messages": [
+                        {
+                            "role": "system",
+                            "content": (
+                                "You are a helpful MEP (Miao Exchange Protocol) bot. "
+                                "MEP is an AI-to-AI economy protocol where agents earn "
+                                "SECONDS by doing work. Reply concisely (max 500 chars)."
+                            ),
+                        },
+                        {"role": "user", "content": payload},
+                    ],
+                    "max_tokens": 300,
+                    "temperature": 0.7,
+                },
+                timeout=30,
+            )
+            if resp.status_code == 200:
+                return resp.json()["choices"][0]["message"]["content"].strip()
+            return f"[DeepSeek] API error {resp.status_code}: {resp.text[:200]}"
+        except Exception as exc:  # noqa: BLE001
+            return f"[DeepSeek] error: {exc}"
+
+
 class RuntimeNode:
-    def __init__(self, identity: MEPIdentity, hub_url: str, ws_url: str, adapter: MockAdapter, alias: Optional[str] = None):
+    def __init__(self, identity: MEPIdentity, hub_url: str, ws_url: str, adapter: Any, alias: Optional[str] = None):
         self.identity = identity
         self.node_id = identity.node_id
         self.hub_url = hub_url.rstrip("/")
@@ -1150,20 +1220,36 @@ def cmd_doctor(args: argparse.Namespace) -> int:
 
 
 def cmd_run(args: argparse.Namespace) -> int:
-    if args.adapter != "mock":
-        print("[mep run] only adapter=mock is supported in this phase")
-        return 2
     _ensure_key_parent(args.key_path)
+    if args.adapter == "deepseek":
+        api_key = (os.getenv("DEEPSEEK_API_KEY") or "").strip()
+        if not api_key:
+            print("[mep run] DEEPSEEK_API_KEY not set, falling back to mock")
+            adapter: Any = MockAdapter()
+        else:
+            adapter = DeepSeekAdapter(
+                api_key=api_key,
+                model=os.getenv("MEP_AI_MODEL", "deepseek-chat"),
+            )
+            print(f"[mep run] adapter=deepseek model={adapter.model}")
+    elif args.adapter == "ollama":
+        adapter = AIAdapter(model=os.getenv("MEP_AI_MODEL", "tinyllama"))
+        print(f"[mep run] adapter=ollama model={adapter.model}")
+    elif args.adapter != "mock":
+        print("[mep run] unsupported adapter, using mock")
+        adapter = MockAdapter()
+    else:
+        adapter = MockAdapter()
     identity = MEPIdentity(args.key_path)
     alias = _resolve_runtime_alias(args.key_path, args.alias, node_id=identity.node_id)
     runtime = RuntimeNode(
         identity=identity,
         hub_url=args.hub_url,
         ws_url=args.ws_url,
-        adapter=MockAdapter(),
+        adapter=adapter,
         alias=alias,
     )
-    print(f"[mep run] adapter=mock node_id={identity.node_id} alias={alias}")
+    print(f"[mep run] adapter={args.adapter} node_id={identity.node_id} alias={alias}")
     try:
         return asyncio.run(runtime.run_forever())
     except KeyboardInterrupt:
@@ -1209,7 +1295,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Path to provider private key (defaults to repo-local .mep/{node_id}.pem after discovery/provisioning).",
     )
-    parser.add_argument("--adapter", default="mock", choices=["mock"], help="Provider adapter.")
+    parser.add_argument("--adapter", default="mock", choices=["mock", "ollama", "deepseek"], help="Provider adapter.")
 
     sub = parser.add_subparsers(dest="command", required=True)
 

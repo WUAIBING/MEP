@@ -229,6 +229,61 @@ class TestRuntimeUx(unittest.TestCase):
         resolve_alias_mock.assert_called_once_with(args.key_path, None, node_id="node_runtime")
         self.assertEqual(runtime_cls.call_args.kwargs["alias"], "persisted-alias")
 
+    def test_parser_accepts_production_runtime_adapters(self):
+        parser = mep_runtime.build_parser()
+
+        deepseek_args = parser.parse_args(["--adapter", "deepseek", "run"])
+        ollama_args = parser.parse_args(["--adapter", "ollama", "status"])
+
+        self.assertEqual(deepseek_args.adapter, "deepseek")
+        self.assertEqual(ollama_args.adapter, "ollama")
+
+    def test_run_with_deepseek_without_api_key_falls_back_to_mock_adapter(self):
+        args = argparse.Namespace(
+            hub_url="http://hub",
+            ws_url="ws://hub",
+            key_path="C:/tmp/test_key.pem",
+            adapter="deepseek",
+            alias="Hub-Sentinel",
+        )
+        fake_runtime = _FakeRuntime()
+        with (
+            patch.dict("os.environ", {}, clear=True),
+            patch("node.mep_runtime._ensure_key_parent"),
+            patch("node.mep_runtime.MEPIdentity", return_value=_FakeIdentity()),
+            patch("node.mep_runtime._resolve_runtime_alias", return_value="Hub-Sentinel"),
+            patch("node.mep_runtime.RuntimeNode", return_value=fake_runtime) as runtime_cls,
+            patch("node.mep_runtime.asyncio.run", side_effect=lambda coro: (coro.close(), 0)[1]),
+        ):
+            code = mep_runtime.cmd_run(args)
+
+        self.assertEqual(code, 0)
+        self.assertIsInstance(runtime_cls.call_args.kwargs["adapter"], mep_runtime.MockAdapter)
+
+    def test_run_with_deepseek_api_key_uses_deepseek_adapter(self):
+        args = argparse.Namespace(
+            hub_url="http://hub",
+            ws_url="ws://hub",
+            key_path="C:/tmp/test_key.pem",
+            adapter="deepseek",
+            alias="Hub-Sentinel",
+        )
+        fake_runtime = _FakeRuntime()
+        with (
+            patch.dict("os.environ", {"DEEPSEEK_API_KEY": "secret-key", "MEP_AI_MODEL": "deepseek-chat"}, clear=True),
+            patch("node.mep_runtime._ensure_key_parent"),
+            patch("node.mep_runtime.MEPIdentity", return_value=_FakeIdentity()),
+            patch("node.mep_runtime._resolve_runtime_alias", return_value="Hub-Sentinel"),
+            patch("node.mep_runtime.RuntimeNode", return_value=fake_runtime) as runtime_cls,
+            patch("node.mep_runtime.asyncio.run", side_effect=lambda coro: (coro.close(), 0)[1]),
+        ):
+            code = mep_runtime.cmd_run(args)
+
+        self.assertEqual(code, 0)
+        adapter = runtime_cls.call_args.kwargs["adapter"]
+        self.assertIsInstance(adapter, mep_runtime.DeepSeekAdapter)
+        self.assertEqual(adapter.model, "deepseek-chat")
+
 
 class TestRuntimeBidPolicy(unittest.TestCase):
     def test_compute_and_chat_tasks_are_bid_by_default(self):
