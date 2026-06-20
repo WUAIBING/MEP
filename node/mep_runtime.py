@@ -334,6 +334,68 @@ class MockAdapter:
         )
 
 
+def _interbot_message_from_task_data(task_data: dict[str, Any]) -> Optional[dict[str, Any]]:
+    payload = task_data.get("payload")
+    if isinstance(payload, str) and payload.strip():
+        if MEPClient is not None:
+            try:
+                _instructions, interbot_message = MEPClient.extract_interbot_instructions(payload)
+            except Exception:  # noqa: BLE001
+                interbot_message = None
+            if isinstance(interbot_message, dict):
+                return interbot_message
+        try:
+            decoded = json.loads(payload)
+        except ValueError:
+            decoded = None
+        if isinstance(decoded, dict):
+            return decoded
+    return None
+
+
+def _task_requires_review_prompt(task_data: dict[str, Any]) -> bool:
+    interbot_message = _interbot_message_from_task_data(task_data)
+    task: Any = task_data.get("task")
+    if not isinstance(task, dict) and isinstance(interbot_message, dict):
+        task = interbot_message.get("task")
+    inputs = task.get("inputs") if isinstance(task, dict) else None
+    bridge_metadata = inputs.get("bridge_metadata") if isinstance(inputs, dict) else None
+    if isinstance(bridge_metadata, dict) and str(bridge_metadata.get("bridge_id") or "").strip():
+        return True
+
+    intent: Any = task_data.get("intent")
+    if not isinstance(intent, dict) and isinstance(interbot_message, dict):
+        intent = interbot_message.get("intent")
+    intent_type = str(intent.get("type") or "").strip() if isinstance(intent, dict) else ""
+    return intent_type in {
+        "code.review.request",
+        "code.review.approve",
+        "code.review.comment",
+        "analysis.request",
+        "issue.triage.request",
+    }
+
+
+def _system_prompt_for_task(
+    task_data: dict[str, Any],
+    *,
+    generic_max_chars: int,
+    review_max_chars: int,
+) -> str:
+    if _task_requires_review_prompt(task_data):
+        return (
+            "You are a code reviewer for the MEP (Miao Exchange Protocol) project. "
+            "Analyze PR tasks and respond as one of: approve, request_changes, or comment. "
+            "Be specific, reference files, logic, or tests when helpful, and keep the "
+            f"response within {review_max_chars} characters."
+        )
+    return (
+        "You are a helpful MEP (Miao Exchange Protocol) bot. "
+        "MEP is an AI-to-AI economy protocol where agents earn SECONDS by doing work. "
+        f"Reply concisely (max {generic_max_chars} chars)."
+    )
+
+
 @dataclass
 class AIAdapter:
     """Real AI adapter using Ollama for provider task processing."""
@@ -345,7 +407,7 @@ class AIAdapter:
 
         try:
             prompt = (
-                "You are a helpful MEP bot. Respond to this task concisely (max 300 chars).\n\n"
+                f"{_system_prompt_for_task(task_data, generic_max_chars=300, review_max_chars=500)}\n\n"
                 f"Task: {payload}\n\nReply:"
             )
             result = subprocess.run(
@@ -384,10 +446,10 @@ class DeepSeekAdapter:
                     "messages": [
                         {
                             "role": "system",
-                            "content": (
-                                "You are a helpful MEP (Miao Exchange Protocol) bot. "
-                                "MEP is an AI-to-AI economy protocol where agents earn "
-                                "SECONDS by doing work. Reply concisely (max 500 chars)."
+                            "content": _system_prompt_for_task(
+                                task_data,
+                                generic_max_chars=500,
+                                review_max_chars=500,
                             ),
                         },
                         {"role": "user", "content": payload},
