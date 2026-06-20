@@ -72,15 +72,18 @@ class _FakeResponse:
 
 
 class _FakeRequestsSession:
-    def __init__(self, responses):
-        self.responses = list(responses)
+    def __init__(self, responses=None, *, default_response=None):
+        self.responses = list(responses or [])
+        self.default_response = default_response
         self.posts = []
 
     def post(self, url, **kwargs):
         self.posts.append({"url": url, **kwargs})
-        if not self.responses:
+        if self.responses:
+            return self.responses.pop(0)
+        if self.default_response is None:
             raise AssertionError("No fake responses remaining")
-        return self.responses.pop(0)
+        return self.default_response
 
 
 def _build_config(tmp_dir: str) -> BridgeConfig:
@@ -89,6 +92,7 @@ def _build_config(tmp_dir: str) -> BridgeConfig:
         key_path=os.path.join(tmp_dir, "bridge_identity.pem"),
         sqlite_path=os.path.join(tmp_dir, "bridge.sqlite3"),
         webhook_secret="github-secret",
+        github_token="github-token",
         target_node_id="node_target",
         target_alias="Hub Sentinel",
         trigger_aliases=["Hub-Sentinel"],
@@ -149,11 +153,13 @@ class TestGitHubToMEPBridge(unittest.TestCase):
         self.store = BridgeStore(self.config.sqlite_path)
         self.submission = _FakeSubmissionClient()
         self.notifier = _FakeNotifier()
+        self.github_session = _FakeRequestsSession(default_response=_FakeResponse({}))
         self.service = GitHubToMEPBridgeService(
             self.config,
             store=self.store,
             submission_client=self.submission,
             notifier=self.notifier,
+            github_session=self.github_session,
         )
         self.client = TestClient(create_app(config=self.config, service=self.service))
 
@@ -253,6 +259,36 @@ class TestGitHubToMEPBridge(unittest.TestCase):
         self.assertTrue(final_message["editing"])
         self.assertIn("status: completed", final_message["text"])
         self.assertIn("action: approved", final_message["text"])
+        self.assertEqual(len(self.github_session.posts), 1)
+        self.assertTrue(self.github_session.posts[0]["url"].endswith("/repos/WUAIBING/MEP/pulls/226/reviews"))
+        self.assertEqual(self.github_session.posts[0]["json"]["event"], "APPROVE")
+        self.assertIn("<!-- mep-bridge:output", self.github_session.posts[0]["json"]["body"])
+
+    def test_status_callback_posts_issue_comment_for_analysis_completion(self):
+        response = self._post_webhook(
+            _issue_comment_payload("@Hub-Sentinel analyze this PR", delivery_number=227),
+            delivery_id="delivery-analysis",
+        )
+        self.assertEqual(response.status_code, 200)
+        bridge_id = response.json()["bridge_id"]
+        self._flush_context(response.json()["context_id"])
+
+        token = self.service._generate_status_token(bridge_id, "node_target")
+        status_response = self.client.post(
+            "/bridge/status",
+            json={
+                "bridge_id": bridge_id,
+                "status": "completed",
+                "target_node_id": "node_target",
+                "task_id": "task-2",
+                "detail": "Analysis complete.",
+            },
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        self.assertEqual(status_response.status_code, 200, status_response.text)
+        self.assertEqual(len(self.github_session.posts), 1)
+        self.assertTrue(self.github_session.posts[0]["url"].endswith("/repos/WUAIBING/MEP/issues/227/comments"))
+        self.assertEqual(self.github_session.posts[0]["json"]["body"].splitlines()[0], "Analysis complete.")
 
     def test_non_maintainer_trigger_is_ignored_when_policy_enabled(self):
         payload = _issue_comment_payload("@Hub-Sentinel review this PR")

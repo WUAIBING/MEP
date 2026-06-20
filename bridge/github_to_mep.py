@@ -60,6 +60,7 @@ class BridgeConfig:
     key_path: str
     sqlite_path: str
     webhook_secret: str
+    github_token: Optional[str]
     target_node_id: str
     target_alias: str
     trigger_aliases: list[str]
@@ -103,6 +104,7 @@ class BridgeConfig:
                 os.path.join(os.path.dirname(os.path.abspath(__file__)), "github_bridge.db"),
             ),
             webhook_secret=os.getenv("GITHUB_WEBHOOK_SECRET", ""),
+            github_token=(os.getenv("GITHUB_TOKEN") or os.getenv("GITHUB_API_TOKEN") or "").strip() or None,
             target_node_id=os.getenv("MEP_BRIDGE_TARGET_NODE_ID", "").strip(),
             target_alias=target_alias,
             trigger_aliases=trigger_aliases,
@@ -500,11 +502,13 @@ class GitHubToMEPBridgeService:
         store: Optional[BridgeStore] = None,
         submission_client: Optional[Any] = None,
         notifier: Optional[Any] = None,
+        github_session: Optional[Any] = None,
     ):
         self.config = config
         self.store = store or BridgeStore(config.sqlite_path)
         self.submission_client = submission_client or DefaultMEPSubmissionClient(config)
         self.notifier = notifier or TelegramNotifier(config)
+        self.github_session = github_session or requests.Session()
         self._pending_lock = asyncio.Lock()
         self._pending_by_context: dict[str, PendingContext] = {}
 
@@ -957,6 +961,78 @@ class GitHubToMEPBridgeService:
             raise HTTPException(status_code=401, detail="Expired bridge status token")
         return claims
 
+    def _resolve_github_writeback_action(
+        self,
+        execution: dict[str, Any],
+        update: BridgeStatusUpdate,
+    ) -> str:
+        explicit_action = str(update.action or "").strip().lower()
+        if explicit_action:
+            return explicit_action
+        intent_type = str(execution.get("intent_type") or "").strip().lower()
+        imperative_verb = str(execution.get("imperative_verb") or "").strip().lower()
+        if intent_type == "code.review.approve" or imperative_verb == "approve":
+            return "approved"
+        if intent_type == "code.review.request" or imperative_verb in {"review", "check"}:
+            return "reviewed"
+        if intent_type == "code.review.comment" or imperative_verb == "comment":
+            return "commented"
+        if intent_type in {"analysis.request", "issue.triage.request"} or imperative_verb in {"analyze", "triage"}:
+            return "commented"
+        return "commented"
+
+    def _render_github_writeback_body(self, bridge_id: str, action: str, detail: Optional[str]) -> str:
+        detail_text = (detail or "").strip() or f"{self.config.target_alias} completed the requested action."
+        marker = f"{BRIDGE_OUTPUT_MARKER} bridge_id={bridge_id} action={action} -->"
+        return f"{detail_text}\n\n{marker}"
+
+    def _post_github_comment(self, repo_full_name: str, number: int, body: str) -> None:
+        if not self.config.github_token:
+            raise HTTPException(status_code=500, detail="Bridge configuration missing: GITHUB_TOKEN")
+        response = self.github_session.post(
+            f"https://api.github.com/repos/{repo_full_name}/issues/{number}/comments",
+            json={"body": body},
+            headers={
+                "Accept": "application/vnd.github+json",
+                "Authorization": f"Bearer {self.config.github_token}",
+                "X-GitHub-Api-Version": "2022-11-28",
+            },
+            timeout=20,
+        )
+        response.raise_for_status()
+
+    def _submit_github_review(self, repo_full_name: str, number: int, event: str, body: str) -> None:
+        if not self.config.github_token:
+            raise HTTPException(status_code=500, detail="Bridge configuration missing: GITHUB_TOKEN")
+        response = self.github_session.post(
+            f"https://api.github.com/repos/{repo_full_name}/pulls/{number}/reviews",
+            json={"event": event, "body": body},
+            headers={
+                "Accept": "application/vnd.github+json",
+                "Authorization": f"Bearer {self.config.github_token}",
+                "X-GitHub-Api-Version": "2022-11-28",
+            },
+            timeout=20,
+        )
+        response.raise_for_status()
+
+    def _write_back_to_github(self, execution: dict[str, Any], update: BridgeStatusUpdate) -> str:
+        repo_full_name = str(execution.get("repo_full_name") or "")
+        number = int(execution.get("issue_number") or 0)
+        entity_type = str(execution.get("entity_type") or "").strip().lower()
+        action = self._resolve_github_writeback_action(execution, update)
+        body = self._render_github_writeback_body(str(execution.get("bridge_id") or update.bridge_id), action, update.detail)
+        review_events = {
+            "approved": "APPROVE",
+            "reviewed": "COMMENT",
+            "changes_requested": "REQUEST_CHANGES",
+        }
+        if entity_type == "pr" and action in review_events:
+            self._submit_github_review(repo_full_name, number, review_events[action], body)
+            return action
+        self._post_github_comment(repo_full_name, number, body)
+        return "commented"
+
     async def handle_status_callback(self, update: BridgeStatusUpdate, token: str) -> dict[str, Any]:
         self._require_runtime_config()
         claims = self._verify_status_token(token)
@@ -975,6 +1051,14 @@ class GitHubToMEPBridgeService:
             action=update.action,
         )
         refreshed = self.store.get_execution(update.bridge_id)
+        resolved_action = update.action
+        if refreshed is None:
+            raise HTTPException(status_code=404, detail="Unknown bridge_id")
+        if str(update.status).strip().lower() == "completed":
+            resolved_action = self._write_back_to_github(refreshed, update)
+            if resolved_action != update.action:
+                self.store.update_execution(update.bridge_id, action=resolved_action)
+                refreshed = self.store.get_execution(update.bridge_id) or refreshed
         event = NormalizedGitHubEvent(
             delivery_id="",
             source_event="",
@@ -1000,7 +1084,7 @@ class GitHubToMEPBridgeService:
                 event,
                 update.status,
                 task_id=update.task_id or refreshed.get("task_id"),
-                action=update.action,
+                action=resolved_action,
                 detail=update.detail,
             ),
         )
