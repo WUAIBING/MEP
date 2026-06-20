@@ -358,6 +358,83 @@ class RuntimeNode:
         headers["Content-Type"] = "application/json"
         return headers
 
+    @staticmethod
+    def _bridge_metadata(interbot_message: Optional[dict[str, Any]]) -> Optional[dict[str, Any]]:
+        if not isinstance(interbot_message, dict):
+            return None
+        task = interbot_message.get("task")
+        if not isinstance(task, dict):
+            return None
+        inputs = task.get("inputs")
+        if not isinstance(inputs, dict):
+            return None
+        bridge_metadata = inputs.get("bridge_metadata")
+        if not isinstance(bridge_metadata, dict):
+            return None
+        if str(bridge_metadata.get("source_type") or "").strip().lower() != "github":
+            return None
+        required = ("bridge_id", "status_endpoint", "status_token")
+        if not all(isinstance(bridge_metadata.get(name), str) and str(bridge_metadata.get(name)).strip() for name in required):
+            return None
+        return bridge_metadata
+
+    @staticmethod
+    def _bridge_status_action(interbot_message: Optional[dict[str, Any]]) -> Optional[str]:
+        if not isinstance(interbot_message, dict):
+            return None
+        intent = interbot_message.get("intent")
+        intent_type = intent.get("type") if isinstance(intent, dict) else None
+        if intent_type == "code.review.approve":
+            return "approved"
+        if intent_type == "code.review.request":
+            return "reviewed"
+        if intent_type == "code.review.comment":
+            return "commented"
+        if intent_type in {"analysis.request", "issue.triage.request"}:
+            return "commented"
+        return None
+
+    def _report_bridge_status(
+        self,
+        interbot_message: Optional[dict[str, Any]],
+        *,
+        task_id: str,
+        status: str,
+        detail: Optional[str],
+    ) -> None:
+        bridge_metadata = self._bridge_metadata(interbot_message)
+        if bridge_metadata is None:
+            return
+        conversation = interbot_message.get("conversation") if isinstance(interbot_message, dict) else None
+        payload: dict[str, Any] = {
+            "bridge_id": bridge_metadata["bridge_id"],
+            "status": status,
+            "target_node_id": self.node_id,
+            "task_id": task_id,
+            "timestamp_ms": int(time.time() * 1000),
+        }
+        if isinstance(conversation, dict) and isinstance(conversation.get("context_id"), str):
+            payload["context_id"] = conversation["context_id"]
+        action = self._bridge_status_action(interbot_message)
+        if action:
+            payload["action"] = action
+        if detail:
+            payload["detail"] = detail[:60000]
+        code, _body, raw = _safe_request(
+            "POST",
+            bridge_metadata["status_endpoint"],
+            json_body=payload,
+            headers={"Authorization": f"Bearer {bridge_metadata['status_token']}"},
+            timeout=20.0,
+        )
+        if code == 200:
+            print(f"[mep run] bridge status reported task={task_id[:8]} bridge_id={bridge_metadata['bridge_id']}")
+        else:
+            print(
+                f"[mep run] bridge status failed task={task_id[:8]} "
+                f"bridge_id={bridge_metadata['bridge_id']} status={code} detail={raw}"
+            )
+
     def register(self, alias: Optional[str]) -> tuple[bool, str]:
         payload = {
             "pubkey": self.identity.pub_pem,
@@ -877,6 +954,12 @@ class RuntimeNode:
         if self._bridge_eligible_interbot_message(task_data, interbot_message):
             bridged = await self._attempt_live_call_bridge(task_data, interbot_message, result)
             if bridged:
+                self._report_bridge_status(
+                    interbot_message,
+                    task_id=task_id,
+                    status="completed",
+                    detail=result,
+                )
                 return
         dm_response = await self._submit_safe_structured_dm_reply(
             result,
@@ -885,8 +968,20 @@ class RuntimeNode:
         )
         if dm_response is not None:
             self.complete(task_id, self._dm_fallback_settlement(task_id, dm_response))
+            self._report_bridge_status(
+                interbot_message,
+                task_id=task_id,
+                status="completed",
+                detail=result,
+            )
             return
         self.complete(task_id, result)
+        self._report_bridge_status(
+            interbot_message,
+            task_id=task_id,
+            status="completed",
+            detail=result,
+        )
 
     def _ws_uri(self) -> str:
         ts = str(int(time.time()))

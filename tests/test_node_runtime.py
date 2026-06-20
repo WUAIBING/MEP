@@ -327,6 +327,52 @@ class TestRuntimeWebSocketLoop(unittest.TestCase):
         adapter_mock.assert_called_once_with("Use only this instruction text.", task_data)
         complete_mock.assert_called_once_with("task_interbot", "reply")
 
+    def test_process_task_reports_bridge_status_when_github_bridge_metadata_is_present(self):
+        node = _runtime_node()
+        task_data = {
+            "id": "task_bridge_status",
+            "bounty": 0.0,
+            "payload": json.dumps(
+                {
+                    "spec_version": "mep.interbot.v1",
+                    "message_id": "msg-bridge-status",
+                    "trace_id": "trace-bridge-status",
+                    "source": {"node_id": "node_bridge"},
+                    "target": {"node_id": node.node_id},
+                    "conversation": {"context_id": "ctx-bridge-status"},
+                    "intent": {"type": "code.review.approve", "priority": "high"},
+                    "task": {
+                        "instructions": "Approve this PR if it looks good.",
+                        "inputs": {
+                            "bridge_metadata": {
+                                "source_type": "github",
+                                "bridge_id": "br-123",
+                                "status_endpoint": "https://bridge.example.test/bridge/status",
+                                "status_token": "status-token",
+                            }
+                        },
+                    },
+                    "economics": {"bounty_seconds": 0.0, "currency": "SECONDS"},
+                    "delivery": {"reply_mode": "new_dm", "settlement_mode": "task_result"},
+                }
+            ),
+        }
+        with (
+            patch.object(node.adapter, "generate_reply", return_value="Looks good to me."),
+            patch.object(node, "complete") as complete_mock,
+            patch("node.mep_runtime._safe_request", return_value=(200, {}, "")) as request_mock,
+        ):
+            asyncio.run(node.process_task(task_data))
+
+        complete_mock.assert_called_once_with("task_bridge_status", "Looks good to me.")
+        request_mock.assert_called_once()
+        self.assertEqual(request_mock.call_args.args, ("POST", "https://bridge.example.test/bridge/status"))
+        self.assertEqual(request_mock.call_args.kwargs["json_body"]["bridge_id"], "br-123")
+        self.assertEqual(request_mock.call_args.kwargs["json_body"]["status"], "completed")
+        self.assertEqual(request_mock.call_args.kwargs["json_body"]["action"], "approved")
+        self.assertEqual(request_mock.call_args.kwargs["json_body"]["detail"], "Looks good to me.")
+        self.assertEqual(request_mock.call_args.kwargs["headers"]["Authorization"], "Bearer status-token")
+
     def test_process_task_live_bridge_sends_frame_and_settles_when_call_is_accepted(self):
         node = _runtime_node()
         node.live_call_enabled = True
