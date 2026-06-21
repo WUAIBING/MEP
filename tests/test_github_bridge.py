@@ -96,6 +96,7 @@ def _build_config(tmp_dir: str) -> BridgeConfig:
         target_node_id="node_target",
         target_alias="Hub Sentinel",
         trigger_aliases=["Hub-Sentinel"],
+        alias_map={"Hub-Sentinel": "node_target"},
         public_base_url="http://bridge.example.test",
         status_secret="status-secret",
         status_token_lifetime_seconds=1800,
@@ -179,6 +180,13 @@ class TestGitHubToMEPBridge(unittest.TestCase):
     def _flush_context(self, context_id: str) -> None:
         asyncio.run(self.service._flush_context(context_id))
 
+    def _configure_multi_target_aliases(self) -> None:
+        self.config.trigger_aliases = ["Hub Sentinel", "Elsaws Bot"]
+        self.config.alias_map = {
+            "Hub Sentinel": "node_target",
+            "Elsaws Bot": "node_elsaws",
+        }
+
     def test_actionable_webhook_submits_structured_dm_after_coalescence(self):
         response = self._post_webhook(
             _issue_comment_payload("@Hub-Sentinel review this PR"),
@@ -224,6 +232,45 @@ class TestGitHubToMEPBridge(unittest.TestCase):
         bridge_metadata = self.submission.calls[0]["envelope"]["task"]["inputs"]["bridge_metadata"]
         self.assertEqual(set(bridge_metadata["coalesced_delivery_ids"]), {"delivery-a", "delivery-b"})
         self.assertEqual(self.submission.calls[0]["intent_type"], "analysis.request")
+        github_inputs = self.submission.calls[0]["envelope"]["task"]["inputs"]["github"]
+        self.assertEqual(github_inputs["source_action"], "edited")
+
+    def test_grouped_multi_alias_trigger_routes_each_target(self):
+        self._configure_multi_target_aliases()
+
+        response = self._post_webhook(
+            _issue_comment_payload("@Hub Sentinel @Elsaws Bot review this PR"),
+            delivery_id="delivery-multi",
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+
+        self._flush_context(response.json()["context_id"])
+
+        self.assertEqual(len(self.submission.calls), 2)
+        routed_targets = {call["target_node_id"] for call in self.submission.calls}
+        self.assertEqual(routed_targets, {"node_target", "node_elsaws"})
+        routed_aliases = {
+            call["envelope"]["target"]["alias"]: call["envelope"]["task"]["inputs"]["bridge_metadata"]["bridge_id"]
+            for call in self.submission.calls
+        }
+        self.assertIn("Hub Sentinel", routed_aliases)
+        self.assertIn("Elsaws Bot", routed_aliases)
+        self.assertNotEqual(routed_aliases["Hub Sentinel"], routed_aliases["Elsaws Bot"])
+
+    def test_same_context_burst_recomputes_targets_from_latest_trigger_text(self):
+        self._configure_multi_target_aliases()
+        payload_one = _issue_comment_payload("@Hub Sentinel review this PR", action="created")
+        payload_two = _issue_comment_payload("@Elsaws Bot review this PR", action="edited")
+
+        first = self._post_webhook(payload_one, delivery_id="delivery-target-a")
+        second = self._post_webhook(payload_two, delivery_id="delivery-target-b")
+        self.assertEqual(first.status_code, 200)
+        self.assertEqual(second.status_code, 200)
+
+        self._flush_context(first.json()["context_id"])
+
+        self.assertEqual(len(self.submission.calls), 1)
+        self.assertEqual(self.submission.calls[0]["target_node_id"], "node_elsaws")
         github_inputs = self.submission.calls[0]["envelope"]["task"]["inputs"]["github"]
         self.assertEqual(github_inputs["source_action"], "edited")
 
@@ -289,6 +336,36 @@ class TestGitHubToMEPBridge(unittest.TestCase):
         self.assertEqual(len(self.github_session.posts), 1)
         self.assertTrue(self.github_session.posts[0]["url"].endswith("/repos/WUAIBING/MEP/issues/227/comments"))
         self.assertEqual(self.github_session.posts[0]["json"]["body"].splitlines()[0], "Analysis complete.")
+
+    def test_status_callback_uses_actual_target_metadata_for_non_default_alias(self):
+        self._configure_multi_target_aliases()
+        response = self._post_webhook(
+            _issue_comment_payload("@Elsaws Bot analyze this PR", delivery_number=228),
+            delivery_id="delivery-elsaws-status",
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+
+        self._flush_context(response.json()["context_id"])
+
+        self.assertEqual(len(self.submission.calls), 1)
+        envelope = self.submission.calls[0]["envelope"]
+        bridge_id = envelope["task"]["inputs"]["bridge_metadata"]["bridge_id"]
+        token = self.service._generate_status_token(bridge_id, "node_elsaws")
+        status_response = self.client.post(
+            "/bridge/status",
+            json={
+                "bridge_id": bridge_id,
+                "status": "completed",
+                "target_node_id": "node_elsaws",
+                "task_id": "task-elsaws",
+            },
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        self.assertEqual(status_response.status_code, 200, status_response.text)
+        self.assertIn("target: Elsaws Bot (node_elsaws)", self.notifier.calls[-1]["text"])
+        self.assertEqual(len(self.github_session.posts), 1)
+        self.assertTrue(self.github_session.posts[0]["url"].endswith("/repos/WUAIBING/MEP/issues/228/comments"))
+        self.assertIn("Elsaws Bot completed the requested action.", self.github_session.posts[0]["json"]["body"])
 
     def test_non_maintainer_trigger_is_ignored_when_policy_enabled(self):
         payload = _issue_comment_payload("@Hub-Sentinel review this PR")
