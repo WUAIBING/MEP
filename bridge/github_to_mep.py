@@ -257,6 +257,7 @@ class BridgeStore:
                 repo_full_name TEXT NOT NULL,
                 issue_number INTEGER NOT NULL,
                 entity_type TEXT NOT NULL,
+                target_alias TEXT NOT NULL,
                 target_node_id TEXT NOT NULL,
                 imperative_verb TEXT NOT NULL,
                 intent_type TEXT NOT NULL,
@@ -284,6 +285,15 @@ class BridgeStore:
             ON bridge_deliveries (context_id, received_at)
             """
         )
+        cursor.execute("PRAGMA table_info(bridge_executions)")
+        execution_columns = {str(row["name"]) for row in cursor.fetchall()}
+        if "target_alias" not in execution_columns:
+            cursor.execute(
+                """
+                ALTER TABLE bridge_executions
+                ADD COLUMN target_alias TEXT NOT NULL DEFAULT ''
+                """
+            )
         conn.commit()
         conn.close()
 
@@ -303,7 +313,7 @@ class BridgeStore:
         conn.close()
         return exists
 
-    def _next_event_sequence(self, context_id: str) -> int:
+    def next_event_sequence(self, context_id: str) -> int:
         conn = self._connect()
         cursor = conn.cursor()
         cursor.execute(
@@ -324,19 +334,28 @@ class BridgeStore:
         conn.close()
         return next_sequence
 
-    def create_execution(self, event: NormalizedGitHubEvent, bridge_id: str, target_node_id: str) -> int:
+    def create_execution(
+        self,
+        event: NormalizedGitHubEvent,
+        bridge_id: str,
+        target_node_id: str,
+        *,
+        target_alias: str,
+        event_sequence: Optional[int] = None,
+    ) -> int:
         now = time.time()
-        event_sequence = self._next_event_sequence(event.context_id)
+        if event_sequence is None:
+            event_sequence = self.next_event_sequence(event.context_id)
         conn = self._connect()
         cursor = conn.cursor()
         cursor.execute(
             """
             INSERT INTO bridge_executions (
                 bridge_id, context_id, repo_full_name, issue_number, entity_type,
-                target_node_id, imperative_verb, intent_type, event_sequence,
+                target_alias, target_node_id, imperative_verb, intent_type, event_sequence,
                 status, created_at, updated_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 bridge_id,
@@ -344,6 +363,7 @@ class BridgeStore:
                 event.repo_full_name,
                 event.number,
                 event.entity_type,
+                target_alias,
                 target_node_id,
                 event.imperative_verb,
                 event.intent_type,
@@ -552,7 +572,7 @@ class GitHubToMEPBridgeService:
             missing.append("GITHUB_WEBHOOK_SECRET")
         if not self.config.hub_url:
             missing.append("MEP_HUB_URL")
-        if not self.config.target_node_id:
+        if not self.config.target_node_id and not self.config.alias_map:
             missing.append("MEP_BRIDGE_TARGET_NODE_ID")
         if not self.config.status_secret:
             missing.append("MEP_BRIDGE_STATUS_SECRET")
@@ -601,6 +621,16 @@ class GitHubToMEPBridgeService:
             pending = self._pending_by_context.get(event.context_id)
             if pending is not None:
                 pending.event = self._merge_events(pending.event, event)
+                pending.targets = self._get_targets_for_event(pending.event)
+                if not pending.targets and self.config.target_node_id:
+                    pending.targets = [
+                        TriggerMatch(
+                            alias=self.config.target_alias,
+                            verb=pending.event.imperative_verb,
+                            intent_type=pending.event.intent_type,
+                            node_id=self.config.target_node_id,
+                        )
+                    ]
                 self.store.record_delivery(
                     delivery_id=event.delivery_id,
                     bridge_id=pending.bridge_id,
@@ -628,9 +658,7 @@ class GitHubToMEPBridgeService:
                     node_id=self.config.target_node_id,
                 )]
             bridge_id = f"br-{secrets.token_hex(8)}"
-            event_sequence = self.store.create_execution(
-                event, bridge_id, targets[0].node_id
-            )
+            event_sequence = self.store.next_event_sequence(event.context_id)
             event.bridge_id = bridge_id
             event.event_sequence = event_sequence
             if not event.coalesced_delivery_ids:
@@ -715,10 +743,17 @@ class GitHubToMEPBridgeService:
                 node_id=self.config.target_node_id,
             )]
 
+        single_target = len(targets) == 1
         for target in targets:
-            target_bridge_id = f"{pending.bridge_id}-{target.alias.replace(' ', '-').lower()}"
+            target_bridge_id = pending.bridge_id if single_target else (
+                f"{pending.bridge_id}-{target.alias.replace(' ', '-').lower()}"
+            )
             self.store.create_execution(
-                pending.event, target_bridge_id, target.node_id
+                pending.event,
+                target_bridge_id,
+                target.node_id,
+                target_alias=target.alias,
+                event_sequence=pending.event.event_sequence,
             )
             self.store.update_execution(target_bridge_id, status="submitting")
             envelope = self._build_interbot_envelope(
@@ -901,27 +936,56 @@ class GitHubToMEPBridgeService:
         """Extract ALL actionable @alias verb mentions from text."""
         if not isinstance(text, str) or not text.strip():
             return []
+        alias_lookup = {
+            alias.strip().lower(): alias
+            for alias in self.config.trigger_aliases
+            if isinstance(alias, str) and alias.strip()
+        }
+        if not alias_lookup:
+            return []
+        alias_pattern = "|".join(
+            sorted((re.escape(alias) for alias in alias_lookup.values()), key=len, reverse=True)
+        )
+        mention_pattern = re.compile(rf"@(?P<alias>{alias_pattern})\b", re.IGNORECASE)
+        mention_matches = list(mention_pattern.finditer(text))
+        if not mention_matches:
+            return []
         matches: list[TriggerMatch] = []
         seen_aliases: set[str] = set()
-        for alias in self.config.trigger_aliases:
-            if alias in seen_aliases:
-                continue
-            pattern = re.compile(
-                rf"@{re.escape(alias)}\b(?:\s+|[,:]\s*)(?P<verb>[a-z][a-z_-]*)",
+        mention_index = 0
+        while mention_index < len(mention_matches):
+            grouped_mentions = [mention_matches[mention_index]]
+            cursor = mention_matches[mention_index].end()
+            mention_index += 1
+            while mention_index < len(mention_matches):
+                separator = text[cursor:mention_matches[mention_index].start()]
+                if re.fullmatch(r"(?:\s|[,:])+", separator):
+                    grouped_mentions.append(mention_matches[mention_index])
+                    cursor = mention_matches[mention_index].end()
+                    mention_index += 1
+                    continue
+                break
+            verb_match = re.match(
+                r"(?:\s+|[,:]\s*)(?P<verb>[a-z][a-z_-]*)\b",
+                text[cursor:],
                 re.IGNORECASE,
             )
-            match = pattern.search(text)
-            if not match:
+            if not verb_match:
                 continue
-            verb = match.group("verb").strip().lower()
+            verb = verb_match.group("verb").strip().lower()
             intent_type = DEFAULT_TRIGGER_VERBS.get(verb)
             if not intent_type:
                 continue
-            node_id = self.config.alias_map.get(alias, self.config.target_node_id)
-            if not node_id:
-                continue
-            matches.append(TriggerMatch(alias=alias, verb=verb, intent_type=intent_type, node_id=node_id))
-            seen_aliases.add(alias)
+            for mention in grouped_mentions:
+                raw_alias = mention.group("alias").strip().lower()
+                alias = alias_lookup.get(raw_alias)
+                if not alias or raw_alias in seen_aliases:
+                    continue
+                node_id = self.config.alias_map.get(alias, self.config.target_node_id)
+                if not node_id:
+                    continue
+                matches.append(TriggerMatch(alias=alias, verb=verb, intent_type=intent_type, node_id=node_id))
+                seen_aliases.add(raw_alias)
         return matches
 
     def _extract_trigger(self, text: str) -> Optional[tuple[str, str]]:
@@ -1097,8 +1161,17 @@ class GitHubToMEPBridgeService:
             return "commented"
         return "commented"
 
-    def _render_github_writeback_body(self, bridge_id: str, action: str, detail: Optional[str]) -> str:
-        detail_text = (detail or "").strip() or f"{self.config.target_alias} completed the requested action."
+    def _render_github_writeback_body(
+        self,
+        bridge_id: str,
+        action: str,
+        detail: Optional[str],
+        *,
+        target_alias: Optional[str] = None,
+    ) -> str:
+        detail_text = (detail or "").strip() or (
+            f"{target_alias or self.config.target_alias} completed the requested action."
+        )
         marker = f"{BRIDGE_OUTPUT_MARKER} bridge_id={bridge_id} action={action} -->"
         return f"{detail_text}\n\n{marker}"
 
@@ -1137,7 +1210,12 @@ class GitHubToMEPBridgeService:
         number = int(execution.get("issue_number") or 0)
         entity_type = str(execution.get("entity_type") or "").strip().lower()
         action = self._resolve_github_writeback_action(execution, update)
-        body = self._render_github_writeback_body(str(execution.get("bridge_id") or update.bridge_id), action, update.detail)
+        body = self._render_github_writeback_body(
+            str(execution.get("bridge_id") or update.bridge_id),
+            action,
+            update.detail,
+            target_alias=str(execution.get("target_alias") or "").strip() or None,
+        )
         review_events = {
             "approved": "APPROVE",
             "reviewed": "COMMENT",
@@ -1202,6 +1280,8 @@ class GitHubToMEPBridgeService:
                 task_id=update.task_id or refreshed.get("task_id"),
                 action=resolved_action,
                 detail=update.detail,
+                target_alias=str(refreshed.get("target_alias") or "").strip() or None,
+                target_node_id=str(refreshed.get("target_node_id") or "").strip() or None,
             ),
         )
         return {"status": "ok", "bridge_id": update.bridge_id}
