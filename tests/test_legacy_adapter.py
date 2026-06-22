@@ -43,6 +43,19 @@ from fastapi.testclient import TestClient  # noqa: E402
 
 client = TestClient(app)
 
+# The hub app and this module share a single cached `db` module, whose DB path
+# and schema are bound once at import time. Other test modules in the suite
+# reload `db` against their own temp file and then delete it on teardown, which
+# can leave the shared connection pointing at an empty database. Re-running
+# init_db() in setUp guarantees the active database has its tables regardless of
+# cross-module test ordering.
+db.init_db()
+
+
+class _AdapterTestCase(unittest.TestCase):
+    def setUp(self):
+        db.init_db()
+
 
 # ---------------------------------------------------------------------------
 # Auth helpers (mirror test_hub_api.py)
@@ -166,7 +179,7 @@ class TestMoneyCanonicalPath(unittest.TestCase):
 # ---------------------------------------------------------------------------
 # Endpoint regression coverage (legacy vs v2 consistency)
 # ---------------------------------------------------------------------------
-class TestBalanceAdapter(unittest.TestCase):
+class TestBalanceAdapter(_AdapterTestCase):
     def test_legacy_and_v2_balance_consistent(self):
         _, pub_pem, node_id = _make_identity()
         _register(pub_pem)
@@ -200,7 +213,7 @@ class TestBalanceAdapter(unittest.TestCase):
         self.assertEqual(client.get("/v2/balance/does-not-exist").status_code, 404)
 
 
-class TestEscrowAdapter(unittest.TestCase):
+class TestEscrowAdapter(_AdapterTestCase):
     def test_escrow_amount_ns_consistent_with_bounty(self):
         consumer_priv, consumer_pub, consumer_id = _make_identity()
         _register(consumer_pub)
@@ -226,7 +239,7 @@ class TestEscrowAdapter(unittest.TestCase):
         self.assertEqual(v2_balance, "7000000000")
 
 
-class TestTaskResultAdapter(unittest.TestCase):
+class TestTaskResultAdapter(_AdapterTestCase):
     def test_legacy_and_v2_task_result_bounty_consistent(self):
         consumer_priv, consumer_pub, consumer_id = _make_identity()
         _register(consumer_pub)
