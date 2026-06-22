@@ -701,6 +701,29 @@ def get_balance(node_id: str) -> Optional[float]:
     _release_conn(conn)
     return row[0] if row else None
 
+# Public alias: the integer ns column is the canonical source of truth, and
+# the money layer reads financial rows through this coercion helper.
+coerce_ns_from_row = _coerce_ns_from_row
+
+def get_balance_row(node_id: str) -> Optional[tuple]:
+    """Return (balance, balance_ns) for a node, or None if it does not exist.
+
+    Exposes the canonical integer-ns column alongside the legacy float so
+    callers can treat ns as the source of truth and convert to float only at
+    the response boundary.
+    """
+    conn = _get_conn()
+    cursor = conn.cursor()
+    if _is_postgres():
+        cursor.execute("SELECT balance, balance_ns FROM ledger WHERE node_id = %s", (node_id,))
+    else:
+        cursor.execute("SELECT balance, balance_ns FROM ledger WHERE node_id = ?", (node_id,))
+    row = cursor.fetchone()
+    _release_conn(conn)
+    if not row:
+        return None
+    return (row[0], row[1])
+
 def get_node_count() -> int:
     conn = _get_conn()
     cursor = conn.cursor()
