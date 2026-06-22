@@ -52,7 +52,8 @@ from v2_models import (
     V2LedgerListResponse,
 )
 
-from nanoseconds import legacy_seconds_to_ns, ns_to_legacy_seconds
+from nanoseconds import ns_to_legacy_seconds
+import money
 
 app = FastAPI(title="MEP Hub", description="The Time Exchange Clearinghouse", version="0.1.2", docs_url="/docs", redoc_url="/redoc")
 
@@ -1708,12 +1709,14 @@ async def register_node_v2(node: NodeRegistration, request: Request):
         log_event("node_pending", f"Node {node_id} registration pending approval", node_id=node_id)
 
     hub_url, ws_url = get_hub_urls(request)
-    balance_ns = legacy_seconds_to_ns(balance, "balance")
+    balance_row = db.get_balance_row(node_id)
+    balance_ns_value = balance_row[1] if balance_row else None
+    balance_ns_str = money.to_v2_ns_string(balance, balance_ns_value, "balance", allow_negative=False)
 
     return V2RegistrationResponse(
         status=status,
         node_id=node_id,
-        balance_ns=str(balance_ns),
+        balance_ns=balance_ns_str,
         hub_url=hub_url,
         ws_url=ws_url
     )
@@ -2142,18 +2145,21 @@ async def get_reputation(node_id: str):
 
 @app.get("/balance/{node_id}")
 async def get_balance(node_id: str):
-    balance = db.get_balance(node_id)
-    if balance is None:
+    row = db.get_balance_row(node_id)
+    if row is None:
         raise HTTPException(status_code=404, detail="Node not found")
-    return {"node_id": node_id, "balance_seconds": balance}
+    balance, balance_ns = row
+    balance_seconds = money.to_legacy_seconds(balance, balance_ns, "balance", allow_negative=False)
+    return {"node_id": node_id, "balance_seconds": balance_seconds}
 
 @app.get("/v2/balance/{node_id}")
 async def get_balance_v2(node_id: str):
-    balance = db.get_balance(node_id)
-    if balance is None:
+    row = db.get_balance_row(node_id)
+    if row is None:
         raise HTTPException(status_code=404, detail="Node not found")
-    balance_ns = legacy_seconds_to_ns(balance, "balance")
-    return V2BalanceResponse(node_id=node_id, balance_ns=str(balance_ns))
+    balance, balance_ns = row
+    balance_ns_str = money.to_v2_ns_string(balance, balance_ns, "balance", allow_negative=False)
+    return V2BalanceResponse(node_id=node_id, balance_ns=balance_ns_str)
 
 @app.post("/tasks/submit")
 async def submit_task(
@@ -2765,11 +2771,14 @@ async def get_task_result(task_id: str, authenticated_node: str = Depends(verify
         raise HTTPException(status_code=404, detail="Task not found or not completed")
     if authenticated_node not in (task["consumer_id"], task["provider_id"]):
         raise HTTPException(status_code=403, detail="Not authorized to view this result")
+    bounty_seconds = money.to_legacy_seconds(
+        task["bounty"], task.get("bounty_ns"), "bounty", allow_negative=True
+    )
     return {
         "task_id": task["task_id"],
         "consumer_id": task["consumer_id"],
         "provider_id": task["provider_id"],
-        "bounty": task["bounty"],
+        "bounty": bounty_seconds,
         "result_payload": task["result_payload"],
         "result_uri": task.get("result_uri")
     }
@@ -2782,14 +2791,16 @@ async def get_task_result_v2(task_id: str, authenticated_node: str = Depends(ver
     if authenticated_node not in (task["consumer_id"], task["provider_id"]):
         raise HTTPException(status_code=403, detail="Not authorized to view this result")
     
-    bounty_ns = legacy_seconds_to_ns(task["bounty"], "bounty_ns")
+    bounty_ns_str = money.to_v2_ns_string(
+        task["bounty"], task.get("bounty_ns"), "bounty", allow_negative=True
+    )
     
     return V2TaskResponse(
         task_id=task["task_id"],
         consumer_id=task["consumer_id"],
         provider_id=task["provider_id"],
         status=task["status"],
-        bounty_ns=str(bounty_ns),
+        bounty_ns=bounty_ns_str,
         result_uri=task.get("result_uri")
     )
 
@@ -3181,26 +3192,27 @@ async def ledger_entries_v2(node_id: str, limit: int = 50, authenticated_node: s
                     key, value = part.split(":", 1)
                     entry_dict[key.strip().lower()] = value.strip()
             
-            # Convert financial values to ns
+            # Ledger entries come from the audit log (legacy text, no ns column),
+            # so this is pure boundary adaptation routed through the money layer.
             amount_ns = None
             balance_ns = None
             if "amount" in entry_dict:
                 try:
                     amount = float(entry_dict["amount"])
-                    amount_ns = legacy_seconds_to_ns(amount, "amount")
+                    amount_ns = money.to_v2_ns_string(amount, None, "amount", allow_negative=True)
                 except (ValueError, KeyError):
                     pass
             if "balance" in entry_dict:
                 try:
                     balance = float(entry_dict["balance"])
-                    balance_ns = legacy_seconds_to_ns(balance, "balance")
+                    balance_ns = money.to_v2_ns_string(balance, None, "balance", allow_negative=False)
                 except (ValueError, KeyError):
                     pass
             
             v2_entries.append(V2LedgerEntryResponse(
                 node_id=node_id,
-                amount_ns=str(amount_ns) if amount_ns is not None else None,
-                balance_ns=str(balance_ns) if balance_ns is not None else None,
+                amount_ns=amount_ns,
+                balance_ns=balance_ns,
                 kind=entry_dict.get("action", "unknown"),
                 reference_id=entry_dict.get("reference")
             ))
@@ -3221,13 +3233,15 @@ async def get_escrow_v2(task_id: str, authenticated_node: str = Depends(verify_r
     if authenticated_node not in (escrow["consumer_id"], escrow.get("provider_id")):
         raise HTTPException(status_code=403, detail="Not authorized to view this escrow")
     
-    amount_ns = legacy_seconds_to_ns(escrow["amount"], "amount")
+    amount_ns_str = money.to_v2_ns_string(
+        escrow["amount"], escrow.get("amount_ns"), "amount", allow_negative=False
+    )
     
     return V2EscrowResponse(
         task_id=task_id,
         consumer_id=escrow["consumer_id"],
         provider_id=escrow.get("provider_id"),
-        amount_ns=str(amount_ns),
+        amount_ns=amount_ns_str,
         status=escrow["status"]
     )
 
@@ -3237,12 +3251,14 @@ async def list_escrows_v2(authenticated_node: str = Depends(verify_request)):
     
     v2_escrows = []
     for escrow in escrows:
-        amount_ns = legacy_seconds_to_ns(escrow["amount"], "amount")
+        amount_ns_str = money.to_v2_ns_string(
+            escrow["amount"], escrow.get("amount_ns"), "amount", allow_negative=False
+        )
         v2_escrows.append(V2EscrowResponse(
             task_id=escrow["task_id"],
             consumer_id=escrow["consumer_id"],
             provider_id=escrow.get("provider_id"),
-            amount_ns=str(amount_ns),
+            amount_ns=amount_ns_str,
             status=escrow["status"]
         ))
     
