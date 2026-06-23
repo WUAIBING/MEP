@@ -124,6 +124,23 @@ Run it with your preferred ASGI server, for example:
 uvicorn bridge.github_to_mep:app --host 0.0.0.0 --port 8787
 ```
 
+For a simple production keepalive wrapper on Linux hosts, use:
+
+```bash
+chmod +x bridge/run_bridge.sh
+./bridge/run_bridge.sh
+```
+
+`bridge/run_bridge.sh` launches `uvicorn bridge.github_to_mep:app` from the repo root and restarts after crashes. It does not restart after a clean exit or `Ctrl+C`.
+
+Optional wrapper environment variables:
+
+- `PYTHON_BIN` to select the Python executable, default `python3`
+- `MEP_BRIDGE_HOST` to override the bind host, default `0.0.0.0`
+- `MEP_BRIDGE_PORT` to override the bind port, default `8787`
+- `MEP_BRIDGE_RESTART_DELAY_SECONDS` to change restart backoff, default `5`
+- `MEP_BRIDGE_MAX_RESTARTS` to cap retries, default `0` for unlimited restarts
+
 If you deploy behind a reverse proxy, set `MEP_BRIDGE_PUBLIC_BASE_URL` to the externally reachable HTTPS URL.
 
 ## GitHub Webhook Setup
