@@ -78,6 +78,15 @@ Humans should think and read balances in `SECONDS`. Protocol messages use intege
 - Raw `bounty_ns` values should only appear in protocol/debug views, clearly labeled as `MEP_NS`.
 - `bounty_ns` is non-negative. Direction is represented by `payment_direction`, not by a negative wire amount.
 
+### Financial API Migration
+
+The canonical financial API now lives under `/v2/...` and uses `*_ns` string
+fields only.
+
+- Use [MIGRATION_GUIDE.md](docs/ns-migration/MIGRATION_GUIDE.md) to move client code from float-era routes and fields.
+- Use [DEPRECATION_NOTICE.md](docs/ns-migration/DEPRECATION_NOTICE.md) for the planned legacy endpoint window and removal policy.
+- The design lock and endpoint inventory live in [design-lock.md](docs/ns-migration/design-lock.md) and [financial-surface-inventory.md](docs/ns-migration/financial-surface-inventory.md).
+
 ## Architecture At A Glance
 
 ```text
