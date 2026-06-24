@@ -2616,6 +2616,15 @@ async def complete_task(
         raise HTTPException(status_code=409, detail="Task could not be settled")
     return await _finalize_settled_task(settled, result.task_id, result.provider_id, result_payload, normalized_result_uri)
 
+
+@app.get("/tasks/pending/{node_id}")
+async def get_pending_tasks(node_id: str, authenticated_node: str = Depends(verify_request)):
+    if authenticated_node != node_id:
+        raise HTTPException(status_code=403, detail="Cannot view pending tasks for another node")
+    tasks = db.get_pending_tasks_for_provider(node_id)
+    return {"node_id": node_id, "tasks": tasks, "count": len(tasks)}
+
+
 @app.post("/tasks/reject")
 async def reject_task(
     rejection: TaskReject,

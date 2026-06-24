@@ -825,10 +825,34 @@ class RuntimeNode:
             return False
         try:
             await self._ws.send(json.dumps(payload))
+            await self._ws.send(json.dumps(payload))
             return True
         except Exception as exc:  # noqa: BLE001
             print(f"[mep run] ws send failed event={payload.get('event')} detail={exc}")
             return False
+
+    def _fetch_pending_tasks(self) -> list[dict[str, Any]]:
+        code, body, raw = _safe_request(
+            "GET",
+            f"{self.hub_url}/tasks/pending/{self.node_id}",
+            headers=self._auth_headers(""),
+            timeout=20.0,
+        )
+        if code != 200:
+            print(f"[mep run] pending task poll failed status={code} detail={raw}")
+            return []
+        tasks = body.get("tasks") if isinstance(body, dict) else None
+        if not isinstance(tasks, list):
+            return []
+        return [task for task in tasks if isinstance(task, dict)]
+
+    async def _recover_pending_tasks(self) -> None:
+        tasks = self._fetch_pending_tasks()
+        if not tasks:
+            return
+        print(f"[mep run] recovered pending tasks count={len(tasks)} node={self.node_id}")
+        for task in tasks:
+            await self.handle_ws_event({"event": "new_task", "data": task})
 
     def _resolve_call_bridge(self, context_id: Optional[str], outcome: dict[str, Any]) -> None:
         if not context_id:
@@ -1339,6 +1363,7 @@ class RuntimeNode:
                 async with ws_connect(uri) as ws:
                     self._ws = ws
                     print(f"[mep run] connected ws node={self.node_id}")
+                    await self._recover_pending_tasks()
                     await self._recv_loop(ws)
             except KeyboardInterrupt:
                 self.running = False

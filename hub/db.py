@@ -1272,6 +1272,31 @@ def get_queued_dms_for_node(node_id: str) -> list:
     return result
 
 
+def get_pending_tasks_for_provider(node_id: str) -> list:
+    """Return assigned tasks for node_id that still need provider-side processing."""
+    conn = _get_conn()
+    if not _is_postgres():
+        conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+    if _is_postgres():
+        cursor.execute(
+            "SELECT * FROM tasks WHERE provider_id = %s AND status = 'assigned' ORDER BY created_at ASC",
+            (node_id,),
+        )
+    else:
+        cursor.execute(
+            "SELECT * FROM tasks WHERE provider_id = ? AND status = 'assigned' ORDER BY created_at ASC",
+            (node_id,),
+        )
+    rows = cursor.fetchall()
+    if _is_postgres():
+        result = [_row_to_dict(cursor, row) for row in rows]
+    else:
+        result = [dict(row) for row in rows]
+    _release_conn(conn)
+    return result
+
+
 def count_queued_dms_for_node(node_id: str) -> int:
     """Count store-and-forward DMs currently queued for node_id."""
     conn = _get_conn()
