@@ -779,6 +779,32 @@ class TestThreeMarketSpecConformance(unittest.TestCase):
         self.assertEqual(stored["provider_id"], target_id)
         self.assertEqual(db.count_queued_dms_for_node(target_id), 0)
 
+    def test_pending_tasks_endpoint_lists_assigned_tasks_for_provider(self):
+        sender_priv, sender_pub, sender_id = _make_identity()
+        target_priv, target_pub, target_id = _make_identity()
+        _register(sender_pub)
+        _register(target_pub)
+
+        live_ws = _FakeWebSocket()
+        main.connected_nodes[target_id] = live_ws
+        try:
+            resp = self._submit_offline_dm(sender_priv, sender_id, target_id, instructions="recover me")
+        finally:
+            main.connected_nodes.pop(target_id, None)
+
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.json()["status"], "success")
+        task_id = resp.json()["task_id"]
+
+        pending = client.get(f"/tasks/pending/{target_id}", headers=_auth_headers(target_priv, target_id, ""))
+        self.assertEqual(pending.status_code, 200, pending.text)
+        body = pending.json()
+        self.assertEqual(body["node_id"], target_id)
+        self.assertEqual(body["count"], 1)
+        self.assertEqual(body["tasks"][0]["task_id"], task_id)
+        self.assertEqual(body["tasks"][0]["provider_id"], target_id)
+        self.assertEqual(body["tasks"][0]["status"], "assigned")
+
     def test_queued_dm_flush_matches_live_targeted_shape(self):
         """A queued DM must be flushed with the same new_task event contract as a
         live targeted delivery, so offline recipients are not handed a thinner
