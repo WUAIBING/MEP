@@ -318,7 +318,11 @@ class TestRuntimeBidPolicy(unittest.TestCase):
 
 class TestRuntimeReviewPrompts(unittest.TestCase):
     @staticmethod
-    def _bridge_review_task_data(intent_type: str = "code.review.request") -> dict:
+    def _bridge_review_task_data(
+        intent_type: str = "code.review.request",
+        *,
+        instructions: str = "Review this PR and provide a concise decision.",
+    ) -> dict:
         return {
             "id": "task_bridge_review",
             "bounty": 0.0,
@@ -332,7 +336,7 @@ class TestRuntimeReviewPrompts(unittest.TestCase):
                     "conversation": {"context_id": "ctx-bridge-review"},
                     "intent": {"type": intent_type, "priority": "high"},
                     "task": {
-                        "instructions": "Review this PR and provide a concise decision.",
+                        "instructions": instructions,
                         "inputs": {
                             "bridge_metadata": {
                                 "source_type": "github",
@@ -359,28 +363,93 @@ class TestRuntimeReviewPrompts(unittest.TestCase):
     def test_ai_adapter_uses_reviewer_prompt_for_bridge_review_tasks(self):
         adapter = mep_runtime.AIAdapter(model="tinyllama")
         task_data = self._bridge_review_task_data()
-        with patch("subprocess.run", return_value=_FakeCompletedProcess(stdout="review output")) as run_mock:
+        with patch(
+            "subprocess.run",
+            return_value=_FakeCompletedProcess(stdout='{"summary":"Checked the provided diff.","findings":[]}'),
+        ) as run_mock:
             reply = adapter.generate_reply("Review this PR", task_data)
 
-        self.assertEqual(reply, "review output")
+        self.assertIn("## Review Summary", reply)
+        self.assertIn("Checked the provided diff.", reply)
         prompt = run_mock.call_args.args[0][3]
-        self.assertIn("You are a code reviewer for the MEP", prompt)
-        self.assertIn("approve, request_changes, or comment", prompt)
+        self.assertIn("You are a senior code reviewer for the MEP", prompt)
+        self.assertIn('"summary": string', prompt)
+        self.assertIn('"observation": string', prompt)
+        self.assertIn('"touched_paths": [string]', prompt)
+        self.assertIn('"tests_reviewed": [string]', prompt)
 
     def test_deepseek_adapter_uses_reviewer_prompt_for_bridge_review_tasks(self):
         adapter = mep_runtime.DeepSeekAdapter(api_key="secret-key", model="deepseek-chat")
-        task_data = self._bridge_review_task_data()
+        task_data = self._bridge_review_task_data(
+            instructions=(
+                "Review this PR.\n\n"
+                "Changed files and patch excerpts:\n"
+                "- bridge/github_to_mep.py (modified, +12/-3, changes=15)\n"
+                "- tests/test_github_bridge.py (modified, +20/-0, changes=20)"
+            )
+        )
         fake_response = _FakeResponse(
             200,
-            {"choices": [{"message": {"content": "**Request Changes** file reference"}}]},
+            {
+                "choices": [
+                    {
+                        "message": {
+                            "content": (
+                                '{"summary":"Checked the bridge diff.","observation":"The new tests cover the diff-context path.",'
+                                '"touched_paths":["bridge/github_to_mep.py"],"tests_reviewed":["tests/test_github_bridge.py"],"findings":'
+                                '[{"file":"bridge/github_to_mep.py","issue":"Preserve coalesced targets",'
+                                '"rationale":"Otherwise the second mention can overwrite the first target during the coalesce window."}]}'
+                            )
+                        }
+                    }
+                ]
+            },
         )
         with patch("node.mep_runtime.requests.post", return_value=fake_response) as post_mock:
             reply = adapter.generate_reply("Review this PR", task_data)
 
-        self.assertEqual(reply, "**Request Changes** file reference")
+        self.assertIn("## Review Findings", reply)
+        self.assertIn("Preserve coalesced targets", reply)
+        self.assertIn("bridge/github_to_mep.py", reply)
+        self.assertIn("Tests reviewed: `tests/test_github_bridge.py`", reply)
+        self.assertIn("Observation: The new tests cover the diff-context path.", reply)
         system_prompt = post_mock.call_args.kwargs["json"]["messages"][0]["content"]
-        self.assertIn("You are a code reviewer for the MEP", system_prompt)
-        self.assertIn("approve, request_changes, or comment", system_prompt)
+        self.assertIn("return ONLY a JSON object", system_prompt)
+
+    def test_deepseek_adapter_filters_weak_review_findings(self):
+        adapter = mep_runtime.DeepSeekAdapter(api_key="secret-key", model="deepseek-chat")
+        task_data = self._bridge_review_task_data(
+            instructions=(
+                "Review this PR.\n\n"
+                "Changed files and patch excerpts:\n"
+                "- node/mep_runtime.py (modified, +45/-2, changes=47)\n"
+                "- tests/test_node_runtime.py (modified, +33/-0, changes=33)"
+            )
+        )
+        fake_response = _FakeResponse(
+            200,
+            {
+                "choices": [
+                    {
+                        "message": {
+                            "content": (
+                                '{"summary":"Missing context to verify the rest of the patch.",'
+                                '"findings":[{"file":"bridge/github_to_mep.py","issue":"Need more context",'
+                                '"rationale":"Cannot verify this path without seeing the full patch excerpt."}]}'
+                            )
+                        }
+                    }
+                ]
+            },
+        )
+
+        with patch("node.mep_runtime.requests.post", return_value=fake_response):
+            reply = adapter.generate_reply("Review this PR", task_data)
+
+        self.assertIn("## Review Summary", reply)
+        self.assertIn("did not identify a concrete blocking issue", reply)
+        self.assertIn("Touched paths: `node/mep_runtime.py`, `tests/test_node_runtime.py`", reply)
+        self.assertIn("Tests reviewed: `tests/test_node_runtime.py`", reply)
 
 
 class TestRuntimeWebSocketLoop(unittest.TestCase):
