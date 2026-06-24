@@ -4,7 +4,7 @@ import json
 import os
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 from node.identity import MEPIdentity
 from node import mep_runtime
@@ -424,6 +424,46 @@ class TestRuntimeWebSocketLoop(unittest.TestCase):
 
         pending_task = asyncio.run(_run())
         self.assertTrue(pending_task.cancelled())
+
+    def test_fetch_pending_tasks_uses_authenticated_get(self):
+        node = _runtime_node()
+        with patch("node.mep_runtime._safe_request", return_value=(200, {"tasks": [{"id": "task_pending"}]}, "")) as request_mock:
+            tasks = node._fetch_pending_tasks()  # noqa: SLF001
+
+        self.assertEqual(tasks, [{"id": "task_pending"}])
+        self.assertEqual(request_mock.call_args.args, ("GET", "http://hub/tasks/pending/node_runtime"))
+        self.assertEqual(request_mock.call_args.kwargs["headers"]["X-MEP-NodeID"], "node_runtime")
+
+    def test_recover_pending_tasks_replays_new_task_events(self):
+        node = _runtime_node()
+        with (
+            patch.object(node, "_fetch_pending_tasks", return_value=[{"id": "task_one"}, {"id": "task_two"}]),
+            patch.object(node, "handle_ws_event", new=AsyncMock()) as handle_mock,
+        ):
+            asyncio.run(node._recover_pending_tasks())  # noqa: SLF001
+
+        self.assertEqual(handle_mock.await_count, 2)
+        self.assertEqual(handle_mock.await_args_list[0].args[0], {"event": "new_task", "data": {"id": "task_one"}})
+        self.assertEqual(handle_mock.await_args_list[1].args[0], {"event": "new_task", "data": {"id": "task_two"}})
+
+    def test_run_forever_recovers_pending_tasks_after_connect(self):
+        node = _runtime_node()
+
+        async def _recv_loop(_ws) -> None:
+            node.running = False
+
+        async def _run() -> int:
+            with (
+                patch.object(node, "register", return_value=(True, "registered")),
+                patch.object(node, "_recover_pending_tasks", new=AsyncMock()) as recover_mock,
+                patch.object(node, "_recv_loop", side_effect=_recv_loop),
+                patch("node.ws_connect.ws_connect", return_value=_FakeConnectContext(_FakeWebSocket([]))),
+            ):
+                code = await node.run_forever()
+                self.assertEqual(recover_mock.await_count, 1)
+                return code
+
+        self.assertEqual(asyncio.run(_run()), 0)
 
     def test_process_task_uses_interbot_instructions_for_adapter_input(self):
         node = _runtime_node()
