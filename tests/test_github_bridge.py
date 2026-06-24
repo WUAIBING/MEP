@@ -59,7 +59,7 @@ class _FakeNotifier:
 
 
 class _FakeResponse:
-    def __init__(self, payload: dict, *, status_code: int = 200):
+    def __init__(self, payload, *, status_code: int = 200):
         self._payload = payload
         self.status_code = status_code
 
@@ -72,10 +72,13 @@ class _FakeResponse:
 
 
 class _FakeRequestsSession:
-    def __init__(self, responses=None, *, default_response=None):
+    def __init__(self, responses=None, *, default_response=None, get_responses=None, default_get_response=None):
         self.responses = list(responses or [])
+        self.get_responses = list(get_responses or [])
         self.default_response = default_response
+        self.default_get_response = default_get_response or _FakeResponse({}, status_code=404)
         self.posts = []
+        self.gets = []
 
     def post(self, url, **kwargs):
         self.posts.append({"url": url, **kwargs})
@@ -84,6 +87,12 @@ class _FakeRequestsSession:
         if self.default_response is None:
             raise AssertionError("No fake responses remaining")
         return self.default_response
+
+    def get(self, url, **kwargs):
+        self.gets.append({"url": url, **kwargs})
+        if self.get_responses:
+            return self.get_responses.pop(0)
+        return self.default_get_response
 
 
 def _build_config(tmp_dir: str) -> BridgeConfig:
@@ -261,7 +270,7 @@ class TestGitHubToMEPBridge(unittest.TestCase):
         self.assertIn("Elsaws Bot", routed_aliases)
         self.assertNotEqual(routed_aliases["Hub Sentinel"], routed_aliases["Elsaws Bot"])
 
-    def test_same_context_burst_recomputes_targets_from_latest_trigger_text(self):
+    def test_same_context_burst_preserves_targets_from_separate_mentions(self):
         self._configure_multi_target_aliases()
         payload_one = _issue_comment_payload("@Hub Sentinel review this PR", action="created")
         payload_two = _issue_comment_payload("@Elsaws Bot review this PR", action="edited")
@@ -273,10 +282,53 @@ class TestGitHubToMEPBridge(unittest.TestCase):
 
         self._flush_context(first.json()["context_id"])
 
+        self.assertEqual(len(self.submission.calls), 2)
+        routed_targets = {call["target_node_id"] for call in self.submission.calls}
+        self.assertEqual(routed_targets, {"node_target", "node_elsaws"})
+        for call in self.submission.calls:
+            github_inputs = call["envelope"]["task"]["inputs"]["github"]
+            self.assertEqual(github_inputs["source_action"], "edited")
+
+    def test_pr_review_instructions_include_diff_context(self):
+        self.github_session.get_responses = [
+            _FakeResponse(
+                {
+                    "body": "Adds review quality handling for bridge-triggered PR reviews.",
+                    "changed_files": 1,
+                    "additions": 12,
+                    "deletions": 3,
+                    "commits": 1,
+                }
+            ),
+            _FakeResponse(
+                [
+                    {
+                        "filename": "bridge/github_to_mep.py",
+                        "status": "modified",
+                        "additions": 12,
+                        "deletions": 3,
+                        "changes": 15,
+                        "patch": "@@ -1,3 +1,8 @@\n+def improved_review_context():\n+    return True",
+                    }
+                ]
+            ),
+        ]
+
+        response = self._post_webhook(
+            _issue_comment_payload("@Hub-Sentinel review this PR"),
+            delivery_id="delivery-context",
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+
+        self._flush_context(response.json()["context_id"])
+
         self.assertEqual(len(self.submission.calls), 1)
-        self.assertEqual(self.submission.calls[0]["target_node_id"], "node_elsaws")
-        github_inputs = self.submission.calls[0]["envelope"]["task"]["inputs"]["github"]
-        self.assertEqual(github_inputs["source_action"], "edited")
+        instructions = self.submission.calls[0]["envelope"]["task"]["instructions"]
+        self.assertIn("Review guidance:", instructions)
+        self.assertIn("PR description:", instructions)
+        self.assertIn("Changed files and patch excerpts:", instructions)
+        self.assertIn("bridge/github_to_mep.py", instructions)
+        self.assertEqual(len(self.github_session.gets), 2)
 
     def test_status_callback_requires_valid_token_and_updates_existing_message(self):
         response = self._post_webhook(

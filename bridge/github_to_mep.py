@@ -658,8 +658,14 @@ class GitHubToMEPBridgeService:
         async with self._pending_lock:
             pending = self._pending_by_context.get(event.context_id)
             if pending is not None:
+                existing_targets = {
+                    _normalize_alias_key(target.alias): target
+                    for target in (pending.targets or [])
+                }
                 pending.event = self._merge_events(pending.event, event)
-                pending.targets = self._get_targets_for_event(pending.event)
+                for target in self._get_targets_for_event(pending.event):
+                    existing_targets[_normalize_alias_key(target.alias)] = target
+                pending.targets = list(existing_targets.values())
                 if not pending.targets and self.config.target_node_id:
                     pending.targets = [
                         TriggerMatch(
@@ -1042,6 +1048,88 @@ class GitHubToMEPBridgeService:
         sender_type = actor_type.strip().lower()
         return sender_type == "bot" or login.endswith("[bot]")
 
+    @staticmethod
+    def _clip_text(value: str, max_chars: int) -> str:
+        text = value.strip()
+        if len(text) <= max_chars:
+            return text
+        return text[:max_chars].rstrip() + "..."
+
+    def _github_read_token(self) -> Optional[str]:
+        if self.config.github_token:
+            return self.config.github_token
+        for token in self.config.github_tokens_by_alias.values():
+            if token and token.strip():
+                return token.strip()
+        return None
+
+    def _fetch_pr_review_context(self, repo_full_name: str, number: int) -> str:
+        token = self._github_read_token()
+        if not token:
+            return ""
+        headers = {
+            "Accept": "application/vnd.github+json",
+            "Authorization": f"Bearer {token}",
+            "X-GitHub-Api-Version": "2022-11-28",
+        }
+        try:
+            pr_response = self.github_session.get(
+                f"https://api.github.com/repos/{repo_full_name}/pulls/{number}",
+                headers=headers,
+                timeout=20,
+            )
+            if pr_response.status_code != 200:
+                return ""
+            pr_data = pr_response.json()
+            files_response = self.github_session.get(
+                f"https://api.github.com/repos/{repo_full_name}/pulls/{number}/files?per_page=20",
+                headers=headers,
+                timeout=20,
+            )
+            files = files_response.json() if files_response.status_code == 200 else []
+        except Exception:
+            return ""
+
+        sections: list[str] = []
+        pr_body = str(pr_data.get("body") or "").strip()
+        if pr_body:
+            sections.append("PR description:\n" + self._clip_text(pr_body, 700))
+
+        changed_files = pr_data.get("changed_files")
+        additions = pr_data.get("additions")
+        deletions = pr_data.get("deletions")
+        commits = pr_data.get("commits")
+        sections.append(
+            "PR stats: "
+            f"changed_files={changed_files}, additions={additions}, deletions={deletions}, commits={commits}"
+        )
+
+        if isinstance(files, list) and files:
+            file_lines: list[str] = []
+            remaining_budget = 2000
+            for item in files[:8]:
+                if not isinstance(item, dict):
+                    continue
+                filename = str(item.get("filename") or "").strip()
+                status = str(item.get("status") or "modified").strip()
+                additions = item.get("additions")
+                deletions = item.get("deletions")
+                changes = item.get("changes")
+                line = f"- {filename} ({status}, +{additions}/-{deletions}, changes={changes})"
+                patch = str(item.get("patch") or "").strip()
+                if patch:
+                    clipped_patch = self._clip_text(patch, 320)
+                    line += "\n  Patch excerpt:\n  " + clipped_patch.replace("\n", "\n  ")
+                if len(line) > remaining_budget:
+                    line = self._clip_text(line, max(120, remaining_budget))
+                file_lines.append(line)
+                remaining_budget -= len(line) + 2
+                if remaining_budget <= 120:
+                    break
+            if file_lines:
+                sections.append("Changed files and patch excerpts:\n" + "\n".join(file_lines))
+        return "\n\n".join(section for section in sections if section.strip())
+
     def _build_instructions(
         self,
         *,
@@ -1059,7 +1147,7 @@ class GitHubToMEPBridgeService:
         if len(clipped_trigger) > 1200:
             clipped_trigger = clipped_trigger[:1200].rstrip() + "..."
         kind = "pull request" if entity_type == "pr" else "issue"
-        return (
+        instructions = (
             f"GitHub {kind} automation request.\n"
             f"Repository: {repo_full_name}\n"
             f"{kind.title()} number: {number}\n"
@@ -1071,6 +1159,18 @@ class GitHubToMEPBridgeService:
             "Instructions:\n"
             f"{clipped_trigger}"
         )
+        if entity_type == "pr":
+            review_context = self._fetch_pr_review_context(repo_full_name, number)
+            if review_context:
+                instructions += (
+                    "\n\nReview guidance:\n"
+                    "Use the actual diff context below to review correctness, regressions, edge cases, "
+                    "security, and missing tests. Reference concrete files or patch excerpts when possible.\n\n"
+                    f"{review_context}"
+                )
+        if len(instructions) > 3800:
+            instructions = instructions[:3800].rstrip() + "..."
+        return instructions
 
     def _build_interbot_envelope(
         self,
