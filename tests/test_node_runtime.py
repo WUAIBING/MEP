@@ -359,28 +359,75 @@ class TestRuntimeReviewPrompts(unittest.TestCase):
     def test_ai_adapter_uses_reviewer_prompt_for_bridge_review_tasks(self):
         adapter = mep_runtime.AIAdapter(model="tinyllama")
         task_data = self._bridge_review_task_data()
-        with patch("subprocess.run", return_value=_FakeCompletedProcess(stdout="review output")) as run_mock:
+        with patch(
+            "subprocess.run",
+            return_value=_FakeCompletedProcess(
+                stdout='{"summary":"Checked the provided diff.","findings":[]}'
+            ),
+        ) as run_mock:
             reply = adapter.generate_reply("Review this PR", task_data)
 
-        self.assertEqual(reply, "review output")
+        self.assertIn("## Review Summary", reply)
+        self.assertIn("Checked the provided diff.", reply)
         prompt = run_mock.call_args.args[0][3]
-        self.assertIn("You are a code reviewer for the MEP", prompt)
-        self.assertIn("approve, request_changes, or comment", prompt)
+        self.assertIn("You are a senior code reviewer for the MEP", prompt)
+        self.assertIn('"summary": string', prompt)
 
     def test_deepseek_adapter_uses_reviewer_prompt_for_bridge_review_tasks(self):
         adapter = mep_runtime.DeepSeekAdapter(api_key="secret-key", model="deepseek-chat")
         task_data = self._bridge_review_task_data()
         fake_response = _FakeResponse(
             200,
-            {"choices": [{"message": {"content": "**Request Changes** file reference"}}]},
+            {
+                "choices": [
+                    {
+                        "message": {
+                            "content": (
+                                '{"summary":"Checked the bridge diff.","findings":'
+                                '[{"file":"bridge/github_to_mep.py","issue":"Preserve coalesced targets",'
+                                '"rationale":"Otherwise the second mention can overwrite the first target during the coalesce window."}]}'
+                            )
+                        }
+                    }
+                ]
+            },
         )
         with patch("node.mep_runtime.requests.post", return_value=fake_response) as post_mock:
             reply = adapter.generate_reply("Review this PR", task_data)
 
-        self.assertEqual(reply, "**Request Changes** file reference")
+        self.assertIn("## Review Findings", reply)
+        self.assertIn("Preserve coalesced targets", reply)
+        self.assertIn("bridge/github_to_mep.py", reply)
         system_prompt = post_mock.call_args.kwargs["json"]["messages"][0]["content"]
-        self.assertIn("You are a code reviewer for the MEP", system_prompt)
-        self.assertIn("approve, request_changes, or comment", system_prompt)
+        self.assertIn("return ONLY a JSON object", system_prompt)
+
+    def test_deepseek_adapter_filters_weak_review_findings(self):
+        adapter = mep_runtime.DeepSeekAdapter(api_key="secret-key", model="deepseek-chat")
+        task_data = self._bridge_review_task_data()
+        fake_response = _FakeResponse(
+            200,
+            {
+                "choices": [
+                    {
+                        "message": {
+                            "content": (
+                                '{"summary":"Missing context to verify the rest of the patch.",'
+                                '"findings":[{"file":"bridge/github_to_mep.py","issue":"Need more context",'
+                                '"rationale":"Cannot verify this path without seeing the full patch excerpt."}]}'
+                            )
+                        }
+                    }
+                ]
+            },
+        )
+
+        with patch("node.mep_runtime.requests.post", return_value=fake_response):
+            reply = adapter.generate_reply("Review this PR", task_data)
+
+        self.assertEqual(
+            reply,
+            "## Review Summary\n\nReviewed the provided diff context and did not identify a concrete issue that is directly supported by the supplied patch excerpts.",
+        )
 
 
 class TestRuntimeWebSocketLoop(unittest.TestCase):

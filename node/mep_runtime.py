@@ -7,6 +7,7 @@ import argparse
 import asyncio
 import json
 import os
+import re
 import time
 import urllib.parse
 import uuid
@@ -384,9 +385,13 @@ def _system_prompt_for_task(
 ) -> str:
     if _task_requires_review_prompt(task_data):
         return (
-            "You are a code reviewer for the MEP (Miao Exchange Protocol) project. "
-            "Analyze PR tasks and respond as one of: approve, request_changes, or comment. "
-            "Be specific, reference files, logic, or tests when helpful, and keep the "
+            "You are a senior code reviewer for the MEP (Miao Exchange Protocol) project. "
+            "Review the provided GitHub PR context and return ONLY a JSON object with this schema: "
+            '{"summary": string, "findings": [{"file": string, "issue": string, "rationale": string}]}. '
+            "Use at most 2 findings. "
+            "Only include a finding when it is directly supported by the provided diff, file list, PR description, or patch excerpts. "
+            "Do not speculate about unseen code, do not ask for more context, and do not include chain-of-thought or any text outside the JSON object. "
+            "If the change looks good, keep findings empty and use summary to say what you verified and mention any residual risk briefly. Keep the "
             f"response within {review_max_chars} characters."
         )
     return (
@@ -394,6 +399,158 @@ def _system_prompt_for_task(
         "MEP is an AI-to-AI economy protocol where agents earn SECONDS by doing work. "
         f"Reply concisely (max {generic_max_chars} chars)."
     )
+
+
+def _extract_first_json_object(text: str) -> Optional[dict[str, Any]]:
+    if not text:
+        return None
+    start = text.find("{")
+    while start != -1:
+        depth = 0
+        in_string = False
+        escape = False
+        for index in range(start, len(text)):
+            char = text[index]
+            if in_string:
+                if escape:
+                    escape = False
+                elif char == "\\":
+                    escape = True
+                elif char == '"':
+                    in_string = False
+                continue
+            if char == '"':
+                in_string = True
+                continue
+            if char == "{":
+                depth += 1
+            elif char == "}":
+                depth -= 1
+                if depth == 0:
+                    candidate = text[start : index + 1]
+                    try:
+                        value = json.loads(candidate)
+                    except json.JSONDecodeError:
+                        break
+                    if isinstance(value, dict):
+                        return value
+                    break
+        start = text.find("{", start + 1)
+    return None
+
+
+def _clean_review_text(value: Any, *, max_chars: int) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    text = re.sub(r"\s+", " ", text).strip()
+    if len(text) > max_chars:
+        clipped = text[:max_chars].rstrip()
+        sentence_break = max(clipped.rfind(". "), clipped.rfind("! "), clipped.rfind("? "))
+        if sentence_break >= max(40, max_chars // 2):
+            clipped = clipped[: sentence_break + 1].rstrip()
+        text = clipped
+    if text and text[-1] not in ".!?":
+        text += "."
+    return text
+
+
+_WEAK_REVIEW_PATTERNS = [
+    r"\bmissing context\b",
+    r"\bpatch excerpt\b",
+    r"\btruncated\b",
+    r"\bcannot verify\b",
+    r"\bimpossible to verify\b",
+    r"\bwithout seeing\b",
+    r"\bwithout the full\b",
+    r"\bdoes not show\b",
+    r"\bdoesn't show\b",
+    r"\bnot enough context\b",
+    r"\bwe need to\b",
+    r"\bwe should\b",
+]
+
+
+def _is_weak_review_text(text: str) -> bool:
+    lowered = text.strip().lower()
+    if not lowered:
+        return True
+    return any(re.search(pattern, lowered) for pattern in _WEAK_REVIEW_PATTERNS)
+
+
+def _finalize_model_reply(text: str, *, max_chars: int) -> str:
+    cleaned = (text or "").strip()
+    if not cleaned:
+        return ""
+    cleaned = cleaned.replace("\r\n", "\n")
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+    if len(cleaned) > max_chars:
+        clipped = cleaned[:max_chars].rstrip()
+        breakpoints = [
+            clipped.rfind("\n\n"),
+            clipped.rfind("\n- "),
+            clipped.rfind(". "),
+            clipped.rfind("! "),
+            clipped.rfind("? "),
+        ]
+        best_break = max(breakpoints)
+        if best_break >= max(120, max_chars // 2):
+            if clipped[best_break : best_break + 2] in {". ", "! ", "? "}:
+                clipped = clipped[: best_break + 1].rstrip()
+            else:
+                clipped = clipped[:best_break].rstrip()
+        cleaned = clipped
+    if cleaned and cleaned[-1] not in ".!?":
+        last_sentence = max(cleaned.rfind(". "), cleaned.rfind("! "), cleaned.rfind("? "))
+        if last_sentence >= max(80, len(cleaned) // 2):
+            cleaned = cleaned[: last_sentence + 1].rstrip()
+        if cleaned and cleaned[-1] not in ".!?":
+            cleaned += "."
+    return cleaned
+
+
+def _render_structured_review(text: str, *, max_chars: int) -> str:
+    parsed = _extract_first_json_object(text)
+    if not isinstance(parsed, dict):
+        return ""
+    summary = _clean_review_text(parsed.get("summary"), max_chars=220)
+    if _is_weak_review_text(summary):
+        summary = ""
+    findings_raw = parsed.get("findings")
+    findings: list[str] = []
+    if isinstance(findings_raw, list):
+        for item in findings_raw[:2]:
+            if not isinstance(item, dict):
+                continue
+            issue = _clean_review_text(item.get("issue"), max_chars=140)
+            if not issue:
+                continue
+            rationale = _clean_review_text(item.get("rationale"), max_chars=260)
+            combined = f"{issue} {rationale}".strip()
+            if _is_weak_review_text(combined):
+                continue
+            file_name = _clean_review_text(item.get("file"), max_chars=80)
+            if file_name:
+                findings.append(f"**{issue}** (`{file_name}`): {rationale or 'Check this path.'}")
+            else:
+                findings.append(f"**{issue}**: {rationale or 'Check this logic.'}")
+    sections: list[str] = []
+    if findings:
+        sections.append("## Review Findings")
+        if summary:
+            sections.append(summary)
+        for index, finding in enumerate(findings, start=1):
+            sections.append(f"{index}. {finding}")
+    elif summary:
+        sections.append("## Review Summary")
+        sections.append(summary)
+    else:
+        sections.append("## Review Summary")
+        sections.append(
+            "Reviewed the provided diff context and did not identify a concrete issue that is directly supported by the supplied patch excerpts."
+        )
+    rendered = "\n\n".join(section for section in sections if section.strip())
+    return _finalize_model_reply(rendered, max_chars=max_chars)
 
 
 @dataclass
@@ -407,7 +564,7 @@ class AIAdapter:
 
         try:
             prompt = (
-                f"{_system_prompt_for_task(task_data, generic_max_chars=300, review_max_chars=500)}\n\n"
+                f"{_system_prompt_for_task(task_data, generic_max_chars=300, review_max_chars=1000)}\n\n"
                 f"Task: {payload}\n\nReply:"
             )
             result = subprocess.run(
@@ -419,6 +576,14 @@ class AIAdapter:
             reply = (result.stdout or "").strip()
             if not reply:
                 return f"[AI adapter] empty response from {self.model}"
+            if _task_requires_review_prompt(task_data):
+                rendered = _render_structured_review(reply, max_chars=1000)
+                if rendered:
+                    return rendered
+                finalized = _finalize_model_reply(reply, max_chars=1000)
+                if finalized:
+                    return finalized
+                return reply[:1000].rstrip() or "[AI adapter] review response was empty"
             return reply
         except subprocess.TimeoutExpired:
             return f"[AI adapter] {self.model} timed out"
@@ -449,18 +614,30 @@ class DeepSeekAdapter:
                             "content": _system_prompt_for_task(
                                 task_data,
                                 generic_max_chars=500,
-                                review_max_chars=500,
+                                review_max_chars=1000,
                             ),
                         },
                         {"role": "user", "content": payload},
                     ],
-                    "max_tokens": 300,
-                    "temperature": 0.7,
+                    "max_tokens": 450,
+                    "temperature": 0.1,
                 },
                 timeout=30,
             )
             if resp.status_code == 200:
-                return resp.json()["choices"][0]["message"]["content"].strip()
+                message = resp.json()["choices"][0]["message"]
+                reply = str(message.get("content") or "").strip()
+                if not reply:
+                    reply = str(message.get("reasoning_content") or "").strip()
+                if _task_requires_review_prompt(task_data):
+                    rendered = _render_structured_review(reply, max_chars=1000)
+                    if rendered:
+                        return rendered
+                    finalized = _finalize_model_reply(reply, max_chars=1000)
+                    if finalized:
+                        return finalized
+                    return reply[:1000].rstrip() or "[DeepSeek] review response was empty"
+                return reply
             return f"[DeepSeek] API error {resp.status_code}: {resp.text[:200]}"
         except Exception as exc:  # noqa: BLE001
             return f"[DeepSeek] error: {exc}"

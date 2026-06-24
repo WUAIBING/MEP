@@ -45,6 +45,33 @@ def _split_csv(raw: str) -> list[str]:
     return [item.strip() for item in raw.split(",") if item and item.strip()]
 
 
+def _normalize_alias_key(value: Optional[str]) -> str:
+    if not value:
+        return ""
+    return re.sub(r"[\s_-]+", " ", value).strip().lower()
+
+
+def _parse_json_str_dict_env(name: str) -> dict[str, str]:
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return {}
+    try:
+        value = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"Invalid {name}: {exc}") from exc
+    if not isinstance(value, dict):
+        raise RuntimeError(f"Invalid {name}: expected JSON object")
+    result: dict[str, str] = {}
+    for key, item in value.items():
+        if not isinstance(key, str) or not isinstance(item, str):
+            raise RuntimeError(f"Invalid {name}: expected string keys and values")
+        normalized_key = key.strip()
+        normalized_value = item.strip()
+        if normalized_key and normalized_value:
+            result[normalized_key] = normalized_value
+    return result
+
+
 def _base64url_encode(data: bytes) -> str:
     return base64.urlsafe_b64encode(data).decode("ascii").rstrip("=")
 
@@ -61,6 +88,10 @@ class BridgeConfig:
     sqlite_path: str
     webhook_secret: str
     github_token: Optional[str]
+    github_writeback_aliases: set[str]
+    github_writeback_login: Optional[str]
+    github_tokens_by_alias: dict[str, str]
+    github_logins_by_alias: dict[str, str]
     target_node_id: str
     target_alias: str
     trigger_aliases: list[str]
@@ -117,6 +148,9 @@ class BridgeConfig:
         trusted_bot_logins = set(
             item.lower() for item in _split_csv(os.getenv("MEP_BRIDGE_TRUSTED_BOT_LOGINS", ""))
         )
+        github_writeback_aliases = set(_split_csv(os.getenv("MEP_BRIDGE_GITHUB_WRITEBACK_ALIASES", "")))
+        github_tokens_by_alias = _parse_json_str_dict_env("MEP_BRIDGE_GITHUB_TOKENS_BY_ALIAS")
+        github_logins_by_alias = _parse_json_str_dict_env("MEP_BRIDGE_GITHUB_LOGINS_BY_ALIAS")
         return cls(
             hub_url=os.getenv("MEP_HUB_URL", "").rstrip("/"),
             key_path=os.getenv(
@@ -129,6 +163,10 @@ class BridgeConfig:
             ),
             webhook_secret=os.getenv("GITHUB_WEBHOOK_SECRET", ""),
             github_token=(os.getenv("GITHUB_TOKEN") or os.getenv("GITHUB_API_TOKEN") or "").strip() or None,
+            github_writeback_aliases=github_writeback_aliases,
+            github_writeback_login=(os.getenv("MEP_BRIDGE_GITHUB_WRITEBACK_LOGIN") or "").strip() or None,
+            github_tokens_by_alias=github_tokens_by_alias,
+            github_logins_by_alias=github_logins_by_alias,
             target_node_id=target_node_id,
             target_alias=target_alias,
             trigger_aliases=trigger_aliases,
@@ -620,8 +658,14 @@ class GitHubToMEPBridgeService:
         async with self._pending_lock:
             pending = self._pending_by_context.get(event.context_id)
             if pending is not None:
+                existing_targets = {
+                    _normalize_alias_key(target.alias): target
+                    for target in (pending.targets or [])
+                }
                 pending.event = self._merge_events(pending.event, event)
-                pending.targets = self._get_targets_for_event(pending.event)
+                for target in self._get_targets_for_event(pending.event):
+                    existing_targets[_normalize_alias_key(target.alias)] = target
+                pending.targets = list(existing_targets.values())
                 if not pending.targets and self.config.target_node_id:
                     pending.targets = [
                         TriggerMatch(
@@ -1004,6 +1048,88 @@ class GitHubToMEPBridgeService:
         sender_type = actor_type.strip().lower()
         return sender_type == "bot" or login.endswith("[bot]")
 
+    @staticmethod
+    def _clip_text(value: str, max_chars: int) -> str:
+        text = value.strip()
+        if len(text) <= max_chars:
+            return text
+        return text[:max_chars].rstrip() + "..."
+
+    def _github_read_token(self) -> Optional[str]:
+        if self.config.github_token:
+            return self.config.github_token
+        for token in self.config.github_tokens_by_alias.values():
+            if token and token.strip():
+                return token.strip()
+        return None
+
+    def _fetch_pr_review_context(self, repo_full_name: str, number: int) -> str:
+        token = self._github_read_token()
+        if not token:
+            return ""
+        headers = {
+            "Accept": "application/vnd.github+json",
+            "Authorization": f"Bearer {token}",
+            "X-GitHub-Api-Version": "2022-11-28",
+        }
+        try:
+            pr_response = self.github_session.get(
+                f"https://api.github.com/repos/{repo_full_name}/pulls/{number}",
+                headers=headers,
+                timeout=20,
+            )
+            if pr_response.status_code != 200:
+                return ""
+            pr_data = pr_response.json()
+            files_response = self.github_session.get(
+                f"https://api.github.com/repos/{repo_full_name}/pulls/{number}/files?per_page=20",
+                headers=headers,
+                timeout=20,
+            )
+            files = files_response.json() if files_response.status_code == 200 else []
+        except Exception:
+            return ""
+
+        sections: list[str] = []
+        pr_body = str(pr_data.get("body") or "").strip()
+        if pr_body:
+            sections.append("PR description:\n" + self._clip_text(pr_body, 700))
+
+        changed_files = pr_data.get("changed_files")
+        additions = pr_data.get("additions")
+        deletions = pr_data.get("deletions")
+        commits = pr_data.get("commits")
+        sections.append(
+            "PR stats: "
+            f"changed_files={changed_files}, additions={additions}, deletions={deletions}, commits={commits}"
+        )
+
+        if isinstance(files, list) and files:
+            file_lines: list[str] = []
+            remaining_budget = 2000
+            for item in files[:8]:
+                if not isinstance(item, dict):
+                    continue
+                filename = str(item.get("filename") or "").strip()
+                status = str(item.get("status") or "modified").strip()
+                additions = item.get("additions")
+                deletions = item.get("deletions")
+                changes = item.get("changes")
+                line = f"- {filename} ({status}, +{additions}/-{deletions}, changes={changes})"
+                patch = str(item.get("patch") or "").strip()
+                if patch:
+                    clipped_patch = self._clip_text(patch, 320)
+                    line += "\n  Patch excerpt:\n  " + clipped_patch.replace("\n", "\n  ")
+                if len(line) > remaining_budget:
+                    line = self._clip_text(line, max(120, remaining_budget))
+                file_lines.append(line)
+                remaining_budget -= len(line) + 2
+                if remaining_budget <= 120:
+                    break
+            if file_lines:
+                sections.append("Changed files and patch excerpts:\n" + "\n".join(file_lines))
+        return "\n\n".join(section for section in sections if section.strip())
+
     def _build_instructions(
         self,
         *,
@@ -1021,7 +1147,7 @@ class GitHubToMEPBridgeService:
         if len(clipped_trigger) > 1200:
             clipped_trigger = clipped_trigger[:1200].rstrip() + "..."
         kind = "pull request" if entity_type == "pr" else "issue"
-        return (
+        instructions = (
             f"GitHub {kind} automation request.\n"
             f"Repository: {repo_full_name}\n"
             f"{kind.title()} number: {number}\n"
@@ -1033,6 +1159,18 @@ class GitHubToMEPBridgeService:
             "Instructions:\n"
             f"{clipped_trigger}"
         )
+        if entity_type == "pr":
+            review_context = self._fetch_pr_review_context(repo_full_name, number)
+            if review_context:
+                instructions += (
+                    "\n\nReview guidance:\n"
+                    "Use the actual diff context below to review correctness, regressions, edge cases, "
+                    "security, and missing tests. Reference concrete files or patch excerpts when possible.\n\n"
+                    f"{review_context}"
+                )
+        if len(instructions) > 3800:
+            instructions = instructions[:3800].rstrip() + "..."
+        return instructions
 
     def _build_interbot_envelope(
         self,
@@ -1175,37 +1313,83 @@ class GitHubToMEPBridgeService:
         marker = f"{BRIDGE_OUTPUT_MARKER} bridge_id={bridge_id} action={action} -->"
         return f"{detail_text}\n\n{marker}"
 
-    def _post_github_comment(self, repo_full_name: str, number: int, body: str) -> None:
-        if not self.config.github_token:
-            raise HTTPException(status_code=500, detail="Bridge configuration missing: GITHUB_TOKEN")
+    def _target_alias_for_execution(self, execution: dict[str, Any]) -> str:
+        return str(execution.get("target_alias") or self.config.target_alias or "").strip()
+
+    def _lookup_alias_value(self, values: dict[str, str], target_alias: str) -> Optional[str]:
+        normalized_target = _normalize_alias_key(target_alias)
+        for alias, value in values.items():
+            if _normalize_alias_key(alias) == normalized_target and value and value.strip():
+                return value.strip()
+        return None
+
+    def _resolve_github_writeback_identity(self, execution: dict[str, Any]) -> tuple[Optional[str], Optional[str]]:
+        target_alias = self._target_alias_for_execution(execution)
+        alias_token = self._lookup_alias_value(self.config.github_tokens_by_alias, target_alias)
+        alias_login = self._lookup_alias_value(self.config.github_logins_by_alias, target_alias)
+        if alias_token:
+            return alias_token, alias_login or target_alias
+        return self.config.github_token, self.config.github_writeback_login
+
+    def _post_github_comment(self, repo_full_name: str, number: int, body: str, github_token: str) -> None:
+        if not github_token:
+            raise HTTPException(status_code=500, detail="Bridge configuration missing: GitHub writeback token")
         response = self.github_session.post(
             f"https://api.github.com/repos/{repo_full_name}/issues/{number}/comments",
             json={"body": body},
             headers={
                 "Accept": "application/vnd.github+json",
-                "Authorization": f"Bearer {self.config.github_token}",
+                "Authorization": f"Bearer {github_token}",
                 "X-GitHub-Api-Version": "2022-11-28",
             },
             timeout=20,
         )
         response.raise_for_status()
 
-    def _submit_github_review(self, repo_full_name: str, number: int, event: str, body: str) -> None:
-        if not self.config.github_token:
-            raise HTTPException(status_code=500, detail="Bridge configuration missing: GITHUB_TOKEN")
+    def _submit_github_review(
+        self, repo_full_name: str, number: int, event: str, body: str, github_token: str
+    ) -> None:
+        if not github_token:
+            raise HTTPException(status_code=500, detail="Bridge configuration missing: GitHub writeback token")
         response = self.github_session.post(
             f"https://api.github.com/repos/{repo_full_name}/pulls/{number}/reviews",
             json={"event": event, "body": body},
             headers={
                 "Accept": "application/vnd.github+json",
-                "Authorization": f"Bearer {self.config.github_token}",
+                "Authorization": f"Bearer {github_token}",
                 "X-GitHub-Api-Version": "2022-11-28",
             },
             timeout=20,
         )
         response.raise_for_status()
 
+    def _assert_writeback_identity_allowed(self, execution: dict[str, Any]) -> None:
+        target_alias = self._target_alias_for_execution(execution)
+        if self._lookup_alias_value(self.config.github_tokens_by_alias, target_alias):
+            return
+        if not self.config.github_writeback_aliases:
+            return
+        normalized_target = _normalize_alias_key(target_alias)
+        normalized_allowed = {
+            _normalize_alias_key(alias) for alias in self.config.github_writeback_aliases if alias and alias.strip()
+        }
+        if normalized_target in normalized_allowed:
+            return
+        identity_label = self.config.github_writeback_login or "configured GitHub token"
+        allowed_aliases = ", ".join(sorted(self.config.github_writeback_aliases))
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"GitHub writeback identity {identity_label} is not allowed for target alias {target_alias!r}. "
+                f"Allowed aliases: {allowed_aliases}"
+            ),
+        )
+
     def _write_back_to_github(self, execution: dict[str, Any], update: BridgeStatusUpdate) -> str:
+        self._assert_writeback_identity_allowed(execution)
+        github_token, _identity_label = self._resolve_github_writeback_identity(execution)
+        if not github_token:
+            raise HTTPException(status_code=500, detail="Bridge configuration missing: GitHub writeback token")
         repo_full_name = str(execution.get("repo_full_name") or "")
         number = int(execution.get("issue_number") or 0)
         entity_type = str(execution.get("entity_type") or "").strip().lower()
@@ -1222,9 +1406,9 @@ class GitHubToMEPBridgeService:
             "changes_requested": "REQUEST_CHANGES",
         }
         if entity_type == "pr" and action in review_events:
-            self._submit_github_review(repo_full_name, number, review_events[action], body)
+            self._submit_github_review(repo_full_name, number, review_events[action], body, github_token)
             return action
-        self._post_github_comment(repo_full_name, number, body)
+        self._post_github_comment(repo_full_name, number, body, github_token)
         return "commented"
 
     async def handle_status_callback(self, update: BridgeStatusUpdate, token: str) -> dict[str, Any]:
