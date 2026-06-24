@@ -7,6 +7,7 @@ import tempfile
 import time
 import asyncio
 import unittest
+from typing import Any
 
 from fastapi.testclient import TestClient
 
@@ -59,7 +60,7 @@ class _FakeNotifier:
 
 
 class _FakeResponse:
-    def __init__(self, payload, *, status_code: int = 200):
+    def __init__(self, payload: Any, *, status_code: int = 200):
         self._payload = payload
         self.status_code = status_code
 
