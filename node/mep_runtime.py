@@ -825,7 +825,6 @@ class RuntimeNode:
             return False
         try:
             await self._ws.send(json.dumps(payload))
-            await self._ws.send(json.dumps(payload))
             return True
         except Exception as exc:  # noqa: BLE001
             print(f"[mep run] ws send failed event={payload.get('event')} detail={exc}")
