@@ -93,6 +93,8 @@ def _build_config(tmp_dir: str) -> BridgeConfig:
         sqlite_path=os.path.join(tmp_dir, "bridge.sqlite3"),
         webhook_secret="github-secret",
         github_token="github-token",
+        github_writeback_aliases=set(),
+        github_writeback_login="bridge-writer",
         target_node_id="node_target",
         target_alias="Hub Sentinel",
         trigger_aliases=["Hub-Sentinel"],
@@ -275,6 +277,7 @@ class TestGitHubToMEPBridge(unittest.TestCase):
         self.assertEqual(github_inputs["source_action"], "edited")
 
     def test_status_callback_requires_valid_token_and_updates_existing_message(self):
+        self.config.github_writeback_aliases = {"Hub Sentinel"}
         response = self._post_webhook(
             _issue_comment_payload("@Hub-Sentinel approve this PR"),
             delivery_id="delivery-status",
@@ -311,6 +314,37 @@ class TestGitHubToMEPBridge(unittest.TestCase):
         self.assertEqual(self.github_session.posts[0]["json"]["event"], "APPROVE")
         self.assertIn("<!-- mep-bridge:output", self.github_session.posts[0]["json"]["body"])
 
+    def test_status_callback_blocks_writeback_when_alias_is_not_allowlisted(self):
+        self.config.github_writeback_login = "wuyanbingep-a11y"
+        self.config.github_writeback_aliases = {"Elsaws Bot"}
+        response = self._post_webhook(
+            _issue_comment_payload("@Hub-Sentinel review this PR", delivery_number=229),
+            delivery_id="delivery-writeback-mismatch",
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        bridge_id = response.json()["bridge_id"]
+        self._flush_context(response.json()["context_id"])
+
+        token = self.service._generate_status_token(bridge_id, "node_target")
+        status_response = self.client.post(
+            "/bridge/status",
+            json={
+                "bridge_id": bridge_id,
+                "status": "completed",
+                "target_node_id": "node_target",
+                "task_id": "task-mismatch",
+                "action": "reviewed",
+            },
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        self.assertEqual(status_response.status_code, 409, status_response.text)
+        self.assertEqual(
+            status_response.json()["detail"],
+            "GitHub writeback identity wuyanbingep-a11y is not allowed for target alias 'Hub-Sentinel'. "
+            "Allowed aliases: Elsaws Bot",
+        )
+        self.assertEqual(len(self.github_session.posts), 0)
+
     def test_status_callback_posts_issue_comment_for_analysis_completion(self):
         response = self._post_webhook(
             _issue_comment_payload("@Hub-Sentinel analyze this PR", delivery_number=227),
@@ -339,6 +373,7 @@ class TestGitHubToMEPBridge(unittest.TestCase):
 
     def test_status_callback_uses_actual_target_metadata_for_non_default_alias(self):
         self._configure_multi_target_aliases()
+        self.config.github_writeback_aliases = {"Elsaws Bot"}
         response = self._post_webhook(
             _issue_comment_payload("@Elsaws Bot analyze this PR", delivery_number=228),
             delivery_id="delivery-elsaws-status",

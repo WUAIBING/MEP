@@ -45,6 +45,12 @@ def _split_csv(raw: str) -> list[str]:
     return [item.strip() for item in raw.split(",") if item and item.strip()]
 
 
+def _normalize_alias_key(value: Optional[str]) -> str:
+    if not value:
+        return ""
+    return re.sub(r"[\s_-]+", " ", value).strip().lower()
+
+
 def _base64url_encode(data: bytes) -> str:
     return base64.urlsafe_b64encode(data).decode("ascii").rstrip("=")
 
@@ -61,6 +67,8 @@ class BridgeConfig:
     sqlite_path: str
     webhook_secret: str
     github_token: Optional[str]
+    github_writeback_aliases: set[str]
+    github_writeback_login: Optional[str]
     target_node_id: str
     target_alias: str
     trigger_aliases: list[str]
@@ -117,6 +125,7 @@ class BridgeConfig:
         trusted_bot_logins = set(
             item.lower() for item in _split_csv(os.getenv("MEP_BRIDGE_TRUSTED_BOT_LOGINS", ""))
         )
+        github_writeback_aliases = set(_split_csv(os.getenv("MEP_BRIDGE_GITHUB_WRITEBACK_ALIASES", "")))
         return cls(
             hub_url=os.getenv("MEP_HUB_URL", "").rstrip("/"),
             key_path=os.getenv(
@@ -129,6 +138,8 @@ class BridgeConfig:
             ),
             webhook_secret=os.getenv("GITHUB_WEBHOOK_SECRET", ""),
             github_token=(os.getenv("GITHUB_TOKEN") or os.getenv("GITHUB_API_TOKEN") or "").strip() or None,
+            github_writeback_aliases=github_writeback_aliases,
+            github_writeback_login=(os.getenv("MEP_BRIDGE_GITHUB_WRITEBACK_LOGIN") or "").strip() or None,
             target_node_id=target_node_id,
             target_alias=target_alias,
             trigger_aliases=trigger_aliases,
@@ -1205,7 +1216,28 @@ class GitHubToMEPBridgeService:
         )
         response.raise_for_status()
 
+    def _assert_writeback_identity_allowed(self, execution: dict[str, Any]) -> None:
+        if not self.config.github_writeback_aliases:
+            return
+        target_alias = str(execution.get("target_alias") or self.config.target_alias or "").strip()
+        normalized_target = _normalize_alias_key(target_alias)
+        normalized_allowed = {
+            _normalize_alias_key(alias) for alias in self.config.github_writeback_aliases if alias and alias.strip()
+        }
+        if normalized_target in normalized_allowed:
+            return
+        identity_label = self.config.github_writeback_login or "configured GitHub token"
+        allowed_aliases = ", ".join(sorted(self.config.github_writeback_aliases))
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"GitHub writeback identity {identity_label} is not allowed for target alias {target_alias!r}. "
+                f"Allowed aliases: {allowed_aliases}"
+            ),
+        )
+
     def _write_back_to_github(self, execution: dict[str, Any], update: BridgeStatusUpdate) -> str:
+        self._assert_writeback_identity_allowed(execution)
         repo_full_name = str(execution.get("repo_full_name") or "")
         number = int(execution.get("issue_number") or 0)
         entity_type = str(execution.get("entity_type") or "").strip().lower()
