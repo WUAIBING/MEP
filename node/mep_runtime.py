@@ -661,6 +661,17 @@ class RuntimeNode:
         self._ws: Any = None
         self._background_tasks: set[asyncio.Task[Any]] = set()
         self._pending_call_bridges: dict[str, asyncio.Future[dict[str, Any]]] = {}
+        self.pending_task_recovery_metrics: dict[str, Any] = {
+            "poll_attempts": 0,
+            "poll_successes": 0,
+            "poll_failures": 0,
+            "malformed_responses": 0,
+            "tasks_recovered": 0,
+            "last_poll_status": None,
+            "last_poll_failure_at": None,
+            "last_poll_failure_detail": None,
+            "last_recovered_at": None,
+        }
 
     def _auth_headers(self, payload: str) -> dict[str, str]:
         headers = self.identity.get_auth_headers(payload)
@@ -830,7 +841,20 @@ class RuntimeNode:
             print(f"[mep run] ws send failed event={payload.get('event')} detail={exc}")
             return False
 
+    def _record_pending_task_poll_failure(self, *, status: Optional[int], detail: str) -> None:
+        metrics = self.pending_task_recovery_metrics
+        metrics["poll_failures"] += 1
+        metrics["last_poll_status"] = status
+        metrics["last_poll_failure_at"] = time.time()
+        metrics["last_poll_failure_detail"] = detail[:240]
+        print(
+            "[mep run] pending task poll failed "
+            f"node={self.node_id} status={status} failures={metrics['poll_failures']} detail={metrics['last_poll_failure_detail']}"
+        )
+
     def _fetch_pending_tasks(self) -> list[dict[str, Any]]:
+        metrics = self.pending_task_recovery_metrics
+        metrics["poll_attempts"] += 1
         code, body, raw = _safe_request(
             "GET",
             f"{self.hub_url}/tasks/pending/{self.node_id}",
@@ -838,18 +862,35 @@ class RuntimeNode:
             timeout=20.0,
         )
         if code != 200:
-            print(f"[mep run] pending task poll failed status={code} detail={raw}")
+            self._record_pending_task_poll_failure(
+                status=code,
+                detail=raw or "pending task poll returned non-200 status",
+            )
             return []
         tasks = body.get("tasks") if isinstance(body, dict) else None
         if not isinstance(tasks, list):
+            metrics["malformed_responses"] += 1
+            self._record_pending_task_poll_failure(
+                status=code,
+                detail="pending task poll returned invalid tasks payload",
+            )
             return []
+        metrics["poll_successes"] += 1
+        metrics["last_poll_status"] = code
         return [task for task in tasks if isinstance(task, dict)]
 
     async def _recover_pending_tasks(self) -> None:
         tasks = self._fetch_pending_tasks()
         if not tasks:
             return
-        print(f"[mep run] recovered pending tasks count={len(tasks)} node={self.node_id}")
+        metrics = self.pending_task_recovery_metrics
+        metrics["tasks_recovered"] += len(tasks)
+        metrics["last_recovered_at"] = time.time()
+        print(
+            "[mep run] recovered pending tasks "
+            f"count={len(tasks)} total_recovered={metrics['tasks_recovered']} "
+            f"successful_polls={metrics['poll_successes']} node={self.node_id}"
+        )
         for task in tasks:
             await self.handle_ws_event({"event": "new_task", "data": task})
 
