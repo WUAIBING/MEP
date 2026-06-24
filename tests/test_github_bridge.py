@@ -93,6 +93,10 @@ def _build_config(tmp_dir: str) -> BridgeConfig:
         sqlite_path=os.path.join(tmp_dir, "bridge.sqlite3"),
         webhook_secret="github-secret",
         github_token="github-token",
+        github_writeback_aliases=set(),
+        github_writeback_login="bridge-writer",
+        github_tokens_by_alias={},
+        github_logins_by_alias={},
         target_node_id="node_target",
         target_alias="Hub Sentinel",
         trigger_aliases=["Hub-Sentinel"],
@@ -366,6 +370,78 @@ class TestGitHubToMEPBridge(unittest.TestCase):
         self.assertEqual(len(self.github_session.posts), 1)
         self.assertTrue(self.github_session.posts[0]["url"].endswith("/repos/WUAIBING/MEP/issues/228/comments"))
         self.assertIn("Elsaws Bot completed the requested action.", self.github_session.posts[0]["json"]["body"])
+
+    def test_status_callback_blocks_writeback_when_alias_is_not_allowlisted(self):
+        self._configure_multi_target_aliases()
+        self.config.github_writeback_aliases = {"Hub Sentinel"}
+        self.config.github_writeback_login = "wuyanbingep-a11y"
+        response = self._post_webhook(
+            _issue_comment_payload("@Elsaws Bot analyze this PR", delivery_number=229),
+            delivery_id="delivery-blocked-elsaws",
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+
+        self._flush_context(response.json()["context_id"])
+
+        self.assertEqual(len(self.submission.calls), 1)
+        envelope = self.submission.calls[0]["envelope"]
+        bridge_id = envelope["task"]["inputs"]["bridge_metadata"]["bridge_id"]
+        token = self.service._generate_status_token(bridge_id, "node_elsaws")
+        status_response = self.client.post(
+            "/bridge/status",
+            json={
+                "bridge_id": bridge_id,
+                "status": "completed",
+                "target_node_id": "node_elsaws",
+                "task_id": "task-blocked",
+            },
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        self.assertEqual(status_response.status_code, 409, status_response.text)
+        self.assertEqual(
+            status_response.json()["detail"],
+            "GitHub writeback identity wuyanbingep-a11y is not allowed for target alias 'Elsaws Bot'. "
+            "Allowed aliases: Hub Sentinel",
+        )
+        self.assertEqual(len(self.github_session.posts), 0)
+
+    def test_status_callback_uses_alias_specific_github_token_for_non_default_alias(self):
+        self._configure_multi_target_aliases()
+        self.config.github_writeback_aliases = {"Hub Sentinel"}
+        self.config.github_writeback_login = "bridge-writer"
+        self.config.github_tokens_by_alias = {"Elsaws Bot": "elsaws-token"}
+        self.config.github_logins_by_alias = {"Elsaws Bot": "wuyanbingep-a11y"}
+        response = self._post_webhook(
+            _issue_comment_payload("@Elsaws Bot analyze this PR", delivery_number=230),
+            delivery_id="delivery-elsaws-token",
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+
+        self._flush_context(response.json()["context_id"])
+
+        self.assertEqual(len(self.submission.calls), 1)
+        envelope = self.submission.calls[0]["envelope"]
+        bridge_id = envelope["task"]["inputs"]["bridge_metadata"]["bridge_id"]
+        token = self.service._generate_status_token(bridge_id, "node_elsaws")
+        status_response = self.client.post(
+            "/bridge/status",
+            json={
+                "bridge_id": bridge_id,
+                "status": "completed",
+                "target_node_id": "node_elsaws",
+                "task_id": "task-elsaws-token",
+                "detail": "Elsaws analysis complete.",
+            },
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        self.assertEqual(status_response.status_code, 200, status_response.text)
+        self.assertEqual(len(self.github_session.posts), 1)
+        self.assertEqual(
+            self.github_session.posts[0]["headers"]["Authorization"],
+            "Bearer elsaws-token",
+        )
+        self.assertTrue(self.github_session.posts[0]["url"].endswith("/repos/WUAIBING/MEP/issues/230/comments"))
+        self.assertEqual(self.github_session.posts[0]["json"]["body"].splitlines()[0], "Elsaws analysis complete.")
 
     def test_non_maintainer_trigger_is_ignored_when_policy_enabled(self):
         payload = _issue_comment_payload("@Hub-Sentinel review this PR")
