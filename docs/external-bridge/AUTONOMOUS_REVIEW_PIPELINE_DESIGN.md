@@ -62,6 +62,8 @@ The current GitHub -> MEP autonomous review loop can:
 - send a review task to a target node
 - write review output back to GitHub
 
+This design builds on the existing GitHub webhook ingress already deployed on the hub, including the current `POST /webhook/github` pathway and bridge-triggered review flow. It is meant to harden and extend that path, not replace it with a separate ingress system.
+
 This proves the transport loop works, but transport correctness is not the same as product usefulness.
 
 The current gap is:
@@ -191,6 +193,24 @@ The bridge should send a structured review package, not just a trigger sentence 
 
 If the bridge cannot collect enough evidence to support a meaningful review, it should reduce scope or defer writeback rather than pretending to have performed a strong review.
 
+### Revision Identity And Dedup
+
+The review package should also carry revision identity and delivery metadata so the bridge can reason about duplicate or stale work:
+
+- PR head SHA
+- delivery ID or equivalent webhook event identity
+- event type
+- force-push indicator when available
+- review-attempt sequence number for the current head SHA
+
+The bridge should maintain a coalescence window keyed at least by repository, PR number, and head SHA.
+
+This is necessary so the system can:
+
+- collapse duplicate webhook deliveries
+- avoid publishing reviews for superseded commits after a rapid force-push
+- retry safely without confusing retry attempts with a new PR revision
+
 ---
 
 ## Review Task Types
@@ -233,6 +253,14 @@ MEP is valuable here because it can support specialist reviewer nodes rather tha
 
 - **Writer**
   - turns approved findings into concise GitHub review output
+
+In Phase 1, orchestration stays in the bridge rather than in a dedicated orchestrator node.
+
+Reason:
+
+- the bridge already owns GitHub ingress, writeback, and retry policy
+- keeping orchestration in the bridge reduces early distributed-system complexity
+- the protocol should still allow later delegation to a dedicated MEP orchestrator node if Phase 3 proves that useful
 
 ### Future Specialist Roles
 
@@ -313,6 +341,16 @@ If the review is too weak:
 2. if still weak, downgrade to an internal-only result
 3. optionally publish a limited summary without strong verdict language
 
+When possible, the retry should not be identical to the failed first pass.
+
+Preferred retry strategy:
+
+- enrich context
+- change reviewer instance or model
+- tighten the reviewer instruction to demand concrete evidence linkage
+
+A retry that uses the same model, same prompt shape, and same evidence often reproduces the same generic output with more words.
+
 ### Approval Gate
 
 Approval should require all of:
@@ -324,6 +362,14 @@ Approval should require all of:
 - no unresolved verifier objections
 
 Autonomous approval should be harder than autonomous comment review.
+
+If reviewer and verifier disagree, the system should not approve by default.
+
+Disagreement policy:
+
+- supported verifier objection blocks approval
+- disagreement can still allow a non-approving comment if the output is useful and clearly framed
+- repeated disagreement should be surfaced for human review or offline evaluation
 
 ---
 
@@ -338,6 +384,10 @@ Every published review should include most of the following:
 - tests reviewed
 
 This is the minimum viable usefulness contract.
+
+If tests did not change, the review should still explicitly state whether existing tests appear to cover the changed code paths, or note that test coverage confidence is limited.
+
+The absence of test changes is itself a review signal, not just missing metadata.
 
 ---
 
@@ -403,12 +453,16 @@ These metrics should exist before claiming production readiness.
 - structured JSON response contract
 - generic-output gate
 - touched file / test mention requirement
+- bridge-owned orchestration only
+- metrics for publish suppression, retry, and concrete observation rate
 
 ### Phase 2 - Verification Layer
 
 - internal verifier pass
 - confidence scoring
 - stronger approval gate
+- reviewer/verifier disagreement handling
+- retry diversity policy
 
 ### Phase 3 - Multi-Node Orchestration
 
@@ -423,6 +477,75 @@ These metrics should exist before claiming production readiness.
 - repo-level risk policy
 - tenant settings
 - evaluation dashboards
+
+---
+
+## Phase 1 Implementation Plan
+
+This section is the initial tracked implementation plan for the first coding slice after this design PR.
+
+### Goal
+
+Upgrade the existing GitHub -> MEP path so single-node reviews become materially more concrete before any multi-node orchestration work begins.
+
+### Scope
+
+- bridge-side review package enrichment
+- runtime-side structured review contract
+- writeback gating for weak output
+- comment-only default policy
+- usefulness metrics
+
+### Deliverables
+
+1. **Bridge review package enrichment**
+   - include revision identity and dedup metadata
+   - include touched paths and touched tests
+   - include bounded surrounding code context where available
+   - include lightweight risk tags derived from file paths or change shape
+
+2. **Runtime structured review contract**
+   - require machine-readable review output
+   - require `summary`, `observations`, `findings`, `tests_reviewed`, and `touched_paths`
+   - require explicit evidence references for findings
+
+3. **Weak-output suppression**
+   - do not publish generic reviews
+   - require at least one concrete path, test, or diff-tied observation
+   - downgrade weak output to retry or internal-only handling
+
+4. **Approval policy split**
+   - keep default public behavior at comment-only
+   - allow approval only behind stricter gates and explicit policy
+
+5. **Metrics**
+   - log concrete observation rate
+   - log publish suppression rate
+   - log retry rate
+   - log approval attempts versus approvals granted
+
+### Suggested PR Breakdown
+
+1. `Phase 1A`
+   - bridge payload enrichment
+   - bridge tests for richer review package assembly
+
+2. `Phase 1B`
+   - runtime structured review schema
+   - runtime tests for parsing, validation, and fallback behavior
+
+3. `Phase 1C`
+   - writeback gating and metrics
+   - integration tests for suppression versus publication behavior
+
+### Exit Criteria
+
+Phase 1 is successful when:
+
+- a normal autonomous review usually mentions real touched paths or tests
+- generic "looks good" output is suppressed rather than posted
+- approvals are still gated more strictly than comments
+- the system can report quality metrics for real PR trials
 
 ---
 
