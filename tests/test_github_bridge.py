@@ -406,6 +406,58 @@ class TestGitHubToMEPBridge(unittest.TestCase):
         self.assertIn("Touched tests:", instructions)
         self.assertIn("Risk tags: persistence", instructions)
 
+    def test_pr_review_package_detects_singular_test_path_and_security_tag(self):
+        self.github_session.get_responses = [
+            _FakeResponse(
+                {
+                    "body": "Adds validation coverage for webhook security handling.",
+                    "changed_files": 2,
+                    "additions": 16,
+                    "deletions": 2,
+                    "commits": 1,
+                    "head": {"sha": "bead1234"},
+                    "base": {"sha": "face5678"},
+                }
+            ),
+            _FakeResponse(
+                [
+                    {
+                        "filename": "bridge/security_validate.py",
+                        "status": "modified",
+                        "additions": 10,
+                        "deletions": 2,
+                        "changes": 12,
+                        "patch": "@@ -1,3 +1,6 @@\n+def validate_signature():\n+    return True",
+                    },
+                    {
+                        "filename": "src/test/webhook_security_test.py",
+                        "status": "added",
+                        "additions": 6,
+                        "deletions": 0,
+                        "changes": 6,
+                        "patch": "@@ -0,0 +1,6 @@\n+def test_webhook_signature():\n+    assert True",
+                    },
+                ]
+            ),
+        ]
+
+        response = self._post_webhook(
+            _issue_comment_payload("@Hub-Sentinel review this PR", delivery_number=231),
+            delivery_id="delivery-security-test",
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+
+        self._flush_context(response.json()["context_id"])
+
+        self.assertEqual(len(self.submission.calls), 1)
+        github_inputs = self.submission.calls[0]["envelope"]["task"]["inputs"]["github"]
+        instructions = self.submission.calls[0]["envelope"]["task"]["instructions"]
+
+        self.assertEqual(github_inputs["touched_tests"], ["src/test/webhook_security_test.py"])
+        self.assertIn("security", github_inputs["risk_tags"])
+        self.assertIn("Touched tests:\n- src/test/webhook_security_test.py", instructions)
+        self.assertIn("Risk tags: security", instructions)
+
     def test_status_callback_requires_valid_token_and_updates_existing_message(self):
         response = self._post_webhook(
             _issue_comment_payload("@Hub-Sentinel approve this PR"),

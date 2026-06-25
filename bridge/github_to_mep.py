@@ -758,6 +758,11 @@ class GitHubToMEPBridgeService:
         existing.intent_type = incoming.intent_type or existing.intent_type
         existing.instructions = incoming.instructions or existing.instructions
         existing.raw_trigger_text = incoming.raw_trigger_text or existing.raw_trigger_text
+        if incoming.github_inputs:
+            existing.github_inputs = {
+                **existing.github_inputs,
+                **incoming.github_inputs,
+            }
         if incoming.delivery_id not in existing.coalesced_delivery_ids:
             existing.coalesced_delivery_ids.append(incoming.delivery_id)
         if incoming.source_action and incoming.source_action not in existing.coalesced_actions:
@@ -1097,7 +1102,9 @@ class GitHubToMEPBridgeService:
         basename = lowered.rsplit("/", 1)[-1]
         return (
             lowered.startswith("tests/")
+            or lowered.startswith("test/")
             or "/tests/" in lowered
+            or "/test/" in lowered
             or basename.startswith("test_")
             or basename.endswith("_test.py")
             or ".test." in basename
@@ -1111,6 +1118,7 @@ class GitHubToMEPBridgeService:
             return []
         tag_rules = [
             ("auth", ("auth", "login", "token", "identity", "permission", "oauth", "credential", "secret")),
+            ("security", ("security", "sanitize", "escape", "validate", "xss", "csrf", "injection")),
             ("persistence", ("db", "sqlite", "postgres", "storage", "persist", "migration", "cache")),
             ("concurrency", ("async", "ws", "websocket", "thread", "queue", "lock", "runtime")),
             ("api_contract", ("api", "schema", "protocol", "webhook", "client", "server", "route", "endpoint")),
@@ -1335,7 +1343,7 @@ class GitHubToMEPBridgeService:
                         "coalesced_delivery_ids": list(event.coalesced_delivery_ids),
                     },
                     "github": {
-                        **event.github_inputs,
+                        **(event.github_inputs or {}),
                         "coalesced_delivery_ids": list(event.coalesced_delivery_ids),
                         "coalesced_actions": list(event.coalesced_actions),
                         "event_sequence": event.event_sequence,
