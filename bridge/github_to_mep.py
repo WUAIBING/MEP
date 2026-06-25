@@ -212,6 +212,7 @@ class NormalizedGitHubEvent:
     intent_type: str
     instructions: str
     raw_trigger_text: str
+    github_inputs: dict[str, Any] = field(default_factory=dict)
     event_sequence: int = 0
     bridge_id: str = ""
     coalesced_delivery_ids: list[str] = field(default_factory=list)
@@ -936,6 +937,25 @@ class GitHubToMEPBridgeService:
         # Use first trigger as primary; all triggers stored on event via _pending_targets
         first_verb = triggers[0].verb
         first_intent = triggers[0].intent_type
+        github_inputs = {
+            "repo_full_name": repo_full_name,
+            "entity_type": entity_type,
+            "number": number,
+            "url": url,
+            "actor_login": actor_login,
+            "author_association": author_association.upper(),
+            "delivery_id": delivery_id,
+            "source_event": github_event,
+            "source_action": action,
+            "trigger_verb": first_verb,
+        }
+        review_context = ""
+        if entity_type == "pr":
+            review_package = self._fetch_pr_review_package(repo_full_name, number)
+            review_context = str(review_package.get("instructions_context") or "")
+            for key, value in review_package.items():
+                if key != "instructions_context":
+                    github_inputs[key] = value
 
         owner, repo_name = repo_full_name.split("/", 1)
         context_id = f"github-{owner}-{repo_name}-{entity_type}-{number}"
@@ -949,6 +969,7 @@ class GitHubToMEPBridgeService:
             action=action,
             imperative_verb=first_verb,
             trigger_text=trigger_text,
+            review_context=review_context,
         )
         return NormalizedGitHubEvent(
             delivery_id=delivery_id,
@@ -966,6 +987,7 @@ class GitHubToMEPBridgeService:
             intent_type=first_intent,
             instructions=instructions,
             raw_trigger_text=trigger_text.strip(),
+            github_inputs=github_inputs,
             coalesced_delivery_ids=[delivery_id],
             coalesced_actions=[action],
         )
@@ -1064,9 +1086,46 @@ class GitHubToMEPBridgeService:
         return None
 
     def _fetch_pr_review_context(self, repo_full_name: str, number: int) -> str:
+        review_package = self._fetch_pr_review_package(repo_full_name, number)
+        return str(review_package.get("instructions_context") or "")
+
+    @staticmethod
+    def _is_test_path(path: str) -> bool:
+        lowered = path.strip().lower()
+        if not lowered:
+            return False
+        basename = lowered.rsplit("/", 1)[-1]
+        return (
+            lowered.startswith("tests/")
+            or "/tests/" in lowered
+            or basename.startswith("test_")
+            or basename.endswith("_test.py")
+            or ".test." in basename
+            or ".spec." in basename
+        )
+
+    @staticmethod
+    def _derive_risk_tags(paths: list[str]) -> list[str]:
+        joined = "\n".join(path.strip().lower() for path in paths if isinstance(path, str))
+        if not joined:
+            return []
+        tag_rules = [
+            ("auth", ("auth", "login", "token", "identity", "permission", "oauth", "credential", "secret")),
+            ("persistence", ("db", "sqlite", "postgres", "storage", "persist", "migration", "cache")),
+            ("concurrency", ("async", "ws", "websocket", "thread", "queue", "lock", "runtime")),
+            ("api_contract", ("api", "schema", "protocol", "webhook", "client", "server", "route", "endpoint")),
+            ("money_flow", ("payment", "billing", "wallet", "balance", "economics", "bounty", "settlement")),
+        ]
+        tags: list[str] = []
+        for tag, keywords in tag_rules:
+            if any(keyword in joined for keyword in keywords):
+                tags.append(tag)
+        return tags
+
+    def _fetch_pr_review_package(self, repo_full_name: str, number: int) -> dict[str, Any]:
         token = self._github_read_token()
         if not token:
-            return ""
+            return {}
         headers = {
             "Accept": "application/vnd.github+json",
             "Authorization": f"Bearer {token}",
@@ -1079,7 +1138,7 @@ class GitHubToMEPBridgeService:
                 timeout=20,
             )
             if pr_response.status_code != 200:
-                return ""
+                return {}
             pr_data = pr_response.json()
             files_response = self.github_session.get(
                 f"https://api.github.com/repos/{repo_full_name}/pulls/{number}/files?per_page=20",
@@ -1088,22 +1147,33 @@ class GitHubToMEPBridgeService:
             )
             files = files_response.json() if files_response.status_code == 200 else []
         except Exception:
-            return ""
+            return {}
 
         sections: list[str] = []
         pr_body = str(pr_data.get("body") or "").strip()
         if pr_body:
             sections.append("PR description:\n" + self._clip_text(pr_body, 700))
 
-        changed_files = pr_data.get("changed_files")
-        additions = pr_data.get("additions")
-        deletions = pr_data.get("deletions")
-        commits = pr_data.get("commits")
+        changed_files = int(pr_data.get("changed_files") or 0)
+        additions = int(pr_data.get("additions") or 0)
+        deletions = int(pr_data.get("deletions") or 0)
+        commits = int(pr_data.get("commits") or 0)
+        head = pr_data.get("head") if isinstance(pr_data.get("head"), dict) else {}
+        base = pr_data.get("base") if isinstance(pr_data.get("base"), dict) else {}
+        head_sha = str(head.get("sha") or "").strip()
+        base_sha = str(base.get("sha") or "").strip()
+        if head_sha or base_sha:
+            sections.append(
+                "Revision identity: "
+                f"head_sha={head_sha or 'unknown'}, base_sha={base_sha or 'unknown'}"
+            )
         sections.append(
             "PR stats: "
             f"changed_files={changed_files}, additions={additions}, deletions={deletions}, commits={commits}"
         )
 
+        touched_paths: list[str] = []
+        changed_file_entries: list[dict[str, Any]] = []
         if isinstance(files, list) and files:
             file_lines: list[str] = []
             remaining_budget = 2000
@@ -1111,24 +1181,64 @@ class GitHubToMEPBridgeService:
                 if not isinstance(item, dict):
                     continue
                 filename = str(item.get("filename") or "").strip()
+                if not filename:
+                    continue
+                touched_paths.append(filename)
                 status = str(item.get("status") or "modified").strip()
-                additions = item.get("additions")
-                deletions = item.get("deletions")
-                changes = item.get("changes")
-                line = f"- {filename} ({status}, +{additions}/-{deletions}, changes={changes})"
+                file_additions = int(item.get("additions") or 0)
+                file_deletions = int(item.get("deletions") or 0)
+                changes = int(item.get("changes") or 0)
+                line = f"- {filename} ({status}, +{file_additions}/-{file_deletions}, changes={changes})"
                 patch = str(item.get("patch") or "").strip()
+                patch_excerpt = ""
                 if patch:
                     clipped_patch = self._clip_text(patch, 320)
+                    patch_excerpt = self._clip_text(patch, 240)
                     line += "\n  Patch excerpt:\n  " + clipped_patch.replace("\n", "\n  ")
                 if len(line) > remaining_budget:
                     line = self._clip_text(line, max(120, remaining_budget))
                 file_lines.append(line)
+                changed_file_entries.append(
+                    {
+                        "filename": filename,
+                        "status": status,
+                        "additions": file_additions,
+                        "deletions": file_deletions,
+                        "changes": changes,
+                        "patch_excerpt": patch_excerpt,
+                    }
+                )
                 remaining_budget -= len(line) + 2
                 if remaining_budget <= 120:
                     break
+            touched_tests = [path for path in touched_paths if self._is_test_path(path)]
+            risk_tags = self._derive_risk_tags(touched_paths)
+            if touched_paths:
+                sections.append("Touched paths:\n" + "\n".join(f"- {path}" for path in touched_paths[:8]))
+            if touched_tests:
+                sections.append("Touched tests:\n" + "\n".join(f"- {path}" for path in touched_tests[:8]))
+            if risk_tags:
+                sections.append("Risk tags: " + ", ".join(risk_tags))
             if file_lines:
                 sections.append("Changed files and patch excerpts:\n" + "\n".join(file_lines))
-        return "\n\n".join(section for section in sections if section.strip())
+        else:
+            touched_tests = []
+            risk_tags = []
+        return {
+            "head_sha": head_sha,
+            "base_sha": base_sha,
+            "pr_stats": {
+                "changed_files": changed_files,
+                "additions": additions,
+                "deletions": deletions,
+                "commits": commits,
+            },
+            "touched_paths": touched_paths,
+            "touched_tests": touched_tests,
+            "risk_tags": risk_tags,
+            "changed_files": changed_file_entries,
+            "instructions_context": "\n\n".join(section for section in sections if section.strip()),
+        }
 
     def _build_instructions(
         self,
@@ -1142,6 +1252,7 @@ class GitHubToMEPBridgeService:
         action: str,
         imperative_verb: str,
         trigger_text: str,
+        review_context: str = "",
     ) -> str:
         clipped_trigger = trigger_text.strip()
         if len(clipped_trigger) > 1200:
@@ -1160,7 +1271,6 @@ class GitHubToMEPBridgeService:
             f"{clipped_trigger}"
         )
         if entity_type == "pr":
-            review_context = self._fetch_pr_review_context(repo_full_name, number)
             if review_context:
                 instructions += (
                     "\n\nReview guidance:\n"
@@ -1225,16 +1335,10 @@ class GitHubToMEPBridgeService:
                         "coalesced_delivery_ids": list(event.coalesced_delivery_ids),
                     },
                     "github": {
-                        "repo_full_name": event.repo_full_name,
-                        "entity_type": event.entity_type,
-                        "number": event.number,
-                        "url": event.url,
-                        "actor_login": event.actor_login,
-                        "author_association": event.author_association,
-                        "source_event": event.source_event,
-                        "source_action": event.source_action,
-                        "trigger_verb": event.imperative_verb,
+                        **event.github_inputs,
+                        "coalesced_delivery_ids": list(event.coalesced_delivery_ids),
                         "coalesced_actions": list(event.coalesced_actions),
+                        "event_sequence": event.event_sequence,
                     },
                 },
             },

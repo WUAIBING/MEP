@@ -299,6 +299,8 @@ class TestGitHubToMEPBridge(unittest.TestCase):
                     "additions": 12,
                     "deletions": 3,
                     "commits": 1,
+                    "head": {"sha": "abc123head"},
+                    "base": {"sha": "def456base"},
                 }
             ),
             _FakeResponse(
@@ -327,9 +329,82 @@ class TestGitHubToMEPBridge(unittest.TestCase):
         instructions = self.submission.calls[0]["envelope"]["task"]["instructions"]
         self.assertIn("Review guidance:", instructions)
         self.assertIn("PR description:", instructions)
+        self.assertIn("Revision identity:", instructions)
         self.assertIn("Changed files and patch excerpts:", instructions)
         self.assertIn("bridge/github_to_mep.py", instructions)
+        github_inputs = self.submission.calls[0]["envelope"]["task"]["inputs"]["github"]
+        self.assertEqual(github_inputs["head_sha"], "abc123head")
+        self.assertEqual(github_inputs["base_sha"], "def456base")
+        self.assertEqual(github_inputs["pr_stats"]["changed_files"], 1)
+        self.assertEqual(github_inputs["touched_paths"], ["bridge/github_to_mep.py"])
         self.assertEqual(len(self.github_session.gets), 2)
+
+    def test_pr_review_package_includes_revision_paths_tests_and_risk_tags(self):
+        self.github_session.get_responses = [
+            _FakeResponse(
+                {
+                    "body": "Tightens persistence handling and expands bridge tests.",
+                    "changed_files": 2,
+                    "additions": 25,
+                    "deletions": 4,
+                    "commits": 2,
+                    "head": {"sha": "1234567890abcdef"},
+                    "base": {"sha": "fedcba0987654321"},
+                }
+            ),
+            _FakeResponse(
+                [
+                    {
+                        "filename": "hub/db.py",
+                        "status": "modified",
+                        "additions": 12,
+                        "deletions": 3,
+                        "changes": 15,
+                        "patch": "@@ -1,3 +1,8 @@\n+def write_state():\n+    return True",
+                    },
+                    {
+                        "filename": "tests/test_github_bridge.py",
+                        "status": "modified",
+                        "additions": 13,
+                        "deletions": 1,
+                        "changes": 14,
+                        "patch": "@@ -1,3 +1,8 @@\n+def test_review_package():\n+    assert True",
+                    },
+                ]
+            ),
+        ]
+
+        response = self._post_webhook(
+            _issue_comment_payload("@Hub-Sentinel review this PR"),
+            delivery_id="delivery-package",
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+
+        self._flush_context(response.json()["context_id"])
+
+        self.assertEqual(len(self.submission.calls), 1)
+        envelope = self.submission.calls[0]["envelope"]
+        github_inputs = envelope["task"]["inputs"]["github"]
+        instructions = envelope["task"]["instructions"]
+
+        self.assertEqual(github_inputs["delivery_id"], "delivery-package")
+        self.assertEqual(github_inputs["head_sha"], "1234567890abcdef")
+        self.assertEqual(github_inputs["base_sha"], "fedcba0987654321")
+        self.assertEqual(
+            github_inputs["touched_paths"],
+            ["hub/db.py", "tests/test_github_bridge.py"],
+        )
+        self.assertEqual(github_inputs["touched_tests"], ["tests/test_github_bridge.py"])
+        self.assertIn("persistence", github_inputs["risk_tags"])
+        self.assertEqual(github_inputs["coalesced_delivery_ids"], ["delivery-package"])
+        self.assertEqual(github_inputs["event_sequence"], 1)
+        self.assertEqual(github_inputs["changed_files"][0]["filename"], "hub/db.py")
+        self.assertEqual(
+            github_inputs["changed_files"][1]["patch_excerpt"],
+            "@@ -1,3 +1,8 @@\n+def test_review_package():\n+    assert True",
+        )
+        self.assertIn("Touched tests:", instructions)
+        self.assertIn("Risk tags: persistence", instructions)
 
     def test_status_callback_requires_valid_token_and_updates_existing_message(self):
         response = self._post_webhook(
