@@ -32,6 +32,20 @@ DEFAULT_TRIGGER_VERBS = {
 }
 DEFAULT_ALLOWED_ASSOCIATIONS = {"OWNER", "MEMBER", "COLLABORATOR"}
 BRIDGE_OUTPUT_MARKER = "<!-- mep-bridge:output"
+_WEAK_GITHUB_REVIEW_PATTERNS = [
+    r"\blooks good\b",
+    r"\blooks correct\b",
+    r"\bwell-scoped\b",
+    r"\bwell scoped\b",
+    r"\bwell-contained\b",
+    r"\bwell contained\b",
+    r"\bminimal and well-scoped\b",
+    r"\bchanges look correct\b",
+    r"\btests pass\b",
+    r"\bno regressions\b",
+    r"\bno blocking issues\b",
+    r"\bfocused runtime tests\b",
+]
 
 
 def _env_bool(name: str, default: bool) -> bool:
@@ -604,6 +618,17 @@ class GitHubToMEPBridgeService:
         self.github_session = github_session or requests.Session()
         self._pending_lock = asyncio.Lock()
         self._pending_by_context: dict[str, PendingContext] = {}
+        self.github_writeback_metrics: dict[str, Any] = {
+            "attempts": 0,
+            "reviews_published": 0,
+            "comments_published": 0,
+            "suppressed_weak_reviews": 0,
+            "suppressed_approvals": 0,
+            "last_action": None,
+            "last_detail_preview": None,
+            "last_suppressed_reason": None,
+            "last_suppressed_at": None,
+        }
 
     def _require_runtime_config(self) -> None:
         missing = []
@@ -1411,6 +1436,88 @@ class GitHubToMEPBridgeService:
             return "commented"
         return "commented"
 
+    @staticmethod
+    def _detail_preview(detail: Optional[str], *, max_chars: int = 240) -> Optional[str]:
+        text = re.sub(r"\s+", " ", str(detail or "").strip())
+        if not text:
+            return None
+        return text[:max_chars]
+
+    @staticmethod
+    def _has_concrete_review_signal(detail: str) -> bool:
+        if not detail:
+            return False
+        lowered = detail.lower()
+        strong_snippets = (
+            "## review findings",
+            "## review summary",
+            "observation:",
+            "touched paths reviewed:",
+            "tests reviewed:",
+        )
+        if any(snippet in lowered for snippet in strong_snippets):
+            return True
+        if re.search(r"\d+\.\s+\*\*.+?\*\*", detail):
+            return True
+        if re.search(r"`[^`]+\.(?:py|ts|tsx|js|jsx|go|rs|java|rb|php|json|yml|yaml|md)`", detail, re.IGNORECASE):
+            return True
+        if re.search(
+            r"(?:^|[\s(])[\w./-]+\.(?:py|ts|tsx|js|jsx|go|rs|java|rb|php|json|yml|yaml|md)(?:[:),\s]|$)",
+            detail,
+            re.IGNORECASE,
+        ):
+            return True
+        return False
+
+    def _classify_review_writeback_detail(self, detail: Optional[str]) -> tuple[bool, str]:
+        normalized = re.sub(r"\s+", " ", str(detail or "").strip())
+        if not normalized:
+            return True, "empty_detail"
+        if self._has_concrete_review_signal(detail or ""):
+            return False, "concrete"
+        lowered = normalized.lower()
+        if len(normalized) < 90:
+            return True, "too_short"
+        if any(re.search(pattern, lowered) for pattern in _WEAK_GITHUB_REVIEW_PATTERNS):
+            return True, "generic_summary"
+        return False, "concrete"
+
+    def _record_github_writeback_attempt(self, action: str, detail: Optional[str]) -> None:
+        metrics = self.github_writeback_metrics
+        metrics["attempts"] += 1
+        metrics["last_action"] = action
+        metrics["last_detail_preview"] = self._detail_preview(detail)
+
+    def _record_github_writeback_publish(self, action: str, *, review_action: bool) -> None:
+        metrics = self.github_writeback_metrics
+        if review_action:
+            metrics["reviews_published"] += 1
+        else:
+            metrics["comments_published"] += 1
+        metrics["last_action"] = action
+        metrics["last_suppressed_reason"] = None
+
+    def _record_github_writeback_suppression(
+        self,
+        *,
+        bridge_id: str,
+        action: str,
+        detail: Optional[str],
+        reason: str,
+    ) -> None:
+        metrics = self.github_writeback_metrics
+        metrics["suppressed_weak_reviews"] += 1
+        if action == "approved":
+            metrics["suppressed_approvals"] += 1
+        metrics["last_action"] = "suppressed"
+        metrics["last_suppressed_reason"] = reason
+        metrics["last_suppressed_at"] = time.time()
+        metrics["last_detail_preview"] = self._detail_preview(detail)
+        print(
+            "[bridge] suppressed weak GitHub review writeback "
+            f"bridge_id={bridge_id} action={action} reason={reason} detail={metrics['last_detail_preview'] or '<empty>'}"
+        )
+
     def _render_github_writeback_body(
         self,
         bridge_id: str,
@@ -1506,21 +1613,35 @@ class GitHubToMEPBridgeService:
         number = int(execution.get("issue_number") or 0)
         entity_type = str(execution.get("entity_type") or "").strip().lower()
         action = self._resolve_github_writeback_action(execution, update)
+        review_events = {
+            "approved": "APPROVE",
+            "reviewed": "COMMENT",
+            "changes_requested": "REQUEST_CHANGES",
+        }
+        review_action = entity_type == "pr" and action in review_events
+        self._record_github_writeback_attempt(action, update.detail)
+        if review_action:
+            suppress, reason = self._classify_review_writeback_detail(update.detail)
+            if suppress:
+                self._record_github_writeback_suppression(
+                    bridge_id=str(execution.get("bridge_id") or update.bridge_id),
+                    action=action,
+                    detail=update.detail,
+                    reason=reason,
+                )
+                return "suppressed"
         body = self._render_github_writeback_body(
             str(execution.get("bridge_id") or update.bridge_id),
             action,
             update.detail,
             target_alias=str(execution.get("target_alias") or "").strip() or None,
         )
-        review_events = {
-            "approved": "APPROVE",
-            "reviewed": "COMMENT",
-            "changes_requested": "REQUEST_CHANGES",
-        }
-        if entity_type == "pr" and action in review_events:
+        if review_action:
             self._submit_github_review(repo_full_name, number, review_events[action], body, github_token)
+            self._record_github_writeback_publish(action, review_action=True)
             return action
         self._post_github_comment(repo_full_name, number, body, github_token)
+        self._record_github_writeback_publish("commented", review_action=False)
         return "commented"
 
     async def handle_status_callback(self, update: BridgeStatusUpdate, token: str) -> dict[str, Any]:
