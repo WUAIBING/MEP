@@ -377,6 +377,35 @@ def _task_requires_review_prompt(task_data: dict[str, Any]) -> bool:
     }
 
 
+def _review_github_inputs(task_data: dict[str, Any]) -> dict[str, Any]:
+    interbot_message = _interbot_message_from_task_data(task_data)
+    task: Any = task_data.get("task")
+    if not isinstance(task, dict) and isinstance(interbot_message, dict):
+        task = interbot_message.get("task")
+    inputs = task.get("inputs") if isinstance(task, dict) else None
+    github_inputs = inputs.get("github") if isinstance(inputs, dict) else None
+    return github_inputs if isinstance(github_inputs, dict) else {}
+
+
+def _clean_review_list(values: Any, *, max_items: int, max_chars: int) -> list[str]:
+    if not isinstance(values, list):
+        return []
+    cleaned: list[str] = []
+    seen: set[str] = set()
+    for item in values:
+        entry = _clean_review_label(item, max_chars=max_chars)
+        if not entry:
+            continue
+        key = entry.lower()
+        if key in seen:
+            continue
+        cleaned.append(entry)
+        seen.add(key)
+        if len(cleaned) >= max_items:
+            break
+    return cleaned
+
+
 def _system_prompt_for_task(
     task_data: dict[str, Any],
     *,
@@ -387,11 +416,15 @@ def _system_prompt_for_task(
         return (
             "You are a senior code reviewer for the MEP (Miao Exchange Protocol) project. "
             "Review the provided GitHub PR context and return ONLY a JSON object with this schema: "
-            '{"summary": string, "findings": [{"file": string, "issue": string, "rationale": string}]}. '
+            '{"summary": string, "observation": string, "touched_paths": [string], "tests_reviewed": [string], '
+            '"findings": [{"file": string, "issue": string, "rationale": string}], '
+            '"approval_recommendation": "approve" | "comment" | "request_changes" | "abstain"}. '
             "Use at most 2 findings. "
+            "Use `observation` for one concrete non-blocking review note tied to the actual diff. "
+            "Prefer real touched files and tests from the supplied GitHub inputs for `touched_paths` and `tests_reviewed`. "
             "Only include a finding when it is directly supported by the provided diff, file list, PR description, or patch excerpts. "
             "Do not speculate about unseen code, do not ask for more context, and do not include chain-of-thought or any text outside the JSON object. "
-            "If the change looks good, keep findings empty and use summary to say what you verified and mention any residual risk briefly. Keep the "
+            "If the change looks good, keep findings empty and use summary to say what you verified, keep observation concrete, and set approval_recommendation to approve or comment. Keep the "
             f"response within {review_max_chars} characters."
         )
     return (
@@ -455,6 +488,16 @@ def _clean_review_text(value: Any, *, max_chars: int) -> str:
     return text
 
 
+def _clean_review_label(value: Any, *, max_chars: int) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    text = re.sub(r"\s+", " ", text).strip()
+    if len(text) > max_chars:
+        text = text[:max_chars].rstrip()
+    return text.rstrip(".,;: ")
+
+
 _WEAK_REVIEW_PATTERNS = [
     r"\bmissing context\b",
     r"\bpatch excerpt\b",
@@ -510,12 +553,31 @@ def _finalize_model_reply(text: str, *, max_chars: int) -> str:
 
 
 def _render_structured_review(text: str, *, max_chars: int) -> str:
+    return _render_structured_review_with_task_data(text, max_chars=max_chars, task_data=None)
+
+
+def _render_structured_review_with_task_data(
+    text: str,
+    *,
+    max_chars: int,
+    task_data: Optional[dict[str, Any]],
+) -> str:
     parsed = _extract_first_json_object(text)
     if not isinstance(parsed, dict):
         return ""
+    github_inputs = _review_github_inputs(task_data or {})
     summary = _clean_review_text(parsed.get("summary"), max_chars=220)
     if _is_weak_review_text(summary):
         summary = ""
+    observation = _clean_review_text(parsed.get("observation"), max_chars=220)
+    if _is_weak_review_text(observation):
+        observation = ""
+    touched_paths = _clean_review_list(parsed.get("touched_paths"), max_items=4, max_chars=120)
+    if not touched_paths:
+        touched_paths = _clean_review_list(github_inputs.get("touched_paths"), max_items=4, max_chars=120)
+    tests_reviewed = _clean_review_list(parsed.get("tests_reviewed"), max_items=3, max_chars=120)
+    if not tests_reviewed:
+        tests_reviewed = _clean_review_list(github_inputs.get("touched_tests"), max_items=3, max_chars=120)
     findings_raw = parsed.get("findings")
     findings: list[str] = []
     if isinstance(findings_raw, list):
@@ -529,7 +591,7 @@ def _render_structured_review(text: str, *, max_chars: int) -> str:
             combined = f"{issue} {rationale}".strip()
             if _is_weak_review_text(combined):
                 continue
-            file_name = _clean_review_text(item.get("file"), max_chars=80)
+            file_name = _clean_review_label(item.get("file"), max_chars=80)
             if file_name:
                 findings.append(f"**{issue}** (`{file_name}`): {rationale or 'Check this path.'}")
             else:
@@ -539,16 +601,32 @@ def _render_structured_review(text: str, *, max_chars: int) -> str:
         sections.append("## Review Findings")
         if summary:
             sections.append(summary)
+        if observation:
+            sections.append(f"Observation: {observation}")
+        if touched_paths:
+            sections.append("Touched paths reviewed: " + ", ".join(f"`{path}`" for path in touched_paths))
+        if tests_reviewed:
+            sections.append("Tests reviewed: " + ", ".join(f"`{path}`" for path in tests_reviewed))
         for index, finding in enumerate(findings, start=1):
             sections.append(f"{index}. {finding}")
     elif summary:
         sections.append("## Review Summary")
         sections.append(summary)
+        if observation:
+            sections.append(f"Observation: {observation}")
+        if touched_paths:
+            sections.append("Touched paths reviewed: " + ", ".join(f"`{path}`" for path in touched_paths))
+        if tests_reviewed:
+            sections.append("Tests reviewed: " + ", ".join(f"`{path}`" for path in tests_reviewed))
     else:
         sections.append("## Review Summary")
         sections.append(
             "Reviewed the provided diff context and did not identify a concrete issue that is directly supported by the supplied patch excerpts."
         )
+        if touched_paths:
+            sections.append("Touched paths reviewed: " + ", ".join(f"`{path}`" for path in touched_paths))
+        if tests_reviewed:
+            sections.append("Tests reviewed: " + ", ".join(f"`{path}`" for path in tests_reviewed))
     rendered = "\n\n".join(section for section in sections if section.strip())
     return _finalize_model_reply(rendered, max_chars=max_chars)
 
@@ -577,7 +655,7 @@ class AIAdapter:
             if not reply:
                 return f"[AI adapter] empty response from {self.model}"
             if _task_requires_review_prompt(task_data):
-                rendered = _render_structured_review(reply, max_chars=1000)
+                rendered = _render_structured_review_with_task_data(reply, max_chars=1000, task_data=task_data)
                 if rendered:
                     return rendered
                 finalized = _finalize_model_reply(reply, max_chars=1000)
@@ -630,7 +708,7 @@ class DeepSeekAdapter:
                 if not reply:
                     reply = str(message.get("reasoning_content") or "").strip()
                 if _task_requires_review_prompt(task_data):
-                    rendered = _render_structured_review(reply, max_chars=1000)
+                    rendered = _render_structured_review_with_task_data(reply, max_chars=1000, task_data=task_data)
                     if rendered:
                         return rendered
                     finalized = _finalize_model_reply(reply, max_chars=1000)
