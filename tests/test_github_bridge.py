@@ -477,7 +477,7 @@ class TestGitHubToMEPBridge(unittest.TestCase):
         self.assertIn("Touched tests:\n- src/test/webhook_security_test.py", instructions)
         self.assertIn("Risk tags: security", instructions)
 
-    def test_status_callback_requires_valid_token_and_updates_existing_message(self):
+    def test_status_callback_suppresses_approve_without_code_evidence_and_updates_existing_message(self):
         response = self._post_webhook(
             _issue_comment_payload("@Hub-Sentinel approve this PR"),
             delivery_id="delivery-status",
@@ -514,14 +514,12 @@ class TestGitHubToMEPBridge(unittest.TestCase):
         self.assertEqual(len(self.notifier.calls), 2)
         final_message = self.notifier.calls[-1]
         self.assertTrue(final_message["editing"])
-        self.assertIn("status: completed", final_message["text"])
-        self.assertIn("action: approved", final_message["text"])
-        self.assertEqual(len(self.github_session.posts), 1)
-        self.assertTrue(self.github_session.posts[0]["url"].endswith("/repos/WUAIBING/MEP/pulls/226/reviews"))
-        self.assertEqual(self.github_session.posts[0]["json"]["event"], "APPROVE")
-        self.assertIn("<!-- mep-bridge:output", self.github_session.posts[0]["json"]["body"])
-        self.assertEqual(self.service.github_writeback_metrics["reviews_published"], 1)
-        self.assertEqual(self.service.github_writeback_metrics["suppressed_weak_reviews"], 0)
+        self.assertIn("action: suppressed", final_message["text"])
+        self.assertEqual(len(self.github_session.posts), 0)
+        self.assertEqual(self.service.github_writeback_metrics["reviews_published"], 0)
+        self.assertEqual(self.service.github_writeback_metrics["suppressed_weak_reviews"], 1)
+        self.assertEqual(self.service.github_writeback_metrics["suppressed_approvals"], 1)
+        self.assertEqual(self.service.github_writeback_metrics["last_suppressed_reason"], "generic_observation")
 
     def test_status_callback_suppresses_generic_pr_review_writeback(self):
         response = self._post_webhook(
@@ -578,7 +576,7 @@ class TestGitHubToMEPBridge(unittest.TestCase):
         )
         self.assertEqual(status_response.status_code, 200, status_response.text)
         self.assertEqual(len(self.github_session.posts), 0)
-        self.assertEqual(self.service.github_writeback_metrics["last_suppressed_reason"], "no_touched_path_anchor")
+        self.assertEqual(self.service.github_writeback_metrics["last_suppressed_reason"], "generic_observation")
 
     def test_status_callback_suppresses_finding_conflicting_with_patch_evidence(self):
         self._set_pr_review_package(
@@ -703,6 +701,183 @@ class TestGitHubToMEPBridge(unittest.TestCase):
         self.assertEqual(status_response.status_code, 200, status_response.text)
         self.assertEqual(len(self.github_session.posts), 1)
         self.assertTrue(self.github_session.posts[0]["url"].endswith("/repos/WUAIBING/MEP/pulls/149/reviews"))
+
+    def test_status_callback_suppresses_summary_with_paths_but_no_code_evidence(self):
+        self._set_pr_review_package(
+            [
+                {
+                    "filename": "node/mep_runtime.py",
+                    "status": "modified",
+                    "additions": 40,
+                    "deletions": 2,
+                    "changes": 42,
+                    "patch": (
+                        "@@ -945,0 +945,29 @@\n"
+                        "+def _record_pending_task_poll_failure(self, status: int, detail: str) -> None:\n"
+                        "+    self.pending_task_recovery_metrics['last_poll_status'] = status\n"
+                        "+    self.pending_task_recovery_metrics['last_poll_failure_detail'] = detail\n"
+                    ),
+                },
+                {
+                    "filename": "tests/test_node_runtime.py",
+                    "status": "modified",
+                    "additions": 20,
+                    "deletions": 0,
+                    "changes": 20,
+                    "patch": (
+                        "@@ -494,0 +494,20 @@\n"
+                        "+def test_fetch_pending_tasks_uses_authenticated_get(self):\n"
+                        "+    self.assertEqual(tasks, [{'id': 'task_pending'}])\n"
+                    ),
+                },
+            ],
+            pr_body="Adds pending-task recovery observability and focused runtime tests.",
+        )
+        response = self._post_webhook(
+            _issue_comment_payload("@Hub-Sentinel review this PR", delivery_number=243),
+            delivery_id="delivery-summary-with-paths-only",
+        )
+        self.assertEqual(response.status_code, 200)
+        bridge_id = response.json()["bridge_id"]
+        self._flush_context(response.json()["context_id"])
+
+        token = self.service._generate_status_token(bridge_id, "node_target")
+        status_response = self.client.post(
+            "/bridge/status",
+            json={
+                "bridge_id": bridge_id,
+                "status": "completed",
+                "target_node_id": "node_target",
+                "task_id": "task-summary-with-paths-only",
+                "detail": (
+                    "## Review Summary\n\n"
+                    "The PR adds pending-task recovery observability with metrics and logging in mep_runtime.py, plus corresponding tests in test_node_runtime.py."
+                ),
+            },
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        self.assertEqual(status_response.status_code, 200, status_response.text)
+        self.assertEqual(len(self.github_session.posts), 0)
+        self.assertEqual(self.service.github_writeback_metrics["last_suppressed_reason"], "summary_without_code_evidence")
+
+    def test_status_callback_allows_summary_with_grounded_code_observation(self):
+        self._set_pr_review_package(
+            [
+                {
+                    "filename": "node/mep_runtime.py",
+                    "status": "modified",
+                    "additions": 40,
+                    "deletions": 2,
+                    "changes": 42,
+                    "patch": (
+                        "@@ -945,0 +945,29 @@\n"
+                        "+def _record_pending_task_poll_failure(self, status: int, detail: str) -> None:\n"
+                        "+    self.pending_task_recovery_metrics['last_poll_status'] = status\n"
+                        "+    self.pending_task_recovery_metrics['last_poll_failure_detail'] = detail\n"
+                    ),
+                },
+                {
+                    "filename": "tests/test_node_runtime.py",
+                    "status": "modified",
+                    "additions": 20,
+                    "deletions": 0,
+                    "changes": 20,
+                    "patch": (
+                        "@@ -494,0 +494,20 @@\n"
+                        "+def test_fetch_pending_tasks_uses_authenticated_get(self):\n"
+                        "+    self.assertEqual(tasks, [{'id': 'task_pending'}])\n"
+                    ),
+                },
+            ],
+            pr_body="Adds pending-task recovery observability and focused runtime tests.",
+        )
+        response = self._post_webhook(
+            _issue_comment_payload("@Hub-Sentinel review this PR", delivery_number=243),
+            delivery_id="delivery-summary-with-observation",
+        )
+        self.assertEqual(response.status_code, 200)
+        bridge_id = response.json()["bridge_id"]
+        self._flush_context(response.json()["context_id"])
+
+        token = self.service._generate_status_token(bridge_id, "node_target")
+        status_response = self.client.post(
+            "/bridge/status",
+            json={
+                "bridge_id": bridge_id,
+                "status": "completed",
+                "target_node_id": "node_target",
+                "task_id": "task-summary-with-observation",
+                "detail": (
+                    "## Review Summary\n\n"
+                    "The PR adds pending-task recovery observability in `node/mep_runtime.py` and corresponding tests in `tests/test_node_runtime.py`.\n\n"
+                    "Observation: `_record_pending_task_poll_failure` now records `last_poll_status`, so malformed payloads will still surface `status=200` in the metrics."
+                ),
+            },
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        self.assertEqual(status_response.status_code, 200, status_response.text)
+        self.assertEqual(len(self.github_session.posts), 1)
+
+    def test_status_callback_suppresses_speculative_finding(self):
+        self._set_pr_review_package(
+            [
+                {
+                    "filename": "node/mep_runtime.py",
+                    "status": "modified",
+                    "additions": 37,
+                    "deletions": 4,
+                    "changes": 41,
+                    "patch": (
+                        "@@ -14,12 +14,51 @@\n"
+                        "+REQUIRED_PACKAGES = ['requests', 'cryptography', 'websockets']\n"
+                        "+def _check_dependencies() -> None:\n"
+                        "+    for pkg in REQUIRED_PACKAGES:\n"
+                        "+        __import__(pkg)\n"
+                    ),
+                },
+                {
+                    "filename": "README.md",
+                    "status": "modified",
+                    "additions": 5,
+                    "deletions": 4,
+                    "changes": 9,
+                    "patch": (
+                        "@@ -117,10 +117,11 @@\n"
+                        "+pip install requests websockets cryptography\n"
+                        "+cd node && python mep_runtime.py run --hub-url https://mep-hub.silentcopilot.ai\n"
+                    ),
+                },
+            ],
+            pr_body="Improves onboarding and adds startup dependency validation.",
+        )
+        response = self._post_webhook(
+            _issue_comment_payload("@Hub-Sentinel review this PR", delivery_number=123),
+            delivery_id="delivery-speculative-finding",
+        )
+        self.assertEqual(response.status_code, 200)
+        bridge_id = response.json()["bridge_id"]
+        self._flush_context(response.json()["context_id"])
+
+        token = self.service._generate_status_token(bridge_id, "node_target")
+        status_response = self.client.post(
+            "/bridge/status",
+            json={
+                "bridge_id": bridge_id,
+                "status": "completed",
+                "target_node_id": "node_target",
+                "task_id": "task-speculative-finding",
+                "detail": (
+                    "## Review Findings\n\n"
+                    "Reviewed PR #123 onboarding dependency validation.\n\n"
+                    "1. **The dependency validation only checks `REQUIRED_PACKAGES`, but the rest of the validation flow may be incomplete.** (`node/mep_runtime.py`): "
+                    "If intended for broader startup validation, this suggests incomplete implementation and potentially leaving other dependencies unvalidated."
+                ),
+            },
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        self.assertEqual(status_response.status_code, 200, status_response.text)
+        self.assertEqual(len(self.github_session.posts), 0)
+        self.assertEqual(self.service.github_writeback_metrics["last_suppressed_reason"], "speculative_finding")
 
     def test_status_callback_posts_issue_comment_for_analysis_completion(self):
         response = self._post_webhook(
