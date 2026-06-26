@@ -181,6 +181,25 @@ class TestGitHubToMEPBridge(unittest.TestCase):
     def tearDown(self):
         self.client.close()
 
+    def _set_pr_review_package(self, changed_files: list[dict[str, Any]], *, pr_body: str = "Bridge review package") -> None:
+        additions = sum(int(item.get("additions") or 0) for item in changed_files)
+        deletions = sum(int(item.get("deletions") or 0) for item in changed_files)
+        pr_payload = {
+            "body": pr_body,
+            "changed_files": len(changed_files),
+            "additions": additions,
+            "deletions": deletions,
+            "commits": 1,
+            "head": {"sha": "headsha123"},
+            "base": {"sha": "basesha456"},
+        }
+        self.github_session.get_responses = [
+            _FakeResponse(pr_payload),
+            _FakeResponse(changed_files),
+            _FakeResponse(pr_payload),
+            _FakeResponse(changed_files),
+        ]
+
     def _post_webhook(self, payload: dict, *, delivery_id: str, event_name: str = "issue_comment"):
         body = json.dumps(payload).encode("utf-8")
         headers = {
@@ -531,6 +550,159 @@ class TestGitHubToMEPBridge(unittest.TestCase):
         self.assertEqual(self.service.github_writeback_metrics["attempts"], 1)
         self.assertEqual(self.service.github_writeback_metrics["suppressed_weak_reviews"], 1)
         self.assertEqual(self.service.github_writeback_metrics["last_suppressed_reason"], "generic_summary")
+
+    def test_status_callback_suppresses_structured_review_without_touched_path_anchor(self):
+        response = self._post_webhook(
+            _issue_comment_payload("@Hub-Sentinel review this PR", delivery_number=232),
+            delivery_id="delivery-structured-weak-review",
+        )
+        self.assertEqual(response.status_code, 200)
+        bridge_id = response.json()["bridge_id"]
+        self._flush_context(response.json()["context_id"])
+
+        token = self.service._generate_status_token(bridge_id, "node_target")
+        status_response = self.client.post(
+            "/bridge/status",
+            json={
+                "bridge_id": bridge_id,
+                "status": "completed",
+                "target_node_id": "node_target",
+                "task_id": "task-structured-weak-review",
+                "detail": (
+                    "## Review Summary\n\n"
+                    "Checked the provided diff and verified the change is scoped.\n\n"
+                    "Observation: The change reads like a small follow-up and the implementation style stays consistent."
+                ),
+            },
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        self.assertEqual(status_response.status_code, 200, status_response.text)
+        self.assertEqual(len(self.github_session.posts), 0)
+        self.assertEqual(self.service.github_writeback_metrics["last_suppressed_reason"], "no_touched_path_anchor")
+
+    def test_status_callback_suppresses_finding_conflicting_with_patch_evidence(self):
+        self._set_pr_review_package(
+            [
+                {
+                    "filename": "hub/main.py",
+                    "status": "modified",
+                    "additions": 9,
+                    "deletions": 0,
+                    "changes": 9,
+                    "patch": (
+                        "@@ -2616,0 +2616,9 @@\n"
+                        '+@app.get("/tasks/pending/{node_id}")\n'
+                        "+async def get_pending_tasks(node_id: str, authenticated_node: str = Depends(verify_request)):\n"
+                        "+    if authenticated_node != node_id:\n"
+                        '+        raise HTTPException(status_code=403, detail="Cannot view pending tasks for another node")\n'
+                    ),
+                },
+                {
+                    "filename": "tests/test_hub_api.py",
+                    "status": "modified",
+                    "additions": 18,
+                    "deletions": 0,
+                    "changes": 18,
+                    "patch": (
+                        "@@ -779,0 +779,18 @@\n"
+                        '+pending = client.get(f"/tasks/pending/{target_id}", headers=_auth_headers(target_priv, target_id, ""))\n'
+                        "+self.assertEqual(pending.status_code, 200, pending.text)\n"
+                    ),
+                },
+            ],
+            pr_body="Adds a pending task endpoint with authentication checks and tests.",
+        )
+        response = self._post_webhook(
+            _issue_comment_payload("@Hub-Sentinel review this PR", delivery_number=244),
+            delivery_id="delivery-conflicting-finding",
+        )
+        self.assertEqual(response.status_code, 200)
+        bridge_id = response.json()["bridge_id"]
+        self._flush_context(response.json()["context_id"])
+
+        token = self.service._generate_status_token(bridge_id, "node_target")
+        status_response = self.client.post(
+            "/bridge/status",
+            json={
+                "bridge_id": bridge_id,
+                "status": "completed",
+                "target_node_id": "node_target",
+                "task_id": "task-conflicting-finding",
+                "detail": (
+                    "## Review Findings\n\n"
+                    "The PR adds the pending tasks endpoint and supporting tests.\n\n"
+                    "1. **New endpoint /tasks/pending/{node_id} has no authentication or authorization checks.** (`hub/main.py`): "
+                    "The patch shows the endpoint is added without any dependency injection or middleware for verifying the caller's identity."
+                ),
+            },
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        self.assertEqual(status_response.status_code, 200, status_response.text)
+        self.assertEqual(len(self.github_session.posts), 0)
+        self.assertEqual(self.service.github_writeback_metrics["last_suppressed_reason"], "ungrounded_finding")
+
+    def test_status_callback_allows_finding_grounded_to_touched_path_and_patch(self):
+        self._set_pr_review_package(
+            [
+                {
+                    "filename": "node/mep_runtime.py",
+                    "status": "modified",
+                    "additions": 10,
+                    "deletions": 1,
+                    "changes": 11,
+                    "patch": (
+                        "@@ -226,7 +226,10 @@ async def run_forever(self) -> int:\n"
+                        "+    from importlib.util import find_spec\n"
+                        '+    if find_spec("websockets") is None:\n'
+                        '+        raise ImportError("websockets not available")\n'
+                        "+    from ws_connect import ws_connect\n"
+                    ),
+                },
+                {
+                    "filename": "node/ws_connect.py",
+                    "status": "added",
+                    "additions": 22,
+                    "deletions": 0,
+                    "changes": 22,
+                    "patch": (
+                        "@@ -0,0 +1,22 @@\n"
+                        "+def ws_connect(uri: str, **kwargs):\n"
+                        '+    import websockets\n'
+                        "+    kwargs.setdefault(\"host\", parsed.hostname)\n"
+                    ),
+                },
+            ],
+            pr_body="Adds a shared websocket helper and switches the runtime to use it.",
+        )
+        response = self._post_webhook(
+            _issue_comment_payload("@Hub-Sentinel review this PR", delivery_number=149),
+            delivery_id="delivery-grounded-finding",
+        )
+        self.assertEqual(response.status_code, 200)
+        bridge_id = response.json()["bridge_id"]
+        self._flush_context(response.json()["context_id"])
+
+        token = self.service._generate_status_token(bridge_id, "node_target")
+        status_response = self.client.post(
+            "/bridge/status",
+            json={
+                "bridge_id": bridge_id,
+                "status": "completed",
+                "target_node_id": "node_target",
+                "task_id": "task-grounded-finding",
+                "detail": (
+                    "## Review Findings\n\n"
+                    "The PR correctly narrows WebSocket connection handling to a shared helper.\n\n"
+                    "1. **Import guard using `find_spec` may be redundant.** (`node/mep_runtime.py`): "
+                    "The `find_spec` check duplicates the later `websockets` import in the helper and adds extra branching to `run_forever`.\n\n"
+                    "Touched paths reviewed: `node/mep_runtime.py`, `node/ws_connect.py`"
+                ),
+            },
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        self.assertEqual(status_response.status_code, 200, status_response.text)
+        self.assertEqual(len(self.github_session.posts), 1)
+        self.assertTrue(self.github_session.posts[0]["url"].endswith("/repos/WUAIBING/MEP/pulls/149/reviews"))
 
     def test_status_callback_posts_issue_comment_for_analysis_completion(self):
         response = self._post_webhook(
