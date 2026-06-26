@@ -480,6 +480,13 @@ class TestGitHubToMEPBridge(unittest.TestCase):
                 "target_node_id": "node_target",
                 "task_id": "task-1",
                 "action": "approved",
+                "detail": (
+                    "## Review Summary\n\n"
+                    "Checked the provided diff.\n\n"
+                    "Observation: The changed path is narrow and test-backed.\n\n"
+                    "Touched paths reviewed: `node/mep_runtime.py`\n\n"
+                    "Tests reviewed: `tests/test_node_runtime.py`."
+                ),
             },
             headers={"Authorization": f"Bearer {token}"},
         )
@@ -494,6 +501,36 @@ class TestGitHubToMEPBridge(unittest.TestCase):
         self.assertTrue(self.github_session.posts[0]["url"].endswith("/repos/WUAIBING/MEP/pulls/226/reviews"))
         self.assertEqual(self.github_session.posts[0]["json"]["event"], "APPROVE")
         self.assertIn("<!-- mep-bridge:output", self.github_session.posts[0]["json"]["body"])
+        self.assertEqual(self.service.github_writeback_metrics["reviews_published"], 1)
+        self.assertEqual(self.service.github_writeback_metrics["suppressed_weak_reviews"], 0)
+
+    def test_status_callback_suppresses_generic_pr_review_writeback(self):
+        response = self._post_webhook(
+            _issue_comment_payload("@Hub-Sentinel review this PR", delivery_number=231),
+            delivery_id="delivery-weak-review",
+        )
+        self.assertEqual(response.status_code, 200)
+        bridge_id = response.json()["bridge_id"]
+        self._flush_context(response.json()["context_id"])
+
+        token = self.service._generate_status_token(bridge_id, "node_target")
+        status_response = self.client.post(
+            "/bridge/status",
+            json={
+                "bridge_id": bridge_id,
+                "status": "completed",
+                "target_node_id": "node_target",
+                "task_id": "task-weak-review",
+                "detail": "The PR adds metrics and logging for pending-task recovery, plus focused runtime tests. The changes are minimal and well-scoped.",
+            },
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        self.assertEqual(status_response.status_code, 200, status_response.text)
+        self.assertEqual(len(self.github_session.posts), 0)
+        self.assertIn("action: suppressed", self.notifier.calls[-1]["text"])
+        self.assertEqual(self.service.github_writeback_metrics["attempts"], 1)
+        self.assertEqual(self.service.github_writeback_metrics["suppressed_weak_reviews"], 1)
+        self.assertEqual(self.service.github_writeback_metrics["last_suppressed_reason"], "generic_summary")
 
     def test_status_callback_posts_issue_comment_for_analysis_completion(self):
         response = self._post_webhook(
