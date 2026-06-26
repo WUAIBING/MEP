@@ -339,7 +339,14 @@ class TestRuntimeReviewPrompts(unittest.TestCase):
                                 "bridge_id": "br-review-123",
                                 "status_endpoint": "https://bridge.example.test/bridge/status",
                                 "status_token": "bridge-status-token",
-                            }
+                            },
+                            "github": {
+                                "repo_full_name": "WUAIBING/MEP",
+                                "entity_type": "pr",
+                                "number": 246,
+                                "touched_paths": ["bridge/github_to_mep.py"],
+                                "touched_tests": ["tests/test_github_bridge.py"],
+                            },
                         },
                     },
                     "economics": {"bounty_seconds": 0.0, "currency": "SECONDS"},
@@ -362,16 +369,28 @@ class TestRuntimeReviewPrompts(unittest.TestCase):
         with patch(
             "subprocess.run",
             return_value=_FakeCompletedProcess(
-                stdout='{"summary":"Checked the provided diff.","findings":[]}'
+                stdout=(
+                    '{"summary":"Checked the provided diff.","observation":"The changed path is narrow and test-backed.",'
+                    '"touched_paths":["bridge/github_to_mep.py"],'
+                    '"tests_reviewed":["tests/test_github_bridge.py"],'
+                    '"findings":[],"approval_recommendation":"approve"}'
+                )
             ),
         ) as run_mock:
             reply = adapter.generate_reply("Review this PR", task_data)
 
         self.assertIn("## Review Summary", reply)
         self.assertIn("Checked the provided diff.", reply)
+        self.assertIn("Observation: The changed path is narrow and test-backed.", reply)
+        self.assertIn("Touched paths reviewed: `bridge/github_to_mep.py`", reply)
+        self.assertIn("Tests reviewed: `tests/test_github_bridge.py`", reply)
         prompt = run_mock.call_args.args[0][3]
         self.assertIn("You are a senior code reviewer for the MEP", prompt)
         self.assertIn('"summary": string', prompt)
+        self.assertIn('"observation": string', prompt)
+        self.assertIn('"touched_paths": [string]', prompt)
+        self.assertIn('"tests_reviewed": [string]', prompt)
+        self.assertIn('"approval_recommendation"', prompt)
 
     def test_deepseek_adapter_uses_reviewer_prompt_for_bridge_review_tasks(self):
         adapter = mep_runtime.DeepSeekAdapter(api_key="secret-key", model="deepseek-chat")
@@ -383,9 +402,13 @@ class TestRuntimeReviewPrompts(unittest.TestCase):
                     {
                         "message": {
                             "content": (
-                                '{"summary":"Checked the bridge diff.","findings":'
+                                '{"summary":"Checked the bridge diff.","observation":"The metadata wiring stays backward-compatible.",'
+                                '"touched_paths":["bridge/github_to_mep.py"],'
+                                '"tests_reviewed":["tests/test_github_bridge.py"],'
+                                '"findings":'
                                 '[{"file":"bridge/github_to_mep.py","issue":"Preserve coalesced targets",'
-                                '"rationale":"Otherwise the second mention can overwrite the first target during the coalesce window."}]}'
+                                '"rationale":"Otherwise the second mention can overwrite the first target during the coalesce window."}],'
+                                '"approval_recommendation":"comment"}'
                             )
                         }
                     }
@@ -398,6 +421,8 @@ class TestRuntimeReviewPrompts(unittest.TestCase):
         self.assertIn("## Review Findings", reply)
         self.assertIn("Preserve coalesced targets", reply)
         self.assertIn("bridge/github_to_mep.py", reply)
+        self.assertIn("Observation: The metadata wiring stays backward-compatible.", reply)
+        self.assertIn("Tests reviewed: `tests/test_github_bridge.py`", reply)
         system_prompt = post_mock.call_args.kwargs["json"]["messages"][0]["content"]
         self.assertIn("return ONLY a JSON object", system_prompt)
 
@@ -426,8 +451,19 @@ class TestRuntimeReviewPrompts(unittest.TestCase):
 
         self.assertEqual(
             reply,
-            "## Review Summary\n\nReviewed the provided diff context and did not identify a concrete issue that is directly supported by the supplied patch excerpts.",
+            "## Review Summary\n\nReviewed the provided diff context and did not identify a concrete issue that is directly supported by the supplied patch excerpts.\n\nTouched paths reviewed: `bridge/github_to_mep.py`\n\nTests reviewed: `tests/test_github_bridge.py`.",
         )
+
+    def test_structured_review_falls_back_to_github_inputs_for_paths_and_tests(self):
+        rendered = mep_runtime._render_structured_review_with_task_data(  # noqa: SLF001
+            '{"summary":"Checked the bridge diff.","observation":"The diff is small and scoped.","findings":[]}',
+            max_chars=1000,
+            task_data=self._bridge_review_task_data(),
+        )
+
+        self.assertIn("Observation: The diff is small and scoped.", rendered)
+        self.assertIn("Touched paths reviewed: `bridge/github_to_mep.py`", rendered)
+        self.assertIn("Tests reviewed: `tests/test_github_bridge.py`", rendered)
 
 
 class TestRuntimeWebSocketLoop(unittest.TestCase):
