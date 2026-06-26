@@ -1444,42 +1444,232 @@ class GitHubToMEPBridgeService:
         return text[:max_chars]
 
     @staticmethod
-    def _has_concrete_review_signal(detail: str) -> bool:
+    def _normalize_review_reference(value: str) -> str:
+        text = str(value or "").strip().strip("`'\"")
+        text = text.lstrip("([{")
+        text = text.rstrip(".,;:)]}")
+        return text.replace("\\", "/").strip().lower()
+
+    @classmethod
+    def _extract_path_like_references(cls, detail: str) -> set[str]:
         if not detail:
-            return False
-        lowered = detail.lower()
-        strong_snippets = (
-            "## review findings",
-            "## review summary",
-            "observation:",
-            "touched paths reviewed:",
-            "tests reviewed:",
+            return set()
+        refs: set[str] = set()
+        patterns = (
+            r"`([^`\n]+)`",
+            r"(?<![\w/.-])(\.[A-Za-z0-9_.-]+)(?![\w/.-])",
+            r"(?<![\w/.-])([A-Za-z0-9_.-]+/[A-Za-z0-9_./-]*[A-Za-z0-9_.-]/?)(?![\w/.-])",
+            r"(?<![\w/.-])([A-Za-z0-9_.-]+\.(?:py|ts|tsx|js|jsx|go|rs|java|rb|php|json|yml|yaml|md|txt|cfg|ini|toml|log))(?![\w/.-])",
         )
-        if any(snippet in lowered for snippet in strong_snippets):
-            return True
-        if re.search(r"\d+\.\s+\*\*.+?\*\*", detail):
-            return True
-        if re.search(r"`[^`]+\.(?:py|ts|tsx|js|jsx|go|rs|java|rb|php|json|yml|yaml|md)`", detail, re.IGNORECASE):
-            return True
-        if re.search(
-            r"(?:^|[\s(])[\w./-]+\.(?:py|ts|tsx|js|jsx|go|rs|java|rb|php|json|yml|yaml|md)(?:[:),\s]|$)",
-            detail,
-            re.IGNORECASE,
-        ):
-            return True
+        for pattern in patterns:
+            for match in re.findall(pattern, detail, re.IGNORECASE):
+                normalized = cls._normalize_review_reference(match)
+                if normalized and ("/" in normalized or "." in normalized):
+                    refs.add(normalized)
+        return refs
+
+    @classmethod
+    def _match_path_reference(cls, reference: str, expected_paths: list[str]) -> set[str]:
+        normalized_ref = cls._normalize_review_reference(reference)
+        if not normalized_ref:
+            return set()
+        matched: set[str] = set()
+        for path in expected_paths:
+            normalized_path = cls._normalize_review_reference(path)
+            if not normalized_path:
+                continue
+            basename = normalized_path.rsplit("/", 1)[-1]
+            if normalized_ref in {normalized_path, basename}:
+                matched.add(path)
+                continue
+            if normalized_ref.endswith("/") and normalized_path.startswith(normalized_ref):
+                matched.add(path)
+        return matched
+
+    @classmethod
+    def _grounded_review_paths(cls, detail: str, expected_paths: list[str]) -> set[str]:
+        refs = cls._extract_path_like_references(detail)
+        if not expected_paths:
+            return refs
+        matched: set[str] = set()
+        for ref in refs:
+            matched.update(cls._match_path_reference(ref, expected_paths))
+        return matched
+
+    @staticmethod
+    def _extract_review_finding_entries(detail: str) -> list[tuple[str, str]]:
+        if not detail:
+            return []
+        findings: list[tuple[str, str]] = []
+        pattern = re.compile(
+            r"^\d+\.\s+\*\*(?P<issue>.+?)\*\*(?:\s+\(`(?P<file>[^`]+)`\))?:\s*(?P<rationale>.+)$",
+            re.MULTILINE,
+        )
+        for match in pattern.finditer(detail):
+            file_hint = str(match.group("file") or "").strip()
+            issue = str(match.group("issue") or "").strip()
+            rationale = str(match.group("rationale") or "").strip()
+            combined = " ".join(part for part in (issue, rationale) if part).strip()
+            if combined:
+                findings.append((file_hint, combined))
+        return findings
+
+    @staticmethod
+    def _extract_identifier_tokens(text: str) -> set[str]:
+        if not text:
+            return set()
+        excluded = {
+            "node_id",
+            "task_id",
+            "repo_name",
+            "issue_number",
+            "bridge_id",
+            "target_node_id",
+        }
+        tokens: set[str] = set()
+        for token in re.findall(r"`([A-Za-z_][A-Za-z0-9_]*)`", text):
+            lowered = token.lower()
+            if len(lowered) >= 4 and lowered not in excluded:
+                tokens.add(lowered)
+        for token in re.findall(r"\b[A-Za-z]+_[A-Za-z0-9_]+\b", text):
+            lowered = token.lower()
+            if len(lowered) >= 4 and lowered not in excluded:
+                tokens.add(lowered)
+        return tokens
+
+    @staticmethod
+    def _is_auth_absence_claim(text: str) -> bool:
+        lowered = str(text or "").lower()
+        if "authentication" not in lowered and "authorization" not in lowered:
+            return False
+        return any(token in lowered for token in (" has no ", " no ", " without ", " missing "))
+
+    @staticmethod
+    def _finding_conflicts_with_patch(finding_text: str, patch_text: str) -> bool:
+        if not finding_text or not patch_text:
+            return False
+        lowered_finding = finding_text.lower()
+        lowered_patch = patch_text.lower()
+        auth_absence_patterns = (
+            r"\bno authentication\b",
+            r"\bno authorization\b",
+            r"\bhas no authentication\b",
+            r"\bhas no authorization\b",
+            r"\bwithout authentication\b",
+            r"\bwithout authorization\b",
+            r"\bwithout any authentication\b",
+            r"\bwithout any authorization\b",
+            r"\bmissing authentication\b",
+            r"\bmissing authorization\b",
+        )
+        auth_evidence_tokens = (
+            "verify_request",
+            "authenticated_",
+            "authorization",
+            "permission",
+            "forbidden",
+            "403",
+            "depends(",
+        )
+        if any(re.search(pattern, lowered_finding) for pattern in auth_absence_patterns):
+            return any(token in lowered_patch for token in auth_evidence_tokens)
+        if GitHubToMEPBridgeService._is_auth_absence_claim(lowered_finding):
+            return any(token in lowered_patch for token in auth_evidence_tokens)
         return False
 
-    def _classify_review_writeback_detail(self, detail: Optional[str]) -> tuple[bool, str]:
+    @staticmethod
+    def _patch_text_by_path(review_package: dict[str, Any]) -> dict[str, str]:
+        patches: dict[str, str] = {}
+        changed_files = review_package.get("changed_files")
+        if not isinstance(changed_files, list):
+            return patches
+        for item in changed_files:
+            if not isinstance(item, dict):
+                continue
+            filename = str(item.get("filename") or "").strip()
+            patch = str(item.get("patch") or "").strip()
+            if filename and patch:
+                patches[filename] = patch.lower()
+        return patches
+
+    @classmethod
+    def _verify_review_findings_against_patch(
+        cls,
+        detail: str,
+        review_package: dict[str, Any],
+        expected_paths: list[str],
+    ) -> Optional[str]:
+        findings = cls._extract_review_finding_entries(detail)
+        if not findings or not review_package or not expected_paths:
+            return None
+        patches_by_path = cls._patch_text_by_path(review_package)
+        for file_hint, finding_text in findings:
+            if cls._is_auth_absence_claim(finding_text) and not cls._extract_identifier_tokens(finding_text):
+                return "ungrounded_finding"
+            matched_paths = cls._match_path_reference(file_hint, expected_paths) if file_hint else set()
+            if not matched_paths:
+                matched_paths = cls._grounded_review_paths(finding_text, expected_paths)
+            if not matched_paths:
+                return "finding_without_touched_path"
+            patch_text = "\n".join(patches_by_path.get(path, "") for path in matched_paths if patches_by_path.get(path))
+            if not patch_text:
+                continue
+            if cls._finding_conflicts_with_patch(finding_text, patch_text):
+                return "ungrounded_finding"
+            identifier_tokens = cls._extract_identifier_tokens(finding_text)
+            if identifier_tokens and not any(token in patch_text for token in identifier_tokens):
+                return "ungrounded_finding"
+        return None
+
+    def _classify_review_writeback_detail(self, execution: dict[str, Any], detail: Optional[str]) -> tuple[bool, str]:
         normalized = re.sub(r"\s+", " ", str(detail or "").strip())
         if not normalized:
             return True, "empty_detail"
-        if self._has_concrete_review_signal(detail or ""):
-            return False, "concrete"
         lowered = normalized.lower()
-        if len(normalized) < 90:
+        review_package: dict[str, Any] = {}
+        entity_type = str(execution.get("entity_type") or "").strip().lower()
+        repo_full_name = str(execution.get("repo_full_name") or "").strip()
+        number = int(execution.get("issue_number") or 0)
+        if entity_type == "pr" and repo_full_name and number > 0:
+            review_package = self._fetch_pr_review_package(repo_full_name, number)
+        expected_paths: list[str] = []
+        for key in ("touched_paths", "touched_tests"):
+            values = review_package.get(key)
+            if isinstance(values, list):
+                for value in values:
+                    text = str(value or "").strip()
+                    if text and text not in expected_paths:
+                        expected_paths.append(text)
+        anchored_paths = self._grounded_review_paths(detail or "", expected_paths)
+        has_findings = "## review findings" in lowered or bool(self._extract_review_finding_entries(detail or ""))
+        has_structured_sections = any(
+            snippet in lowered
+            for snippet in (
+                "## review summary",
+                "## review findings",
+                "observation:",
+                "touched paths reviewed:",
+                "tests reviewed:",
+            )
+        )
+        if has_findings and not anchored_paths:
+            return True, "finding_without_touched_path"
+        finding_reason = self._verify_review_findings_against_patch(detail or "", review_package, expected_paths)
+        if finding_reason:
+            return True, finding_reason
+        if has_findings and anchored_paths and review_package:
+            patches_by_path = self._patch_text_by_path(review_package)
+            anchored_patch_text = "\n".join(
+                patches_by_path.get(path, "") for path in anchored_paths if patches_by_path.get(path)
+            )
+            if self._finding_conflicts_with_patch(detail or "", anchored_patch_text):
+                return True, "ungrounded_finding"
+        if len(normalized) < 90 and not anchored_paths:
             return True, "too_short"
-        if any(re.search(pattern, lowered) for pattern in _WEAK_GITHUB_REVIEW_PATTERNS):
+        if any(re.search(pattern, lowered) for pattern in _WEAK_GITHUB_REVIEW_PATTERNS) and not anchored_paths:
             return True, "generic_summary"
+        if has_structured_sections and not anchored_paths:
+            return True, "no_touched_path_anchor"
         return False, "concrete"
 
     def _record_github_writeback_attempt(self, action: str, detail: Optional[str]) -> None:
@@ -1621,7 +1811,7 @@ class GitHubToMEPBridgeService:
         review_action = entity_type == "pr" and action in review_events
         self._record_github_writeback_attempt(action, update.detail)
         if review_action:
-            suppress, reason = self._classify_review_writeback_detail(update.detail)
+            suppress, reason = self._classify_review_writeback_detail(execution, update.detail)
             if suppress:
                 self._record_github_writeback_suppression(
                     bridge_id=str(execution.get("bridge_id") or update.bridge_id),
