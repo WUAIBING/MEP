@@ -46,6 +46,16 @@ _WEAK_GITHUB_REVIEW_PATTERNS = [
     r"\bno blocking issues\b",
     r"\bfocused runtime tests\b",
 ]
+_SPECULATIVE_FINDING_PATTERNS = [
+    r"\bif intended\b",
+    r"\bif .*? intended for\b",
+    r"\bif .*? meant to\b",
+    r"\bsuggests incomplete implementation\b",
+    r"\bpotentially leaving\b",
+    r"\bappears to\b",
+    r"\bseems to\b",
+    r"\bcould indicate\b",
+]
 
 
 def _env_bool(name: str, default: bool) -> bool:
@@ -1538,6 +1548,29 @@ class GitHubToMEPBridgeService:
         return tokens
 
     @staticmethod
+    def _extract_observation_text(detail: str) -> str:
+        if not detail:
+            return ""
+        match = re.search(r"Observation:\s*(.+)", detail, re.IGNORECASE)
+        if not match:
+            return ""
+        return str(match.group(1) or "").strip()
+
+    @classmethod
+    def _grounded_code_tokens(cls, text: str, patch_text: str) -> set[str]:
+        if not text or not patch_text:
+            return set()
+        tokens = cls._extract_identifier_tokens(text)
+        return {token for token in tokens if token in patch_text.lower()}
+
+    @staticmethod
+    def _is_speculative_finding(text: str) -> bool:
+        lowered = str(text or "").strip().lower()
+        if not lowered:
+            return False
+        return any(re.search(pattern, lowered) for pattern in _SPECULATIVE_FINDING_PATTERNS)
+
+    @staticmethod
     def _is_auth_absence_claim(text: str) -> bool:
         lowered = str(text or "").lower()
         if "authentication" not in lowered and "authorization" not in lowered:
@@ -1619,6 +1652,9 @@ class GitHubToMEPBridgeService:
             identifier_tokens = cls._extract_identifier_tokens(finding_text)
             if identifier_tokens and not any(token in patch_text for token in identifier_tokens):
                 return "ungrounded_finding"
+            grounded_tokens = cls._grounded_code_tokens(finding_text, patch_text)
+            if cls._is_speculative_finding(finding_text) and len(grounded_tokens) < 2:
+                return "speculative_finding"
         return None
 
     def _classify_review_writeback_detail(self, execution: dict[str, Any], detail: Optional[str]) -> tuple[bool, str]:
@@ -1641,7 +1677,12 @@ class GitHubToMEPBridgeService:
                     if text and text not in expected_paths:
                         expected_paths.append(text)
         anchored_paths = self._grounded_review_paths(detail or "", expected_paths)
+        patches_by_path = self._patch_text_by_path(review_package)
+        anchored_patch_text = "\n".join(
+            patches_by_path.get(path, "") for path in anchored_paths if patches_by_path.get(path)
+        )
         has_findings = "## review findings" in lowered or bool(self._extract_review_finding_entries(detail or ""))
+        observation_text = self._extract_observation_text(detail or "")
         has_structured_sections = any(
             snippet in lowered
             for snippet in (
@@ -1657,13 +1698,18 @@ class GitHubToMEPBridgeService:
         finding_reason = self._verify_review_findings_against_patch(detail or "", review_package, expected_paths)
         if finding_reason:
             return True, finding_reason
+        grounded_tokens = self._grounded_code_tokens(detail or "", anchored_patch_text)
+        if has_findings and self._is_speculative_finding(detail or "") and len(grounded_tokens) < 2:
+            return True, "speculative_finding"
         if has_findings and anchored_paths and review_package:
-            patches_by_path = self._patch_text_by_path(review_package)
-            anchored_patch_text = "\n".join(
-                patches_by_path.get(path, "") for path in anchored_paths if patches_by_path.get(path)
-            )
             if self._finding_conflicts_with_patch(detail or "", anchored_patch_text):
                 return True, "ungrounded_finding"
+        if has_structured_sections and not has_findings:
+            if not observation_text and not grounded_tokens:
+                return True, "summary_without_code_evidence"
+            observation_tokens = self._extract_identifier_tokens(observation_text)
+            if observation_text and not grounded_tokens and len(observation_tokens) < 2:
+                return True, "generic_observation"
         if len(normalized) < 90 and not anchored_paths:
             return True, "too_short"
         if any(re.search(pattern, lowered) for pattern in _WEAK_GITHUB_REVIEW_PATTERNS) and not anchored_paths:
