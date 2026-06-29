@@ -602,7 +602,6 @@ def _render_structured_review_with_task_data(
     if not isinstance(parsed, dict):
         return ""
     github_inputs = _review_github_inputs(task_data or {})
-    approval_mode = _task_is_approval_review(task_data or {})
     summary = _clean_review_text(parsed.get("summary"), max_chars=220)
     if _is_weak_review_text(summary):
         summary = ""
@@ -616,7 +615,6 @@ def _render_structured_review_with_task_data(
     if not tests_reviewed:
         tests_reviewed = _clean_review_list(github_inputs.get("touched_tests"), max_items=3, max_chars=120)
     verified_identifiers = _clean_review_list(parsed.get("verified_identifiers"), max_items=4, max_chars=80)
-    approval_recommendation = str(parsed.get("approval_recommendation") or "").strip().lower()
     findings_raw = parsed.get("findings")
     findings: list[str] = []
     if isinstance(findings_raw, list):
