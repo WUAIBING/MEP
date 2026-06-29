@@ -593,7 +593,12 @@ class TestRuntimeWebSocketLoop(unittest.TestCase):
         ):
             asyncio.run(node.process_task(task_data))
 
-        adapter_mock.assert_called_once_with("Use only this instruction text.", task_data)
+        adapter_mock.assert_called_once()
+        self.assertEqual(adapter_mock.call_args.args[0], "Use only this instruction text.")
+        adapter_task_data = adapter_mock.call_args.args[1]
+        self.assertEqual(adapter_task_data["payload"], task_data["payload"])
+        self.assertEqual(adapter_task_data["task"]["instructions"], "Use only this instruction text.")
+        self.assertEqual(adapter_task_data["intent"]["type"], "chat.request")
         complete_mock.assert_called_once_with("task_interbot", "reply")
 
     def test_process_task_reports_bridge_status_when_github_bridge_metadata_is_present(self):
@@ -641,6 +646,47 @@ class TestRuntimeWebSocketLoop(unittest.TestCase):
         self.assertEqual(request_mock.call_args.kwargs["json_body"]["action"], "approved")
         self.assertEqual(request_mock.call_args.kwargs["json_body"]["detail"], "Looks good to me.")
         self.assertEqual(request_mock.call_args.kwargs["headers"]["Authorization"], "Bearer status-token")
+
+    def test_process_task_appends_synced_workspace_context_to_review_input(self):
+        node = _runtime_node()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            os.makedirs(os.path.join(tmpdir, "bridge"), exist_ok=True)
+            with open(os.path.join(tmpdir, "bridge", "github_to_mep.py"), "w", encoding="utf-8") as handle:
+                handle.write("def live_sync_context():\n    return True\n")
+
+            task_data = TestRuntimeReviewPrompts._bridge_review_task_data()
+            payload = json.loads(task_data["payload"])
+            payload["task"]["inputs"]["github"].update(
+                {
+                    "repo_clone_url": "https://github.com/example/repo.git",
+                    "head_sha": "abc12345",
+                    "head_ref": "feature/test",
+                }
+            )
+            task_data["payload"] = json.dumps(payload)
+
+            with (
+                patch.object(node.workspace, "sync_pr_workspace", return_value=(True, tmpdir)) as sync_mock,
+                patch.object(node.adapter, "generate_reply", return_value="reply") as adapter_mock,
+                patch.object(node, "complete") as complete_mock,
+            ):
+                asyncio.run(node.process_task(task_data))
+
+        sync_mock.assert_called_once_with(
+            "https://github.com/example/repo.git",
+            "abc12345",
+            "feature/test",
+            bridge_id="trace-bridge-review",
+        )
+        instructions, adapter_task_data = adapter_mock.call_args.args
+        self.assertIn("Additional local workspace context:", instructions)
+        self.assertIn("Local workspace path:", instructions)
+        self.assertIn("live_sync_context", instructions)
+        self.assertEqual(
+            adapter_task_data["task"]["inputs"]["github"]["local_workspace_path"],
+            tmpdir,
+        )
+        complete_mock.assert_called_once_with("task_bridge_review", "reply")
 
     def test_process_task_live_bridge_sends_frame_and_settles_when_call_is_accepted(self):
         node = _runtime_node()

@@ -8,6 +8,7 @@ import time
 import asyncio
 import unittest
 from typing import Any
+from unittest.mock import patch
 
 from fastapi.testclient import TestClient
 
@@ -563,6 +564,81 @@ class TestGitHubToMEPBridge(unittest.TestCase):
         self.assertEqual(self.service.github_writeback_metrics["attempts"], 1)
         self.assertEqual(self.service.github_writeback_metrics["suppressed_weak_reviews"], 1)
         self.assertEqual(self.service.github_writeback_metrics["last_suppressed_reason"], "generic_summary")
+
+    def test_retry_task_preserves_original_github_inputs(self):
+        self._set_pr_review_package(
+            [
+                {
+                    "filename": "bridge/github_to_mep.py",
+                    "status": "modified",
+                    "additions": 4,
+                    "deletions": 1,
+                    "changes": 5,
+                    "patch": (
+                        "@@ -1,2 +1,5 @@\n"
+                        "+def preserve_retry_context():\n"
+                        "+    return True\n"
+                    ),
+                }
+            ],
+            pr_body="Ensures retry submissions keep the original review package metadata.",
+        )
+        response = self._post_webhook(
+            _issue_comment_payload("@Hub-Sentinel review this PR", delivery_number=234),
+            delivery_id="delivery-retry-context",
+        )
+        self.assertEqual(response.status_code, 200)
+        bridge_id = response.json()["bridge_id"]
+        self._flush_context(response.json()["context_id"])
+
+        token = self.service._generate_status_token(bridge_id, "node_target")
+        status_response = self.client.post(
+            "/bridge/status",
+            json={
+                "bridge_id": bridge_id,
+                "status": "completed",
+                "target_node_id": "node_target",
+                "detail": "The change looks fine and focused.",
+            },
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        self.assertEqual(status_response.status_code, 200, status_response.text)
+        self.assertEqual(len(self.submission.calls), 2)
+        retry_envelope = self.submission.calls[-1]["envelope"]
+        github_inputs = retry_envelope["task"]["inputs"]["github"]
+        self.assertEqual(github_inputs["head_sha"], "headsha123")
+        self.assertEqual(github_inputs["head_ref"], "headref")
+        self.assertEqual(github_inputs["repo_clone_url"], "https://github.com/example/repo.git")
+        self.assertEqual(github_inputs["touched_paths"], ["bridge/github_to_mep.py"])
+
+    def test_status_callback_keeps_action_suppressed_when_retry_submit_fails(self):
+        response = self._post_webhook(
+            _issue_comment_payload("@Hub-Sentinel review this PR", delivery_number=235),
+            delivery_id="delivery-retry-fail",
+        )
+        self.assertEqual(response.status_code, 200)
+        bridge_id = response.json()["bridge_id"]
+        self._flush_context(response.json()["context_id"])
+
+        token = self.service._generate_status_token(bridge_id, "node_target")
+        with patch.object(self.submission, "submit_structured_dm", side_effect=RuntimeError("retry submit failed")):
+            status_response = self.client.post(
+                "/bridge/status",
+                json={
+                    "bridge_id": bridge_id,
+                    "status": "completed",
+                    "target_node_id": "node_target",
+                    "detail": "Too short review",
+                },
+                headers={"Authorization": f"Bearer {token}"},
+            )
+
+        self.assertEqual(status_response.status_code, 200, status_response.text)
+        self.assertIn("action: suppressed", self.notifier.calls[-1]["text"])
+        execution = self.store.get_execution(bridge_id)
+        self.assertIsNotNone(execution)
+        self.assertEqual(execution["action"], "suppressed")
+        self.assertEqual(execution["retry_count"], 0)
 
     def test_status_callback_stops_retrying_after_max_retries(self):
         response = self._post_webhook(
