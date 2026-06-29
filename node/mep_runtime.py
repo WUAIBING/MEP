@@ -41,6 +41,10 @@ def _env_truthy(name: str, default: str = "0") -> bool:
     return os.getenv(name, default) not in ("0", "false", "False", "")
 
 
+def _strict_adapter_mode() -> bool:
+    return _env_truthy("MEP_STRICT_ADAPTERS", "0")
+
+
 def _env_positive_int(name: str, default: int) -> int:
     raw = os.getenv(name)
     if raw is None:
@@ -1565,6 +1569,9 @@ def cmd_run(args: argparse.Namespace) -> int:
     if args.adapter == "deepseek":
         api_key = (os.getenv("DEEPSEEK_API_KEY") or "").strip()
         if not api_key:
+            if _strict_adapter_mode():
+                print("[mep run] DEEPSEEK_API_KEY not set; strict adapter mode refusing mock fallback")
+                return 2
             print("[mep run] DEEPSEEK_API_KEY not set, falling back to mock")
             adapter: Any = MockAdapter()
         else:

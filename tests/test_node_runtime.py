@@ -265,6 +265,24 @@ class TestRuntimeUx(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertIsInstance(runtime_cls.call_args.kwargs["adapter"], mep_runtime.MockAdapter)
 
+    def test_run_with_strict_deepseek_without_api_key_fails_closed(self):
+        args = argparse.Namespace(
+            hub_url="http://hub",
+            ws_url="ws://hub",
+            key_path="C:/tmp/test_key.pem",
+            adapter="deepseek",
+            alias="Hub-Sentinel",
+        )
+        with (
+            patch.dict("os.environ", {"MEP_STRICT_ADAPTERS": "true"}, clear=True),
+            patch("node.mep_runtime._ensure_key_parent"),
+            patch("node.mep_runtime.RuntimeNode") as runtime_cls,
+        ):
+            code = mep_runtime.cmd_run(args)
+
+        self.assertEqual(code, 2)
+        runtime_cls.assert_not_called()
+
     def test_run_with_deepseek_api_key_uses_deepseek_adapter(self):
         args = argparse.Namespace(
             hub_url="http://hub",

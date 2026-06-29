@@ -114,6 +114,18 @@ Documented but not yet enforced in this first bridge-side implementation:
 
 These remain approved design follow-up settings, not active runtime behavior in this slice.
 
+## Reviewer Runtime Safety
+
+Production reviewer nodes such as `Hub Sentinel` and `Elsaws Bot` should not silently downgrade from a requested AI adapter to `MockAdapter`.
+
+Set these runtime variables for both reviewer nodes:
+
+- `DEEPSEEK_API_KEY=<real key>`
+- `MEP_AI_MODEL=deepseek-chat`
+- `MEP_STRICT_ADAPTERS=true`
+
+With `MEP_STRICT_ADAPTERS=true`, `python -m node.mep_runtime --adapter deepseek run` fails closed if `DEEPSEEK_API_KEY` is missing instead of publishing `MOCK_ADAPTER_OK` placeholder output. Keep mock mode only for local onboarding or smoke tests where deterministic non-AI output is intentional.
+
 ## Starting The Bridge
 
 The bridge is implemented as a Python module under `bridge/`.
