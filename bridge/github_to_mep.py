@@ -1230,10 +1230,15 @@ class GitHubToMEPBridgeService:
         base = pr_data.get("base") if isinstance(pr_data.get("base"), dict) else {}
         head_sha = str(head.get("sha") or "").strip()
         base_sha = str(base.get("sha") or "").strip()
+        head_ref = str(head.get("ref") or "").strip()
+        base_ref = str(base.get("ref") or "").strip()
+        repo_clone_url = str((head.get("repo") or {}).get("clone_url") or "").strip()
+
         if head_sha or base_sha:
             sections.append(
                 "Revision identity: "
-                f"head_sha={head_sha or 'unknown'}, base_sha={base_sha or 'unknown'}"
+                f"head_sha={head_sha or 'unknown'}, base_sha={base_sha or 'unknown'}, "
+                f"head_ref={head_ref or 'unknown'}, base_ref={base_ref or 'unknown'}"
             )
         sections.append(
             "PR stats: "
@@ -1296,6 +1301,9 @@ class GitHubToMEPBridgeService:
         return {
             "head_sha": head_sha,
             "base_sha": base_sha,
+            "head_ref": head_ref,
+            "base_ref": base_ref,
+            "repo_clone_url": repo_clone_url,
             "pr_stats": {
                 "changed_files": changed_files,
                 "additions": additions,
