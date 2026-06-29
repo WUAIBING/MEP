@@ -26,6 +26,7 @@ class _FakeIdentity:
     node_id = "node_runtime"
     pub_pem = "pub"
     x25519_public_key = "encpub"
+    key_path = "fake.pem"
 
     def get_auth_headers(self, payload: str) -> dict:
         return {"X-MEP-NodeID": self.node_id, "X-MEP-Signature": "sig"}

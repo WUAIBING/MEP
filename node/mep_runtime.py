@@ -8,6 +8,7 @@ import asyncio
 import json
 import os
 import re
+import subprocess
 import time
 import urllib.parse
 import uuid
@@ -725,6 +726,59 @@ class DeepSeekAdapter:
             return f"[DeepSeek] error: {exc}"
 
 
+class WorkspaceManager:
+    """Manages autonomous workspace synchronization (Git fetch/checkout)."""
+
+    def __init__(self, base_dir: str):
+        self.base_dir = os.path.abspath(base_dir)
+        os.makedirs(self.base_dir, exist_ok=True)
+
+    def _run_git(self, cwd: str, args: list[str]) -> tuple[int, str]:
+        try:
+            result = subprocess.run(
+                ["git", *args],
+                cwd=cwd,
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=60,
+            )
+            return result.returncode, (result.stdout + result.stderr).strip()
+        except Exception as exc:  # noqa: BLE001
+            return -1, str(exc)
+
+    def sync_pr_workspace(self, repo_url: str, head_sha: str, head_ref: str, bridge_id: Optional[str] = None) -> tuple[bool, str]:
+        """Ensures the local workspace is synced to the target PR branch/commit."""
+        # Phase 4 Isolation: Use a specific directory for this bridge_id if provided
+        if bridge_id:
+            workspace_path = os.path.join(self.base_dir, bridge_id)
+        else:
+            workspace_path = os.path.join(self.base_dir, "shared")
+        
+        os.makedirs(workspace_path, exist_ok=True)
+        
+        if not os.path.exists(os.path.join(workspace_path, ".git")):
+            print(f"[mep workspace] cloning {repo_url} into {workspace_path}")
+            code, out = self._run_git(os.path.dirname(workspace_path), ["clone", repo_url, os.path.basename(workspace_path)])
+            if code != 0:
+                return False, f"clone failed: {out}"
+
+        print(f"[mep workspace] fetching {head_ref} ({head_sha[:8]})")
+        code, out = self._run_git(workspace_path, ["fetch", "origin", head_ref])
+        if code != 0:
+            # Fallback to fetching everything if ref-specific fetch fails
+            code, out = self._run_git(workspace_path, ["fetch", "--all"])
+            if code != 0:
+                return False, f"fetch failed: {out}"
+
+        print(f"[mep workspace] checking out {head_sha[:8]}")
+        code, out = self._run_git(workspace_path, ["checkout", head_sha])
+        if code != 0:
+            return False, f"checkout failed: {out}"
+
+        return True, workspace_path
+
+
 class RuntimeNode:
     def __init__(self, identity: MEPIdentity, hub_url: str, ws_url: str, adapter: Any, alias: Optional[str] = None):
         self.identity = identity
@@ -743,6 +797,14 @@ class RuntimeNode:
         self._ws: Any = None
         self._background_tasks: set[asyncio.Task[Any]] = set()
         self._pending_call_bridges: dict[str, asyncio.Future[dict[str, Any]]] = {}
+        
+        # Phase 4: Autonomous Workspace Management
+        workspace_dir = os.getenv("MEP_WORKSPACE_DIR")
+        if not workspace_dir:
+            # Fallback to a subfolder in the identity directory
+            key_path = getattr(identity, "key_path", "node.pem")
+            workspace_dir = os.path.join(os.path.dirname(os.path.abspath(key_path)), "workspace", (alias or "default").replace(" ", "-").lower())
+        self.workspace = WorkspaceManager(workspace_dir)
 
     def _auth_headers(self, payload: str) -> dict[str, str]:
         headers = self.identity.get_auth_headers(payload)
@@ -1364,6 +1426,24 @@ class RuntimeNode:
         interbot_message: Optional[dict[str, Any]] = None
         if MEPClient is not None:
             instructions, interbot_message = MEPClient.extract_interbot_instructions(payload)
+        
+        # Phase 4: Sync workspace if this is a GitHub PR task
+        if interbot_message:
+            github_inputs = interbot_message.get("task", {}).get("inputs", {}).get("github", {})
+            repo_url = github_inputs.get("repo_clone_url")
+            head_sha = github_inputs.get("head_sha")
+            head_ref = github_inputs.get("head_ref")
+            bridge_id = interbot_message.get("trace_id") or interbot_message.get("task", {}).get("inputs", {}).get("bridge_metadata", {}).get("bridge_id")
+            
+            if repo_url and head_sha and head_ref:
+                print(f"[mep workspace] auto-syncing for task={task_id[:8]} bridge_id={bridge_id}")
+                ok, path_or_err = await asyncio.to_thread(self.workspace.sync_pr_workspace, repo_url, head_sha, head_ref, bridge_id=bridge_id)
+                if ok:
+                    print(f"[mep workspace] synced to {path_or_err}")
+                else:
+                    print(f"[mep workspace] sync failed: {path_or_err}")
+                    # We continue anyway, but the adapter might be working on stale code
+
         result = self.adapter.generate_reply(instructions, task_data)
         if self._bridge_eligible_interbot_message(task_data, interbot_message):
             bridged = await self._attempt_live_call_bridge(task_data, interbot_message, result)
