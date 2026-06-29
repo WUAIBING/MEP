@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import copy
 import json
 import os
 import re
@@ -418,6 +419,14 @@ def _system_prompt_for_task(
     review_max_chars: int,
 ) -> str:
     if _task_requires_review_prompt(task_data):
+        github_inputs = _review_github_inputs(task_data)
+        workspace_path = str(github_inputs.get("local_workspace_path") or "").strip()
+        workspace_hint = ""
+        if workspace_path:
+            workspace_hint = (
+                f" A checked-out local workspace is available at `{workspace_path}` and any embedded workspace excerpts "
+                "come from the PR head commit; treat that material as authoritative code context."
+            )
         return (
             "You are a senior code reviewer for the MEP (Miao Exchange Protocol) project. "
             "Review the provided GitHub PR context and return ONLY a JSON object with this schema: "
@@ -430,7 +439,7 @@ def _system_prompt_for_task(
             "Only include a finding when it is directly supported by the provided diff, file list, PR description, or patch excerpts. "
             "Do not speculate about unseen code, do not ask for more context, and do not include chain-of-thought or any text outside the JSON object. "
             "If the change looks good, keep findings empty and use summary to say what you verified, keep observation concrete, and set approval_recommendation to approve or comment. Keep the "
-            f"response within {review_max_chars} characters."
+            f"response within {review_max_chars} characters.{workspace_hint}"
         )
     return (
         "You are a helpful MEP (Miao Exchange Protocol) bot. "
@@ -777,6 +786,55 @@ class WorkspaceManager:
             return False, f"checkout failed: {out}"
 
         return True, workspace_path
+
+    @staticmethod
+    def _resolve_repo_file(workspace_path: str, relative_path: str) -> Optional[str]:
+        normalized_relative = str(relative_path or "").replace("\\", "/").strip("/")
+        if not normalized_relative:
+            return None
+        candidate = os.path.abspath(os.path.join(workspace_path, *normalized_relative.split("/")))
+        try:
+            if os.path.commonpath([os.path.abspath(workspace_path), candidate]) != os.path.abspath(workspace_path):
+                return None
+        except ValueError:
+            return None
+        return candidate
+
+    def build_review_context(
+        self,
+        workspace_path: str,
+        touched_paths: list[str],
+        *,
+        max_files: int = 3,
+        max_chars: int = 2200,
+    ) -> str:
+        if not workspace_path or not isinstance(touched_paths, list):
+            return ""
+        sections = [f"Local workspace path: {workspace_path}", "Workspace file excerpts:"]
+        remaining = max_chars
+        added = 0
+        for path in touched_paths:
+            if added >= max_files or remaining <= 180:
+                break
+            resolved = self._resolve_repo_file(workspace_path, str(path or ""))
+            if not resolved or not os.path.isfile(resolved):
+                continue
+            try:
+                with open(resolved, "r", encoding="utf-8", errors="replace") as handle:
+                    content = handle.read()
+            except OSError:
+                continue
+            content = content.strip()
+            if not content:
+                continue
+            excerpt = content[: min(remaining, 700)].strip()
+            block = f"- {path}\n{excerpt}"
+            sections.append(block)
+            remaining -= len(block) + 2
+            added += 1
+        if added == 0:
+            return ""
+        return "\n\n".join(sections)
 
 
 class RuntimeNode:
@@ -1423,28 +1481,53 @@ class RuntimeNode:
         task_id = str(task_data.get("id") or "")
         payload = str(task_data.get("payload") or "")
         instructions = payload
+        adapter_task_data = copy.deepcopy(task_data)
         interbot_message: Optional[dict[str, Any]] = None
         if MEPClient is not None:
             instructions, interbot_message = MEPClient.extract_interbot_instructions(payload)
-        
+        workspace_path = ""
+
         # Phase 4: Sync workspace if this is a GitHub PR task
         if interbot_message:
-            github_inputs = interbot_message.get("task", {}).get("inputs", {}).get("github", {})
+            task = interbot_message.get("task") if isinstance(interbot_message.get("task"), dict) else {}
+            inputs = task.get("inputs") if isinstance(task.get("inputs"), dict) else {}
+            github_inputs = dict(inputs.get("github") or {}) if isinstance(inputs.get("github"), dict) else {}
             repo_url = github_inputs.get("repo_clone_url")
             head_sha = github_inputs.get("head_sha")
             head_ref = github_inputs.get("head_ref")
             bridge_id = interbot_message.get("trace_id") or interbot_message.get("task", {}).get("inputs", {}).get("bridge_metadata", {}).get("bridge_id")
-            
+
             if repo_url and head_sha and head_ref:
                 print(f"[mep workspace] auto-syncing for task={task_id[:8]} bridge_id={bridge_id}")
                 ok, path_or_err = await asyncio.to_thread(self.workspace.sync_pr_workspace, repo_url, head_sha, head_ref, bridge_id=bridge_id)
                 if ok:
                     print(f"[mep workspace] synced to {path_or_err}")
+                    workspace_path = path_or_err
+                    github_inputs["local_workspace_path"] = workspace_path
+                    touched_paths = github_inputs.get("touched_paths") if isinstance(github_inputs.get("touched_paths"), list) else []
+                    workspace_context = await asyncio.to_thread(
+                        self.workspace.build_review_context,
+                        workspace_path,
+                        touched_paths,
+                    )
+                    if workspace_context:
+                        instructions = f"{instructions}\n\nAdditional local workspace context:\n{workspace_context}"
                 else:
                     print(f"[mep workspace] sync failed: {path_or_err}")
                     # We continue anyway, but the adapter might be working on stale code
 
-        result = self.adapter.generate_reply(instructions, task_data)
+            task_copy = copy.deepcopy(task) if isinstance(task, dict) else {}
+            inputs_copy = copy.deepcopy(inputs) if isinstance(inputs, dict) else {}
+            inputs_copy["github"] = github_inputs
+            if inputs_copy:
+                task_copy["inputs"] = inputs_copy
+            if task_copy:
+                adapter_task_data["task"] = task_copy
+            intent = interbot_message.get("intent")
+            if isinstance(intent, dict):
+                adapter_task_data["intent"] = copy.deepcopy(intent)
+
+        result = self.adapter.generate_reply(instructions, adapter_task_data)
         if self._bridge_eligible_interbot_message(task_data, interbot_message):
             bridged = await self._attempt_live_call_bridge(task_data, interbot_message, result)
             if bridged:

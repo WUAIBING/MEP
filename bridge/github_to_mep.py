@@ -330,6 +330,7 @@ class BridgeStore:
                 action TEXT,
                 telegram_message_id TEXT,
                 instructions TEXT NOT NULL DEFAULT '',
+                github_inputs_json TEXT NOT NULL DEFAULT '{}',
                 retry_count INTEGER NOT NULL DEFAULT 0,
                 created_at REAL NOT NULL,
                 updated_at REAL NOT NULL
@@ -371,6 +372,13 @@ class BridgeStore:
                 """
                 ALTER TABLE bridge_executions
                 ADD COLUMN instructions TEXT NOT NULL DEFAULT ''
+                """
+            )
+        if "github_inputs_json" not in execution_columns:
+            cursor.execute(
+                """
+                ALTER TABLE bridge_executions
+                ADD COLUMN github_inputs_json TEXT NOT NULL DEFAULT '{}'
                 """
             )
         conn.commit()
@@ -433,9 +441,9 @@ class BridgeStore:
             INSERT INTO bridge_executions (
                 bridge_id, context_id, repo_full_name, issue_number, entity_type,
                 target_alias, target_node_id, imperative_verb, intent_type, event_sequence,
-                status, instructions, retry_count, created_at, updated_at
+                status, instructions, github_inputs_json, retry_count, created_at, updated_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)
             """,
             (
                 bridge_id,
@@ -450,6 +458,7 @@ class BridgeStore:
                 event_sequence,
                 "buffered",
                 instructions,
+                json.dumps(event.github_inputs or {}, separators=(",", ":"), sort_keys=True),
                 now,
                 now,
             ),
@@ -1018,7 +1027,8 @@ class GitHubToMEPBridgeService:
         if entity_type == "pr":
             review_package = self._fetch_pr_review_package(repo_full_name, number)
             review_context = str(review_package.get("instructions_context") or "")
-            for key, value in review_package.items():
+            compact_review_package = self._compact_review_package_for_task_inputs(review_package)
+            for key, value in compact_review_package.items():
                 if key != "instructions_context":
                     github_inputs[key] = value
 
@@ -1153,6 +1163,56 @@ class GitHubToMEPBridgeService:
     def _fetch_pr_review_context(self, repo_full_name: str, number: int) -> str:
         review_package = self._fetch_pr_review_package(repo_full_name, number)
         return str(review_package.get("instructions_context") or "")
+
+    def _compact_review_package_for_task_inputs(self, review_package: dict[str, Any]) -> dict[str, Any]:
+        if not isinstance(review_package, dict):
+            return {}
+        compact: dict[str, Any] = {}
+        for key in (
+            "head_sha",
+            "base_sha",
+            "head_ref",
+            "base_ref",
+            "repo_clone_url",
+            "pr_stats",
+            "touched_paths",
+            "touched_tests",
+            "risk_tags",
+        ):
+            value = review_package.get(key)
+            if value not in (None, "", [], {}):
+                compact[key] = value
+
+        instructions_context = str(review_package.get("instructions_context") or "").strip()
+        if instructions_context:
+            compact["instructions_context"] = self._clip_text(instructions_context, 2200)
+
+        changed_files = review_package.get("changed_files")
+        compact_files: list[dict[str, Any]] = []
+        if isinstance(changed_files, list):
+            remaining_patch_budget = 1200
+            for item in changed_files[:6]:
+                if not isinstance(item, dict):
+                    continue
+                filename = str(item.get("filename") or "").strip()
+                if not filename:
+                    continue
+                entry = {
+                    "filename": filename,
+                    "status": str(item.get("status") or "modified").strip(),
+                    "additions": int(item.get("additions") or 0),
+                    "deletions": int(item.get("deletions") or 0),
+                    "changes": int(item.get("changes") or 0),
+                }
+                patch_excerpt = str(item.get("patch_excerpt") or "").strip()
+                if patch_excerpt and remaining_patch_budget > 0:
+                    clipped_excerpt = self._clip_text(patch_excerpt, min(remaining_patch_budget, 240))
+                    entry["patch_excerpt"] = clipped_excerpt
+                    remaining_patch_budget -= len(clipped_excerpt)
+                compact_files.append(entry)
+        if compact_files:
+            compact["changed_files"] = compact_files
+        return compact
 
     @staticmethod
     def _is_test_path(path: str) -> bool:
@@ -1838,6 +1898,17 @@ class GitHubToMEPBridgeService:
         marker = f"{BRIDGE_OUTPUT_MARKER} bridge_id={bridge_id} action={action} -->"
         return f"{detail_text}\n\n{marker}"
 
+    @staticmethod
+    def _execution_github_inputs(execution: dict[str, Any]) -> dict[str, Any]:
+        raw = str(execution.get("github_inputs_json") or "").strip()
+        if not raw:
+            return {}
+        try:
+            decoded = json.loads(raw)
+        except json.JSONDecodeError:
+            return {}
+        return decoded if isinstance(decoded, dict) else {}
+
     def _target_alias_for_execution(self, execution: dict[str, Any]) -> str:
         return str(execution.get("target_alias") or self.config.target_alias or "").strip()
 
@@ -1976,8 +2047,9 @@ class GitHubToMEPBridgeService:
             if resolved_action == "suppressed":
                 retry_count = int(refreshed.get("retry_count") or 0)
                 if retry_count < 2:  # MAX_RETRIES = 2
-                    await self._issue_retry_task(refreshed, suppression_reason)
-                    resolved_action = "retrying"
+                    retry_queued = await self._issue_retry_task(refreshed, suppression_reason)
+                    if retry_queued:
+                        resolved_action = "retrying"
             if resolved_action != update.action:
                 self.store.update_execution(update.bridge_id, action=resolved_action)
                 refreshed = self.store.get_execution(update.bridge_id) or refreshed
@@ -2014,15 +2086,14 @@ class GitHubToMEPBridgeService:
         )
         return {"status": "ok", "bridge_id": update.bridge_id}
 
-    async def _issue_retry_task(self, execution: dict[str, Any], reason: Optional[str]) -> None:
+    async def _issue_retry_task(self, execution: dict[str, Any], reason: Optional[str]) -> bool:
         bridge_id = str(execution["bridge_id"])
         context_id = str(execution["context_id"])
         target_node_id = str(execution["target_node_id"])
         target_alias = str(execution["target_alias"])
         retry_count = int(execution.get("retry_count") or 0) + 1
-        
-        self.store.update_execution(bridge_id, retry_count=retry_count)
-        
+        github_inputs = self._execution_github_inputs(execution)
+
         # Build critique instructions
         critique = f"Your previous review was suppressed because: {reason or 'weak_output'}.\n"
         if reason == "summary_without_code_evidence":
@@ -2051,24 +2122,38 @@ class GitHubToMEPBridgeService:
             intent_type=str(execution["intent_type"]),
             instructions=f"{critique}\n\nOriginal instructions follow:\n{execution.get('instructions', '')}",
             raw_trigger_text="",
+            github_inputs=github_inputs,
             event_sequence=new_sequence,
             bridge_id=bridge_id,
         )
-        
+
         envelope = self._build_interbot_envelope(
             event, target_node_id=target_node_id,
             target_alias=target_alias, bridge_id=bridge_id,
         )
-        
+
         try:
-            await asyncio.to_thread(
+            response = await asyncio.to_thread(
                 self.submission_client.submit_structured_dm,
                 envelope,
                 target_node_id,
                 event.intent_type,
             )
+            status_code = int(response.get("status_code") or 500) if isinstance(response, dict) else 500
+            payload = response.get("json") if isinstance(response, dict) else None
+            if status_code >= 400 or not isinstance(payload, dict):
+                return False
+            task_id = payload.get("task_id")
+            execution_status = str(payload.get("status") or "submitted")
+            self.store.update_execution(
+                bridge_id,
+                status=execution_status,
+                task_id=str(task_id) if task_id else None,
+                retry_count=retry_count,
+            )
+            return True
         except Exception:  # noqa: BLE001
-            pass
+            return False
 
     def _render_status_text(
         self,
