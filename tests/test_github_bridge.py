@@ -534,6 +534,132 @@ class TestGitHubToMEPBridge(unittest.TestCase):
         self.assertEqual(self.service.github_writeback_metrics["suppressed_approvals"], 1)
         self.assertEqual(self.service.github_writeback_metrics["last_suppressed_reason"], "generic_observation")
 
+    def test_status_callback_suppresses_approve_without_test_awareness(self):
+        self._set_pr_review_package(
+            [
+                {
+                    "filename": "node/mep_runtime.py",
+                    "status": "modified",
+                    "additions": 6,
+                    "deletions": 1,
+                    "changes": 7,
+                    "patch": (
+                        "@@ -945,0 +945,6 @@\n"
+                        "+def _record_pending_task_poll_failure(self, status: int, detail: str) -> None:\n"
+                        "+    self.pending_task_recovery_metrics['last_poll_status'] = status\n"
+                    ),
+                },
+                {
+                    "filename": "tests/test_node_runtime.py",
+                    "status": "modified",
+                    "additions": 8,
+                    "deletions": 0,
+                    "changes": 8,
+                    "patch": (
+                        "@@ -494,0 +494,8 @@\n"
+                        "+def test_fetch_pending_tasks_uses_authenticated_get(self):\n"
+                        "+    self.assertEqual(tasks, [{'id': 'task_pending'}])\n"
+                    ),
+                },
+            ],
+            pr_body="Adds pending-task recovery observability and focused runtime tests.",
+        )
+        response = self._post_webhook(
+            _issue_comment_payload("@Hub-Sentinel approve this PR", delivery_number=245),
+            delivery_id="delivery-approve-no-tests",
+        )
+        self.assertEqual(response.status_code, 200)
+        bridge_id = response.json()["bridge_id"]
+        self._flush_context(response.json()["context_id"])
+
+        token = self.service._generate_status_token(bridge_id, "node_target")
+        status_response = self.client.post(
+            "/bridge/status",
+            json={
+                "bridge_id": bridge_id,
+                "status": "completed",
+                "target_node_id": "node_target",
+                "task_id": "task-approve-no-tests",
+                "action": "approved",
+                "detail": (
+                    "## Review Summary\n\n"
+                    "The PR adds pending-task recovery observability in `node/mep_runtime.py`.\n\n"
+                    "Observation: `_record_pending_task_poll_failure` now records `last_poll_status`, which makes the recovery metrics more actionable.\n\n"
+                    "Touched paths reviewed: `node/mep_runtime.py`."
+                ),
+            },
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        self.assertEqual(status_response.status_code, 200, status_response.text)
+        self.assertEqual(len(self.github_session.posts), 0)
+        self.assertIn("action: retrying", self.notifier.calls[-1]["text"])
+        self.assertEqual(self.service.github_writeback_metrics["suppressed_approvals"], 1)
+        self.assertEqual(self.service.github_writeback_metrics["last_suppressed_reason"], "approval_without_test_awareness")
+        self.assertGreaterEqual(self.service.github_writeback_metrics["last_quality_score"], 2)
+
+    def test_status_callback_allows_approve_with_grounded_code_and_test_awareness(self):
+        self._set_pr_review_package(
+            [
+                {
+                    "filename": "node/mep_runtime.py",
+                    "status": "modified",
+                    "additions": 6,
+                    "deletions": 1,
+                    "changes": 7,
+                    "patch": (
+                        "@@ -945,0 +945,6 @@\n"
+                        "+def _record_pending_task_poll_failure(self, status: int, detail: str) -> None:\n"
+                        "+    self.pending_task_recovery_metrics['last_poll_status'] = status\n"
+                    ),
+                },
+                {
+                    "filename": "tests/test_node_runtime.py",
+                    "status": "modified",
+                    "additions": 8,
+                    "deletions": 0,
+                    "changes": 8,
+                    "patch": (
+                        "@@ -494,0 +494,8 @@\n"
+                        "+def test_fetch_pending_tasks_uses_authenticated_get(self):\n"
+                        "+    self.assertEqual(tasks, [{'id': 'task_pending'}])\n"
+                    ),
+                },
+            ],
+            pr_body="Adds pending-task recovery observability and focused runtime tests.",
+        )
+        response = self._post_webhook(
+            _issue_comment_payload("@Hub-Sentinel approve this PR", delivery_number=246),
+            delivery_id="delivery-approve-with-tests",
+        )
+        self.assertEqual(response.status_code, 200)
+        bridge_id = response.json()["bridge_id"]
+        self._flush_context(response.json()["context_id"])
+
+        token = self.service._generate_status_token(bridge_id, "node_target")
+        status_response = self.client.post(
+            "/bridge/status",
+            json={
+                "bridge_id": bridge_id,
+                "status": "completed",
+                "target_node_id": "node_target",
+                "task_id": "task-approve-with-tests",
+                "action": "approved",
+                "detail": (
+                    "## Review Summary\n\n"
+                    "The PR adds pending-task recovery observability in `node/mep_runtime.py` and keeps the verification path narrow.\n\n"
+                    "Observation: `_record_pending_task_poll_failure` now records `last_poll_status`, and the changed test keeps the recovery behavior covered. No risky changes.\n\n"
+                    "Touched paths reviewed: `node/mep_runtime.py`, `tests/test_node_runtime.py`\n\n"
+                    "Tests reviewed: `tests/test_node_runtime.py`."
+                ),
+            },
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        self.assertEqual(status_response.status_code, 200, status_response.text)
+        self.assertEqual(len(self.github_session.posts), 1)
+        self.assertEqual(self.github_session.posts[0]["json"]["event"], "APPROVE")
+        self.assertEqual(self.service.github_writeback_metrics["suppressed_approvals"], 0)
+        self.assertGreaterEqual(self.service.github_writeback_metrics["last_quality_score"], 4)
+
     def test_status_callback_suppresses_generic_pr_review_writeback(self):
         response = self._post_webhook(
             _issue_comment_payload("@Hub-Sentinel review this PR", delivery_number=231),
