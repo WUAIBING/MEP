@@ -706,6 +706,50 @@ class TestRuntimeWebSocketLoop(unittest.TestCase):
         self.assertEqual(request_mock.call_args.kwargs["json_body"]["detail"], "Looks good to me.")
         self.assertEqual(request_mock.call_args.kwargs["headers"]["Authorization"], "Bearer status-token")
 
+    def test_process_task_reports_failed_status_when_adapter_errors_on_review(self):
+        node = _runtime_node()
+        task_data = {
+            "id": "task_bridge_error",
+            "bounty": 0.0,
+            "payload": json.dumps(
+                {
+                    "spec_version": "mep.interbot.v1",
+                    "message_id": "msg-bridge-error",
+                    "trace_id": "trace-bridge-error",
+                    "source": {"node_id": "node_bridge"},
+                    "target": {"node_id": node.node_id},
+                    "conversation": {"context_id": "ctx-bridge-error"},
+                    "intent": {"type": "code.review.approve", "priority": "high"},
+                    "task": {
+                        "instructions": "Approve this PR if it looks good.",
+                        "inputs": {
+                            "bridge_metadata": {
+                                "source_type": "github",
+                                "bridge_id": "br-err-1",
+                                "status_endpoint": "https://bridge.example.test/bridge/status",
+                                "status_token": "status-token",
+                            }
+                        },
+                    },
+                    "economics": {"bounty_seconds": 0.0, "currency": "SECONDS"},
+                    "delivery": {"reply_mode": "new_dm", "settlement_mode": "task_result"},
+                }
+            ),
+        }
+        error_reply = '[DeepSeek] API error 402: {"error":{"message":"Insufficient Balance"}}'
+        with (
+            patch.object(node.adapter, "generate_reply", return_value=error_reply),
+            patch.object(node, "complete") as complete_mock,
+            patch("node.mep_runtime._safe_request", return_value=(200, {}, "")) as request_mock,
+        ):
+            asyncio.run(node.process_task(task_data))
+
+        complete_mock.assert_called_once()
+        request_mock.assert_called_once()
+        body = request_mock.call_args.kwargs["json_body"]
+        self.assertEqual(body["status"], "failed")
+        self.assertNotIn("action", body)
+
     def test_process_task_appends_synced_workspace_context_to_review_input(self):
         node = _runtime_node()
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1095,6 +1139,62 @@ class TestRuntimeKeyDirResolution(unittest.TestCase):
             self.assertEqual(code, 2)
             printed = "\n".join(str(call.args[0]) for call in print_mock.call_args_list if call.args)
             self.assertIn("multiple local identities found", printed)
+
+
+class TestAdapterErrorDetection(unittest.TestCase):
+    def test_is_adapter_error_detects_error_sentinels(self):
+        self.assertTrue(mep_runtime._is_adapter_error("[DeepSeek] API error 402: Insufficient Balance"))  # noqa: SLF001
+        self.assertTrue(mep_runtime._is_adapter_error("[DeepSeek] error: connection reset"))  # noqa: SLF001
+        self.assertTrue(mep_runtime._is_adapter_error("[AI adapter] tinyllama timed out"))  # noqa: SLF001
+        self.assertTrue(mep_runtime._is_adapter_error("[AI adapter] empty response from tinyllama"))  # noqa: SLF001
+        self.assertTrue(mep_runtime._is_adapter_error(""))  # noqa: SLF001
+
+    def test_is_adapter_error_allows_real_reviews(self):
+        self.assertFalse(  # noqa: SLF001
+            mep_runtime._is_adapter_error("## Review Summary\n\nThe change is scoped and tested.")
+        )
+
+
+class TestWorkspaceReviewContext(unittest.TestCase):
+    def test_build_review_context_includes_full_file_contents(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            os.makedirs(os.path.join(tmp, "bridge"), exist_ok=True)
+            body = "\n".join(f"line_{i} = {i}" for i in range(200))
+            with open(os.path.join(tmp, "bridge", "big.py"), "w", encoding="utf-8") as handle:
+                handle.write(body)
+
+            wm = mep_runtime.WorkspaceManager(tmp)
+            ctx = wm.build_review_context(tmp, ["bridge/big.py"])
+
+        self.assertIn("Full contents of changed files", ctx)
+        self.assertIn("line_0 = 0", ctx)
+        # The tail of a >700 char file must be present: earlier excerpt logic clipped it.
+        self.assertIn("line_199 = 199", ctx)
+
+    def test_build_verification_report_disabled_by_default(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            wm = mep_runtime.WorkspaceManager(tmp)
+            self.assertEqual(
+                wm.build_verification_report(tmp, ["node/x.py"], ["tests/test_x.py"]),
+                "",
+            )
+
+    def test_build_verification_report_runs_pytest_when_enabled(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            wm = mep_runtime.WorkspaceManager(tmp)
+            with patch.object(wm, "_run_check", return_value=(0, "1 passed in 0.01s")) as run_mock:
+                report = wm.build_verification_report(
+                    tmp,
+                    ["node/x.py"],
+                    ["tests/test_x.py"],
+                    enabled=True,
+                )
+
+        self.assertIn("Automated verification run on the checked-out PR head", report)
+        self.assertIn("pytest (changed tests): passed", report)
+        self.assertIn("1 passed", report)
+        invoked = [call.args[1] for call in run_mock.call_args_list]
+        self.assertTrue(any("tests/test_x.py" in args for args in invoked))
 
 
 if __name__ == "__main__":

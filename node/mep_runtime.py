@@ -9,7 +9,9 @@ import copy
 import json
 import os
 import re
+import shutil
 import subprocess
+import sys
 import time
 import urllib.parse
 import uuid
@@ -45,6 +47,33 @@ def _env_truthy(name: str, default: str = "0") -> bool:
 
 def _strict_adapter_mode() -> bool:
     return _env_truthy("MEP_STRICT_ADAPTERS", "0")
+
+
+def _review_max_chars() -> int:
+    return _env_positive_int("MEP_REVIEW_MAX_CHARS", 4000)
+
+
+def _review_run_checks_enabled() -> bool:
+    return _env_truthy("MEP_REVIEW_RUN_CHECKS", "0")
+
+
+def _is_adapter_error(text: str) -> bool:
+    """Detect adapter failures that must never be published as a real review.
+
+    Reviewer runtimes return error sentinels (missing/expired API key, HTTP
+    errors, timeouts, empty completions) as plain strings. Treating those as a
+    completed review is how an approval can be written back on top of an API
+    error, so the bridge must see a failed status instead.
+    """
+    cleaned = (text or "").strip()
+    if not cleaned:
+        return True
+    lowered = cleaned.lower()
+    if cleaned.startswith("[DeepSeek]") and ("api error" in lowered or "error:" in lowered or "empty" in lowered):
+        return True
+    if cleaned.startswith("[AI adapter]") and ("error" in lowered or "empty" in lowered or "timed out" in lowered):
+        return True
+    return False
 
 
 def _env_positive_int(name: str, default: int) -> int:
@@ -437,8 +466,11 @@ def _system_prompt_for_task(
         workspace_hint = ""
         if workspace_path:
             workspace_hint = (
-                f" A checked-out local workspace is available at `{workspace_path}` and any embedded workspace excerpts "
-                "come from the PR head commit; treat that material as authoritative code context."
+                f" A checked-out local workspace is available at `{workspace_path}`. The input may include the full "
+                "contents of the changed files and automated verification (test/lint) results from the PR head commit; "
+                "treat that material as the authoritative code context. Base findings on what the full files and "
+                "verification output actually show. Do not claim code is truncated, missing, or a placeholder because "
+                "of how the input is formatted or because a file body was shortened for length."
             )
         approval_hint = ""
         if approval_mode:
@@ -609,10 +641,10 @@ def _render_structured_review_with_task_data(
     if not isinstance(parsed, dict):
         return ""
     github_inputs = _review_github_inputs(task_data or {})
-    summary = _clean_review_text(parsed.get("summary"), max_chars=220)
+    summary = _clean_review_text(parsed.get("summary"), max_chars=500)
     if _is_weak_review_text(summary):
         summary = ""
-    observation = _clean_review_text(parsed.get("observation"), max_chars=220)
+    observation = _clean_review_text(parsed.get("observation"), max_chars=400)
     if _is_weak_review_text(observation):
         observation = ""
     touched_paths = _clean_review_list(parsed.get("touched_paths"), max_items=4, max_chars=120)
@@ -623,7 +655,7 @@ def _render_structured_review_with_task_data(
         tests_reviewed = _clean_review_list(github_inputs.get("touched_tests"), max_items=3, max_chars=120)
     risk_areas_checked = _clean_review_list(parsed.get("risk_areas_checked"), max_items=4, max_chars=100)
     checks_performed = _clean_review_list(parsed.get("checks_performed"), max_items=4, max_chars=120)
-    why_no_finding = _clean_review_text(parsed.get("why_no_finding"), max_chars=240)
+    why_no_finding = _clean_review_text(parsed.get("why_no_finding"), max_chars=400)
     if _is_weak_review_text(why_no_finding):
         why_no_finding = ""
     verified_identifiers = _clean_review_list(parsed.get("verified_identifiers"), max_items=4, max_chars=80)
@@ -633,10 +665,10 @@ def _render_structured_review_with_task_data(
         for item in findings_raw[:2]:
             if not isinstance(item, dict):
                 continue
-            issue = _clean_review_text(item.get("issue"), max_chars=140)
+            issue = _clean_review_text(item.get("issue"), max_chars=200)
             if not issue:
                 continue
-            rationale = _clean_review_text(item.get("rationale"), max_chars=260)
+            rationale = _clean_review_text(item.get("rationale"), max_chars=400)
             combined = f"{issue} {rationale}".strip()
             if _is_weak_review_text(combined):
                 continue
@@ -712,8 +744,9 @@ class AIAdapter:
         import subprocess
 
         try:
+            review_max = _review_max_chars()
             prompt = (
-                f"{_system_prompt_for_task(task_data, generic_max_chars=300, review_max_chars=1000)}\n\n"
+                f"{_system_prompt_for_task(task_data, generic_max_chars=300, review_max_chars=review_max)}\n\n"
                 f"Task: {payload}\n\nReply:"
             )
             result = subprocess.run(
@@ -726,13 +759,13 @@ class AIAdapter:
             if not reply:
                 return f"[AI adapter] empty response from {self.model}"
             if _task_requires_review_prompt(task_data):
-                rendered = _render_structured_review_with_task_data(reply, max_chars=1000, task_data=task_data)
+                rendered = _render_structured_review_with_task_data(reply, max_chars=review_max, task_data=task_data)
                 if rendered:
                     return rendered
-                finalized = _finalize_model_reply(reply, max_chars=1000)
+                finalized = _finalize_model_reply(reply, max_chars=review_max)
                 if finalized:
                     return finalized
-                return reply[:1000].rstrip() or "[AI adapter] review response was empty"
+                return reply[:review_max].rstrip() or "[AI adapter] review response was empty"
             return reply
         except subprocess.TimeoutExpired:
             return f"[AI adapter] {self.model} timed out"
@@ -748,6 +781,7 @@ class DeepSeekAdapter:
     model: str = "deepseek-chat"
 
     def generate_reply(self, payload: str, task_data: dict[str, Any]) -> str:
+        review_max = _review_max_chars()
         try:
             resp = requests.post(
                 "https://api.deepseek.com/v1/chat/completions",
@@ -763,15 +797,15 @@ class DeepSeekAdapter:
                             "content": _system_prompt_for_task(
                                 task_data,
                                 generic_max_chars=500,
-                                review_max_chars=1000,
+                                review_max_chars=review_max,
                             ),
                         },
                         {"role": "user", "content": payload},
                     ],
-                    "max_tokens": 450,
+                    "max_tokens": _env_positive_int("MEP_AI_MAX_TOKENS", 4000),
                     "temperature": 0.1,
                 },
-                timeout=30,
+                timeout=_env_positive_int("MEP_AI_TIMEOUT_SECONDS", 120),
             )
             if resp.status_code == 200:
                 message = resp.json()["choices"][0]["message"]
@@ -779,13 +813,13 @@ class DeepSeekAdapter:
                 if not reply:
                     reply = str(message.get("reasoning_content") or "").strip()
                 if _task_requires_review_prompt(task_data):
-                    rendered = _render_structured_review_with_task_data(reply, max_chars=1000, task_data=task_data)
+                    rendered = _render_structured_review_with_task_data(reply, max_chars=review_max, task_data=task_data)
                     if rendered:
                         return rendered
-                    finalized = _finalize_model_reply(reply, max_chars=1000)
+                    finalized = _finalize_model_reply(reply, max_chars=review_max)
                     if finalized:
                         return finalized
-                    return reply[:1000].rstrip() or "[DeepSeek] review response was empty"
+                    return reply[:review_max].rstrip() or "[DeepSeek] review response was empty"
                 return reply
             return f"[DeepSeek] API error {resp.status_code}: {resp.text[:200]}"
         except Exception as exc:  # noqa: BLE001
@@ -862,16 +896,27 @@ class WorkspaceManager:
         workspace_path: str,
         touched_paths: list[str],
         *,
-        max_files: int = 3,
-        max_chars: int = 2200,
+        max_files: int = 12,
+        max_file_chars: int = 20000,
+        max_chars: int = 60000,
     ) -> str:
+        """Embed the full contents of changed files from the checked-out PR head.
+
+        Earlier revisions only embedded ~700 chars per file across 3 files, which
+        starved the reviewer of context and caused it to mistake its own
+        truncated input for defects in the code. Providing whole files (within a
+        generous budget) lets the model reason about the real change.
+        """
         if not workspace_path or not isinstance(touched_paths, list):
             return ""
-        sections = [f"Local workspace path: {workspace_path}", "Workspace file excerpts:"]
+        sections = [
+            f"Local workspace path: {workspace_path}",
+            "Full contents of changed files at the PR head commit (authoritative source for your review):",
+        ]
         remaining = max_chars
         added = 0
         for path in touched_paths:
-            if added >= max_files or remaining <= 180:
+            if added >= max_files or remaining <= 400:
                 break
             resolved = self._resolve_repo_file(workspace_path, str(path or ""))
             if not resolved or not os.path.isfile(resolved):
@@ -881,17 +926,98 @@ class WorkspaceManager:
                     content = handle.read()
             except OSError:
                 continue
-            content = content.strip()
-            if not content:
+            if not content.strip():
                 continue
-            excerpt = content[: min(remaining, 700)].strip()
-            block = f"- {path}\n{excerpt}"
+            budget = min(remaining, max_file_chars)
+            truncated = len(content) > budget
+            body = content[:budget].rstrip() if truncated else content.rstrip()
+            block = f"### {path}\n```\n{body}\n```"
+            if truncated:
+                block += (
+                    f"\n[note: file body shown up to {budget} characters for length; "
+                    "this is an input-size limit, not a defect in the code]"
+                )
             sections.append(block)
             remaining -= len(block) + 2
             added += 1
         if added == 0:
             return ""
         return "\n\n".join(sections)
+
+    def _run_check(self, cwd: str, args: list[str], timeout: int) -> tuple[int, str]:
+        try:
+            result = subprocess.run(
+                args,
+                cwd=cwd,
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=timeout,
+            )
+            return result.returncode, (result.stdout + result.stderr).strip()
+        except subprocess.TimeoutExpired:
+            return -1, f"timed out after {timeout}s"
+        except Exception as exc:  # noqa: BLE001
+            return -1, str(exc)
+
+    def build_verification_report(
+        self,
+        workspace_path: str,
+        touched_paths: list[str],
+        touched_tests: list[str],
+        *,
+        enabled: Optional[bool] = None,
+        timeout: Optional[int] = None,
+        max_output_chars: int = 2500,
+    ) -> str:
+        """Run the repo's linters/tests against the checked-out PR head.
+
+        Opt-in via ``MEP_REVIEW_RUN_CHECKS`` because this executes code from the
+        PR under review; it should only run inside the isolated per-bridge
+        workspace. The captured pass/fail signal is fed to the reviewer so it can
+        ground its review in real verification instead of guessing from a diff.
+        """
+        if enabled is None:
+            enabled = _review_run_checks_enabled()
+        if not enabled or not workspace_path or not os.path.isdir(workspace_path):
+            return ""
+        if timeout is None:
+            timeout = _env_positive_int("MEP_REVIEW_CHECK_TIMEOUT", 180)
+        touched_paths = touched_paths if isinstance(touched_paths, list) else []
+        touched_tests = touched_tests if isinstance(touched_tests, list) else []
+        py_files = [str(p) for p in touched_paths if str(p).endswith(".py")]
+
+        def _tail(text: str) -> str:
+            text = (text or "").strip()
+            if len(text) > max_output_chars:
+                return "...\n" + text[-max_output_chars:]
+            return text
+
+        reports: list[str] = []
+        if py_files and shutil.which("ruff"):
+            code, out = self._run_check(workspace_path, ["ruff", "check", *py_files], timeout)
+            status = "passed" if code == 0 else f"failed (exit {code})"
+            reports.append(f"$ ruff check (changed files): {status}\n{_tail(out)}")
+
+        test_targets = [str(t) for t in touched_tests if str(t).strip()]
+        if not test_targets:
+            test_targets = [p for p in py_files if "test" in os.path.basename(p).lower()]
+        if test_targets:
+            code, out = self._run_check(
+                workspace_path,
+                [sys.executable, "-m", "pytest", *test_targets, "-q"],
+                timeout,
+            )
+            status = "passed" if code == 0 else f"failed (exit {code})"
+            reports.append(f"$ pytest (changed tests): {status}\n{_tail(out)}")
+
+        if not reports:
+            return ""
+        header = (
+            "Automated verification run on the checked-out PR head (authoritative; "
+            "use these results in your review):"
+        )
+        return header + "\n\n" + "\n\n".join(reports)
 
 
 class RuntimeNode:
@@ -984,7 +1110,7 @@ class RuntimeNode:
         if isinstance(conversation, dict) and isinstance(conversation.get("context_id"), str):
             payload["context_id"] = conversation["context_id"]
         action = self._bridge_status_action(interbot_message)
-        if action:
+        if action and status == "completed":
             payload["action"] = action
         if detail:
             payload["detail"] = detail[:60000]
@@ -1562,6 +1688,7 @@ class RuntimeNode:
                     workspace_path = path_or_err
                     github_inputs["local_workspace_path"] = workspace_path
                     touched_paths = github_inputs.get("touched_paths") if isinstance(github_inputs.get("touched_paths"), list) else []
+                    touched_tests = github_inputs.get("touched_tests") if isinstance(github_inputs.get("touched_tests"), list) else []
                     workspace_context = await asyncio.to_thread(
                         self.workspace.build_review_context,
                         workspace_path,
@@ -1569,6 +1696,14 @@ class RuntimeNode:
                     )
                     if workspace_context:
                         instructions = f"{instructions}\n\nAdditional local workspace context:\n{workspace_context}"
+                    verification_report = await asyncio.to_thread(
+                        self.workspace.build_verification_report,
+                        workspace_path,
+                        touched_paths,
+                        touched_tests,
+                    )
+                    if verification_report:
+                        instructions = f"{instructions}\n\n{verification_report}"
                 else:
                     print(f"[mep workspace] sync failed: {path_or_err}")
                     # We continue anyway, but the adapter might be working on stale code
@@ -1585,6 +1720,25 @@ class RuntimeNode:
                 adapter_task_data["intent"] = copy.deepcopy(intent)
 
         result = self.adapter.generate_reply(instructions, adapter_task_data)
+
+        # Fail-safe: a reviewer runtime must never let an adapter error (missing or
+        # expired API key, HTTP error, timeout, empty completion) be written back as
+        # a completed review/approval. Report a failed status with no review action so
+        # the bridge does not publish a decision built on error text.
+        if (
+            interbot_message is not None
+            and self._bridge_status_action(interbot_message) is not None
+            and _is_adapter_error(result)
+        ):
+            self.complete(task_id, result)
+            self._report_bridge_status(
+                interbot_message,
+                task_id=task_id,
+                status="failed",
+                detail=f"Reviewer runtime produced no publishable review; adapter error: {result[:1000]}",
+            )
+            return
+
         if self._bridge_eligible_interbot_message(task_data, interbot_message):
             bridged = await self._attempt_live_call_bridge(task_data, interbot_message, result)
             if bridged:
