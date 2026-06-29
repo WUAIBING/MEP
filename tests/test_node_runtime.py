@@ -411,6 +411,21 @@ class TestRuntimeReviewPrompts(unittest.TestCase):
         self.assertIn('"tests_reviewed": [string]', prompt)
         self.assertIn('"approval_recommendation"', prompt)
 
+    def test_approval_review_prompt_requires_verified_identifiers_and_test_awareness(self):
+        task_data = self._bridge_review_task_data(intent_type="code.review.approve")
+        prompt = mep_runtime._system_prompt_for_task(  # noqa: SLF001
+            task_data,
+            generic_max_chars=300,
+            review_max_chars=1000,
+        )
+
+        self.assertIn('"verified_identifiers": [string]', prompt)
+        self.assertIn("Approval mode is active.", prompt)
+        self.assertIn("at least two exact identifiers", prompt)
+        self.assertIn("mention the changed tests", prompt)
+        self.assertIn("state the scope is low-risk", prompt)
+        self.assertIn("checks are pending or failing", prompt)
+
     def test_deepseek_adapter_uses_reviewer_prompt_for_bridge_review_tasks(self):
         adapter = mep_runtime.DeepSeekAdapter(api_key="secret-key", model="deepseek-chat")
         task_data = self._bridge_review_task_data()
@@ -482,6 +497,24 @@ class TestRuntimeReviewPrompts(unittest.TestCase):
 
         self.assertIn("Observation: The diff is small and scoped.", rendered)
         self.assertIn("Touched paths reviewed: `bridge/github_to_mep.py`", rendered)
+        self.assertIn("Tests reviewed: `tests/test_github_bridge.py`", rendered)
+
+    def test_structured_approval_review_renders_verified_identifiers(self):
+        rendered = mep_runtime._render_structured_review_with_task_data(  # noqa: SLF001
+            (
+                '{"summary":"Verified the approval gate stays low-risk.",'
+                '"observation":"`_score_review_quality` and `_approval_quality_failure` now enforce changed-line and test-aware approvals.",'
+                '"touched_paths":["bridge/github_to_mep.py"],'
+                '"tests_reviewed":["tests/test_github_bridge.py"],'
+                '"verified_identifiers":["_score_review_quality","_approval_quality_failure"],'
+                '"findings":[],"approval_recommendation":"approve"}'
+            ),
+            max_chars=1000,
+            task_data=self._bridge_review_task_data(intent_type="code.review.approve"),
+        )
+
+        self.assertIn("## Review Summary", rendered)
+        self.assertIn("Changed identifiers verified: `_score_review_quality`, `_approval_quality_failure`", rendered)
         self.assertIn("Tests reviewed: `tests/test_github_bridge.py`", rendered)
 
 

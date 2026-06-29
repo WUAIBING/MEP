@@ -671,6 +671,8 @@ class GitHubToMEPBridgeService:
             "last_detail_preview": None,
             "last_suppressed_reason": None,
             "last_suppressed_at": None,
+            "last_quality_score": 0,
+            "last_quality_reasons": [],
         }
 
     def _require_runtime_config(self) -> None:
@@ -1175,6 +1177,7 @@ class GitHubToMEPBridgeService:
             "base_ref",
             "repo_clone_url",
             "pr_stats",
+            "ci_checks",
             "touched_paths",
             "touched_tests",
             "risk_tags",
@@ -1293,12 +1296,35 @@ class GitHubToMEPBridgeService:
         head_ref = str(head.get("ref") or "").strip()
         base_ref = str(base.get("ref") or "").strip()
         repo_clone_url = str((head.get("repo") or {}).get("clone_url") or "").strip()
+        check_runs_payload: Any = {}
+        if head_sha:
+            try:
+                check_runs_response = self.github_session.get(
+                    f"https://api.github.com/repos/{repo_full_name}/commits/{head_sha}/check-runs?per_page=20",
+                    headers=headers,
+                    timeout=20,
+                )
+                if check_runs_response.status_code == 200:
+                    check_runs_payload = check_runs_response.json()
+            except Exception:
+                check_runs_payload = {}
+        ci_checks = self._summarize_pr_checks(check_runs_payload)
 
         if head_sha or base_sha:
             sections.append(
                 "Revision identity: "
                 f"head_sha={head_sha or 'unknown'}, base_sha={base_sha or 'unknown'}, "
                 f"head_ref={head_ref or 'unknown'}, base_ref={base_ref or 'unknown'}"
+            )
+        if ci_checks.get("has_checks"):
+            check_lines = [
+                f"- {item.get('name')}: {item.get('state')}"
+                for item in ci_checks.get("summary", [])
+                if isinstance(item, dict)
+            ]
+            sections.append(
+                "PR checks: "
+                f"state={ci_checks.get('state')}\n" + "\n".join(check_lines)
             )
         sections.append(
             "PR stats: "
@@ -1370,6 +1396,7 @@ class GitHubToMEPBridgeService:
                 "deletions": deletions,
                 "commits": commits,
             },
+            "ci_checks": ci_checks,
             "touched_paths": touched_paths,
             "touched_tests": touched_tests,
             "risk_tags": risk_tags,
@@ -1734,6 +1761,192 @@ class GitHubToMEPBridgeService:
                 }
         return patches
 
+    @staticmethod
+    def _summarize_pr_checks(check_runs_payload: Any) -> dict[str, Any]:
+        raw_runs = check_runs_payload.get("check_runs") if isinstance(check_runs_payload, dict) else []
+        if not isinstance(raw_runs, list):
+            raw_runs = []
+        summary: list[dict[str, str]] = []
+        pending_count = 0
+        failing_count = 0
+        successful_count = 0
+        for item in raw_runs[:8]:
+            if not isinstance(item, dict):
+                continue
+            name = str(item.get("name") or "unnamed-check").strip() or "unnamed-check"
+            status = str(item.get("status") or "").strip().lower()
+            conclusion = str(item.get("conclusion") or "").strip().lower()
+            if status and status != "completed":
+                state = status
+                pending_count += 1
+            elif conclusion in {"success", "neutral", "skipped"}:
+                state = conclusion or "success"
+                successful_count += 1
+            else:
+                state = conclusion or "unknown"
+                failing_count += 1
+            summary.append(
+                {
+                    "name": name,
+                    "status": status,
+                    "conclusion": conclusion,
+                    "state": state,
+                }
+            )
+        if summary:
+            if pending_count:
+                overall_state = "pending"
+            elif failing_count:
+                overall_state = "failing"
+            elif successful_count == len(summary):
+                overall_state = "green"
+            else:
+                overall_state = "unknown"
+        else:
+            overall_state = "none"
+        return {
+            "has_checks": bool(summary),
+            "state": overall_state,
+            "all_green": bool(summary) and pending_count == 0 and failing_count == 0,
+            "pending_count": pending_count,
+            "failing_count": failing_count,
+            "summary": summary,
+        }
+
+    def _build_review_snapshot(self, execution: dict[str, Any], detail: Optional[str]) -> dict[str, Any]:
+        normalized = re.sub(r"\s+", " ", str(detail or "").strip())
+        lowered = normalized.lower()
+        review_package: dict[str, Any] = {}
+        entity_type = str(execution.get("entity_type") or "").strip().lower()
+        repo_full_name = str(execution.get("repo_full_name") or "").strip()
+        number = int(execution.get("issue_number") or 0)
+        if entity_type == "pr" and repo_full_name and number > 0:
+            review_package = self._fetch_pr_review_package(repo_full_name, number)
+        expected_paths: list[str] = []
+        expected_tests: list[str] = []
+        for key in ("touched_paths", "touched_tests"):
+            values = review_package.get(key)
+            if isinstance(values, list):
+                for value in values:
+                    text = str(value or "").strip()
+                    if not text:
+                        continue
+                    if text not in expected_paths:
+                        expected_paths.append(text)
+                    if key == "touched_tests" and text not in expected_tests:
+                        expected_tests.append(text)
+        anchored_paths = self._grounded_review_paths(detail or "", expected_paths)
+        anchored_tests = self._grounded_review_paths(detail or "", expected_tests)
+        patches_by_path = self._patch_text_by_path(review_package)
+        anchored_patch_info = {
+            "full": "\n".join(patches_by_path.get(path, {}).get("full", "") for path in anchored_paths),
+            "changes": "\n".join(patches_by_path.get(path, {}).get("changes", "") for path in anchored_paths),
+        }
+        has_findings = "## review findings" in lowered or bool(self._extract_review_finding_entries(detail or ""))
+        observation_text = self._extract_observation_text(detail or "")
+        has_structured_sections = any(
+            snippet in lowered
+            for snippet in (
+                "## review summary",
+                "## review findings",
+                "observation:",
+                "touched paths reviewed:",
+                "tests reviewed:",
+            )
+        )
+        grounded_tokens = self._grounded_code_tokens(detail or "", anchored_patch_info)
+        changed_tokens = {token for token in grounded_tokens if token in anchored_patch_info["changes"]}
+        mentions_tests = bool(anchored_tests)
+        if not mentions_tests and expected_tests:
+            mentions_tests = bool(re.search(r"\btest(?:s|ed|ing)?\b", lowered))
+        return {
+            "normalized": normalized,
+            "lowered": lowered,
+            "review_package": review_package,
+            "ci_checks": review_package.get("ci_checks") or {},
+            "expected_paths": expected_paths,
+            "expected_tests": expected_tests,
+            "anchored_paths": anchored_paths,
+            "anchored_tests": anchored_tests,
+            "patches_by_path": patches_by_path,
+            "anchored_patch_info": anchored_patch_info,
+            "has_findings": has_findings,
+            "observation_text": observation_text,
+            "has_structured_sections": has_structured_sections,
+            "grounded_tokens": grounded_tokens,
+            "changed_tokens": changed_tokens,
+            "mentions_tests": mentions_tests,
+        }
+
+    def _score_review_quality(self, snapshot: dict[str, Any], *, action: str) -> tuple[int, list[str]]:
+        score = 0
+        reasons: list[str] = []
+        anchored_paths = snapshot.get("anchored_paths") or set()
+        changed_tokens = snapshot.get("changed_tokens") or set()
+        grounded_tokens = snapshot.get("grounded_tokens") or set()
+        has_findings = bool(snapshot.get("has_findings"))
+        observation_text = str(snapshot.get("observation_text") or "").strip()
+        expected_tests = snapshot.get("expected_tests") or []
+        mentions_tests = bool(snapshot.get("mentions_tests"))
+        lowered = str(snapshot.get("lowered") or "")
+
+        if anchored_paths:
+            score += 1
+            reasons.append("touched_path_anchor")
+        if len(anchored_paths) >= 2:
+            score += 1
+            reasons.append("multi_path_anchor")
+        if changed_tokens:
+            score += 1
+            reasons.append("changed_code_evidence")
+        if len(changed_tokens) >= 2:
+            score += 1
+            reasons.append("multiple_changed_identifiers")
+        if has_findings:
+            score += 2
+            reasons.append("concrete_findings")
+        elif observation_text and grounded_tokens:
+            score += 1
+            reasons.append("grounded_observation")
+        if mentions_tests:
+            score += 1
+            reasons.append("test_awareness")
+        elif not expected_tests and re.search(r"\btest(?:s|ed|ing)?\b", lowered):
+            score += 1
+            reasons.append("general_test_awareness")
+        if action == "approved" and "no risky changes" in lowered:
+            score += 1
+            reasons.append("explicit_low_risk_claim")
+        return score, reasons
+
+    def _approval_quality_failure(self, snapshot: dict[str, Any], score: int) -> Optional[str]:
+        ci_checks = snapshot.get("ci_checks") or {}
+        if ci_checks.get("has_checks"):
+            if ci_checks.get("state") == "pending":
+                return "approval_checks_pending"
+            if not ci_checks.get("all_green"):
+                return "approval_checks_not_green"
+        if snapshot.get("has_findings"):
+            return "approval_contains_findings"
+        if not snapshot.get("anchored_paths"):
+            return "approval_without_touched_path_anchor"
+        if not snapshot.get("changed_tokens"):
+            return "approval_without_changed_code_evidence"
+        if snapshot.get("expected_tests") and not snapshot.get("mentions_tests"):
+            return "approval_without_test_awareness"
+        if score < 4:
+            return "approval_below_quality_bar"
+        return None
+
+    def _record_review_quality(self, score: int, reasons: list[str]) -> None:
+        metrics = self.github_writeback_metrics
+        metrics["last_quality_score"] = int(score)
+        metrics["last_quality_reasons"] = list(reasons)
+
+    @staticmethod
+    def _suppression_reason_allows_retry(reason: Optional[str]) -> bool:
+        return reason not in {"approval_checks_pending", "approval_checks_not_green"}
+
     @classmethod
     def _verify_review_findings_against_patch(
         cls,
@@ -1776,53 +1989,32 @@ class GitHubToMEPBridgeService:
                 return "speculative_finding"
         return None
 
-    def _classify_review_writeback_detail(self, execution: dict[str, Any], detail: Optional[str]) -> tuple[bool, str]:
-        normalized = re.sub(r"\s+", " ", str(detail or "").strip())
+    def _classify_review_writeback_detail(
+        self,
+        execution: dict[str, Any],
+        detail: Optional[str],
+        *,
+        snapshot: Optional[dict[str, Any]] = None,
+    ) -> tuple[bool, str]:
+        snapshot = snapshot or self._build_review_snapshot(execution, detail)
+        normalized = str(snapshot.get("normalized") or "")
         if not normalized:
             return True, "empty_detail"
-        lowered = normalized.lower()
-        review_package: dict[str, Any] = {}
-        entity_type = str(execution.get("entity_type") or "").strip().lower()
-        repo_full_name = str(execution.get("repo_full_name") or "").strip()
-        number = int(execution.get("issue_number") or 0)
-        if entity_type == "pr" and repo_full_name and number > 0:
-            review_package = self._fetch_pr_review_package(repo_full_name, number)
-        expected_paths: list[str] = []
-        for key in ("touched_paths", "touched_tests"):
-            values = review_package.get(key)
-            if isinstance(values, list):
-                for value in values:
-                    text = str(value or "").strip()
-                    if text and text not in expected_paths:
-                        expected_paths.append(text)
-        anchored_paths = self._grounded_review_paths(detail or "", expected_paths)
-        patches_by_path = self._patch_text_by_path(review_package)
-        
-        anchored_patch_info = {
-            "full": "\n".join(patches_by_path.get(path, {}).get("full", "") for path in anchored_paths),
-            "changes": "\n".join(patches_by_path.get(path, {}).get("changes", "") for path in anchored_paths),
-        }
-
-        has_findings = "## review findings" in lowered or bool(self._extract_review_finding_entries(detail or ""))
-        observation_text = self._extract_observation_text(detail or "")
-        has_structured_sections = any(
-            snippet in lowered
-            for snippet in (
-                "## review summary",
-                "## review findings",
-                "observation:",
-                "touched paths reviewed:",
-                "tests reviewed:",
-            )
-        )
+        lowered = str(snapshot.get("lowered") or "")
+        review_package = snapshot.get("review_package") or {}
+        expected_paths = list(snapshot.get("expected_paths") or [])
+        anchored_paths = snapshot.get("anchored_paths") or set()
+        anchored_patch_info = snapshot.get("anchored_patch_info") or {"full": "", "changes": ""}
+        has_findings = bool(snapshot.get("has_findings"))
+        observation_text = str(snapshot.get("observation_text") or "")
+        has_structured_sections = bool(snapshot.get("has_structured_sections"))
+        grounded_tokens = snapshot.get("grounded_tokens") or set()
+        changed_tokens = snapshot.get("changed_tokens") or set()
         if has_findings and not anchored_paths:
             return True, "finding_without_touched_path"
         finding_reason = self._verify_review_findings_against_patch(detail or "", review_package, expected_paths)
         if finding_reason:
             return True, finding_reason
-        
-        grounded_tokens = self._grounded_code_tokens(detail or "", anchored_patch_info)
-        changed_tokens = {t for t in grounded_tokens if t in anchored_patch_info["changes"]}
 
         if has_findings and self._is_speculative_finding(detail or "") and len(grounded_tokens) < 2:
             return True, "speculative_finding"
@@ -1998,7 +2190,13 @@ class GitHubToMEPBridgeService:
         review_action = entity_type == "pr" and action in review_events
         self._record_github_writeback_attempt(action, update.detail)
         if review_action:
-            suppress, reason = self._classify_review_writeback_detail(execution, update.detail)
+            snapshot = self._build_review_snapshot(execution, update.detail)
+            suppress, reason = self._classify_review_writeback_detail(execution, update.detail, snapshot=snapshot)
+            score, reasons = self._score_review_quality(snapshot, action=action)
+            self._record_review_quality(score, reasons)
+            if not suppress and action == "approved":
+                reason = self._approval_quality_failure(snapshot, score)
+                suppress = reason is not None
             if suppress:
                 self._record_github_writeback_suppression(
                     bridge_id=str(execution.get("bridge_id") or update.bridge_id),
@@ -2046,7 +2244,7 @@ class GitHubToMEPBridgeService:
             resolved_action, suppression_reason = self._write_back_to_github(refreshed, update)
             if resolved_action == "suppressed":
                 retry_count = int(refreshed.get("retry_count") or 0)
-                if retry_count < 2:  # MAX_RETRIES = 2
+                if retry_count < 2 and self._suppression_reason_allows_retry(suppression_reason):  # MAX_RETRIES = 2
                     retry_queued = await self._issue_retry_task(refreshed, suppression_reason)
                     if retry_queued:
                         resolved_action = "retrying"
@@ -2100,6 +2298,16 @@ class GitHubToMEPBridgeService:
             critique += "Please provide a more detailed review with concrete code identifiers (variables, functions) found in the actual PR diff."
         elif reason in ("finding_in_context_only", "observation_in_context_only"):
             critique += "The code identifiers you mentioned are in the file context but NOT in the actual changed lines (+/-). Please focus your review on the actual changes."
+        elif reason == "approval_without_changed_code_evidence":
+            critique += "You attempted to approve the PR without citing changed-line code evidence. Reference concrete identifiers from the actual diff before approving."
+        elif reason == "approval_without_test_awareness":
+            critique += "You attempted to approve the PR without acknowledging the relevant changed tests. Re-check the diff and mention the test coverage you relied on."
+        elif reason == "approval_below_quality_bar":
+            critique += "You attempted to approve the PR with insufficient evidence density. Add concrete changed-line evidence and test/risk coverage before approving."
+        elif reason == "approval_checks_pending":
+            critique += "You attempted to approve the PR before its GitHub checks finished. Do not approve while CI is still pending or running."
+        elif reason == "approval_checks_not_green":
+            critique += "You attempted to approve the PR even though one or more GitHub checks are failing. Do not approve until the checks are green."
         else:
             critique += "Please re-examine the PR diff and provide a higher-quality review anchored to the actual changes."
             
