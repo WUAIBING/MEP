@@ -611,6 +611,52 @@ class TestGitHubToMEPBridge(unittest.TestCase):
         self.assertEqual(github_inputs["repo_clone_url"], "https://github.com/example/repo.git")
         self.assertEqual(github_inputs["touched_paths"], ["bridge/github_to_mep.py"])
 
+    def test_pr_review_submission_compacts_review_package_payload(self):
+        large_patch = "@@ -1,1 +1,120 @@\n" + "\n".join(
+            f"+line_{index:03d} = 'payload'" for index in range(120)
+        )
+        self._set_pr_review_package(
+            [
+                {
+                    "filename": "bridge/github_to_mep.py",
+                    "status": "modified",
+                    "additions": 120,
+                    "deletions": 1,
+                    "changes": 121,
+                    "patch": large_patch,
+                },
+                {
+                    "filename": "tests/test_github_bridge.py",
+                    "status": "modified",
+                    "additions": 120,
+                    "deletions": 1,
+                    "changes": 121,
+                    "patch": large_patch,
+                },
+            ],
+            pr_body="Large review payload regression.",
+        )
+
+        response = self._post_webhook(
+            _issue_comment_payload("@Hub-Sentinel review this PR", delivery_number=236),
+            delivery_id="delivery-compact-review-package",
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        self._flush_context(response.json()["context_id"])
+        self.assertEqual(len(self.submission.calls), 1)
+
+        envelope = self.submission.calls[0]["envelope"]
+        github_inputs = envelope["task"]["inputs"]["github"]
+        serialized = json.dumps(envelope)
+        instructions = envelope["task"]["instructions"]
+
+        self.assertLess(len(serialized), 20_000)
+        self.assertIn("changed_files", github_inputs)
+        self.assertNotIn("patch", github_inputs["changed_files"][0])
+        self.assertIn("patch_excerpt", github_inputs["changed_files"][0])
+        self.assertNotIn("instructions_context", github_inputs)
+        self.assertLessEqual(len(instructions), 3803)
+
     def test_status_callback_keeps_action_suppressed_when_retry_submit_fails(self):
         response = self._post_webhook(
             _issue_comment_payload("@Hub-Sentinel review this PR", delivery_number=235),

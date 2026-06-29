@@ -1027,7 +1027,8 @@ class GitHubToMEPBridgeService:
         if entity_type == "pr":
             review_package = self._fetch_pr_review_package(repo_full_name, number)
             review_context = str(review_package.get("instructions_context") or "")
-            for key, value in review_package.items():
+            compact_review_package = self._compact_review_package_for_task_inputs(review_package)
+            for key, value in compact_review_package.items():
                 if key != "instructions_context":
                     github_inputs[key] = value
 
@@ -1162,6 +1163,56 @@ class GitHubToMEPBridgeService:
     def _fetch_pr_review_context(self, repo_full_name: str, number: int) -> str:
         review_package = self._fetch_pr_review_package(repo_full_name, number)
         return str(review_package.get("instructions_context") or "")
+
+    def _compact_review_package_for_task_inputs(self, review_package: dict[str, Any]) -> dict[str, Any]:
+        if not isinstance(review_package, dict):
+            return {}
+        compact: dict[str, Any] = {}
+        for key in (
+            "head_sha",
+            "base_sha",
+            "head_ref",
+            "base_ref",
+            "repo_clone_url",
+            "pr_stats",
+            "touched_paths",
+            "touched_tests",
+            "risk_tags",
+        ):
+            value = review_package.get(key)
+            if value not in (None, "", [], {}):
+                compact[key] = value
+
+        instructions_context = str(review_package.get("instructions_context") or "").strip()
+        if instructions_context:
+            compact["instructions_context"] = self._clip_text(instructions_context, 2200)
+
+        changed_files = review_package.get("changed_files")
+        compact_files: list[dict[str, Any]] = []
+        if isinstance(changed_files, list):
+            remaining_patch_budget = 1200
+            for item in changed_files[:6]:
+                if not isinstance(item, dict):
+                    continue
+                filename = str(item.get("filename") or "").strip()
+                if not filename:
+                    continue
+                entry = {
+                    "filename": filename,
+                    "status": str(item.get("status") or "modified").strip(),
+                    "additions": int(item.get("additions") or 0),
+                    "deletions": int(item.get("deletions") or 0),
+                    "changes": int(item.get("changes") or 0),
+                }
+                patch_excerpt = str(item.get("patch_excerpt") or "").strip()
+                if patch_excerpt and remaining_patch_budget > 0:
+                    clipped_excerpt = self._clip_text(patch_excerpt, min(remaining_patch_budget, 240))
+                    entry["patch_excerpt"] = clipped_excerpt
+                    remaining_patch_budget -= len(clipped_excerpt)
+                compact_files.append(entry)
+        if compact_files:
+            compact["changed_files"] = compact_files
+        return compact
 
     @staticmethod
     def _is_test_path(path: str) -> bool:
