@@ -450,18 +450,24 @@ def _system_prompt_for_task(
             )
         return (
             "You are a senior code reviewer for the MEP (Miao Exchange Protocol) project. "
+            "Your primary job is to find the highest-value correctness, regression, edge-case, or missing-validation risk in the supplied PR context before you summarize anything. "
             "Review the provided GitHub PR context and return ONLY a JSON object with this schema: "
             '{"summary": string, "observation": string, "touched_paths": [string], "tests_reviewed": [string], '
+            '"risk_areas_checked": [string], "checks_performed": [string], "why_no_finding": string, '
             '"verified_identifiers": [string], '
             '"findings": [{"file": string, "issue": string, "rationale": string}], '
             '"approval_recommendation": "approve" | "comment" | "request_changes" | "abstain"}. '
             "Use at most 2 findings. "
             "Use `observation` for one concrete non-blocking review note tied to the actual diff. "
+            "Use `risk_areas_checked` for 1-4 concrete risk themes you examined in the changed code. "
+            "Use `checks_performed` for 1-4 specific verification steps you actually performed against the diff, tests, or workspace excerpts. "
+            "When findings are empty, `why_no_finding` must explain why the changed behavior looks safe based on those checks; do not use it for generic praise. "
             "Use `verified_identifiers` for exact function/variable/class names copied from changed lines in the supplied diff or workspace excerpts. "
             "Prefer real touched files and tests from the supplied GitHub inputs for `touched_paths` and `tests_reviewed`. "
             "Only include a finding when it is directly supported by the provided diff, file list, PR description, or patch excerpts. "
             "Do not speculate about unseen code, do not ask for more context, and do not include chain-of-thought or any text outside the JSON object. "
-            "If the change looks good, keep findings empty and use summary to say what you verified, keep observation concrete, and set approval_recommendation to approve or comment. Keep the "
+            "If the change looks good, keep findings empty, use summary to state the overall conclusion, list the risk areas and checks you covered, explain why no finding is warranted, keep observation concrete, and set approval_recommendation to approve or comment. "
+            "Diff restatement without risk coverage is not a sufficient review. Keep the "
             f"response within {review_max_chars} characters.{approval_hint}{workspace_hint}"
         )
     return (
@@ -615,6 +621,11 @@ def _render_structured_review_with_task_data(
     tests_reviewed = _clean_review_list(parsed.get("tests_reviewed"), max_items=3, max_chars=120)
     if not tests_reviewed:
         tests_reviewed = _clean_review_list(github_inputs.get("touched_tests"), max_items=3, max_chars=120)
+    risk_areas_checked = _clean_review_list(parsed.get("risk_areas_checked"), max_items=4, max_chars=100)
+    checks_performed = _clean_review_list(parsed.get("checks_performed"), max_items=4, max_chars=120)
+    why_no_finding = _clean_review_text(parsed.get("why_no_finding"), max_chars=240)
+    if _is_weak_review_text(why_no_finding):
+        why_no_finding = ""
     verified_identifiers = _clean_review_list(parsed.get("verified_identifiers"), max_items=4, max_chars=80)
     findings_raw = parsed.get("findings")
     findings: list[str] = []
@@ -645,6 +656,12 @@ def _render_structured_review_with_task_data(
             sections.append("Touched paths reviewed: " + ", ".join(f"`{path}`" for path in touched_paths))
         if tests_reviewed:
             sections.append("Tests reviewed: " + ", ".join(f"`{path}`" for path in tests_reviewed))
+        if risk_areas_checked:
+            sections.append("Risk areas checked: " + ", ".join(risk_areas_checked))
+        if checks_performed:
+            sections.append("Checks performed: " + ", ".join(checks_performed))
+        if why_no_finding:
+            sections.append(f"Why no finding: {why_no_finding}")
         if verified_identifiers:
             sections.append("Changed identifiers verified: " + ", ".join(f"`{name}`" for name in verified_identifiers))
         for index, finding in enumerate(findings, start=1):
@@ -658,6 +675,12 @@ def _render_structured_review_with_task_data(
             sections.append("Touched paths reviewed: " + ", ".join(f"`{path}`" for path in touched_paths))
         if tests_reviewed:
             sections.append("Tests reviewed: " + ", ".join(f"`{path}`" for path in tests_reviewed))
+        if risk_areas_checked:
+            sections.append("Risk areas checked: " + ", ".join(risk_areas_checked))
+        if checks_performed:
+            sections.append("Checks performed: " + ", ".join(checks_performed))
+        if why_no_finding:
+            sections.append(f"Why no finding: {why_no_finding}")
         if verified_identifiers:
             sections.append("Changed identifiers verified: " + ", ".join(f"`{name}`" for name in verified_identifiers))
     else:
@@ -669,6 +692,12 @@ def _render_structured_review_with_task_data(
             sections.append("Touched paths reviewed: " + ", ".join(f"`{path}`" for path in touched_paths))
         if tests_reviewed:
             sections.append("Tests reviewed: " + ", ".join(f"`{path}`" for path in tests_reviewed))
+        if risk_areas_checked:
+            sections.append("Risk areas checked: " + ", ".join(risk_areas_checked))
+        if checks_performed:
+            sections.append("Checks performed: " + ", ".join(checks_performed))
+        if why_no_finding:
+            sections.append(f"Why no finding: {why_no_finding}")
     rendered = "\n\n".join(section for section in sections if section.strip())
     return _finalize_model_reply(rendered, max_chars=max_chars)
 

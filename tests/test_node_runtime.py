@@ -409,7 +409,11 @@ class TestRuntimeReviewPrompts(unittest.TestCase):
         self.assertIn('"observation": string', prompt)
         self.assertIn('"touched_paths": [string]', prompt)
         self.assertIn('"tests_reviewed": [string]', prompt)
+        self.assertIn('"risk_areas_checked": [string]', prompt)
+        self.assertIn('"checks_performed": [string]', prompt)
+        self.assertIn('"why_no_finding": string', prompt)
         self.assertIn('"approval_recommendation"', prompt)
+        self.assertIn("highest-value correctness, regression, edge-case", prompt)
 
     def test_approval_review_prompt_requires_verified_identifiers_and_test_awareness(self):
         task_data = self._bridge_review_task_data(intent_type="code.review.approve")
@@ -425,6 +429,7 @@ class TestRuntimeReviewPrompts(unittest.TestCase):
         self.assertIn("mention the changed tests", prompt)
         self.assertIn("state the scope is low-risk", prompt)
         self.assertIn("checks are pending or failing", prompt)
+        self.assertIn("Diff restatement without risk coverage is not a sufficient review", prompt)
 
     def test_deepseek_adapter_uses_reviewer_prompt_for_bridge_review_tasks(self):
         adapter = mep_runtime.DeepSeekAdapter(api_key="secret-key", model="deepseek-chat")
@@ -516,6 +521,27 @@ class TestRuntimeReviewPrompts(unittest.TestCase):
         self.assertIn("## Review Summary", rendered)
         self.assertIn("Changed identifiers verified: `_score_review_quality`, `_approval_quality_failure`", rendered)
         self.assertIn("Tests reviewed: `tests/test_github_bridge.py`", rendered)
+
+    def test_structured_review_renders_risk_coverage_for_no_finding_reviews(self):
+        rendered = mep_runtime._render_structured_review_with_task_data(  # noqa: SLF001
+            (
+                '{"summary":"Checked the review trial ledger flow end to end.",'
+                '"observation":"`_build_review_trial_result` and `list_review_trials` stay aligned with the stored JSON payload.",'
+                '"touched_paths":["bridge/github_to_mep.py"],'
+                '"tests_reviewed":["tests/test_github_bridge.py"],'
+                '"risk_areas_checked":["trial persistence","endpoint decoding"],'
+                '"checks_performed":["verified suppression and publish paths mention `review_result_json`","checked `/bridge/review-trials` returns stored review metadata"],'
+                '"why_no_finding":"The new writes and reads stay consistent across both persistence paths, so the telemetry path looks low-risk.",'
+                '"verified_identifiers":["_build_review_trial_result","list_review_trials"],'
+                '"findings":[],"approval_recommendation":"comment"}'
+            ),
+            max_chars=1000,
+            task_data=self._bridge_review_task_data(),
+        )
+
+        self.assertIn("Risk areas checked: trial persistence, endpoint decoding", rendered)
+        self.assertIn("Checks performed: verified suppression and publish paths mention `review_result_json`, checked `/bridge/review-trials` returns stored review metadata", rendered)
+        self.assertIn("Why no finding: The new writes and reads stay consistent across both persistence paths, so the telemetry path looks low-risk.", rendered)
 
 
 class TestRuntimeWebSocketLoop(unittest.TestCase):

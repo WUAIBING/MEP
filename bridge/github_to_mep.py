@@ -1502,8 +1502,11 @@ class GitHubToMEPBridgeService:
             if review_context:
                 instructions += (
                     "\n\nReview guidance:\n"
-                    "Use the actual diff context below to review correctness, regressions, edge cases, "
-                    "security, and missing tests. Reference concrete files or patch excerpts when possible.\n\n"
+                    "Primary objective: identify the highest-value correctness, regression, edge-case, security, "
+                    "or missing-validation risk in the actual changed code before summarizing anything. "
+                    "If you do not find a concrete issue, explicitly state which risk areas you checked, which checks "
+                    "you performed against the diff/workspace/tests, and why no finding is warranted. "
+                    "Reference concrete files, changed identifiers, or patch excerpts when possible.\n\n"
                     f"{review_context}"
                 )
         if len(instructions) > 3800:
@@ -1741,6 +1744,27 @@ class GitHubToMEPBridgeService:
             return ""
         return str(match.group(1) or "").strip()
 
+    @staticmethod
+    def _extract_review_section_text(detail: str, label: str) -> str:
+        if not detail:
+            return ""
+        match = re.search(rf"{re.escape(label)}:\s*(.+)", detail, re.IGNORECASE)
+        if not match:
+            return ""
+        return str(match.group(1) or "").strip()
+
+    @classmethod
+    def _extract_review_section_list(cls, detail: str, label: str) -> list[str]:
+        text = cls._extract_review_section_text(detail, label)
+        if not text:
+            return []
+        values: list[str] = []
+        for part in text.split(","):
+            cleaned = re.sub(r"\s+", " ", str(part or "").strip(" `")).strip()
+            if cleaned and cleaned not in values:
+                values.append(cleaned)
+        return values
+
     @classmethod
     def _grounded_code_tokens(cls, text: str, patch_info: dict[str, str]) -> set[str]:
         if not text or not patch_info:
@@ -1908,6 +1932,9 @@ class GitHubToMEPBridgeService:
         }
         has_findings = "## review findings" in lowered or bool(self._extract_review_finding_entries(detail or ""))
         observation_text = self._extract_observation_text(detail or "")
+        risk_areas_checked = self._extract_review_section_list(detail or "", "Risk areas checked")
+        checks_performed = self._extract_review_section_list(detail or "", "Checks performed")
+        why_no_finding = self._extract_review_section_text(detail or "", "Why no finding")
         has_structured_sections = any(
             snippet in lowered
             for snippet in (
@@ -1916,6 +1943,9 @@ class GitHubToMEPBridgeService:
                 "observation:",
                 "touched paths reviewed:",
                 "tests reviewed:",
+                "risk areas checked:",
+                "checks performed:",
+                "why no finding:",
             )
         )
         grounded_tokens = self._grounded_code_tokens(detail or "", anchored_patch_info)
@@ -1936,6 +1966,9 @@ class GitHubToMEPBridgeService:
             "anchored_patch_info": anchored_patch_info,
             "has_findings": has_findings,
             "observation_text": observation_text,
+            "risk_areas_checked": risk_areas_checked,
+            "checks_performed": checks_performed,
+            "why_no_finding": why_no_finding,
             "has_structured_sections": has_structured_sections,
             "grounded_tokens": grounded_tokens,
             "changed_tokens": changed_tokens,
@@ -1950,6 +1983,9 @@ class GitHubToMEPBridgeService:
         grounded_tokens = snapshot.get("grounded_tokens") or set()
         has_findings = bool(snapshot.get("has_findings"))
         observation_text = str(snapshot.get("observation_text") or "").strip()
+        risk_areas_checked = snapshot.get("risk_areas_checked") or []
+        checks_performed = snapshot.get("checks_performed") or []
+        why_no_finding = str(snapshot.get("why_no_finding") or "").strip()
         expected_tests = snapshot.get("expected_tests") or []
         mentions_tests = bool(snapshot.get("mentions_tests"))
         lowered = str(snapshot.get("lowered") or "")
@@ -1972,6 +2008,15 @@ class GitHubToMEPBridgeService:
         elif observation_text and grounded_tokens:
             score += 1
             reasons.append("grounded_observation")
+        if risk_areas_checked:
+            score += 1
+            reasons.append("risk_coverage")
+        if checks_performed:
+            score += 1
+            reasons.append("explicit_checks")
+        if why_no_finding and not has_findings:
+            score += 1
+            reasons.append("why_no_finding")
         if mentions_tests:
             score += 1
             reasons.append("test_awareness")
@@ -2059,6 +2104,7 @@ class GitHubToMEPBridgeService:
         detail: Optional[str],
         *,
         snapshot: Optional[dict[str, Any]] = None,
+        action: Optional[str] = None,
     ) -> tuple[bool, str]:
         snapshot = snapshot or self._build_review_snapshot(execution, detail)
         normalized = str(snapshot.get("normalized") or "")
@@ -2071,7 +2117,10 @@ class GitHubToMEPBridgeService:
         anchored_patch_info = snapshot.get("anchored_patch_info") or {"full": "", "changes": ""}
         has_findings = bool(snapshot.get("has_findings"))
         observation_text = str(snapshot.get("observation_text") or "")
+        risk_areas_checked = snapshot.get("risk_areas_checked") or []
+        checks_performed = snapshot.get("checks_performed") or []
         has_structured_sections = bool(snapshot.get("has_structured_sections"))
+        why_no_finding = str(snapshot.get("why_no_finding") or "").strip()
         grounded_tokens = snapshot.get("grounded_tokens") or set()
         changed_tokens = snapshot.get("changed_tokens") or set()
         if has_findings and not anchored_paths:
@@ -2086,7 +2135,7 @@ class GitHubToMEPBridgeService:
             if self._finding_conflicts_with_patch(detail or "", anchored_patch_info["full"]):
                 return True, "ungrounded_finding"
         if has_structured_sections and not has_findings:
-            if not observation_text and not grounded_tokens:
+            if not observation_text and not grounded_tokens and not checks_performed and not risk_areas_checked:
                 return True, "summary_without_code_evidence"
             observation_tokens = self._extract_identifier_tokens(observation_text)
             
@@ -2096,12 +2145,18 @@ class GitHubToMEPBridgeService:
 
             if observation_text and not grounded_tokens and len(observation_tokens) < 2:
                 return True, "generic_observation"
+            why_tokens = self._extract_identifier_tokens(why_no_finding)
+            if why_tokens and not changed_tokens:
+                return True, "summary_without_changed_behavior_evidence"
         if len(normalized) < 90 and not anchored_paths:
             return True, "too_short"
         if any(re.search(pattern, lowered) for pattern in _WEAK_GITHUB_REVIEW_PATTERNS) and not anchored_paths:
             return True, "generic_summary"
         if has_structured_sections and not anchored_paths:
             return True, "no_touched_path_anchor"
+        if has_structured_sections and not has_findings and action != "approved":
+            if not risk_areas_checked and not checks_performed:
+                return True, "summary_without_risk_coverage"
         return False, "concrete"
 
     def _record_github_writeback_attempt(self, action: str, detail: Optional[str]) -> None:
@@ -2324,7 +2379,12 @@ class GitHubToMEPBridgeService:
         review_result: Optional[dict[str, Any]] = None
         if review_action:
             snapshot = self._build_review_snapshot(execution, update.detail)
-            suppress, reason = self._classify_review_writeback_detail(execution, update.detail, snapshot=snapshot)
+            suppress, reason = self._classify_review_writeback_detail(
+                execution,
+                update.detail,
+                snapshot=snapshot,
+                action=action,
+            )
             score, reasons = self._score_review_quality(snapshot, action=action)
             self._record_review_quality(score, reasons)
             if not suppress and action == "approved":
@@ -2461,6 +2521,10 @@ class GitHubToMEPBridgeService:
         critique = f"Your previous review was suppressed because: {reason or 'weak_output'}.\n"
         if reason == "summary_without_code_evidence":
             critique += "Please provide a more detailed review with concrete code identifiers (variables, functions) found in the actual PR diff."
+        elif reason == "summary_without_risk_coverage":
+            critique += "You summarized the diff without stating which risk areas or checks you actually covered. Re-review the PR and list the concrete risk areas checked and checks performed."
+        elif reason == "summary_without_changed_behavior_evidence":
+            critique += "Your why-no-finding explanation mentioned code behavior without grounding it in changed-line identifiers. Re-check the actual diff and cite the changed behavior you verified."
         elif reason in ("finding_in_context_only", "observation_in_context_only"):
             critique += "The code identifiers you mentioned are in the file context but NOT in the actual changed lines (+/-). Please focus your review on the actual changes."
         elif reason == "approval_without_changed_code_evidence":

@@ -1403,13 +1403,76 @@ class TestGitHubToMEPBridge(unittest.TestCase):
                 "detail": (
                     "## Review Summary\n\n"
                     "The PR adds pending-task recovery observability in `node/mep_runtime.py` and corresponding tests in `tests/test_node_runtime.py`.\n\n"
-                    "Observation: `_record_pending_task_poll_failure` now records `last_poll_status`, so malformed payloads will still surface `status=200` in the metrics."
+                    "Observation: `_record_pending_task_poll_failure` now records `last_poll_status`, so malformed payloads will still surface `status=200` in the metrics.\n\n"
+                    "Risk areas checked: metrics correctness, test coverage\n\n"
+                    "Checks performed: verified `_record_pending_task_poll_failure` writes `last_poll_status`, checked `test_fetch_pending_tasks_uses_authenticated_get` covers the recovery path\n\n"
+                    "Why no finding: The new metrics write is narrowly scoped and the changed test covers the intended recovery behavior."
                 ),
             },
             headers={"Authorization": f"Bearer {token}"},
         )
         self.assertEqual(status_response.status_code, 200, status_response.text)
         self.assertEqual(len(self.github_session.posts), 1)
+
+    def test_status_callback_suppresses_summary_without_risk_coverage(self):
+        self._set_pr_review_package(
+            [
+                {
+                    "filename": "node/mep_runtime.py",
+                    "status": "modified",
+                    "additions": 40,
+                    "deletions": 2,
+                    "changes": 42,
+                    "patch": (
+                        "@@ -945,0 +945,29 @@\n"
+                        "+def _record_pending_task_poll_failure(self, status: int, detail: str) -> None:\n"
+                        "+    self.pending_task_recovery_metrics['last_poll_status'] = status\n"
+                        "+    self.pending_task_recovery_metrics['last_poll_failure_detail'] = detail\n"
+                    ),
+                },
+                {
+                    "filename": "tests/test_node_runtime.py",
+                    "status": "modified",
+                    "additions": 20,
+                    "deletions": 0,
+                    "changes": 20,
+                    "patch": (
+                        "@@ -494,0 +494,20 @@\n"
+                        "+def test_fetch_pending_tasks_uses_authenticated_get(self):\n"
+                        "+    self.assertEqual(tasks, [{'id': 'task_pending'}])\n"
+                    ),
+                },
+            ],
+            pr_body="Adds pending-task recovery observability and focused runtime tests.",
+        )
+        response = self._post_webhook(
+            _issue_comment_payload("@Hub-Sentinel review this PR", delivery_number=244),
+            delivery_id="delivery-summary-without-risk-coverage",
+        )
+        self.assertEqual(response.status_code, 200)
+        bridge_id = response.json()["bridge_id"]
+        self._flush_context(response.json()["context_id"])
+
+        token = self.service._generate_status_token(bridge_id, "node_target")
+        status_response = self.client.post(
+            "/bridge/status",
+            json={
+                "bridge_id": bridge_id,
+                "status": "completed",
+                "target_node_id": "node_target",
+                "task_id": "task-summary-without-risk-coverage",
+                "detail": (
+                    "## Review Summary\n\n"
+                    "The PR adds pending-task recovery observability in `node/mep_runtime.py` and corresponding tests in `tests/test_node_runtime.py`.\n\n"
+                    "Observation: `_record_pending_task_poll_failure` now records `last_poll_status`, so malformed payloads will still surface `status=200` in the metrics."
+                ),
+            },
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        self.assertEqual(status_response.status_code, 200, status_response.text)
+        self.assertEqual(len(self.github_session.posts), 0)
+        self.assertIn("action: retrying", self.notifier.calls[-1]["text"])
+        self.assertEqual(self.service.github_writeback_metrics["last_suppressed_reason"], "summary_without_risk_coverage")
 
     def test_status_callback_suppresses_finding_grounded_only_to_context_lines(self):
         self._set_pr_review_package(
