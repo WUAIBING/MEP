@@ -329,6 +329,8 @@ class BridgeStore:
                 task_id TEXT,
                 action TEXT,
                 telegram_message_id TEXT,
+                instructions TEXT NOT NULL DEFAULT '',
+                retry_count INTEGER NOT NULL DEFAULT 0,
                 created_at REAL NOT NULL,
                 updated_at REAL NOT NULL
             )
@@ -355,6 +357,20 @@ class BridgeStore:
                 """
                 ALTER TABLE bridge_executions
                 ADD COLUMN target_alias TEXT NOT NULL DEFAULT ''
+                """
+            )
+        if "retry_count" not in execution_columns:
+            cursor.execute(
+                """
+                ALTER TABLE bridge_executions
+                ADD COLUMN retry_count INTEGER NOT NULL DEFAULT 0
+                """
+            )
+        if "instructions" not in execution_columns:
+            cursor.execute(
+                """
+                ALTER TABLE bridge_executions
+                ADD COLUMN instructions TEXT NOT NULL DEFAULT ''
                 """
             )
         conn.commit()
@@ -404,6 +420,7 @@ class BridgeStore:
         target_node_id: str,
         *,
         target_alias: str,
+        instructions: str = "",
         event_sequence: Optional[int] = None,
     ) -> int:
         now = time.time()
@@ -416,9 +433,9 @@ class BridgeStore:
             INSERT INTO bridge_executions (
                 bridge_id, context_id, repo_full_name, issue_number, entity_type,
                 target_alias, target_node_id, imperative_verb, intent_type, event_sequence,
-                status, created_at, updated_at
+                status, instructions, retry_count, created_at, updated_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)
             """,
             (
                 bridge_id,
@@ -432,6 +449,7 @@ class BridgeStore:
                 event.intent_type,
                 event_sequence,
                 "buffered",
+                instructions,
                 now,
                 now,
             ),
@@ -487,6 +505,7 @@ class BridgeStore:
         task_id: Optional[str] = None,
         action: Optional[str] = None,
         telegram_message_id: Optional[str] = None,
+        retry_count: Optional[int] = None,
     ) -> None:
         assignments = []
         params: list[Any] = []
@@ -502,6 +521,9 @@ class BridgeStore:
         if telegram_message_id is not None:
             assignments.append("telegram_message_id = ?")
             params.append(str(telegram_message_id))
+        if retry_count is not None:
+            assignments.append("retry_count = ?")
+            params.append(retry_count)
         assignments.append("updated_at = ?")
         params.append(time.time())
         params.append(bridge_id)
@@ -612,6 +634,8 @@ class TelegramNotifier:
 
 
 class GitHubToMEPBridgeService:
+    MAX_RETRIES = 2
+
     def __init__(
         self,
         config: BridgeConfig,
@@ -838,6 +862,7 @@ class GitHubToMEPBridgeService:
                 target_bridge_id,
                 target.node_id,
                 target_alias=target.alias,
+                instructions=pending.event.instructions or "",
                 event_sequence=pending.event.event_sequence,
             )
             self.store.update_execution(target_bridge_id, status="submitting")
@@ -1877,7 +1902,7 @@ class GitHubToMEPBridgeService:
             ),
         )
 
-    def _write_back_to_github(self, execution: dict[str, Any], update: BridgeStatusUpdate) -> str:
+    def _write_back_to_github(self, execution: dict[str, Any], update: BridgeStatusUpdate) -> tuple[str, Optional[str]]:
         self._assert_writeback_identity_allowed(execution)
         github_token, _identity_label = self._resolve_github_writeback_identity(execution)
         if not github_token:
@@ -1902,7 +1927,7 @@ class GitHubToMEPBridgeService:
                     detail=update.detail,
                     reason=reason,
                 )
-                return "suppressed"
+                return "suppressed", reason
         body = self._render_github_writeback_body(
             str(execution.get("bridge_id") or update.bridge_id),
             action,
@@ -1912,10 +1937,10 @@ class GitHubToMEPBridgeService:
         if review_action:
             self._submit_github_review(repo_full_name, number, review_events[action], body, github_token)
             self._record_github_writeback_publish(action, review_action=True)
-            return action
+            return action, None
         self._post_github_comment(repo_full_name, number, body, github_token)
         self._record_github_writeback_publish("commented", review_action=False)
-        return "commented"
+        return "commented", None
 
     async def handle_status_callback(self, update: BridgeStatusUpdate, token: str) -> dict[str, Any]:
         self._require_runtime_config()
@@ -1939,7 +1964,12 @@ class GitHubToMEPBridgeService:
         if refreshed is None:
             raise HTTPException(status_code=404, detail="Unknown bridge_id")
         if str(update.status).strip().lower() == "completed":
-            resolved_action = self._write_back_to_github(refreshed, update)
+            resolved_action, suppression_reason = self._write_back_to_github(refreshed, update)
+            if resolved_action == "suppressed":
+                retry_count = int(refreshed.get("retry_count") or 0)
+                if retry_count < 2:  # MAX_RETRIES = 2
+                    await self._issue_retry_task(refreshed, suppression_reason)
+                    resolved_action = "retrying"
             if resolved_action != update.action:
                 self.store.update_execution(update.bridge_id, action=resolved_action)
                 refreshed = self.store.get_execution(update.bridge_id) or refreshed
@@ -1975,6 +2005,62 @@ class GitHubToMEPBridgeService:
             ),
         )
         return {"status": "ok", "bridge_id": update.bridge_id}
+
+    async def _issue_retry_task(self, execution: dict[str, Any], reason: Optional[str]) -> None:
+        bridge_id = str(execution["bridge_id"])
+        context_id = str(execution["context_id"])
+        target_node_id = str(execution["target_node_id"])
+        target_alias = str(execution["target_alias"])
+        retry_count = int(execution.get("retry_count") or 0) + 1
+        
+        self.store.update_execution(bridge_id, retry_count=retry_count)
+        
+        # Build critique instructions
+        critique = f"Your previous review was suppressed because: {reason or 'weak_output'}.\n"
+        if reason == "summary_without_code_evidence":
+            critique += "Please provide a more detailed review with concrete code identifiers (variables, functions) found in the actual PR diff."
+        elif reason in ("finding_in_context_only", "observation_in_context_only"):
+            critique += "The code identifiers you mentioned are in the file context but NOT in the actual changed lines (+/-). Please focus your review on the actual changes."
+        else:
+            critique += "Please re-examine the PR diff and provide a higher-quality review anchored to the actual changes."
+            
+        new_sequence = self.store.next_event_sequence(context_id)
+        
+        # Reconstruct event enough for envelope
+        event = NormalizedGitHubEvent(
+            delivery_id="",
+            source_event="retry",
+            source_action="retry",
+            repo_full_name=str(execution["repo_full_name"]),
+            entity_type=str(execution["entity_type"]),
+            number=int(execution["issue_number"]),
+            title="",
+            url="",
+            actor_login="",
+            author_association="",
+            context_id=context_id,
+            imperative_verb=str(execution["imperative_verb"]),
+            intent_type=str(execution["intent_type"]),
+            instructions=f"{critique}\n\nOriginal instructions follow:\n{execution.get('instructions', '')}",
+            raw_trigger_text="",
+            event_sequence=new_sequence,
+            bridge_id=bridge_id,
+        )
+        
+        envelope = self._build_interbot_envelope(
+            event, target_node_id=target_node_id,
+            target_alias=target_alias, bridge_id=bridge_id,
+        )
+        
+        try:
+            await asyncio.to_thread(
+                self.submission_client.submit_structured_dm,
+                envelope,
+                target_node_id,
+                event.intent_type,
+            )
+        except Exception:  # noqa: BLE001
+            pass
 
     def _render_status_text(
         self,
