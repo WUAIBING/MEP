@@ -424,6 +424,7 @@ class TestRuntimeReviewPrompts(unittest.TestCase):
         self.assertIn("at least two exact identifiers", prompt)
         self.assertIn("mention the changed tests", prompt)
         self.assertIn("state the scope is low-risk", prompt)
+        self.assertIn("checks are pending or failing", prompt)
 
     def test_deepseek_adapter_uses_reviewer_prompt_for_bridge_review_tasks(self):
         adapter = mep_runtime.DeepSeekAdapter(api_key="secret-key", model="deepseek-chat")

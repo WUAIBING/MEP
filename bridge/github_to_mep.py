@@ -1177,6 +1177,7 @@ class GitHubToMEPBridgeService:
             "base_ref",
             "repo_clone_url",
             "pr_stats",
+            "ci_checks",
             "touched_paths",
             "touched_tests",
             "risk_tags",
@@ -1295,12 +1296,35 @@ class GitHubToMEPBridgeService:
         head_ref = str(head.get("ref") or "").strip()
         base_ref = str(base.get("ref") or "").strip()
         repo_clone_url = str((head.get("repo") or {}).get("clone_url") or "").strip()
+        check_runs_payload: Any = {}
+        if head_sha:
+            try:
+                check_runs_response = self.github_session.get(
+                    f"https://api.github.com/repos/{repo_full_name}/commits/{head_sha}/check-runs?per_page=20",
+                    headers=headers,
+                    timeout=20,
+                )
+                if check_runs_response.status_code == 200:
+                    check_runs_payload = check_runs_response.json()
+            except Exception:
+                check_runs_payload = {}
+        ci_checks = self._summarize_pr_checks(check_runs_payload)
 
         if head_sha or base_sha:
             sections.append(
                 "Revision identity: "
                 f"head_sha={head_sha or 'unknown'}, base_sha={base_sha or 'unknown'}, "
                 f"head_ref={head_ref or 'unknown'}, base_ref={base_ref or 'unknown'}"
+            )
+        if ci_checks.get("has_checks"):
+            check_lines = [
+                f"- {item.get('name')}: {item.get('state')}"
+                for item in ci_checks.get("summary", [])
+                if isinstance(item, dict)
+            ]
+            sections.append(
+                "PR checks: "
+                f"state={ci_checks.get('state')}\n" + "\n".join(check_lines)
             )
         sections.append(
             "PR stats: "
@@ -1372,6 +1396,7 @@ class GitHubToMEPBridgeService:
                 "deletions": deletions,
                 "commits": commits,
             },
+            "ci_checks": ci_checks,
             "touched_paths": touched_paths,
             "touched_tests": touched_tests,
             "risk_tags": risk_tags,
@@ -1736,6 +1761,58 @@ class GitHubToMEPBridgeService:
                 }
         return patches
 
+    @staticmethod
+    def _summarize_pr_checks(check_runs_payload: Any) -> dict[str, Any]:
+        raw_runs = check_runs_payload.get("check_runs") if isinstance(check_runs_payload, dict) else []
+        if not isinstance(raw_runs, list):
+            raw_runs = []
+        summary: list[dict[str, str]] = []
+        pending_count = 0
+        failing_count = 0
+        successful_count = 0
+        for item in raw_runs[:8]:
+            if not isinstance(item, dict):
+                continue
+            name = str(item.get("name") or "unnamed-check").strip() or "unnamed-check"
+            status = str(item.get("status") or "").strip().lower()
+            conclusion = str(item.get("conclusion") or "").strip().lower()
+            if status and status != "completed":
+                state = status
+                pending_count += 1
+            elif conclusion in {"success", "neutral", "skipped"}:
+                state = conclusion or "success"
+                successful_count += 1
+            else:
+                state = conclusion or "unknown"
+                failing_count += 1
+            summary.append(
+                {
+                    "name": name,
+                    "status": status,
+                    "conclusion": conclusion,
+                    "state": state,
+                }
+            )
+        if summary:
+            if pending_count:
+                overall_state = "pending"
+            elif failing_count:
+                overall_state = "failing"
+            elif successful_count == len(summary):
+                overall_state = "green"
+            else:
+                overall_state = "unknown"
+        else:
+            overall_state = "none"
+        return {
+            "has_checks": bool(summary),
+            "state": overall_state,
+            "all_green": bool(summary) and pending_count == 0 and failing_count == 0,
+            "pending_count": pending_count,
+            "failing_count": failing_count,
+            "summary": summary,
+        }
+
     def _build_review_snapshot(self, execution: dict[str, Any], detail: Optional[str]) -> dict[str, Any]:
         normalized = re.sub(r"\s+", " ", str(detail or "").strip())
         lowered = normalized.lower()
@@ -1786,6 +1863,7 @@ class GitHubToMEPBridgeService:
             "normalized": normalized,
             "lowered": lowered,
             "review_package": review_package,
+            "ci_checks": review_package.get("ci_checks") or {},
             "expected_paths": expected_paths,
             "expected_tests": expected_tests,
             "anchored_paths": anchored_paths,
@@ -1842,6 +1920,12 @@ class GitHubToMEPBridgeService:
         return score, reasons
 
     def _approval_quality_failure(self, snapshot: dict[str, Any], score: int) -> Optional[str]:
+        ci_checks = snapshot.get("ci_checks") or {}
+        if ci_checks.get("has_checks"):
+            if ci_checks.get("state") == "pending":
+                return "approval_checks_pending"
+            if not ci_checks.get("all_green"):
+                return "approval_checks_not_green"
         if snapshot.get("has_findings"):
             return "approval_contains_findings"
         if not snapshot.get("anchored_paths"):
@@ -1858,6 +1942,10 @@ class GitHubToMEPBridgeService:
         metrics = self.github_writeback_metrics
         metrics["last_quality_score"] = int(score)
         metrics["last_quality_reasons"] = list(reasons)
+
+    @staticmethod
+    def _suppression_reason_allows_retry(reason: Optional[str]) -> bool:
+        return reason not in {"approval_checks_pending", "approval_checks_not_green"}
 
     @classmethod
     def _verify_review_findings_against_patch(
@@ -2156,7 +2244,7 @@ class GitHubToMEPBridgeService:
             resolved_action, suppression_reason = self._write_back_to_github(refreshed, update)
             if resolved_action == "suppressed":
                 retry_count = int(refreshed.get("retry_count") or 0)
-                if retry_count < 2:  # MAX_RETRIES = 2
+                if retry_count < 2 and self._suppression_reason_allows_retry(suppression_reason):  # MAX_RETRIES = 2
                     retry_queued = await self._issue_retry_task(refreshed, suppression_reason)
                     if retry_queued:
                         resolved_action = "retrying"
@@ -2216,6 +2304,10 @@ class GitHubToMEPBridgeService:
             critique += "You attempted to approve the PR without acknowledging the relevant changed tests. Re-check the diff and mention the test coverage you relied on."
         elif reason == "approval_below_quality_bar":
             critique += "You attempted to approve the PR with insufficient evidence density. Add concrete changed-line evidence and test/risk coverage before approving."
+        elif reason == "approval_checks_pending":
+            critique += "You attempted to approve the PR before its GitHub checks finished. Do not approve while CI is still pending or running."
+        elif reason == "approval_checks_not_green":
+            critique += "You attempted to approve the PR even though one or more GitHub checks are failing. Do not approve until the checks are green."
         else:
             critique += "Please re-examine the PR diff and provide a higher-quality review anchored to the actual changes."
             

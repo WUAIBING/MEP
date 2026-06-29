@@ -445,6 +445,7 @@ def _system_prompt_for_task(
             approval_hint = (
                 " Approval mode is active. Only use `approval_recommendation: \"approve\"` when you can cite at least two exact identifiers from changed lines "
                 "in `verified_identifiers`, mention the changed tests when any are provided, and explicitly state the scope is low-risk. "
+                "If the supplied PR checks are pending or failing, use `comment` instead of `approve`. "
                 "If you cannot satisfy that evidence bar, use `comment` instead of `approve`."
             )
         return (
