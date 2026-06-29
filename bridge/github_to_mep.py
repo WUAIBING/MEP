@@ -1248,6 +1248,7 @@ class GitHubToMEPBridgeService:
                         "additions": file_additions,
                         "deletions": file_deletions,
                         "changes": changes,
+                        "patch": patch,
                         "patch_excerpt": patch_excerpt,
                     }
                 )
@@ -1739,12 +1740,13 @@ class GitHubToMEPBridgeService:
             if not observation_text and not grounded_tokens:
                 return True, "summary_without_code_evidence"
             observation_tokens = self._extract_identifier_tokens(observation_text)
-            if observation_text and not grounded_tokens and len(observation_tokens) < 2:
-                return True, "generic_observation"
             
             # Phase 3A: Summary-only reviews must anchor to at least one changed token if they mention code
             if observation_tokens and not changed_tokens:
                 return True, "observation_in_context_only"
+
+            if observation_text and not grounded_tokens and len(observation_tokens) < 2:
+                return True, "generic_observation"
         if len(normalized) < 90 and not anchored_paths:
             return True, "too_short"
         if any(re.search(pattern, lowered) for pattern in _WEAK_GITHUB_REVIEW_PATTERNS) and not anchored_paths:
