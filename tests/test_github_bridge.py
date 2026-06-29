@@ -818,6 +818,127 @@ class TestGitHubToMEPBridge(unittest.TestCase):
         self.assertEqual(status_response.status_code, 200, status_response.text)
         self.assertEqual(len(self.github_session.posts), 1)
 
+    def test_status_callback_suppresses_finding_grounded_only_to_context_lines(self):
+        self._set_pr_review_package(
+            [
+                {
+                    "filename": "hub/main.py",
+                    "status": "modified",
+                    "patch": (
+                        " def existing_function():\n"
+                        "     pass\n"
+                        "+def new_function():\n"
+                        "+    pass\n"
+                    ),
+                },
+            ],
+        )
+        response = self._post_webhook(
+            _issue_comment_payload("@Hub-Sentinel review this PR"),
+            delivery_id="delivery-context-only-finding",
+        )
+        bridge_id = response.json()["bridge_id"]
+        self._flush_context(response.json()["context_id"])
+
+        token = self.service._generate_status_token(bridge_id, "node_target")
+        status_response = self.client.post(
+            "/bridge/status",
+            json={
+                "bridge_id": bridge_id,
+                "status": "completed",
+                "target_node_id": "node_target",
+                "detail": (
+                    "## Review Findings\n\n"
+                    "1. **Hallucinated issue in `existing_function`.** (`hub/main.py`): "
+                    "The `existing_function` is incorrectly implemented."
+                ),
+            },
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        self.assertEqual(status_response.status_code, 200)
+        self.assertEqual(len(self.github_session.posts), 0)
+        self.assertEqual(self.service.github_writeback_metrics["last_suppressed_reason"], "finding_in_context_only")
+
+    def test_status_callback_suppresses_observation_grounded_only_to_context_lines(self):
+        self._set_pr_review_package(
+            [
+                {
+                    "filename": "hub/main.py",
+                    "status": "modified",
+                    "patch": (
+                        " def important_variable = 42\n"
+                        "+def unrelated_change():\n"
+                        "+    pass\n"
+                    ),
+                },
+            ],
+        )
+        response = self._post_webhook(
+            _issue_comment_payload("@Hub-Sentinel review this PR"),
+            delivery_id="delivery-context-only-observation",
+        )
+        bridge_id = response.json()["bridge_id"]
+        self._flush_context(response.json()["context_id"])
+
+        token = self.service._generate_status_token(bridge_id, "node_target")
+        status_response = self.client.post(
+            "/bridge/status",
+            json={
+                "bridge_id": bridge_id,
+                "status": "completed",
+                "target_node_id": "node_target",
+                "detail": (
+                    "## Review Summary\n\n"
+                    "Observation: This PR touches code near `important_variable`."
+                ),
+            },
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        self.assertEqual(status_response.status_code, 200)
+        self.assertEqual(len(self.github_session.posts), 0)
+        self.assertEqual(self.service.github_writeback_metrics["last_suppressed_reason"], "observation_in_context_only")
+
+    def test_status_callback_allows_finding_grounded_to_changed_lines(self):
+        self._set_pr_review_package(
+            [
+                {
+                    "filename": "hub/main.py",
+                    "status": "modified",
+                    "patch": (
+                        " def existing_function():\n"
+                        "     pass\n"
+                        "+def new_function_with_bug():\n"
+                        "+    x = 1 / 0\n"
+                    ),
+                },
+            ],
+        )
+        response = self._post_webhook(
+            _issue_comment_payload("@Hub-Sentinel review this PR"),
+            delivery_id="delivery-changed-line-finding",
+        )
+        bridge_id = response.json()["bridge_id"]
+        self._flush_context(response.json()["context_id"])
+
+        token = self.service._generate_status_token(bridge_id, "node_target")
+        status_response = self.client.post(
+            "/bridge/status",
+            json={
+                "bridge_id": bridge_id,
+                "status": "completed",
+                "target_node_id": "node_target",
+                "detail": (
+                    "## Review Findings\n\n"
+                    "1. **Real bug in `new_function_with_bug`.** (`hub/main.py`): "
+                    "Division by zero in the new function."
+                ),
+            },
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        self.assertEqual(status_response.status_code, 200)
+        self.assertEqual(len(self.github_session.posts), 1)
+        self.assertIn("Real bug", self.github_session.posts[0]["json"]["body"])
+
     def test_status_callback_suppresses_speculative_finding(self):
         self._set_pr_review_package(
             [

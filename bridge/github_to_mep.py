@@ -1248,6 +1248,7 @@ class GitHubToMEPBridgeService:
                         "additions": file_additions,
                         "deletions": file_deletions,
                         "changes": changes,
+                        "patch": patch,
                         "patch_excerpt": patch_excerpt,
                     }
                 )
@@ -1541,7 +1542,7 @@ class GitHubToMEPBridgeService:
             lowered = token.lower()
             if len(lowered) >= 4 and lowered not in excluded:
                 tokens.add(lowered)
-        for token in re.findall(r"\b[A-Za-z]+_[A-Za-z0-9_]+\b", text):
+        for token in re.findall(r"\b[A-Za-z_][A-Za-z0-9_]*_[A-Za-z0-9_]+\b", text):
             lowered = token.lower()
             if len(lowered) >= 4 and lowered not in excluded:
                 tokens.add(lowered)
@@ -1557,11 +1558,19 @@ class GitHubToMEPBridgeService:
         return str(match.group(1) or "").strip()
 
     @classmethod
-    def _grounded_code_tokens(cls, text: str, patch_text: str) -> set[str]:
-        if not text or not patch_text:
+    def _grounded_code_tokens(cls, text: str, patch_info: dict[str, str]) -> set[str]:
+        if not text or not patch_info:
             return set()
         tokens = cls._extract_identifier_tokens(text)
-        return {token for token in tokens if token in patch_text.lower()}
+        full_text = patch_info.get("full", "").lower()
+        changed_text = patch_info.get("changes", "").lower()
+
+        # Priority: tokens in actual changes
+        grounded = {token for token in tokens if token in changed_text}
+        # Secondary: tokens in context lines
+        context_grounded = {token for token in tokens if token in full_text}
+
+        return grounded | context_grounded
 
     @staticmethod
     def _is_speculative_finding(text: str) -> bool:
@@ -1611,8 +1620,8 @@ class GitHubToMEPBridgeService:
         return False
 
     @staticmethod
-    def _patch_text_by_path(review_package: dict[str, Any]) -> dict[str, str]:
-        patches: dict[str, str] = {}
+    def _patch_text_by_path(review_package: dict[str, Any]) -> dict[str, dict[str, str]]:
+        patches: dict[str, dict[str, str]] = {}
         changed_files = review_package.get("changed_files")
         if not isinstance(changed_files, list):
             return patches
@@ -1622,7 +1631,14 @@ class GitHubToMEPBridgeService:
             filename = str(item.get("filename") or "").strip()
             patch = str(item.get("patch") or "").strip()
             if filename and patch:
-                patches[filename] = patch.lower()
+                lowered_patch = patch.lower()
+                changes_only = "\n".join(
+                    line[1:] for line in lowered_patch.splitlines() if line.startswith(("+", "-"))
+                )
+                patches[filename] = {
+                    "full": lowered_patch,
+                    "changes": changes_only,
+                }
         return patches
 
     @classmethod
@@ -1644,15 +1660,25 @@ class GitHubToMEPBridgeService:
                 matched_paths = cls._grounded_review_paths(finding_text, expected_paths)
             if not matched_paths:
                 return "finding_without_touched_path"
-            patch_text = "\n".join(patches_by_path.get(path, "") for path in matched_paths if patches_by_path.get(path))
-            if not patch_text:
+            patch_info = {
+                "full": "\n".join(patches_by_path.get(path, {}).get("full", "") for path in matched_paths),
+                "changes": "\n".join(patches_by_path.get(path, {}).get("changes", "") for path in matched_paths),
+            }
+            if not patch_info["full"]:
                 continue
-            if cls._finding_conflicts_with_patch(finding_text, patch_text):
+            if cls._finding_conflicts_with_patch(finding_text, patch_info["full"]):
                 return "ungrounded_finding"
             identifier_tokens = cls._extract_identifier_tokens(finding_text)
-            if identifier_tokens and not any(token in patch_text for token in identifier_tokens):
+            if identifier_tokens and not any(token in patch_info["full"] for token in identifier_tokens):
                 return "ungrounded_finding"
-            grounded_tokens = cls._grounded_code_tokens(finding_text, patch_text)
+            
+            grounded_tokens = cls._grounded_code_tokens(finding_text, patch_info)
+            changed_tokens = {t for t in grounded_tokens if t in patch_info["changes"]}
+            
+            if identifier_tokens and not changed_tokens:
+                # Finding mentions code identifiers, but none of them are in the actual diff (+/-)
+                return "finding_in_context_only"
+
             if cls._is_speculative_finding(finding_text) and len(grounded_tokens) < 2:
                 return "speculative_finding"
         return None
@@ -1678,9 +1704,12 @@ class GitHubToMEPBridgeService:
                         expected_paths.append(text)
         anchored_paths = self._grounded_review_paths(detail or "", expected_paths)
         patches_by_path = self._patch_text_by_path(review_package)
-        anchored_patch_text = "\n".join(
-            patches_by_path.get(path, "") for path in anchored_paths if patches_by_path.get(path)
-        )
+        
+        anchored_patch_info = {
+            "full": "\n".join(patches_by_path.get(path, {}).get("full", "") for path in anchored_paths),
+            "changes": "\n".join(patches_by_path.get(path, {}).get("changes", "") for path in anchored_paths),
+        }
+
         has_findings = "## review findings" in lowered or bool(self._extract_review_finding_entries(detail or ""))
         observation_text = self._extract_observation_text(detail or "")
         has_structured_sections = any(
@@ -1698,16 +1727,24 @@ class GitHubToMEPBridgeService:
         finding_reason = self._verify_review_findings_against_patch(detail or "", review_package, expected_paths)
         if finding_reason:
             return True, finding_reason
-        grounded_tokens = self._grounded_code_tokens(detail or "", anchored_patch_text)
+        
+        grounded_tokens = self._grounded_code_tokens(detail or "", anchored_patch_info)
+        changed_tokens = {t for t in grounded_tokens if t in anchored_patch_info["changes"]}
+
         if has_findings and self._is_speculative_finding(detail or "") and len(grounded_tokens) < 2:
             return True, "speculative_finding"
         if has_findings and anchored_paths and review_package:
-            if self._finding_conflicts_with_patch(detail or "", anchored_patch_text):
+            if self._finding_conflicts_with_patch(detail or "", anchored_patch_info["full"]):
                 return True, "ungrounded_finding"
         if has_structured_sections and not has_findings:
             if not observation_text and not grounded_tokens:
                 return True, "summary_without_code_evidence"
             observation_tokens = self._extract_identifier_tokens(observation_text)
+            
+            # Phase 3A: Summary-only reviews must anchor to at least one changed token if they mention code
+            if observation_tokens and not changed_tokens:
+                return True, "observation_in_context_only"
+
             if observation_text and not grounded_tokens and len(observation_tokens) < 2:
                 return True, "generic_observation"
         if len(normalized) < 90 and not anchored_paths:
