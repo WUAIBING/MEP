@@ -1827,6 +1827,40 @@ class GitHubToMEPBridgeService:
             return any(token in lowered_patch for token in auth_evidence_tokens)
         return False
 
+    @classmethod
+    def _observation_conflicts_with_patch(cls, observation_text: str, patch_text: str) -> bool:
+        if not observation_text or not patch_text:
+            return False
+        lowered_observation = observation_text.lower()
+        lowered_patch = patch_text.lower()
+
+        placeholder_claim_patterns = (
+            r"\btruncat(?:e|es|ed|ing)\b",
+            r"\bplaceholder\b",
+            r"\bellipsis\b",
+            r"\bcut off\b",
+            r"\bclipp(?:ed|ing)\b",
+        )
+        placeholder_evidence_tokens = ("...", "…", "placeholder")
+        if any(re.search(pattern, lowered_observation) for pattern in placeholder_claim_patterns):
+            if not any(token in lowered_patch for token in placeholder_evidence_tokens):
+                return True
+
+        absence_claim_patterns = (
+            r"\bmissing\b",
+            r"\bomitted\b",
+            r"\babsent\b",
+            r"\bnot present\b",
+            r"\bnot included\b",
+            r"\bwithout\b",
+            r"\black(?:s|ing)?\b",
+        )
+        identifier_tokens = cls._extract_identifier_tokens(observation_text)
+        if identifier_tokens and any(re.search(pattern, lowered_observation) for pattern in absence_claim_patterns):
+            if any(token in lowered_patch for token in identifier_tokens):
+                return True
+        return False
+
     @staticmethod
     def _patch_text_by_path(review_package: dict[str, Any]) -> dict[str, dict[str, str]]:
         patches: dict[str, dict[str, str]] = {}
@@ -2134,6 +2168,9 @@ class GitHubToMEPBridgeService:
         if has_findings and anchored_paths and review_package:
             if self._finding_conflicts_with_patch(detail or "", anchored_patch_info["full"]):
                 return True, "ungrounded_finding"
+        if observation_text and anchored_paths and review_package:
+            if self._observation_conflicts_with_patch(observation_text, anchored_patch_info["full"]):
+                return True, "ungrounded_observation"
         if has_structured_sections and not has_findings:
             if not observation_text and not grounded_tokens and not checks_performed and not risk_areas_checked:
                 return True, "summary_without_code_evidence"
@@ -2525,6 +2562,8 @@ class GitHubToMEPBridgeService:
             critique += "You summarized the diff without stating which risk areas or checks you actually covered. Re-review the PR and list the concrete risk areas checked and checks performed."
         elif reason == "summary_without_changed_behavior_evidence":
             critique += "Your why-no-finding explanation mentioned code behavior without grounding it in changed-line identifiers. Re-check the actual diff and cite the changed behavior you verified."
+        elif reason == "ungrounded_observation":
+            critique += "Your observation makes a concrete claim that conflicts with the actual patch evidence. Re-check the diff and only mention placeholders, truncation, or missing items when the changed lines support that claim."
         elif reason in ("finding_in_context_only", "observation_in_context_only"):
             critique += "The code identifiers you mentioned are in the file context but NOT in the actual changed lines (+/-). Please focus your review on the actual changes."
         elif reason == "approval_without_changed_code_evidence":

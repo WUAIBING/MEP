@@ -1554,6 +1554,94 @@ class TestGitHubToMEPBridge(unittest.TestCase):
         self.assertEqual(len(self.github_session.posts), 0)
         self.assertEqual(self.service.github_writeback_metrics["last_suppressed_reason"], "observation_in_context_only")
 
+    def test_status_callback_suppresses_observation_claiming_truncation_without_patch_evidence(self):
+        self._set_pr_review_package(
+            [
+                {
+                    "filename": "bridge/github_to_mep.py",
+                    "status": "modified",
+                    "patch": (
+                        "@@ -1504,0 +1504,6 @@\n"
+                        '+                    "Review guidance:\\n"\n'
+                        '+                    "Primary objective: identify the highest-value correctness, regression, edge-case, security, "\n'
+                        '+                    "or missing-validation risk in the actual changed code before summarizing anything. "\n'
+                    ),
+                },
+            ],
+            pr_body="Strengthens review guidance wording.",
+        )
+        response = self._post_webhook(
+            _issue_comment_payload("@Hub-Sentinel review this PR"),
+            delivery_id="delivery-observation-truncation-claim",
+        )
+        bridge_id = response.json()["bridge_id"]
+        self._flush_context(response.json()["context_id"])
+
+        token = self.service._generate_status_token(bridge_id, "node_target")
+        status_response = self.client.post(
+            "/bridge/status",
+            json={
+                "bridge_id": bridge_id,
+                "status": "completed",
+                "target_node_id": "node_target",
+                "detail": (
+                    "## Review Summary\n\n"
+                    "Verified the review contract wording in `bridge/github_to_mep.py`.\n\n"
+                    "Observation: The patch in `bridge/github_to_mep.py` truncates the review guidance string at `Re...`, which could break the final instructions.\n\n"
+                    "Touched paths reviewed: `bridge/github_to_mep.py`."
+                ),
+            },
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        self.assertEqual(status_response.status_code, 200)
+        self.assertEqual(len(self.github_session.posts), 0)
+        self.assertIn("action: retrying", self.notifier.calls[-1]["text"])
+        self.assertEqual(self.service.github_writeback_metrics["last_suppressed_reason"], "ungrounded_observation")
+
+    def test_status_callback_suppresses_observation_claiming_placeholder_without_patch_evidence(self):
+        self._set_pr_review_package(
+            [
+                {
+                    "filename": "tests/test_github_bridge.py",
+                    "status": "modified",
+                    "patch": (
+                        "@@ -1403,0 +1403,6 @@\n"
+                        '+                    "## Review Summary\\n\\n"\n'
+                        '+                    "The PR adds pending-task recovery observability in `node/mep_runtime.py`.\\n\\n"\n'
+                        '+                    "Observation: `_record_pending_task_poll_failure` now records `last_poll_status`.\\n\\n"\n'
+                    ),
+                },
+            ],
+            pr_body="Adds stronger review-body assertions.",
+        )
+        response = self._post_webhook(
+            _issue_comment_payload("@Hub-Sentinel review this PR"),
+            delivery_id="delivery-observation-placeholder-claim",
+        )
+        bridge_id = response.json()["bridge_id"]
+        self._flush_context(response.json()["context_id"])
+
+        token = self.service._generate_status_token(bridge_id, "node_target")
+        status_response = self.client.post(
+            "/bridge/status",
+            json={
+                "bridge_id": bridge_id,
+                "status": "completed",
+                "target_node_id": "node_target",
+                "detail": (
+                    "## Review Summary\n\n"
+                    "Verified the new test coverage in `tests/test_github_bridge.py`.\n\n"
+                    "Observation: The patch in `tests/test_github_bridge.py` replaces the review body with a placeholder `...`, so the risk coverage assertions might not really execute.\n\n"
+                    "Touched paths reviewed: `tests/test_github_bridge.py`."
+                ),
+            },
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        self.assertEqual(status_response.status_code, 200)
+        self.assertEqual(len(self.github_session.posts), 0)
+        self.assertIn("action: retrying", self.notifier.calls[-1]["text"])
+        self.assertEqual(self.service.github_writeback_metrics["last_suppressed_reason"], "ungrounded_observation")
+
     def test_status_callback_allows_finding_grounded_to_changed_lines(self):
         self._set_pr_review_package(
             [
