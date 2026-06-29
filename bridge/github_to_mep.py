@@ -288,6 +288,17 @@ class BridgeStore:
         os.makedirs(os.path.dirname(os.path.abspath(db_path)), exist_ok=True)
         self._init_db()
 
+    @staticmethod
+    def _decode_json_dict(raw: Any) -> dict[str, Any]:
+        text = str(raw or "").strip()
+        if not text:
+            return {}
+        try:
+            decoded = json.loads(text)
+        except json.JSONDecodeError:
+            return {}
+        return decoded if isinstance(decoded, dict) else {}
+
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.db_path, check_same_thread=False)
         conn.row_factory = sqlite3.Row
@@ -331,6 +342,7 @@ class BridgeStore:
                 telegram_message_id TEXT,
                 instructions TEXT NOT NULL DEFAULT '',
                 github_inputs_json TEXT NOT NULL DEFAULT '{}',
+                review_result_json TEXT NOT NULL DEFAULT '{}',
                 retry_count INTEGER NOT NULL DEFAULT 0,
                 created_at REAL NOT NULL,
                 updated_at REAL NOT NULL
@@ -379,6 +391,13 @@ class BridgeStore:
                 """
                 ALTER TABLE bridge_executions
                 ADD COLUMN github_inputs_json TEXT NOT NULL DEFAULT '{}'
+                """
+            )
+        if "review_result_json" not in execution_columns:
+            cursor.execute(
+                """
+                ALTER TABLE bridge_executions
+                ADD COLUMN review_result_json TEXT NOT NULL DEFAULT '{}'
                 """
             )
         conn.commit()
@@ -441,9 +460,9 @@ class BridgeStore:
             INSERT INTO bridge_executions (
                 bridge_id, context_id, repo_full_name, issue_number, entity_type,
                 target_alias, target_node_id, imperative_verb, intent_type, event_sequence,
-                status, instructions, github_inputs_json, retry_count, created_at, updated_at
+                status, instructions, github_inputs_json, review_result_json, retry_count, created_at, updated_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '{}', 0, ?, ?)
             """,
             (
                 bridge_id,
@@ -514,6 +533,7 @@ class BridgeStore:
         task_id: Optional[str] = None,
         action: Optional[str] = None,
         telegram_message_id: Optional[str] = None,
+        review_result: Optional[dict[str, Any]] = None,
         retry_count: Optional[int] = None,
     ) -> None:
         assignments = []
@@ -530,6 +550,9 @@ class BridgeStore:
         if telegram_message_id is not None:
             assignments.append("telegram_message_id = ?")
             params.append(str(telegram_message_id))
+        if review_result is not None:
+            assignments.append("review_result_json = ?")
+            params.append(json.dumps(review_result, separators=(",", ":"), sort_keys=True))
         if retry_count is not None:
             assignments.append("retry_count = ?")
             params.append(retry_count)
@@ -551,7 +574,48 @@ class BridgeStore:
         cursor.execute("SELECT * FROM bridge_executions WHERE bridge_id = ?", (bridge_id,))
         row = cursor.fetchone()
         conn.close()
-        return dict(row) if row else None
+        if row is None:
+            return None
+        record = dict(row)
+        record["github_inputs"] = self._decode_json_dict(record.get("github_inputs_json"))
+        record["review_result"] = self._decode_json_dict(record.get("review_result_json"))
+        return record
+
+    def list_recent_review_trials(self, *, limit: int = 20) -> list[dict[str, Any]]:
+        safe_limit = max(1, min(int(limit), 200))
+        conn = self._connect()
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            SELECT *
+            FROM bridge_executions
+            WHERE entity_type = 'pr' AND review_result_json != '{}'
+            ORDER BY updated_at DESC
+            LIMIT ?
+            """,
+            (safe_limit,),
+        )
+        rows = cursor.fetchall()
+        conn.close()
+        items: list[dict[str, Any]] = []
+        for row in rows:
+            record = dict(row)
+            items.append(
+                {
+                    "bridge_id": str(record.get("bridge_id") or ""),
+                    "context_id": str(record.get("context_id") or ""),
+                    "repo_full_name": str(record.get("repo_full_name") or ""),
+                    "issue_number": int(record.get("issue_number") or 0),
+                    "target_alias": str(record.get("target_alias") or ""),
+                    "intent_type": str(record.get("intent_type") or ""),
+                    "status": str(record.get("status") or ""),
+                    "action": str(record.get("action") or ""),
+                    "retry_count": int(record.get("retry_count") or 0),
+                    "updated_at": float(record.get("updated_at") or 0),
+                    "review_result": self._decode_json_dict(record.get("review_result_json")),
+                }
+            )
+        return items
 
 
 class DefaultMEPSubmissionClient:
@@ -2076,6 +2140,72 @@ class GitHubToMEPBridgeService:
             f"bridge_id={bridge_id} action={action} reason={reason} detail={metrics['last_detail_preview'] or '<empty>'}"
         )
 
+    @staticmethod
+    def _sorted_sample(values: set[str], *, limit: int) -> list[str]:
+        return sorted(str(value) for value in values if str(value).strip())[:limit]
+
+    def _build_review_trial_result(
+        self,
+        execution: dict[str, Any],
+        update: BridgeStatusUpdate,
+        *,
+        attempted_action: str,
+        resolved_action: str,
+        review_action: bool,
+        snapshot: dict[str, Any],
+        score: int,
+        reasons: list[str],
+        suppression_reason: Optional[str],
+    ) -> dict[str, Any]:
+        review_package = snapshot.get("review_package") or {}
+        ci_checks = snapshot.get("ci_checks") or {}
+        anchored_paths = snapshot.get("anchored_paths") or set()
+        changed_tokens = snapshot.get("changed_tokens") or set()
+        grounded_tokens = snapshot.get("grounded_tokens") or set()
+        expected_tests = list(snapshot.get("expected_tests") or [])
+        ci_summary = []
+        for item in ci_checks.get("summary", []):
+            if isinstance(item, dict):
+                ci_summary.append(
+                    {
+                        "name": str(item.get("name") or "").strip(),
+                        "state": str(item.get("state") or "").strip(),
+                    }
+                )
+        return {
+            "recorded_at": time.time(),
+            "status": str(update.status or "").strip().lower(),
+            "attempted_action": attempted_action,
+            "resolved_action": resolved_action,
+            "review_action": bool(review_action),
+            "published": bool(review_action and resolved_action in {"approved", "reviewed", "changes_requested"}),
+            "suppressed": bool(suppression_reason),
+            "suppression_reason": suppression_reason,
+            "quality_score": int(score),
+            "quality_reasons": list(reasons),
+            "repo_full_name": str(execution.get("repo_full_name") or ""),
+            "issue_number": int(execution.get("issue_number") or 0),
+            "target_alias": str(execution.get("target_alias") or ""),
+            "intent_type": str(execution.get("intent_type") or ""),
+            "head_sha": str(review_package.get("head_sha") or ""),
+            "ci_state": str(ci_checks.get("state") or "none"),
+            "ci_has_checks": bool(ci_checks.get("has_checks")),
+            "ci_all_green": bool(ci_checks.get("all_green")),
+            "ci_summary": ci_summary,
+            "anchored_paths": self._sorted_sample(anchored_paths, limit=6),
+            "anchored_path_count": len(anchored_paths),
+            "changed_token_sample": self._sorted_sample(changed_tokens, limit=8),
+            "changed_token_count": len(changed_tokens),
+            "grounded_token_count": len(grounded_tokens),
+            "expected_tests": [str(item) for item in expected_tests[:6]],
+            "expected_test_count": len(expected_tests),
+            "mentions_tests": bool(snapshot.get("mentions_tests")),
+            "has_findings": bool(snapshot.get("has_findings")),
+            "detail_preview": self._detail_preview(update.detail),
+            "retry_queued": False,
+            "retry_count": int(execution.get("retry_count") or 0),
+        }
+
     def _render_github_writeback_body(
         self,
         bridge_id: str,
@@ -2173,7 +2303,9 @@ class GitHubToMEPBridgeService:
             ),
         )
 
-    def _write_back_to_github(self, execution: dict[str, Any], update: BridgeStatusUpdate) -> tuple[str, Optional[str]]:
+    def _write_back_to_github(
+        self, execution: dict[str, Any], update: BridgeStatusUpdate
+    ) -> tuple[str, Optional[str], Optional[dict[str, Any]]]:
         self._assert_writeback_identity_allowed(execution)
         github_token, _identity_label = self._resolve_github_writeback_identity(execution)
         if not github_token:
@@ -2189,6 +2321,7 @@ class GitHubToMEPBridgeService:
         }
         review_action = entity_type == "pr" and action in review_events
         self._record_github_writeback_attempt(action, update.detail)
+        review_result: Optional[dict[str, Any]] = None
         if review_action:
             snapshot = self._build_review_snapshot(execution, update.detail)
             suppress, reason = self._classify_review_writeback_detail(execution, update.detail, snapshot=snapshot)
@@ -2198,13 +2331,24 @@ class GitHubToMEPBridgeService:
                 reason = self._approval_quality_failure(snapshot, score)
                 suppress = reason is not None
             if suppress:
+                review_result = self._build_review_trial_result(
+                    execution,
+                    update,
+                    attempted_action=action,
+                    resolved_action="suppressed",
+                    review_action=review_action,
+                    snapshot=snapshot,
+                    score=score,
+                    reasons=reasons,
+                    suppression_reason=reason,
+                )
                 self._record_github_writeback_suppression(
                     bridge_id=str(execution.get("bridge_id") or update.bridge_id),
                     action=action,
                     detail=update.detail,
                     reason=reason,
                 )
-                return "suppressed", reason
+                return "suppressed", reason, review_result
         body = self._render_github_writeback_body(
             str(execution.get("bridge_id") or update.bridge_id),
             action,
@@ -2214,10 +2358,21 @@ class GitHubToMEPBridgeService:
         if review_action:
             self._submit_github_review(repo_full_name, number, review_events[action], body, github_token)
             self._record_github_writeback_publish(action, review_action=True)
-            return action, None
+            review_result = self._build_review_trial_result(
+                execution,
+                update,
+                attempted_action=action,
+                resolved_action=action,
+                review_action=review_action,
+                snapshot=snapshot,
+                score=score,
+                reasons=reasons,
+                suppression_reason=None,
+            )
+            return action, None, review_result
         self._post_github_comment(repo_full_name, number, body, github_token)
         self._record_github_writeback_publish("commented", review_action=False)
-        return "commented", None
+        return "commented", None, None
 
     async def handle_status_callback(self, update: BridgeStatusUpdate, token: str) -> dict[str, Any]:
         self._require_runtime_config()
@@ -2241,7 +2396,7 @@ class GitHubToMEPBridgeService:
         if refreshed is None:
             raise HTTPException(status_code=404, detail="Unknown bridge_id")
         if str(update.status).strip().lower() == "completed":
-            resolved_action, suppression_reason = self._write_back_to_github(refreshed, update)
+            resolved_action, suppression_reason, review_result = self._write_back_to_github(refreshed, update)
             if resolved_action == "suppressed":
                 retry_count = int(refreshed.get("retry_count") or 0)
                 if retry_count < 2 and self._suppression_reason_allows_retry(suppression_reason):  # MAX_RETRIES = 2
@@ -2250,6 +2405,12 @@ class GitHubToMEPBridgeService:
                         resolved_action = "retrying"
             if resolved_action != update.action:
                 self.store.update_execution(update.bridge_id, action=resolved_action)
+                refreshed = self.store.get_execution(update.bridge_id) or refreshed
+            if review_result is not None:
+                review_result["resolved_action"] = resolved_action
+                review_result["retry_queued"] = resolved_action == "retrying"
+                review_result["retry_count"] = int(refreshed.get("retry_count") or 0)
+                self.store.update_execution(update.bridge_id, review_result=review_result)
                 refreshed = self.store.get_execution(update.bridge_id) or refreshed
         event = NormalizedGitHubEvent(
             delivery_id="",
@@ -2283,6 +2444,10 @@ class GitHubToMEPBridgeService:
             ),
         )
         return {"status": "ok", "bridge_id": update.bridge_id}
+
+    def list_review_trials(self, *, limit: int = 20) -> dict[str, Any]:
+        items = self.store.list_recent_review_trials(limit=limit)
+        return {"status": "ok", "count": len(items), "items": items}
 
     async def _issue_retry_task(self, execution: dict[str, Any], reason: Optional[str]) -> bool:
         bridge_id = str(execution["bridge_id"])
@@ -2467,6 +2632,10 @@ def create_app(
         if not token and authorization and authorization.lower().startswith("bearer "):
             token = authorization.split(" ", 1)[1].strip()
         return await bridge_service.handle_status_callback(update, token or "")
+
+    @app.get("/bridge/review-trials")
+    async def bridge_review_trials(limit: int = 20) -> dict[str, Any]:
+        return bridge_service.list_review_trials(limit=limit)
 
     return app
 
