@@ -944,6 +944,17 @@ class WorkspaceManager:
             return ""
         return "\n\n".join(sections)
 
+    @staticmethod
+    def _clean_check_env() -> dict[str, str]:
+        """Environment for verification subprocesses with the reviewer's own
+        ``MEP_REVIEW_*`` / ``MEP_AI_*`` knobs stripped, so the bot's runtime
+        configuration can never alter the outcome of the PR's own tests."""
+        env = dict(os.environ)
+        for key in list(env):
+            if key.startswith("MEP_REVIEW_") or key.startswith("MEP_AI_"):
+                env.pop(key, None)
+        return env
+
     def _run_check(self, cwd: str, args: list[str], timeout: int) -> tuple[int, str]:
         try:
             result = subprocess.run(
@@ -953,6 +964,7 @@ class WorkspaceManager:
                 text=True,
                 check=False,
                 timeout=timeout,
+                env=self._clean_check_env(),
             )
             return result.returncode, (result.stdout + result.stderr).strip()
         except subprocess.TimeoutExpired:

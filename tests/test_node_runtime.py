@@ -1172,12 +1172,29 @@ class TestWorkspaceReviewContext(unittest.TestCase):
         self.assertIn("line_199 = 199", ctx)
 
     def test_build_verification_report_disabled_by_default(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with (
+            tempfile.TemporaryDirectory() as tmp,
+            patch.dict(os.environ, {"MEP_REVIEW_RUN_CHECKS": "0"}),
+        ):
             wm = mep_runtime.WorkspaceManager(tmp)
             self.assertEqual(
                 wm.build_verification_report(tmp, ["node/x.py"], ["tests/test_x.py"]),
                 "",
             )
+
+    def test_clean_check_env_strips_reviewer_knobs(self):
+        with patch.dict(
+            os.environ,
+            {
+                "MEP_REVIEW_RUN_CHECKS": "true",
+                "MEP_AI_MAX_TOKENS": "4000",
+                "PATH": os.environ.get("PATH", ""),
+            },
+        ):
+            env = mep_runtime.WorkspaceManager._clean_check_env()  # noqa: SLF001
+        self.assertNotIn("MEP_REVIEW_RUN_CHECKS", env)
+        self.assertNotIn("MEP_AI_MAX_TOKENS", env)
+        self.assertIn("PATH", env)
 
     def test_build_verification_report_runs_pytest_when_enabled(self):
         with tempfile.TemporaryDirectory() as tmp:
