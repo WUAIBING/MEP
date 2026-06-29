@@ -190,8 +190,15 @@ class TestGitHubToMEPBridge(unittest.TestCase):
             "additions": additions,
             "deletions": deletions,
             "commits": 1,
-            "head": {"sha": "headsha123"},
-            "base": {"sha": "basesha456"},
+            "head": {
+                "sha": "headsha123",
+                "ref": "headref",
+                "repo": {"clone_url": "https://github.com/example/repo.git"},
+            },
+            "base": {
+                "sha": "basesha456",
+                "ref": "baseref",
+            },
         }
         self.github_session.get_responses = [
             _FakeResponse(pr_payload),
