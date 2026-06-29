@@ -802,7 +802,8 @@ class RuntimeNode:
         workspace_dir = os.getenv("MEP_WORKSPACE_DIR")
         if not workspace_dir:
             # Fallback to a subfolder in the identity directory
-            workspace_dir = os.path.join(os.path.dirname(identity.key_path), "workspace", (alias or "default").replace(" ", "-").lower())
+            key_path = getattr(identity, "key_path", "node.pem")
+            workspace_dir = os.path.join(os.path.dirname(os.path.abspath(key_path)), "workspace", (alias or "default").replace(" ", "-").lower())
         self.workspace = WorkspaceManager(workspace_dir)
 
     def _auth_headers(self, payload: str) -> dict[str, str]:
