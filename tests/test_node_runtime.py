@@ -534,6 +534,37 @@ class TestRuntimeWebSocketLoop(unittest.TestCase):
         self.assertEqual(tasks, [{"id": "task_pending"}])
         self.assertEqual(request_mock.call_args.args, ("GET", "http://hub/tasks/pending/node_runtime"))
         self.assertEqual(request_mock.call_args.kwargs["headers"]["X-MEP-NodeID"], "node_runtime")
+        self.assertEqual(node.pending_task_recovery_metrics["poll_attempts"], 1)  # noqa: SLF001
+        self.assertEqual(node.pending_task_recovery_metrics["poll_successes"], 1)  # noqa: SLF001
+
+    def test_fetch_pending_tasks_records_poll_failure_metrics(self):
+        node = _runtime_node()
+        with patch("node.mep_runtime._safe_request", return_value=(503, None, "hub unavailable")):
+            tasks = node._fetch_pending_tasks()  # noqa: SLF001
+
+        self.assertEqual(tasks, [])
+        metrics = node.pending_task_recovery_metrics  # noqa: SLF001
+        self.assertEqual(metrics["poll_attempts"], 1)
+        self.assertEqual(metrics["poll_failures"], 1)
+        self.assertEqual(metrics["poll_successes"], 0)
+        self.assertEqual(metrics["last_poll_status"], 503)
+        self.assertEqual(metrics["last_poll_failure_detail"], "hub unavailable")
+        self.assertIsNotNone(metrics["last_poll_failure_at"])
+
+    def test_fetch_pending_tasks_records_malformed_response_metrics(self):
+        node = _runtime_node()
+        with patch("node.mep_runtime._safe_request", return_value=(200, {"tasks": "not-a-list"}, "")):
+            tasks = node._fetch_pending_tasks()  # noqa: SLF001
+
+        self.assertEqual(tasks, [])
+        metrics = node.pending_task_recovery_metrics  # noqa: SLF001
+        self.assertEqual(metrics["poll_attempts"], 1)
+        self.assertEqual(metrics["poll_failures"], 1)
+        self.assertEqual(metrics["malformed_responses"], 1)
+        self.assertEqual(metrics["poll_successes"], 0)
+        self.assertEqual(metrics["last_poll_status"], 200)
+        self.assertEqual(metrics["last_poll_failure_detail"], "pending task poll returned invalid tasks payload")
+        self.assertIsNotNone(metrics["last_poll_failure_at"])
 
     def test_recover_pending_tasks_replays_new_task_events(self):
         node = _runtime_node()
@@ -546,6 +577,8 @@ class TestRuntimeWebSocketLoop(unittest.TestCase):
         self.assertEqual(handle_mock.await_count, 2)
         self.assertEqual(handle_mock.await_args_list[0].args[0], {"event": "new_task", "data": {"id": "task_one"}})
         self.assertEqual(handle_mock.await_args_list[1].args[0], {"event": "new_task", "data": {"id": "task_two"}})
+        self.assertEqual(node.pending_task_recovery_metrics["tasks_recovered"], 2)  # noqa: SLF001
+        self.assertIsNotNone(node.pending_task_recovery_metrics["last_recovered_at"])  # noqa: SLF001
 
     def test_run_forever_recovers_pending_tasks_after_connect(self):
         node = _runtime_node()
