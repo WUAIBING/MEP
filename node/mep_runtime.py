@@ -393,6 +393,18 @@ def _review_github_inputs(task_data: dict[str, Any]) -> dict[str, Any]:
     return github_inputs if isinstance(github_inputs, dict) else {}
 
 
+def _review_intent_type(task_data: dict[str, Any]) -> str:
+    interbot_message = _interbot_message_from_task_data(task_data)
+    intent: Any = task_data.get("intent")
+    if not isinstance(intent, dict) and isinstance(interbot_message, dict):
+        intent = interbot_message.get("intent")
+    return str(intent.get("type") or "").strip().lower() if isinstance(intent, dict) else ""
+
+
+def _task_is_approval_review(task_data: dict[str, Any]) -> bool:
+    return _review_intent_type(task_data) == "code.review.approve"
+
+
 def _clean_review_list(values: Any, *, max_items: int, max_chars: int) -> list[str]:
     if not isinstance(values, list):
         return []
@@ -420,6 +432,7 @@ def _system_prompt_for_task(
 ) -> str:
     if _task_requires_review_prompt(task_data):
         github_inputs = _review_github_inputs(task_data)
+        approval_mode = _task_is_approval_review(task_data)
         workspace_path = str(github_inputs.get("local_workspace_path") or "").strip()
         workspace_hint = ""
         if workspace_path:
@@ -427,19 +440,28 @@ def _system_prompt_for_task(
                 f" A checked-out local workspace is available at `{workspace_path}` and any embedded workspace excerpts "
                 "come from the PR head commit; treat that material as authoritative code context."
             )
+        approval_hint = ""
+        if approval_mode:
+            approval_hint = (
+                " Approval mode is active. Only use `approval_recommendation: \"approve\"` when you can cite at least two exact identifiers from changed lines "
+                "in `verified_identifiers`, mention the changed tests when any are provided, and explicitly state the scope is low-risk. "
+                "If you cannot satisfy that evidence bar, use `comment` instead of `approve`."
+            )
         return (
             "You are a senior code reviewer for the MEP (Miao Exchange Protocol) project. "
             "Review the provided GitHub PR context and return ONLY a JSON object with this schema: "
             '{"summary": string, "observation": string, "touched_paths": [string], "tests_reviewed": [string], '
+            '"verified_identifiers": [string], '
             '"findings": [{"file": string, "issue": string, "rationale": string}], '
             '"approval_recommendation": "approve" | "comment" | "request_changes" | "abstain"}. '
             "Use at most 2 findings. "
             "Use `observation` for one concrete non-blocking review note tied to the actual diff. "
+            "Use `verified_identifiers` for exact function/variable/class names copied from changed lines in the supplied diff or workspace excerpts. "
             "Prefer real touched files and tests from the supplied GitHub inputs for `touched_paths` and `tests_reviewed`. "
             "Only include a finding when it is directly supported by the provided diff, file list, PR description, or patch excerpts. "
             "Do not speculate about unseen code, do not ask for more context, and do not include chain-of-thought or any text outside the JSON object. "
             "If the change looks good, keep findings empty and use summary to say what you verified, keep observation concrete, and set approval_recommendation to approve or comment. Keep the "
-            f"response within {review_max_chars} characters.{workspace_hint}"
+            f"response within {review_max_chars} characters.{approval_hint}{workspace_hint}"
         )
     return (
         "You are a helpful MEP (Miao Exchange Protocol) bot. "
@@ -580,6 +602,7 @@ def _render_structured_review_with_task_data(
     if not isinstance(parsed, dict):
         return ""
     github_inputs = _review_github_inputs(task_data or {})
+    approval_mode = _task_is_approval_review(task_data or {})
     summary = _clean_review_text(parsed.get("summary"), max_chars=220)
     if _is_weak_review_text(summary):
         summary = ""
@@ -592,6 +615,8 @@ def _render_structured_review_with_task_data(
     tests_reviewed = _clean_review_list(parsed.get("tests_reviewed"), max_items=3, max_chars=120)
     if not tests_reviewed:
         tests_reviewed = _clean_review_list(github_inputs.get("touched_tests"), max_items=3, max_chars=120)
+    verified_identifiers = _clean_review_list(parsed.get("verified_identifiers"), max_items=4, max_chars=80)
+    approval_recommendation = str(parsed.get("approval_recommendation") or "").strip().lower()
     findings_raw = parsed.get("findings")
     findings: list[str] = []
     if isinstance(findings_raw, list):
@@ -621,6 +646,8 @@ def _render_structured_review_with_task_data(
             sections.append("Touched paths reviewed: " + ", ".join(f"`{path}`" for path in touched_paths))
         if tests_reviewed:
             sections.append("Tests reviewed: " + ", ".join(f"`{path}`" for path in tests_reviewed))
+        if verified_identifiers:
+            sections.append("Changed identifiers verified: " + ", ".join(f"`{name}`" for name in verified_identifiers))
         for index, finding in enumerate(findings, start=1):
             sections.append(f"{index}. {finding}")
     elif summary:
@@ -632,6 +659,8 @@ def _render_structured_review_with_task_data(
             sections.append("Touched paths reviewed: " + ", ".join(f"`{path}`" for path in touched_paths))
         if tests_reviewed:
             sections.append("Tests reviewed: " + ", ".join(f"`{path}`" for path in tests_reviewed))
+        if verified_identifiers:
+            sections.append("Changed identifiers verified: " + ", ".join(f"`{name}`" for name in verified_identifiers))
     else:
         sections.append("## Review Summary")
         sections.append(
