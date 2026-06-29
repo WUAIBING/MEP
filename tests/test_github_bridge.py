@@ -514,8 +514,13 @@ class TestGitHubToMEPBridge(unittest.TestCase):
         self.assertEqual(len(self.notifier.calls), 2)
         final_message = self.notifier.calls[-1]
         self.assertTrue(final_message["editing"])
-        self.assertIn("action: suppressed", final_message["text"])
+        self.assertIn("action: retrying", final_message["text"])
         self.assertEqual(len(self.github_session.posts), 0)
+        
+        # Verify retry task was emitted
+        self.assertEqual(len(self.submission.calls), 2)
+        retry_task = self.submission.calls[-1]
+        self.assertIn("Your previous review was suppressed because: generic_observation", retry_task["envelope"]["task"]["instructions"])
         self.assertEqual(self.service.github_writeback_metrics["reviews_published"], 0)
         self.assertEqual(self.service.github_writeback_metrics["suppressed_weak_reviews"], 1)
         self.assertEqual(self.service.github_writeback_metrics["suppressed_approvals"], 1)
@@ -544,10 +549,65 @@ class TestGitHubToMEPBridge(unittest.TestCase):
         )
         self.assertEqual(status_response.status_code, 200, status_response.text)
         self.assertEqual(len(self.github_session.posts), 0)
-        self.assertIn("action: suppressed", self.notifier.calls[-1]["text"])
+        self.assertIn("action: retrying", self.notifier.calls[-1]["text"])
+        self.assertEqual(len(self.submission.calls), 2)
+        retry_task = self.submission.calls[-1]
+        self.assertIn("Your previous review was suppressed because: generic_summary", retry_task["envelope"]["task"]["instructions"])
         self.assertEqual(self.service.github_writeback_metrics["attempts"], 1)
         self.assertEqual(self.service.github_writeback_metrics["suppressed_weak_reviews"], 1)
         self.assertEqual(self.service.github_writeback_metrics["last_suppressed_reason"], "generic_summary")
+
+    def test_status_callback_stops_retrying_after_max_retries(self):
+        response = self._post_webhook(
+            _issue_comment_payload("@Hub-Sentinel review this PR", delivery_number=233),
+            delivery_id="delivery-max-retry",
+        )
+        bridge_id = response.json()["bridge_id"]
+        self._flush_context(response.json()["context_id"])
+
+        token = self.service._generate_status_token(bridge_id, "node_target")
+        
+        # Retry 1
+        self.client.post(
+            "/bridge/status",
+            json={
+                "bridge_id": bridge_id,
+                "status": "completed",
+                "target_node_id": "node_target",
+                "detail": "Too short review 1",
+            },
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        self.assertIn("action: retrying", self.notifier.calls[-1]["text"])
+        self.assertEqual(len(self.submission.calls), 2)
+        
+        # Retry 2
+        self.client.post(
+            "/bridge/status",
+            json={
+                "bridge_id": bridge_id,
+                "status": "completed",
+                "target_node_id": "node_target",
+                "detail": "Too short review 2",
+            },
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        self.assertIn("action: retrying", self.notifier.calls[-1]["text"])
+        self.assertEqual(len(self.submission.calls), 3)
+        
+        # Should stop now (Retry 3)
+        self.client.post(
+            "/bridge/status",
+            json={
+                "bridge_id": bridge_id,
+                "status": "completed",
+                "target_node_id": "node_target",
+                "detail": "Too short review 3",
+            },
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        self.assertIn("action: suppressed", self.notifier.calls[-1]["text"])
+        self.assertEqual(len(self.submission.calls), 3) # No new call
 
     def test_status_callback_suppresses_structured_review_without_touched_path_anchor(self):
         response = self._post_webhook(
