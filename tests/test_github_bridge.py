@@ -456,6 +456,9 @@ class TestGitHubToMEPBridge(unittest.TestCase):
         self.assertEqual(github_inputs["touched_tests"], ["tests/test_github_bridge.py"])
         self.assertEqual(github_inputs["ci_checks"]["state"], "none")
         self.assertIn("persistence", github_inputs["risk_tags"])
+        self.assertEqual(github_inputs["risk_pack"]["changed_identifiers"], ["write_state", "test_review_package"])
+        self.assertIn("persistence", github_inputs["risk_pack"]["risk_tags"])
+        self.assertEqual(github_inputs["risk_pack"]["deleted_tests"], [])
         self.assertEqual(github_inputs["coalesced_delivery_ids"], ["delivery-package"])
         self.assertEqual(github_inputs["event_sequence"], 1)
         self.assertEqual(github_inputs["changed_files"][0]["filename"], "hub/db.py")
@@ -465,6 +468,8 @@ class TestGitHubToMEPBridge(unittest.TestCase):
         )
         self.assertIn("Touched tests:", instructions)
         self.assertIn("Risk tags: persistence", instructions)
+        self.assertIn("Deterministic risk pack:", instructions)
+        self.assertIn("Changed identifiers: write_state, test_review_package", instructions)
 
     def test_pr_review_package_detects_singular_test_path_and_security_tag(self):
         self.github_session.get_responses = [
@@ -517,6 +522,75 @@ class TestGitHubToMEPBridge(unittest.TestCase):
         self.assertIn("security", github_inputs["risk_tags"])
         self.assertIn("Touched tests:\n- src/test/webhook_security_test.py", instructions)
         self.assertIn("Risk tags: security", instructions)
+
+    def test_pr_review_package_builds_risk_pack_for_config_and_deleted_tests(self):
+        self.github_session.get_responses = [
+            _FakeResponse(
+                {
+                    "body": "Updates runtime environment handling and removes a stale test.",
+                    "changed_files": 3,
+                    "additions": 18,
+                    "deletions": 9,
+                    "commits": 1,
+                    "head": {"sha": "feed1234"},
+                    "base": {"sha": "dead5678"},
+                }
+            ),
+            _FakeResponse(
+                [
+                    {
+                        "filename": ".github/workflows/ci.yml",
+                        "status": "modified",
+                        "additions": 4,
+                        "deletions": 1,
+                        "changes": 5,
+                        "patch": "@@ -1,3 +1,6 @@\n+env:\n+  MEP_REVIEW_RUN_CHECKS: true\n",
+                    },
+                    {
+                        "filename": "node/mep_runtime.py",
+                        "status": "modified",
+                        "additions": 10,
+                        "deletions": 2,
+                        "changes": 12,
+                        "patch": (
+                            "@@ -10,3 +10,10 @@\n"
+                            "+def build_verification_report():\n"
+                            "+    value = os.getenv('MEP_REVIEW_RUN_CHECKS')\n"
+                            "+    return requests.get('https://example.test').status_code\n"
+                        ),
+                    },
+                    {
+                        "filename": "tests/test_legacy_bridge.py",
+                        "status": "removed",
+                        "additions": 0,
+                        "deletions": 6,
+                        "changes": 6,
+                        "patch": "@@ -1,6 +0,0 @@\n-def test_legacy_bridge():\n-    assert True\n",
+                    },
+                ]
+            ),
+        ]
+
+        response = self._post_webhook(
+            _issue_comment_payload("@Hub-Sentinel review this PR", delivery_number=263),
+            delivery_id="delivery-risk-pack",
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+
+        self._flush_context(response.json()["context_id"])
+
+        github_inputs = self.submission.calls[0]["envelope"]["task"]["inputs"]["github"]
+        instructions = self.submission.calls[0]["envelope"]["task"]["instructions"]
+
+        self.assertEqual(github_inputs["risk_pack"]["changed_identifiers"], ["build_verification_report", "value"])
+        self.assertIn("network_io", github_inputs["risk_pack"]["risky_api_hits"])
+        self.assertIn("env_config", github_inputs["risk_pack"]["risky_api_hits"])
+        self.assertEqual(github_inputs["risk_pack"]["config_paths"], [".github/workflows/ci.yml"])
+        self.assertEqual(github_inputs["risk_pack"]["deleted_tests"], ["tests/test_legacy_bridge.py"])
+        self.assertIn("Risky API hits:", instructions)
+        self.assertIn("env_config", instructions)
+        self.assertIn("network_io", instructions)
+        self.assertIn("Deleted tests: tests/test_legacy_bridge.py", instructions)
 
     def test_status_callback_suppresses_approve_without_code_evidence_and_updates_existing_message(self):
         response = self._post_webhook(

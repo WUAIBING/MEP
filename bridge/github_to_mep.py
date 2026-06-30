@@ -1259,6 +1259,7 @@ class GitHubToMEPBridgeService:
             "touched_tests",
             "risk_tags",
             "reviewability",
+            "risk_pack",
         ):
             value = review_package.get(key)
             if value not in (None, "", [], {}):
@@ -1330,6 +1331,113 @@ class GitHubToMEPBridgeService:
             if any(keyword in joined for keyword in keywords):
                 tags.append(tag)
         return tags
+
+    @staticmethod
+    def _is_config_or_env_path(path: str) -> bool:
+        lowered = str(path or "").strip().lower()
+        if not lowered:
+            return False
+        basename = lowered.rsplit("/", 1)[-1]
+        return (
+            basename.startswith(".env")
+            or basename.endswith((".ini", ".toml", ".yaml", ".yml", ".json"))
+            or lowered.endswith(".service")
+            or lowered.endswith(".conf")
+            or "/workflows/" in lowered
+        )
+
+    @staticmethod
+    def _extract_changed_identifiers(patch_text: str) -> list[str]:
+        if not patch_text:
+            return []
+        identifiers: list[str] = []
+        seen: set[str] = set()
+        patterns = (
+            re.compile(r"^[+-]\s*def\s+([A-Za-z_][A-Za-z0-9_]*)\s*\("),
+            re.compile(r"^[+-]\s*class\s+([A-Za-z_][A-Za-z0-9_]*)\b"),
+            re.compile(r"^[+-]\s*([A-Za-z_][A-Za-z0-9_]*)\s*="),
+        )
+        for line in patch_text.splitlines():
+            if not line.startswith(("+", "-")) or line.startswith(("+++", "---")):
+                continue
+            for pattern in patterns:
+                match = pattern.search(line)
+                if not match:
+                    continue
+                identifier = match.group(1)
+                if identifier not in seen:
+                    identifiers.append(identifier)
+                    seen.add(identifier)
+                break
+            if len(identifiers) >= 12:
+                break
+        return identifiers
+
+    @staticmethod
+    def _extract_risky_api_hits(path: str, patch_text: str) -> list[str]:
+        lowered = f"{str(path or '').lower()}\n{str(patch_text or '').lower()}"
+        if not lowered.strip():
+            return []
+        rules = [
+            ("subprocess", ("subprocess.", "subprocess ", "popen(", "run(")),
+            ("network_io", ("requests.", "httpx.", "urllib.", "aiohttp", "websocket", "ws_connect")),
+            ("filesystem", ("open(", "pathlib", "os.path", "shutil.", "tempfile")),
+            ("auth_identity", ("token", "auth", "verify_request", "permission", "credential", "secret")),
+            ("env_config", ("os.getenv", "os.environ", ".env", "systemctl", "workflow", "yaml", "toml")),
+            ("persistence", ("sqlite", "postgres", "cache", "storage", "persist")),
+        ]
+        hits: list[str] = []
+        for label, needles in rules:
+            if any(needle in lowered for needle in needles):
+                hits.append(label)
+        return hits
+
+    @classmethod
+    def _build_risk_pack(
+        cls,
+        *,
+        changed_file_entries: list[dict[str, Any]],
+        touched_paths: list[str],
+        touched_tests: list[str],
+        risk_tags: list[str],
+    ) -> dict[str, Any]:
+        changed_identifiers: list[str] = []
+        risky_api_hits: list[str] = []
+        config_paths: list[str] = []
+        deleted_tests: list[str] = []
+        seen_identifiers: set[str] = set()
+        seen_hits: set[str] = set()
+        for entry in changed_file_entries:
+            if not isinstance(entry, dict):
+                continue
+            filename = str(entry.get("filename") or "").strip()
+            patch_text = str(entry.get("patch") or "").strip()
+            status = str(entry.get("status") or "").strip().lower()
+            include_identifiers = not (status == "removed" and cls._is_test_path(filename))
+            if include_identifiers:
+                for identifier in cls._extract_changed_identifiers(patch_text):
+                    if identifier not in seen_identifiers:
+                        changed_identifiers.append(identifier)
+                        seen_identifiers.add(identifier)
+            for hit in cls._extract_risky_api_hits(filename, patch_text):
+                if hit not in seen_hits:
+                    risky_api_hits.append(hit)
+                    seen_hits.add(hit)
+            if filename and cls._is_config_or_env_path(filename) and filename not in config_paths:
+                config_paths.append(filename)
+            if status == "removed" and cls._is_test_path(filename) and filename not in deleted_tests:
+                deleted_tests.append(filename)
+        return {
+            "changed_identifiers": changed_identifiers[:12],
+            "risky_api_hits": risky_api_hits[:8],
+            "config_paths": config_paths[:6],
+            "deleted_tests": deleted_tests[:6],
+            "has_touched_tests": bool(touched_tests),
+            "risk_tags": list(risk_tags[:6]),
+            "touched_non_test_paths": [
+                path for path in touched_paths[:8] if path not in set(touched_tests)
+            ][:6],
+        }
 
     @staticmethod
     def _is_docs_only_path(path: str) -> bool:
@@ -1512,12 +1620,37 @@ class GitHubToMEPBridgeService:
                     break
             touched_tests = [path for path in touched_paths if self._is_test_path(path)]
             risk_tags = self._derive_risk_tags(touched_paths)
+            risk_pack = self._build_risk_pack(
+                changed_file_entries=changed_file_entries,
+                touched_paths=touched_paths,
+                touched_tests=touched_tests,
+                risk_tags=risk_tags,
+            )
             if touched_paths:
                 sections.append("Touched paths:\n" + "\n".join(f"- {path}" for path in touched_paths[:8]))
             if touched_tests:
                 sections.append("Touched tests:\n" + "\n".join(f"- {path}" for path in touched_tests[:8]))
             if risk_tags:
                 sections.append("Risk tags: " + ", ".join(risk_tags))
+            risk_pack_lines: list[str] = []
+            if risk_pack.get("changed_identifiers"):
+                risk_pack_lines.append(
+                    "- Changed identifiers: " + ", ".join(str(item) for item in risk_pack["changed_identifiers"])
+                )
+            if risk_pack.get("risky_api_hits"):
+                risk_pack_lines.append(
+                    "- Risky API hits: " + ", ".join(str(item) for item in risk_pack["risky_api_hits"])
+                )
+            if risk_pack.get("config_paths"):
+                risk_pack_lines.append(
+                    "- Config/env paths: " + ", ".join(str(item) for item in risk_pack["config_paths"])
+                )
+            if risk_pack.get("deleted_tests"):
+                risk_pack_lines.append(
+                    "- Deleted tests: " + ", ".join(str(item) for item in risk_pack["deleted_tests"])
+                )
+            if risk_pack_lines:
+                sections.append("Deterministic risk pack:\n" + "\n".join(risk_pack_lines))
             reviewability = self._classify_reviewability(
                 touched_paths=touched_paths,
                 touched_tests=touched_tests,
@@ -1540,6 +1673,15 @@ class GitHubToMEPBridgeService:
         else:
             touched_tests = []
             risk_tags = []
+            risk_pack = {
+                "changed_identifiers": [],
+                "risky_api_hits": [],
+                "config_paths": [],
+                "deleted_tests": [],
+                "has_touched_tests": False,
+                "risk_tags": [],
+                "touched_non_test_paths": [],
+            }
             reviewability = {
                 "bucket": "standard",
                 "reasons": [],
@@ -1562,6 +1704,7 @@ class GitHubToMEPBridgeService:
             "touched_paths": touched_paths,
             "touched_tests": touched_tests,
             "risk_tags": risk_tags,
+            "risk_pack": risk_pack,
             "reviewability": reviewability,
             "changed_files": changed_file_entries,
             "instructions_context": "\n\n".join(section for section in sections if section.strip()),
