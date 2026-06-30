@@ -1258,6 +1258,7 @@ class GitHubToMEPBridgeService:
             "touched_paths",
             "touched_tests",
             "risk_tags",
+            "reviewability",
         ):
             value = review_package.get(key)
             if value not in (None, "", [], {}):
@@ -1329,6 +1330,67 @@ class GitHubToMEPBridgeService:
             if any(keyword in joined for keyword in keywords):
                 tags.append(tag)
         return tags
+
+    @staticmethod
+    def _is_docs_only_path(path: str) -> bool:
+        lowered = str(path or "").strip().lower()
+        if not lowered:
+            return False
+        if lowered.startswith("docs/"):
+            return True
+        basename = lowered.rsplit("/", 1)[-1]
+        if basename in {
+            "readme",
+            "readme.md",
+            "contributing.md",
+            "license",
+            "license.md",
+            "changelog.md",
+            "security.md",
+        }:
+            return True
+        return any(lowered.endswith(suffix) for suffix in (".md", ".rst", ".txt", ".adoc"))
+
+    @classmethod
+    def _classify_reviewability(
+        cls,
+        *,
+        touched_paths: list[str],
+        touched_tests: list[str],
+        risk_tags: list[str],
+        pr_stats: dict[str, Any],
+    ) -> dict[str, Any]:
+        changed_files = int(pr_stats.get("changed_files") or 0)
+        additions = int(pr_stats.get("additions") or 0)
+        deletions = int(pr_stats.get("deletions") or 0)
+        normalized_paths = [str(path).strip() for path in touched_paths if str(path).strip()]
+        if normalized_paths and all(cls._is_docs_only_path(path) for path in normalized_paths):
+            return {
+                "bucket": "low_signal",
+                "reasons": ["docs_only_patch"],
+                "publish_no_finding": False,
+                "summary": "Docs-only patch with low behavioral signal; suppress generic no-finding review writeback unless a concrete issue is found.",
+            }
+        if (
+            normalized_paths
+            and not risk_tags
+            and not touched_tests
+            and changed_files <= 1
+            and additions + deletions <= 12
+            and all(cls._is_test_path(path) for path in normalized_paths)
+        ):
+            return {
+                "bucket": "low_signal",
+                "reasons": ["single_small_test_only_patch"],
+                "publish_no_finding": False,
+                "summary": "Small test-only patch; publish only if the reviewer finds a concrete regression or unsupported expectation.",
+            }
+        return {
+            "bucket": "standard",
+            "reasons": [],
+            "publish_no_finding": True,
+            "summary": "Standard review path; publish grounded findings or sufficiently concrete no-finding reviews.",
+        }
 
     def _fetch_pr_review_package(self, repo_full_name: str, number: int) -> dict[str, Any]:
         token = self._github_read_token()
@@ -1456,11 +1518,34 @@ class GitHubToMEPBridgeService:
                 sections.append("Touched tests:\n" + "\n".join(f"- {path}" for path in touched_tests[:8]))
             if risk_tags:
                 sections.append("Risk tags: " + ", ".join(risk_tags))
+            reviewability = self._classify_reviewability(
+                touched_paths=touched_paths,
+                touched_tests=touched_tests,
+                risk_tags=risk_tags,
+                pr_stats={
+                    "changed_files": changed_files,
+                    "additions": additions,
+                    "deletions": deletions,
+                    "commits": commits,
+                },
+            )
+            sections.append(
+                "Reviewability assessment: "
+                f"bucket={reviewability.get('bucket', 'standard')}; "
+                f"reasons={', '.join(reviewability.get('reasons') or ['none'])}; "
+                f"guidance={reviewability.get('summary', '')}"
+            )
             if file_lines:
                 sections.append("Changed files and patch excerpts:\n" + "\n".join(file_lines))
         else:
             touched_tests = []
             risk_tags = []
+            reviewability = {
+                "bucket": "standard",
+                "reasons": [],
+                "publish_no_finding": True,
+                "summary": "Standard review path; publish grounded findings or sufficiently concrete no-finding reviews.",
+            }
         return {
             "head_sha": head_sha,
             "base_sha": base_sha,
@@ -1477,6 +1562,7 @@ class GitHubToMEPBridgeService:
             "touched_paths": touched_paths,
             "touched_tests": touched_tests,
             "risk_tags": risk_tags,
+            "reviewability": reviewability,
             "changed_files": changed_file_entries,
             "instructions_context": "\n\n".join(section for section in sections if section.strip()),
         }
@@ -1971,6 +2057,7 @@ class GitHubToMEPBridgeService:
             "lowered": lowered,
             "review_package": review_package,
             "ci_checks": review_package.get("ci_checks") or {},
+            "reviewability": review_package.get("reviewability") or {},
             "expected_paths": expected_paths,
             "expected_tests": expected_tests,
             "anchored_paths": anchored_paths,
@@ -2067,7 +2154,7 @@ class GitHubToMEPBridgeService:
 
     @staticmethod
     def _suppression_reason_allows_retry(reason: Optional[str]) -> bool:
-        return reason not in {"approval_checks_pending", "approval_checks_not_green"}
+        return reason not in {"approval_checks_pending", "approval_checks_not_green", "low_signal_no_finding"}
 
     @classmethod
     def _verify_review_findings_against_patch(
@@ -2136,6 +2223,8 @@ class GitHubToMEPBridgeService:
         why_no_finding = str(snapshot.get("why_no_finding") or "").strip()
         grounded_tokens = snapshot.get("grounded_tokens") or set()
         changed_tokens = snapshot.get("changed_tokens") or set()
+        reviewability = snapshot.get("reviewability") or {}
+        reviewability_bucket = str(reviewability.get("bucket") or "standard").strip().lower()
         if has_findings and not anchored_paths:
             return True, "finding_without_touched_path"
         finding_reason = self._verify_review_findings_against_patch(detail or "", review_package, expected_paths)
@@ -2147,6 +2236,8 @@ class GitHubToMEPBridgeService:
         if has_findings and anchored_paths and review_package:
             if self._finding_conflicts_with_patch(detail or "", anchored_patch_info["full"]):
                 return True, "ungrounded_finding"
+        if reviewability_bucket == "low_signal" and not has_findings and action != "approved":
+            return True, "low_signal_no_finding"
         if has_structured_sections and not has_findings:
             if not observation_text and not grounded_tokens and not checks_performed and not risk_areas_checked:
                 return True, "summary_without_code_evidence"
@@ -2231,6 +2322,7 @@ class GitHubToMEPBridgeService:
         changed_tokens = snapshot.get("changed_tokens") or set()
         grounded_tokens = snapshot.get("grounded_tokens") or set()
         expected_tests = list(snapshot.get("expected_tests") or [])
+        reviewability = snapshot.get("reviewability") or {}
         ci_summary = []
         for item in ci_checks.get("summary", []):
             if isinstance(item, dict):
@@ -2267,6 +2359,8 @@ class GitHubToMEPBridgeService:
             "grounded_token_count": len(grounded_tokens),
             "expected_tests": [str(item) for item in expected_tests[:6]],
             "expected_test_count": len(expected_tests),
+            "reviewability_bucket": str(reviewability.get("bucket") or "standard"),
+            "reviewability_reasons": [str(item) for item in (reviewability.get("reasons") or [])[:4]],
             "mentions_tests": bool(snapshot.get("mentions_tests")),
             "has_findings": bool(snapshot.get("has_findings")),
             "detail_preview": self._detail_preview(update.detail),
