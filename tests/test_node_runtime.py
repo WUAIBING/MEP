@@ -1182,22 +1182,33 @@ class TestWorkspaceReviewContext(unittest.TestCase):
                 "",
             )
 
-    def test_clean_check_env_strips_reviewer_knobs(self):
+    def test_clean_check_env_uses_allowlist_and_throwaway_home(self):
         with patch.dict(
             os.environ,
             {
                 "MEP_REVIEW_RUN_CHECKS": "true",
                 "MEP_AI_MAX_TOKENS": "4000",
+                "DEEPSEEK_API_KEY": "super-secret",
+                "R2_SECRET_ACCESS_KEY": "hidden",
                 "PATH": os.environ.get("PATH", ""),
+                "PYTHONPATH": "repo",
             },
         ):
-            env = mep_runtime.WorkspaceManager._clean_check_env()  # noqa: SLF001
+            env = mep_runtime.WorkspaceManager._clean_check_env("C:/tmp/mep-review-home")  # noqa: SLF001
         self.assertNotIn("MEP_REVIEW_RUN_CHECKS", env)
         self.assertNotIn("MEP_AI_MAX_TOKENS", env)
+        self.assertNotIn("DEEPSEEK_API_KEY", env)
+        self.assertNotIn("R2_SECRET_ACCESS_KEY", env)
         self.assertIn("PATH", env)
+        self.assertEqual(env["HOME"], "C:/tmp/mep-review-home")
+        self.assertEqual(env["USERPROFILE"], "C:/tmp/mep-review-home")
+        self.assertEqual(env["PYTHONPATH"], "repo")
 
     def test_build_verification_report_runs_pytest_when_enabled(self):
         with tempfile.TemporaryDirectory() as tmp:
+            os.makedirs(os.path.join(tmp, "tests"), exist_ok=True)
+            with open(os.path.join(tmp, "tests", "test_x.py"), "w", encoding="utf-8") as handle:
+                handle.write("def test_x():\n    assert True\n")
             wm = mep_runtime.WorkspaceManager(tmp)
             with patch.object(wm, "_run_check", return_value=(0, "1 passed in 0.01s")) as run_mock:
                 report = wm.build_verification_report(
@@ -1212,6 +1223,27 @@ class TestWorkspaceReviewContext(unittest.TestCase):
         self.assertIn("1 passed", report)
         invoked = [call.args[1] for call in run_mock.call_args_list]
         self.assertTrue(any("tests/test_x.py" in args for args in invoked))
+
+    def test_build_verification_report_skips_missing_or_deleted_targets(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            os.makedirs(os.path.join(tmp, "tests"), exist_ok=True)
+            with open(os.path.join(tmp, "tests", "test_present.py"), "w", encoding="utf-8") as handle:
+                handle.write("def test_present():\n    assert True\n")
+            wm = mep_runtime.WorkspaceManager(tmp)
+            with patch.object(wm, "_run_check", return_value=(0, "1 passed in 0.01s")) as run_mock:
+                report = wm.build_verification_report(
+                    tmp,
+                    ["deleted.py", "tests/test_present.py"],
+                    ["tests/test_present.py", "tests/test_removed.py"],
+                    enabled=True,
+                )
+
+        self.assertIn("pytest (changed tests): passed", report)
+        invoked = [call.args[1] for call in run_mock.call_args_list]
+        flattened = " ".join(" ".join(args) for args in invoked)
+        self.assertIn("tests/test_present.py", flattened)
+        self.assertNotIn("deleted.py", flattened)
+        self.assertNotIn("tests/test_removed.py", flattened)
 
 
 if __name__ == "__main__":

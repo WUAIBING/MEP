@@ -12,6 +12,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.parse
 import uuid
@@ -945,17 +946,37 @@ class WorkspaceManager:
         return "\n\n".join(sections)
 
     @staticmethod
-    def _clean_check_env() -> dict[str, str]:
-        """Environment for verification subprocesses with the reviewer's own
-        ``MEP_REVIEW_*`` / ``MEP_AI_*`` knobs stripped, so the bot's runtime
-        configuration can never alter the outcome of the PR's own tests."""
-        env = dict(os.environ)
-        for key in list(env):
-            if key.startswith("MEP_REVIEW_") or key.startswith("MEP_AI_"):
-                env.pop(key, None)
+    def _clean_check_env(temp_home: str) -> dict[str, str]:
+        """Build a minimal environment for verification subprocesses.
+
+        The reviewer may execute PR-owned code via ``pytest``/``ruff``. Use an
+        allowlist plus a throwaway HOME/USERPROFILE so those subprocesses cannot
+        read deployment secrets from the bot host environment.
+        """
+        allowed_passthrough = {
+            "PATH",
+            "PATHEXT",
+            "SYSTEMROOT",
+            "COMSPEC",
+            "WINDIR",
+            "TMPDIR",
+            "LANG",
+            "LC_ALL",
+            "LC_CTYPE",
+            "PYTHONPATH",
+            "PYTHONIOENCODING",
+            "PYTHONUTF8",
+            "VIRTUAL_ENV",
+        }
+        env = {key: value for key, value in os.environ.items() if key in allowed_passthrough and value}
+        env["HOME"] = temp_home
+        env["USERPROFILE"] = temp_home
+        env["TMPDIR"] = temp_home
+        env["TEMP"] = temp_home
+        env["TMP"] = temp_home
         return env
 
-    def _run_check(self, cwd: str, args: list[str], timeout: int) -> tuple[int, str]:
+    def _run_check(self, cwd: str, args: list[str], timeout: int, *, env: Optional[dict[str, str]] = None) -> tuple[int, str]:
         try:
             result = subprocess.run(
                 args,
@@ -964,13 +985,24 @@ class WorkspaceManager:
                 text=True,
                 check=False,
                 timeout=timeout,
-                env=self._clean_check_env(),
+                env=env,
             )
             return result.returncode, (result.stdout + result.stderr).strip()
         except subprocess.TimeoutExpired:
             return -1, f"timed out after {timeout}s"
         except Exception as exc:  # noqa: BLE001
             return -1, str(exc)
+
+    def _resolve_existing_review_targets(self, workspace_path: str, candidates: list[str]) -> list[str]:
+        resolved: list[str] = []
+        for candidate in candidates:
+            text = str(candidate or "").strip()
+            if not text:
+                continue
+            path = self._resolve_repo_file(workspace_path, text)
+            if path and os.path.isfile(path):
+                resolved.append(text)
+        return resolved
 
     def build_verification_report(
         self,
@@ -997,7 +1029,10 @@ class WorkspaceManager:
             timeout = _env_positive_int("MEP_REVIEW_CHECK_TIMEOUT", 180)
         touched_paths = touched_paths if isinstance(touched_paths, list) else []
         touched_tests = touched_tests if isinstance(touched_tests, list) else []
-        py_files = [str(p) for p in touched_paths if str(p).endswith(".py")]
+        py_files = self._resolve_existing_review_targets(
+            workspace_path,
+            [str(p) for p in touched_paths if str(p).endswith(".py")],
+        )
 
         def _tail(text: str) -> str:
             text = (text or "").strip()
@@ -1006,22 +1041,33 @@ class WorkspaceManager:
             return text
 
         reports: list[str] = []
-        if py_files and shutil.which("ruff"):
-            code, out = self._run_check(workspace_path, ["ruff", "check", *py_files], timeout)
-            status = "passed" if code == 0 else f"failed (exit {code})"
-            reports.append(f"$ ruff check (changed files): {status}\n{_tail(out)}")
-
-        test_targets = [str(t) for t in touched_tests if str(t).strip()]
+        test_targets = self._resolve_existing_review_targets(
+            workspace_path,
+            [str(t) for t in touched_tests if str(t).strip()],
+        )
         if not test_targets:
             test_targets = [p for p in py_files if "test" in os.path.basename(p).lower()]
-        if test_targets:
-            code, out = self._run_check(
-                workspace_path,
-                [sys.executable, "-m", "pytest", *test_targets, "-q"],
-                timeout,
-            )
-            status = "passed" if code == 0 else f"failed (exit {code})"
-            reports.append(f"$ pytest (changed tests): {status}\n{_tail(out)}")
+        with tempfile.TemporaryDirectory(prefix="mep-review-check-") as temp_home:
+            check_env = self._clean_check_env(temp_home)
+            if py_files and shutil.which("ruff"):
+                code, out = self._run_check(
+                    workspace_path,
+                    ["ruff", "check", *py_files],
+                    timeout,
+                    env=check_env,
+                )
+                status = "passed" if code == 0 else f"failed (exit {code})"
+                reports.append(f"$ ruff check (changed files): {status}\n{_tail(out)}")
+
+            if test_targets:
+                code, out = self._run_check(
+                    workspace_path,
+                    [sys.executable, "-m", "pytest", *test_targets, "-q"],
+                    timeout,
+                    env=check_env,
+                )
+                status = "passed" if code == 0 else f"failed (exit {code})"
+                reports.append(f"$ pytest (changed tests): {status}\n{_tail(out)}")
 
         if not reports:
             return ""
