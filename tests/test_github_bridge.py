@@ -1033,6 +1033,224 @@ class TestGitHubToMEPBridge(unittest.TestCase):
         self.assertTrue(item["review_result"]["published"])
         self.assertEqual(item["review_result"]["head_sha"], "headsha123")
         self.assertEqual(item["review_result"]["ci_state"], "green")
+        self.assertEqual(payload["summary"]["total_trials"], 1)
+        self.assertEqual(payload["summary"]["published_count"], 1)
+        self.assertEqual(payload["summary"]["resolved_actions"], {"approved": 1})
+
+    def test_review_trials_feedback_endpoint_records_feedback_and_summary(self):
+        checks_payload = {
+            "total_count": 2,
+            "check_runs": [
+                {
+                    "name": "test (ubuntu-latest, 3.10)",
+                    "status": "completed",
+                    "conclusion": "success",
+                },
+                {
+                    "name": "test (windows-latest, 3.10)",
+                    "status": "completed",
+                    "conclusion": "success",
+                },
+            ],
+        }
+        self._set_pr_review_package(
+            [
+                {
+                    "filename": "node/mep_runtime.py",
+                    "status": "modified",
+                    "additions": 6,
+                    "deletions": 1,
+                    "changes": 7,
+                    "patch": (
+                        "@@ -945,0 +945,6 @@\n"
+                        "+def _record_pending_task_poll_failure(self, status: int, detail: str) -> None:\n"
+                        "+    self.pending_task_recovery_metrics['last_poll_status'] = status\n"
+                    ),
+                },
+                {
+                    "filename": "tests/test_node_runtime.py",
+                    "status": "modified",
+                    "additions": 8,
+                    "deletions": 0,
+                    "changes": 8,
+                    "patch": (
+                        "@@ -494,0 +494,8 @@\n"
+                        "+def test_fetch_pending_tasks_uses_authenticated_get(self):\n"
+                        "+    self.assertEqual(tasks, [{'id': 'task_pending'}])\n"
+                    ),
+                },
+            ],
+            pr_body="Adds pending-task recovery observability and focused runtime tests.",
+            checks_payload=checks_payload,
+        )
+        approved_response = self._post_webhook(
+            _issue_comment_payload("@Hub-Sentinel approve this PR", delivery_number=270),
+            delivery_id="delivery-feedback-approved",
+        )
+        self.assertEqual(approved_response.status_code, 200)
+        approved_bridge_id = approved_response.json()["bridge_id"]
+        self._flush_context(approved_response.json()["context_id"])
+
+        approved_token = self.service._generate_status_token(approved_bridge_id, "node_target")
+        approved_status = self.client.post(
+            "/bridge/status",
+            json={
+                "bridge_id": approved_bridge_id,
+                "status": "completed",
+                "target_node_id": "node_target",
+                "task_id": "task-feedback-approved",
+                "action": "approved",
+                "detail": (
+                    "## Review Summary\n\n"
+                    "The PR adds pending-task recovery observability in `node/mep_runtime.py` and keeps the verification path narrow.\n\n"
+                    "Observation: `_record_pending_task_poll_failure` now records `last_poll_status`, and the changed test keeps the recovery behavior covered. No risky changes.\n\n"
+                    "Touched paths reviewed: `node/mep_runtime.py`, `tests/test_node_runtime.py`\n\n"
+                    "Tests reviewed: `tests/test_node_runtime.py`."
+                ),
+            },
+            headers={"Authorization": f"Bearer {approved_token}"},
+        )
+        self.assertEqual(approved_status.status_code, 200, approved_status.text)
+
+        self._set_pr_review_package(
+            [
+                {
+                    "filename": "README.md",
+                    "status": "modified",
+                    "additions": 8,
+                    "deletions": 3,
+                    "changes": 11,
+                    "patch": "@@ -1,3 +1,8 @@\n+# Reviewer docs\n+Updated wording.\n",
+                },
+                {
+                    "filename": "docs/external-bridge/README.md",
+                    "status": "modified",
+                    "additions": 6,
+                    "deletions": 1,
+                    "changes": 7,
+                    "patch": "@@ -40,1 +40,6 @@\n+Added trigger examples.\n",
+                },
+            ],
+            pr_body="Docs-only clarification for reviewer trigger examples.",
+        )
+        suppressed_response = self._post_webhook(
+            _issue_comment_payload("@Hub-Sentinel review this PR", delivery_number=271),
+            delivery_id="delivery-feedback-suppressed",
+        )
+        self.assertEqual(suppressed_response.status_code, 200)
+        suppressed_bridge_id = suppressed_response.json()["bridge_id"]
+        self._flush_context(suppressed_response.json()["context_id"])
+
+        suppressed_token = self.service._generate_status_token(suppressed_bridge_id, "node_target")
+        suppressed_status = self.client.post(
+            "/bridge/status",
+            json={
+                "bridge_id": suppressed_bridge_id,
+                "status": "completed",
+                "target_node_id": "node_target",
+                "task_id": "task-feedback-suppressed",
+                "detail": (
+                    "## Review Summary\n\n"
+                    "The docs update keeps the trigger examples aligned with the current reviewer behavior.\n\n"
+                    "Touched paths reviewed: `README.md`, `docs/external-bridge/README.md`\n\n"
+                    "Risk areas checked: operator guidance\n\n"
+                    "Checks performed: compared the two README updates for consistency\n\n"
+                    "Why no finding: The patch only changes documentation text and does not alter runtime behavior."
+                ),
+            },
+            headers={"Authorization": f"Bearer {suppressed_token}"},
+        )
+        self.assertEqual(suppressed_status.status_code, 200, suppressed_status.text)
+
+        feedback_response = self.client.post(
+            f"/bridge/review-trials/{approved_bridge_id}/feedback",
+            json={
+                "benchmark_label": "phase6c",
+                "verdict": "useful",
+                "notes": "Two-pass review was more concrete than the earlier baseline.",
+            },
+            headers={"Authorization": f"Bearer {self.config.status_secret}"},
+        )
+        self.assertEqual(feedback_response.status_code, 200, feedback_response.text)
+        feedback_payload = feedback_response.json()
+        self.assertEqual(feedback_payload["review_feedback"]["benchmark_label"], "phase6c")
+        self.assertEqual(feedback_payload["review_feedback"]["verdict"], "useful")
+
+        trials_response = self.client.get("/bridge/review-trials?limit=5")
+        self.assertEqual(trials_response.status_code, 200, trials_response.text)
+        payload = trials_response.json()
+        self.assertEqual(payload["count"], 2)
+        self.assertEqual(payload["summary"]["total_trials"], 2)
+        self.assertEqual(payload["summary"]["published_count"], 1)
+        self.assertEqual(payload["summary"]["suppressed_count"], 1)
+        self.assertEqual(payload["summary"]["resolved_actions"]["approved"], 1)
+        self.assertEqual(payload["summary"]["resolved_actions"]["suppressed"], 1)
+        self.assertEqual(payload["summary"]["suppression_reasons"]["low_signal_no_finding"], 1)
+        self.assertEqual(payload["summary"]["feedback_verdicts"]["useful"], 1)
+        self.assertEqual(payload["summary"]["benchmark_labels"]["phase6c"], 1)
+        self.assertEqual(payload["summary"]["feedback_count"], 1)
+        self.assertEqual(payload["summary"]["feedback_useful_rate"], 1.0)
+
+        filtered_response = self.client.get(
+            "/bridge/review-trials?limit=5&target_alias=Hub-Sentinel&benchmark_label=phase6c&verdict=useful"
+        )
+        self.assertEqual(filtered_response.status_code, 200, filtered_response.text)
+        filtered = filtered_response.json()
+        self.assertEqual(filtered["count"], 1)
+        self.assertEqual(filtered["items"][0]["bridge_id"], approved_bridge_id)
+        self.assertEqual(filtered["items"][0]["review_feedback"]["verdict"], "useful")
+
+    def test_review_feedback_endpoint_requires_valid_feedback_token(self):
+        self._set_pr_review_package(
+            [
+                {
+                    "filename": "node/mep_runtime.py",
+                    "status": "modified",
+                    "additions": 6,
+                    "deletions": 1,
+                    "changes": 7,
+                    "patch": (
+                        "@@ -945,0 +945,6 @@\n"
+                        "+def _record_pending_task_poll_failure(self, status: int, detail: str) -> None:\n"
+                        "+    self.pending_task_recovery_metrics['last_poll_status'] = status\n"
+                    ),
+                }
+            ],
+            pr_body="Adds pending-task recovery observability.",
+        )
+        response = self._post_webhook(
+            _issue_comment_payload("@Hub-Sentinel review this PR", delivery_number=272),
+            delivery_id="delivery-feedback-auth",
+        )
+        self.assertEqual(response.status_code, 200)
+        bridge_id = response.json()["bridge_id"]
+        self._flush_context(response.json()["context_id"])
+
+        token = self.service._generate_status_token(bridge_id, "node_target")
+        status_response = self.client.post(
+            "/bridge/status",
+            json={
+                "bridge_id": bridge_id,
+                "status": "completed",
+                "target_node_id": "node_target",
+                "task_id": "task-feedback-auth",
+                "detail": (
+                    "## Review Summary\n\n"
+                    "The PR adds pending-task recovery observability.\n\n"
+                    "Observation: `_record_pending_task_poll_failure` records the latest poll status.\n\n"
+                    "Touched paths reviewed: `node/mep_runtime.py`."
+                ),
+            },
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        self.assertEqual(status_response.status_code, 200, status_response.text)
+
+        feedback_response = self.client.post(
+            f"/bridge/review-trials/{bridge_id}/feedback",
+            json={"verdict": "useful"},
+            headers={"Authorization": "Bearer wrong-token"},
+        )
+        self.assertEqual(feedback_response.status_code, 403, feedback_response.text)
 
     def test_status_callback_suppresses_generic_pr_review_writeback(self):
         response = self._post_webhook(

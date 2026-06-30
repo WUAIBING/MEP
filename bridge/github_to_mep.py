@@ -9,6 +9,7 @@ import secrets
 import sqlite3
 import time
 import uuid
+from collections import Counter
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from typing import Any, Optional
@@ -272,6 +273,12 @@ class BridgeStatusUpdate(BaseModel):
     detail: Optional[str] = None
 
 
+class BridgeReviewFeedbackUpdate(BaseModel):
+    benchmark_label: Optional[str] = Field(default=None, max_length=120)
+    verdict: Optional[str] = Field(default=None, max_length=64)
+    notes: Optional[str] = Field(default=None, max_length=2000)
+
+
 class BridgeRegistrationPendingApprovalError(RuntimeError):
     def __init__(self, node_id: str):
         super().__init__(
@@ -343,6 +350,7 @@ class BridgeStore:
                 instructions TEXT NOT NULL DEFAULT '',
                 github_inputs_json TEXT NOT NULL DEFAULT '{}',
                 review_result_json TEXT NOT NULL DEFAULT '{}',
+                review_feedback_json TEXT NOT NULL DEFAULT '{}',
                 retry_count INTEGER NOT NULL DEFAULT 0,
                 created_at REAL NOT NULL,
                 updated_at REAL NOT NULL
@@ -398,6 +406,13 @@ class BridgeStore:
                 """
                 ALTER TABLE bridge_executions
                 ADD COLUMN review_result_json TEXT NOT NULL DEFAULT '{}'
+                """
+            )
+        if "review_feedback_json" not in execution_columns:
+            cursor.execute(
+                """
+                ALTER TABLE bridge_executions
+                ADD COLUMN review_feedback_json TEXT NOT NULL DEFAULT '{}'
                 """
             )
         conn.commit()
@@ -534,6 +549,7 @@ class BridgeStore:
         action: Optional[str] = None,
         telegram_message_id: Optional[str] = None,
         review_result: Optional[dict[str, Any]] = None,
+        review_feedback: Optional[dict[str, Any]] = None,
         retry_count: Optional[int] = None,
     ) -> None:
         assignments = []
@@ -553,6 +569,9 @@ class BridgeStore:
         if review_result is not None:
             assignments.append("review_result_json = ?")
             params.append(json.dumps(review_result, separators=(",", ":"), sort_keys=True))
+        if review_feedback is not None:
+            assignments.append("review_feedback_json = ?")
+            params.append(json.dumps(review_feedback, separators=(",", ":"), sort_keys=True))
         if retry_count is not None:
             assignments.append("retry_count = ?")
             params.append(retry_count)
@@ -579,6 +598,7 @@ class BridgeStore:
         record = dict(row)
         record["github_inputs"] = self._decode_json_dict(record.get("github_inputs_json"))
         record["review_result"] = self._decode_json_dict(record.get("review_result_json"))
+        record["review_feedback"] = self._decode_json_dict(record.get("review_feedback_json"))
         return record
 
     def list_recent_review_trials(self, *, limit: int = 20) -> list[dict[str, Any]]:
@@ -613,6 +633,7 @@ class BridgeStore:
                     "retry_count": int(record.get("retry_count") or 0),
                     "updated_at": float(record.get("updated_at") or 0),
                     "review_result": self._decode_json_dict(record.get("review_result_json")),
+                    "review_feedback": self._decode_json_dict(record.get("review_feedback_json")),
                 }
             )
         return items
@@ -1856,6 +1877,14 @@ class GitHubToMEPBridgeService:
             raise HTTPException(status_code=401, detail="Expired bridge status token")
         return claims
 
+    def _verify_feedback_token(self, token: str) -> None:
+        expected = str(self.config.status_secret or "").strip()
+        provided = str(token or "").strip()
+        if not expected:
+            raise HTTPException(status_code=500, detail="Bridge configuration missing: MEP_BRIDGE_STATUS_SECRET")
+        if not provided or not secrets.compare_digest(expected, provided):
+            raise HTTPException(status_code=403, detail="Invalid bridge feedback token")
+
     def _resolve_github_writeback_action(
         self,
         execution: dict[str, Any],
@@ -2755,9 +2784,137 @@ class GitHubToMEPBridgeService:
         )
         return {"status": "ok", "bridge_id": update.bridge_id}
 
-    def list_review_trials(self, *, limit: int = 20) -> dict[str, Any]:
-        items = self.store.list_recent_review_trials(limit=limit)
-        return {"status": "ok", "count": len(items), "items": items}
+    def list_review_trials(
+        self,
+        *,
+        limit: int = 20,
+        target_alias: Optional[str] = None,
+        benchmark_label: Optional[str] = None,
+        verdict: Optional[str] = None,
+    ) -> dict[str, Any]:
+        raw_limit = max(limit, 200) if any((target_alias, benchmark_label, verdict)) else limit
+        items = self.store.list_recent_review_trials(limit=raw_limit)
+        normalized_target = _normalize_alias_key(target_alias)
+        normalized_label = self._normalize_feedback_text(benchmark_label, max_chars=120)
+        normalized_verdict = self._normalize_feedback_verdict(verdict)
+        filtered: list[dict[str, Any]] = []
+        for item in items:
+            if normalized_target and _normalize_alias_key(str(item.get("target_alias") or "")) != normalized_target:
+                continue
+            feedback = item.get("review_feedback") or {}
+            if normalized_label and str(feedback.get("benchmark_label") or "").strip() != normalized_label:
+                continue
+            if normalized_verdict and str(feedback.get("verdict") or "").strip().lower() != normalized_verdict:
+                continue
+            filtered.append(item)
+        items = filtered[: max(1, min(int(limit), 200))]
+        return {"status": "ok", "count": len(items), "items": items, "summary": self._summarize_review_trials(items)}
+
+    @staticmethod
+    def _normalize_feedback_text(value: Optional[str], *, max_chars: int) -> str:
+        text = re.sub(r"\s+", " ", str(value or "")).strip()
+        return text[:max_chars]
+
+    @staticmethod
+    def _normalize_feedback_verdict(value: Optional[str]) -> str:
+        normalized = re.sub(r"[\s_-]+", "_", str(value or "")).strip().lower()
+        allowed = {"useful", "not_useful", "false_positive", "missed_issue"}
+        if not normalized:
+            return ""
+        if normalized not in allowed:
+            allowed_text = ", ".join(sorted(allowed))
+            raise HTTPException(status_code=400, detail=f"Unsupported review feedback verdict. Allowed: {allowed_text}")
+        return normalized
+
+    def record_review_feedback(self, bridge_id: str, update: BridgeReviewFeedbackUpdate, token: str) -> dict[str, Any]:
+        self._verify_feedback_token(token)
+        execution = self.store.get_execution(bridge_id)
+        if execution is None:
+            raise HTTPException(status_code=404, detail="Unknown bridge_id")
+        review_result = execution.get("review_result") or {}
+        if not review_result:
+            raise HTTPException(status_code=409, detail="Review trial result is not recorded yet")
+        existing = execution.get("review_feedback") or {}
+        benchmark_label = self._normalize_feedback_text(update.benchmark_label, max_chars=120)
+        verdict = self._normalize_feedback_verdict(update.verdict)
+        notes = self._normalize_feedback_text(update.notes, max_chars=2000)
+        if not any((benchmark_label, verdict, notes)):
+            raise HTTPException(status_code=400, detail="Feedback payload must include benchmark_label, verdict, or notes")
+        feedback: dict[str, Any] = {
+            "recorded_at": float(existing.get("recorded_at") or time.time()),
+            "updated_at": time.time(),
+        }
+        if benchmark_label:
+            feedback["benchmark_label"] = benchmark_label
+        elif existing.get("benchmark_label"):
+            feedback["benchmark_label"] = str(existing.get("benchmark_label"))
+        if verdict:
+            feedback["verdict"] = verdict
+        elif existing.get("verdict"):
+            feedback["verdict"] = str(existing.get("verdict"))
+        if notes:
+            feedback["notes"] = notes
+        elif existing.get("notes"):
+            feedback["notes"] = str(existing.get("notes"))
+        self.store.update_execution(bridge_id, review_feedback=feedback)
+        return {"status": "ok", "bridge_id": bridge_id, "review_feedback": feedback}
+
+    @staticmethod
+    def _summarize_review_trials(items: list[dict[str, Any]]) -> dict[str, Any]:
+        resolved_actions: Counter[str] = Counter()
+        suppression_reasons: Counter[str] = Counter()
+        feedback_verdicts: Counter[str] = Counter()
+        benchmark_labels: Counter[str] = Counter()
+        target_aliases: Counter[str] = Counter()
+        published_count = 0
+        suppressed_count = 0
+        retry_queued_count = 0
+        quality_scores: list[int] = []
+        for item in items:
+            target_alias = str(item.get("target_alias") or "").strip()
+            if target_alias:
+                target_aliases[target_alias] += 1
+            review_result = item.get("review_result") or {}
+            review_feedback = item.get("review_feedback") or {}
+            resolved_action = str(review_result.get("resolved_action") or "").strip()
+            if resolved_action:
+                resolved_actions[resolved_action] += 1
+            suppression_reason = str(review_result.get("suppression_reason") or "").strip()
+            if suppression_reason:
+                suppression_reasons[suppression_reason] += 1
+            if review_result.get("published"):
+                published_count += 1
+            if review_result.get("suppressed"):
+                suppressed_count += 1
+            if review_result.get("retry_queued"):
+                retry_queued_count += 1
+            quality_score = review_result.get("quality_score")
+            if isinstance(quality_score, (int, float)):
+                quality_scores.append(int(quality_score))
+            verdict = str(review_feedback.get("verdict") or "").strip().lower()
+            if verdict:
+                feedback_verdicts[verdict] += 1
+            benchmark_label = str(review_feedback.get("benchmark_label") or "").strip()
+            if benchmark_label:
+                benchmark_labels[benchmark_label] += 1
+        feedback_count = sum(feedback_verdicts.values())
+        useful_count = int(feedback_verdicts.get("useful") or 0)
+        avg_quality_score = round(sum(quality_scores) / len(quality_scores), 2) if quality_scores else 0.0
+        useful_rate = round(useful_count / feedback_count, 4) if feedback_count else None
+        return {
+            "total_trials": len(items),
+            "published_count": published_count,
+            "suppressed_count": suppressed_count,
+            "retry_queued_count": retry_queued_count,
+            "avg_quality_score": avg_quality_score,
+            "resolved_actions": dict(sorted(resolved_actions.items())),
+            "suppression_reasons": dict(sorted(suppression_reasons.items())),
+            "feedback_verdicts": dict(sorted(feedback_verdicts.items())),
+            "benchmark_labels": dict(sorted(benchmark_labels.items())),
+            "target_aliases": dict(sorted(target_aliases.items())),
+            "feedback_count": feedback_count,
+            "feedback_useful_rate": useful_rate,
+        }
 
     async def _issue_retry_task(self, execution: dict[str, Any], reason: Optional[str]) -> bool:
         bridge_id = str(execution["bridge_id"])
@@ -2948,8 +3105,30 @@ def create_app(
         return await bridge_service.handle_status_callback(update, token or "")
 
     @app.get("/bridge/review-trials")
-    async def bridge_review_trials(limit: int = 20) -> dict[str, Any]:
-        return bridge_service.list_review_trials(limit=limit)
+    async def bridge_review_trials(
+        limit: int = 20,
+        target_alias: Optional[str] = None,
+        benchmark_label: Optional[str] = None,
+        verdict: Optional[str] = None,
+    ) -> dict[str, Any]:
+        return bridge_service.list_review_trials(
+            limit=limit,
+            target_alias=target_alias,
+            benchmark_label=benchmark_label,
+            verdict=verdict,
+        )
+
+    @app.post("/bridge/review-trials/{bridge_id}/feedback")
+    async def bridge_review_feedback(
+        bridge_id: str,
+        update: BridgeReviewFeedbackUpdate,
+        authorization: Optional[str] = Header(default=None),
+        x_bridge_feedback_token: Optional[str] = Header(default=None),
+    ) -> dict[str, Any]:
+        token = x_bridge_feedback_token
+        if not token and authorization and authorization.lower().startswith("bearer "):
+            token = authorization.split(" ", 1)[1].strip()
+        return bridge_service.record_review_feedback(bridge_id, update, token or "")
 
     return app
 
