@@ -1083,6 +1083,99 @@ class TestGitHubToMEPBridge(unittest.TestCase):
         self.assertNotIn("instructions_context", github_inputs)
         self.assertLessEqual(len(instructions), 3803)
 
+    def test_fetch_pr_review_package_marks_docs_only_patch_as_low_signal(self):
+        self._set_pr_review_package(
+            [
+                {
+                    "filename": "README.md",
+                    "status": "modified",
+                    "additions": 8,
+                    "deletions": 3,
+                    "changes": 11,
+                    "patch": "@@ -1,3 +1,8 @@\n+# Reviewer docs\n+Updated wording.\n",
+                },
+                {
+                    "filename": "docs/external-bridge/README.md",
+                    "status": "modified",
+                    "additions": 6,
+                    "deletions": 1,
+                    "changes": 7,
+                    "patch": "@@ -40,1 +40,6 @@\n+Added trigger examples.\n",
+                },
+            ],
+            pr_body="Docs-only clarification for reviewer trigger examples.",
+        )
+
+        review_package = self.service._fetch_pr_review_package("WUAIBING/MEP", 262)
+
+        self.assertEqual(review_package["reviewability"]["bucket"], "low_signal")
+        self.assertEqual(review_package["reviewability"]["reasons"], ["docs_only_patch"])
+        self.assertFalse(review_package["reviewability"]["publish_no_finding"])
+        self.assertIn("Reviewability assessment:", review_package["instructions_context"])
+
+    def test_status_callback_suppresses_low_signal_no_finding_without_retry(self):
+        self._set_pr_review_package(
+            [
+                {
+                    "filename": "README.md",
+                    "status": "modified",
+                    "additions": 8,
+                    "deletions": 3,
+                    "changes": 11,
+                    "patch": "@@ -1,3 +1,8 @@\n+# Reviewer docs\n+Updated wording.\n",
+                },
+                {
+                    "filename": "docs/external-bridge/README.md",
+                    "status": "modified",
+                    "additions": 6,
+                    "deletions": 1,
+                    "changes": 7,
+                    "patch": "@@ -40,1 +40,6 @@\n+Added trigger examples.\n",
+                },
+            ],
+            pr_body="Docs-only clarification for reviewer trigger examples.",
+        )
+        response = self._post_webhook(
+            _issue_comment_payload("@Hub-Sentinel review this PR", delivery_number=262),
+            delivery_id="delivery-low-signal-docs",
+        )
+        self.assertEqual(response.status_code, 200)
+        bridge_id = response.json()["bridge_id"]
+        self._flush_context(response.json()["context_id"])
+
+        token = self.service._generate_status_token(bridge_id, "node_target")
+        status_response = self.client.post(
+            "/bridge/status",
+            json={
+                "bridge_id": bridge_id,
+                "status": "completed",
+                "target_node_id": "node_target",
+                "task_id": "task-low-signal-docs",
+                "detail": (
+                    "## Review Summary\n\n"
+                    "The docs update keeps the trigger examples aligned with the current reviewer behavior.\n\n"
+                    "Touched paths reviewed: `README.md`, `docs/external-bridge/README.md`\n\n"
+                    "Risk areas checked: operator guidance\n\n"
+                    "Checks performed: compared the two README updates for consistency\n\n"
+                    "Why no finding: The patch only changes documentation text and does not alter runtime behavior."
+                ),
+            },
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        self.assertEqual(status_response.status_code, 200, status_response.text)
+        self.assertEqual(len(self.github_session.posts), 0)
+        self.assertEqual(len(self.submission.calls), 1)
+        self.assertIn("action: suppressed", self.notifier.calls[-1]["text"])
+        self.assertEqual(self.service.github_writeback_metrics["last_suppressed_reason"], "low_signal_no_finding")
+
+        execution = self.store.get_execution(bridge_id)
+        self.assertIsNotNone(execution)
+        trial = execution["review_result"]
+        self.assertEqual(trial["resolved_action"], "suppressed")
+        self.assertFalse(trial["retry_queued"])
+        self.assertEqual(trial["reviewability_bucket"], "low_signal")
+        self.assertEqual(trial["reviewability_reasons"], ["docs_only_patch"])
+
     def test_status_callback_keeps_action_suppressed_when_retry_submit_fails(self):
         response = self._post_webhook(
             _issue_comment_payload("@Hub-Sentinel review this PR", delivery_number=235),
