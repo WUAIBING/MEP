@@ -259,6 +259,28 @@ class TestGitHubToMEPBridge(unittest.TestCase):
         self.assertIn("/bridge/status", bridge_metadata["status_endpoint"])
         self.assertTrue(bridge_metadata["status_token"])
 
+    def test_extract_trigger_accepts_polite_review_prefixes(self):
+        self.assertEqual(
+            self.service._extract_trigger("@Hub-Sentinel please review this PR"),
+            ("review", "code.review.request"),
+        )
+        self.assertEqual(
+            self.service._extract_trigger("@Hub-Sentinel kindly review this PR"),
+            ("review", "code.review.request"),
+        )
+
+    def test_extract_trigger_accepts_rereview_variants(self):
+        for body in (
+            "@Hub-Sentinel re-review this PR",
+            "@Hub-Sentinel rereview this PR",
+            "@Hub-Sentinel re review this PR",
+            "@Hub-Sentinel please re-review this PR",
+        ):
+            self.assertEqual(
+                self.service._extract_trigger(body),
+                ("review", "code.review.request"),
+            )
+
     def test_duplicate_delivery_is_deduplicated(self):
         payload = _issue_comment_payload("@Hub-Sentinel review this PR")
         first = self._post_webhook(payload, delivery_id="delivery-dup")
