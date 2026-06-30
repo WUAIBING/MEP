@@ -434,27 +434,46 @@ class TestRuntimeReviewPrompts(unittest.TestCase):
     def test_deepseek_adapter_uses_reviewer_prompt_for_bridge_review_tasks(self):
         adapter = mep_runtime.DeepSeekAdapter(api_key="secret-key", model="deepseek-chat")
         task_data = self._bridge_review_task_data()
-        fake_response = _FakeResponse(
-            200,
-            {
-                "choices": [
-                    {
-                        "message": {
-                            "content": (
-                                '{"summary":"Checked the bridge diff.","observation":"The metadata wiring stays backward-compatible.",'
-                                '"touched_paths":["bridge/github_to_mep.py"],'
-                                '"tests_reviewed":["tests/test_github_bridge.py"],'
-                                '"findings":'
-                                '[{"file":"bridge/github_to_mep.py","issue":"Preserve coalesced targets",'
-                                '"rationale":"Otherwise the second mention can overwrite the first target during the coalesce window."}],'
-                                '"approval_recommendation":"comment"}'
-                            )
+        fake_responses = [
+            _FakeResponse(
+                200,
+                {
+                    "choices": [
+                        {
+                            "message": {
+                                "content": (
+                                    '{"risk_candidates":['
+                                    '{"file":"bridge/github_to_mep.py","claim":"Coalesced targets can be overwritten during the window.",'
+                                    '"reason":"The candidate pass noticed multiple target writes in the same bridge flow."}'
+                                    '],"coverage":["bridge metadata coalescing"]}'
+                                )
+                            }
                         }
-                    }
-                ]
-            },
-        )
-        with patch("node.mep_runtime.requests.post", return_value=fake_response) as post_mock:
+                    ]
+                },
+            ),
+            _FakeResponse(
+                200,
+                {
+                    "choices": [
+                        {
+                            "message": {
+                                "content": (
+                                    '{"summary":"Checked the bridge diff.","observation":"The metadata wiring stays backward-compatible.",'
+                                    '"touched_paths":["bridge/github_to_mep.py"],'
+                                    '"tests_reviewed":["tests/test_github_bridge.py"],'
+                                    '"findings":'
+                                    '[{"file":"bridge/github_to_mep.py","issue":"Preserve coalesced targets",'
+                                    '"rationale":"Otherwise the second mention can overwrite the first target during the coalesce window."}],'
+                                    '"approval_recommendation":"comment"}'
+                                )
+                            }
+                        }
+                    ]
+                },
+            ),
+        ]
+        with patch("node.mep_runtime.requests.post", side_effect=fake_responses) as post_mock:
             reply = adapter.generate_reply("Review this PR", task_data)
 
         self.assertIn("## Review Findings", reply)
@@ -462,8 +481,14 @@ class TestRuntimeReviewPrompts(unittest.TestCase):
         self.assertIn("bridge/github_to_mep.py", reply)
         self.assertIn("Observation: The metadata wiring stays backward-compatible.", reply)
         self.assertIn("Tests reviewed: `tests/test_github_bridge.py`", reply)
-        system_prompt = post_mock.call_args.kwargs["json"]["messages"][0]["content"]
-        self.assertIn("return ONLY a JSON object", system_prompt)
+        self.assertEqual(post_mock.call_count, 2)
+        first_system_prompt = post_mock.call_args_list[0].kwargs["json"]["messages"][0]["content"]
+        second_system_prompt = post_mock.call_args_list[1].kwargs["json"]["messages"][0]["content"]
+        second_user_payload = post_mock.call_args_list[1].kwargs["json"]["messages"][1]["content"]
+        self.assertIn("candidate-generation pass", first_system_prompt)
+        self.assertIn("return ONLY a JSON object", second_system_prompt)
+        self.assertIn("This is the verification pass.", second_system_prompt)
+        self.assertIn("Candidate risks to verify before publishing any finding", second_user_payload)
 
     def test_deepseek_adapter_filters_weak_review_findings(self):
         adapter = mep_runtime.DeepSeekAdapter(api_key="secret-key", model="deepseek-chat")
@@ -542,6 +567,28 @@ class TestRuntimeReviewPrompts(unittest.TestCase):
         self.assertIn("Risk areas checked: trial persistence, endpoint decoding", rendered)
         self.assertIn("Checks performed: verified suppression and publish paths mention `review_result_json`, checked `/bridge/review-trials` returns stored review metadata", rendered)
         self.assertIn("Why no finding: The new writes and reads stay consistent across both persistence paths, so the telemetry path looks low-risk.", rendered)
+
+    def test_extract_review_candidates_deduplicates_and_cleans_items(self):
+        candidates = mep_runtime._extract_review_candidates(  # noqa: SLF001
+            (
+                '{"risk_candidates":['
+                '{"file":"bridge/github_to_mep.py","claim":"Coalesce window can overwrite the first target","reason":"Multiple writes share the same metadata bucket"},'
+                '{"file":"bridge/github_to_mep.py","claim":"Coalesce window can overwrite the first target","reason":"duplicate"},'
+                '{"file":"","claim":"  ","reason":"empty"}'
+                ']}'
+            )
+        )
+
+        self.assertEqual(
+            candidates,
+            [
+                {
+                    "file": "bridge/github_to_mep.py",
+                    "claim": "Coalesce window can overwrite the first target.",
+                    "reason": "Multiple writes share the same metadata bucket.",
+                }
+            ],
+        )
 
 
 class TestRuntimeWebSocketLoop(unittest.TestCase):
