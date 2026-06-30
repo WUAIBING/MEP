@@ -1139,6 +1139,24 @@ class GitHubToMEPBridgeService:
         """Re-extract multi-target triggers from a normalized event's trigger text."""
         return self._extract_triggers(event.raw_trigger_text)
 
+    @staticmethod
+    def _extract_trigger_verb(text: str) -> Optional[str]:
+        command_match = re.match(
+            r"""
+            (?:\s+|[,:]\s*)*
+            (?:(?:please|pls|kindly)\s+)*
+            (?P<verb>re(?:\s+|-)?review|rereview|[a-z][a-z_-]*)\b
+            """,
+            text,
+            re.IGNORECASE | re.VERBOSE,
+        )
+        if not command_match:
+            return None
+        verb = re.sub(r"[\s-]+", "", command_match.group("verb").strip().lower())
+        if verb == "rereview":
+            return "review"
+        return verb
+
     def _extract_triggers(self, text: str) -> list[TriggerMatch]:
         """Extract ALL actionable @alias verb mentions from text."""
         if not isinstance(text, str) or not text.strip():
@@ -1172,14 +1190,9 @@ class GitHubToMEPBridgeService:
                     mention_index += 1
                     continue
                 break
-            verb_match = re.match(
-                r"(?:\s+|[,:]\s*)(?P<verb>[a-z][a-z_-]*)\b",
-                text[cursor:],
-                re.IGNORECASE,
-            )
-            if not verb_match:
+            verb = self._extract_trigger_verb(text[cursor:])
+            if not verb:
                 continue
-            verb = verb_match.group("verb").strip().lower()
             intent_type = DEFAULT_TRIGGER_VERBS.get(verb)
             if not intent_type:
                 continue
