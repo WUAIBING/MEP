@@ -510,6 +510,31 @@ def _system_prompt_for_task(
     )
 
 
+def _candidate_system_prompt_for_task(task_data: dict[str, Any], *, review_max_chars: int) -> str:
+    if not _task_requires_review_prompt(task_data):
+        return _system_prompt_for_task(task_data, generic_max_chars=500, review_max_chars=review_max_chars)
+    return (
+        "You are the candidate-generation pass for a MEP GitHub code review. "
+        "Scan the supplied PR context, diff excerpts, risk pack, workspace context, and verification output. "
+        "Return ONLY a JSON object with this schema: "
+        '{"risk_candidates": [{"file": string, "claim": string, "reason": string}], "coverage": [string]}. '
+        "Generate at most 3 candidate risks. Each candidate must be concrete, tied to a changed file, and phrased as a potential bug or regression worth verifying. "
+        "Do not summarize the PR. Do not give praise. Do not include chain-of-thought. "
+        "If nothing looks risky enough to verify, return an empty `risk_candidates` list and use `coverage` to note what you inspected."
+    )
+
+
+def _verification_system_prompt_for_task(task_data: dict[str, Any], *, review_max_chars: int) -> str:
+    base = _system_prompt_for_task(task_data, generic_max_chars=500, review_max_chars=review_max_chars)
+    if not _task_requires_review_prompt(task_data):
+        return base
+    return (
+        f"{base} This is the verification pass. The user message may include provisional candidate risks from an earlier pass. "
+        "Treat those candidates as hypotheses only. Promote a candidate into `findings` only when the supplied diff, workspace context, tests, or verification output directly support it. "
+        "If no candidate survives verification, keep `findings` empty, explain the checks you performed, and explicitly state why no finding is warranted."
+    )
+
+
 def _extract_first_json_object(text: str) -> Optional[dict[str, Any]]:
     if not text:
         return None
@@ -572,6 +597,63 @@ def _clean_review_label(value: Any, *, max_chars: int) -> str:
     if len(text) > max_chars:
         text = text[:max_chars].rstrip()
     return text.rstrip(".,;: ")
+
+
+def _extract_review_candidates(text: str) -> list[dict[str, str]]:
+    parsed = _extract_first_json_object(text)
+    if not isinstance(parsed, dict):
+        return []
+    raw_candidates = parsed.get("risk_candidates")
+    if not isinstance(raw_candidates, list):
+        return []
+    cleaned: list[dict[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for item in raw_candidates[:3]:
+        if not isinstance(item, dict):
+            continue
+        file_name = _clean_review_label(item.get("file"), max_chars=120)
+        claim = _clean_review_text(item.get("claim"), max_chars=220)
+        reason = _clean_review_text(item.get("reason"), max_chars=240)
+        if not claim:
+            continue
+        key = (file_name.lower(), claim.lower())
+        if key in seen:
+            continue
+        seen.add(key)
+        cleaned.append({"file": file_name, "claim": claim, "reason": reason})
+    return cleaned
+
+
+def _candidate_payload_for_verification(payload: str, candidates: list[dict[str, str]]) -> str:
+    base = (payload or "").strip()
+    if not candidates:
+        return base
+    candidate_json = json.dumps({"risk_candidates": candidates}, ensure_ascii=True)
+    return (
+        f"{base}\n\n"
+        "Candidate risks to verify before publishing any finding:\n"
+        f"{candidate_json}"
+    ).strip()
+
+
+def _run_two_pass_review(
+    *,
+    task_data: dict[str, Any],
+    payload: str,
+    review_max_chars: int,
+    invoke_model: Any,
+) -> str:
+    candidate_reply = invoke_model(_candidate_system_prompt_for_task(task_data, review_max_chars=review_max_chars), payload)
+    candidates = _extract_review_candidates(candidate_reply)
+    verification_payload = _candidate_payload_for_verification(payload, candidates)
+    final_reply = invoke_model(_verification_system_prompt_for_task(task_data, review_max_chars=review_max_chars), verification_payload)
+    rendered = _render_structured_review_with_task_data(final_reply, max_chars=review_max_chars, task_data=task_data)
+    if rendered:
+        return rendered
+    finalized = _finalize_model_reply(final_reply, max_chars=review_max_chars)
+    if finalized:
+        return finalized
+    return final_reply[:review_max_chars].rstrip() or "[review runtime] review response was empty"
 
 
 _WEAK_REVIEW_PATTERNS = [
@@ -746,6 +828,26 @@ class AIAdapter:
 
         try:
             review_max = _review_max_chars()
+            if _task_requires_review_prompt(task_data):
+                def _invoke(system_prompt: str, user_payload: str) -> str:
+                    prompt = f"{system_prompt}\n\nTask: {user_payload}\n\nReply:"
+                    result = subprocess.run(
+                        ["ollama", "run", self.model, prompt],
+                        capture_output=True,
+                        text=True,
+                        timeout=45,
+                    )
+                    return (result.stdout or "").strip()
+
+                result = _run_two_pass_review(
+                    task_data=task_data,
+                    payload=payload,
+                    review_max_chars=review_max,
+                    invoke_model=_invoke,
+                )
+                if result:
+                    return result
+                return f"[AI adapter] empty response from {self.model}"
             prompt = (
                 f"{_system_prompt_for_task(task_data, generic_max_chars=300, review_max_chars=review_max)}\n\n"
                 f"Task: {payload}\n\nReply:"
@@ -759,14 +861,6 @@ class AIAdapter:
             reply = (result.stdout or "").strip()
             if not reply:
                 return f"[AI adapter] empty response from {self.model}"
-            if _task_requires_review_prompt(task_data):
-                rendered = _render_structured_review_with_task_data(reply, max_chars=review_max, task_data=task_data)
-                if rendered:
-                    return rendered
-                finalized = _finalize_model_reply(reply, max_chars=review_max)
-                if finalized:
-                    return finalized
-                return reply[:review_max].rstrip() or "[AI adapter] review response was empty"
             return reply
         except subprocess.TimeoutExpired:
             return f"[AI adapter] {self.model} timed out"
@@ -784,45 +878,54 @@ class DeepSeekAdapter:
     def generate_reply(self, payload: str, task_data: dict[str, Any]) -> str:
         review_max = _review_max_chars()
         try:
-            resp = requests.post(
-                "https://api.deepseek.com/v1/chat/completions",
-                headers={
-                    "Authorization": f"Bearer {self.api_key}",
-                    "Content-Type": "application/json",
-                },
-                json={
-                    "model": self.model,
-                    "messages": [
-                        {
-                            "role": "system",
-                            "content": _system_prompt_for_task(
-                                task_data,
-                                generic_max_chars=500,
-                                review_max_chars=review_max,
-                            ),
-                        },
-                        {"role": "user", "content": payload},
-                    ],
-                    "max_tokens": _env_positive_int("MEP_AI_MAX_TOKENS", 4000),
-                    "temperature": 0.1,
-                },
-                timeout=_env_positive_int("MEP_AI_TIMEOUT_SECONDS", 120),
-            )
-            if resp.status_code == 200:
+            def _invoke(system_prompt: str, user_payload: str) -> str:
+                resp = requests.post(
+                    "https://api.deepseek.com/v1/chat/completions",
+                    headers={
+                        "Authorization": f"Bearer {self.api_key}",
+                        "Content-Type": "application/json",
+                    },
+                    json={
+                        "model": self.model,
+                        "messages": [
+                            {"role": "system", "content": system_prompt},
+                            {"role": "user", "content": user_payload},
+                        ],
+                        "max_tokens": _env_positive_int("MEP_AI_MAX_TOKENS", 4000),
+                        "temperature": 0.1,
+                    },
+                    timeout=_env_positive_int("MEP_AI_TIMEOUT_SECONDS", 120),
+                )
+                if resp.status_code != 200:
+                    return f"[DeepSeek] API error {resp.status_code}: {resp.text[:200]}"
                 message = resp.json()["choices"][0]["message"]
                 reply = str(message.get("content") or "").strip()
                 if not reply:
                     reply = str(message.get("reasoning_content") or "").strip()
-                if _task_requires_review_prompt(task_data):
-                    rendered = _render_structured_review_with_task_data(reply, max_chars=review_max, task_data=task_data)
-                    if rendered:
-                        return rendered
-                    finalized = _finalize_model_reply(reply, max_chars=review_max)
-                    if finalized:
-                        return finalized
-                    return reply[:review_max].rstrip() or "[DeepSeek] review response was empty"
                 return reply
-            return f"[DeepSeek] API error {resp.status_code}: {resp.text[:200]}"
+
+            if _task_requires_review_prompt(task_data):
+                result = _run_two_pass_review(
+                    task_data=task_data,
+                    payload=payload,
+                    review_max_chars=review_max,
+                    invoke_model=_invoke,
+                )
+                if result:
+                    return result
+                return "[DeepSeek] review response was empty"
+
+            reply = _invoke(
+                _system_prompt_for_task(
+                    task_data,
+                    generic_max_chars=500,
+                    review_max_chars=review_max,
+                ),
+                payload,
+            )
+            if reply:
+                return reply
+            return "[DeepSeek] review response was empty"
         except Exception as exc:  # noqa: BLE001
             return f"[DeepSeek] error: {exc}"
 
