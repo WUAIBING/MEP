@@ -454,6 +454,24 @@ def _clean_review_list(values: Any, *, max_items: int, max_chars: int) -> list[s
     return cleaned
 
 
+def _filter_review_list_to_allowed(values: list[str], allowed: list[str]) -> list[str]:
+    if not values:
+        return []
+    if not allowed:
+        return values
+    allowed_map = {item.lower(): item for item in allowed if item}
+    filtered: list[str] = []
+    seen: set[str] = set()
+    for item in values:
+        normalized = item.lower()
+        matched = allowed_map.get(normalized)
+        if not matched or normalized in seen:
+            continue
+        filtered.append(matched)
+        seen.add(normalized)
+    return filtered
+
+
 def _system_prompt_for_task(
     task_data: dict[str, Any],
     *,
@@ -531,6 +549,8 @@ def _verification_system_prompt_for_task(task_data: dict[str, Any], *, review_ma
     return (
         f"{base} This is the verification pass. The user message may include provisional candidate risks from an earlier pass. "
         "Treat those candidates as hypotheses only. Promote a candidate into `findings` only when the supplied diff, workspace context, tests, or verification output directly support it. "
+        "For every published finding, set `file` to one of the supplied touched paths and include at least one exact changed-line identifier in `verified_identifiers` that supports the claim. "
+        "Reject any candidate that relies only on nearby file context, naming similarity, or speculation. "
         "If no candidate survives verification, keep `findings` empty, explain the checks you performed, and explicitly state why no finding is warranted."
     )
 
@@ -724,6 +744,18 @@ def _render_structured_review_with_task_data(
     if not isinstance(parsed, dict):
         return ""
     github_inputs = _review_github_inputs(task_data or {})
+    allowed_paths = _clean_review_list(github_inputs.get("touched_paths"), max_items=4, max_chars=120)
+    allowed_tests = _clean_review_list(github_inputs.get("touched_tests"), max_items=3, max_chars=120)
+    risk_pack = github_inputs.get("risk_pack")
+    allowed_identifiers = (
+        _clean_review_list(
+            risk_pack.get("changed_identifiers"),
+            max_items=8,
+            max_chars=80,
+        )
+        if isinstance(risk_pack, dict)
+        else []
+    )
     summary = _clean_review_text(parsed.get("summary"), max_chars=500)
     if _is_weak_review_text(summary):
         summary = ""
@@ -731,19 +763,23 @@ def _render_structured_review_with_task_data(
     if _is_weak_review_text(observation):
         observation = ""
     touched_paths = _clean_review_list(parsed.get("touched_paths"), max_items=4, max_chars=120)
+    touched_paths = _filter_review_list_to_allowed(touched_paths, allowed_paths)
     if not touched_paths:
-        touched_paths = _clean_review_list(github_inputs.get("touched_paths"), max_items=4, max_chars=120)
+        touched_paths = allowed_paths
     tests_reviewed = _clean_review_list(parsed.get("tests_reviewed"), max_items=3, max_chars=120)
+    tests_reviewed = _filter_review_list_to_allowed(tests_reviewed, allowed_tests)
     if not tests_reviewed:
-        tests_reviewed = _clean_review_list(github_inputs.get("touched_tests"), max_items=3, max_chars=120)
+        tests_reviewed = allowed_tests
     risk_areas_checked = _clean_review_list(parsed.get("risk_areas_checked"), max_items=4, max_chars=100)
     checks_performed = _clean_review_list(parsed.get("checks_performed"), max_items=4, max_chars=120)
     why_no_finding = _clean_review_text(parsed.get("why_no_finding"), max_chars=400)
     if _is_weak_review_text(why_no_finding):
         why_no_finding = ""
     verified_identifiers = _clean_review_list(parsed.get("verified_identifiers"), max_items=4, max_chars=80)
+    verified_identifiers = _filter_review_list_to_allowed(verified_identifiers, allowed_identifiers)
     findings_raw = parsed.get("findings")
     findings: list[str] = []
+    allowed_path_keys = {item.lower(): item for item in allowed_paths}
     if isinstance(findings_raw, list):
         for item in findings_raw[:2]:
             if not isinstance(item, dict):
@@ -756,10 +792,17 @@ def _render_structured_review_with_task_data(
             if _is_weak_review_text(combined):
                 continue
             file_name = _clean_review_label(item.get("file"), max_chars=80)
+            if file_name and allowed_path_keys:
+                matched = allowed_path_keys.get(file_name.lower())
+                if not matched:
+                    continue
+                file_name = matched
             if file_name:
                 findings.append(f"**{issue}** (`{file_name}`): {rationale or 'Check this path.'}")
             else:
                 findings.append(f"**{issue}**: {rationale or 'Check this logic.'}")
+    if findings and allowed_identifiers and not verified_identifiers:
+        findings = []
     sections: list[str] = []
     if findings:
         sections.append("## Review Findings")
