@@ -33,6 +33,43 @@ DEFAULT_TRIGGER_VERBS = {
 }
 DEFAULT_ALLOWED_ASSOCIATIONS = {"OWNER", "MEMBER", "COLLABORATOR"}
 BRIDGE_OUTPUT_MARKER = "<!-- mep-bridge:output"
+REVIEW_BENCHMARK_SCENARIOS = [
+    {
+        "id": "docs_only_precision",
+        "suite": "phase6_precision",
+        "title": "Docs-only suppression precision",
+        "goal": "Verify that docs-only PRs are suppressed unless the reviewer cites a concrete behavioral issue.",
+        "expected_focus": ["low_signal", "suppression", "no_finding"],
+    },
+    {
+        "id": "config_env_precision",
+        "suite": "phase6_precision",
+        "title": "Config/env change grounding",
+        "goal": "Verify that config or workflow changes produce grounded risk analysis tied to the actual changed files.",
+        "expected_focus": ["env_config", "workflow", "grounding"],
+    },
+    {
+        "id": "false_positive_guard",
+        "suite": "phase6_precision",
+        "title": "Plausible-but-wrong false positive guard",
+        "goal": "Catch reviews that sound right but cite the wrong file, wrong identifier, or wrong causal explanation.",
+        "expected_focus": ["false_positive", "verifier", "identifier_anchor"],
+    },
+    {
+        "id": "approval_safety",
+        "suite": "phase6_approval",
+        "title": "Approval evidence safety",
+        "goal": "Require approvals to cite changed-line identifiers, touched tests, and green CI before publishing APPROVE.",
+        "expected_focus": ["approval", "ci_gate", "changed_identifiers"],
+    },
+    {
+        "id": "missed_issue_recall",
+        "suite": "phase6_recall",
+        "title": "Known-risk recall",
+        "goal": "Track PRs seeded with known regressions so missed findings are labeled and measured against baseline.",
+        "expected_focus": ["missed_issue", "recall", "risk_pack"],
+    },
+]
 _WEAK_GITHUB_REVIEW_PATTERNS = [
     r"\blooks good\b",
     r"\blooks correct\b",
@@ -2851,24 +2888,51 @@ class GitHubToMEPBridgeService:
         target_alias: Optional[str] = None,
         benchmark_label: Optional[str] = None,
         verdict: Optional[str] = None,
+        needs_feedback: Optional[bool] = None,
     ) -> dict[str, Any]:
-        raw_limit = max(limit, 200) if any((target_alias, benchmark_label, verdict)) else limit
+        raw_limit = max(limit, 200) if any((target_alias, benchmark_label, verdict, needs_feedback is not None)) else limit
         items = self.store.list_recent_review_trials(limit=raw_limit)
         normalized_target = _normalize_alias_key(target_alias)
         normalized_label = self._normalize_feedback_text(benchmark_label, max_chars=120)
         normalized_verdict = self._normalize_feedback_verdict(verdict)
         filtered: list[dict[str, Any]] = []
         for item in items:
+            review_result = item.get("review_result") or {}
+            feedback = item.get("review_feedback") or {}
+            feedback_recorded = bool(str(feedback.get("verdict") or "").strip())
+            feedback_required = bool(review_result)
             if normalized_target and _normalize_alias_key(str(item.get("target_alias") or "")) != normalized_target:
                 continue
-            feedback = item.get("review_feedback") or {}
             if normalized_label and str(feedback.get("benchmark_label") or "").strip() != normalized_label:
                 continue
             if normalized_verdict and str(feedback.get("verdict") or "").strip().lower() != normalized_verdict:
                 continue
-            filtered.append(item)
+            if needs_feedback is True and (not feedback_required or feedback_recorded):
+                continue
+            if needs_feedback is False and not feedback_recorded:
+                continue
+            materialized = dict(item)
+            materialized["feedback_required"] = feedback_required
+            materialized["feedback_recorded"] = feedback_recorded
+            materialized["feedback_status"] = "labeled" if feedback_recorded else ("pending" if feedback_required else "not_applicable")
+            filtered.append(materialized)
         items = filtered[: max(1, min(int(limit), 200))]
         return {"status": "ok", "count": len(items), "items": items, "summary": self._summarize_review_trials(items)}
+
+    def list_review_benchmarks(self, *, suite: Optional[str] = None) -> dict[str, Any]:
+        normalized_suite = self._normalize_feedback_text(suite, max_chars=120)
+        items = [
+            item
+            for item in REVIEW_BENCHMARK_SCENARIOS
+            if not normalized_suite or str(item.get("suite") or "").strip() == normalized_suite
+        ]
+        suites = Counter(str(item.get("suite") or "").strip() for item in items if str(item.get("suite") or "").strip())
+        return {
+            "status": "ok",
+            "count": len(items),
+            "items": items,
+            "suites": dict(sorted(suites.items())),
+        }
 
     @staticmethod
     def _normalize_feedback_text(value: Optional[str], *, max_chars: int) -> str:
@@ -2929,6 +2993,7 @@ class GitHubToMEPBridgeService:
         published_count = 0
         suppressed_count = 0
         retry_queued_count = 0
+        feedback_pending_count = 0
         quality_scores: list[int] = []
         for item in items:
             target_alias = str(item.get("target_alias") or "").strip()
@@ -2954,6 +3019,8 @@ class GitHubToMEPBridgeService:
             verdict = str(review_feedback.get("verdict") or "").strip().lower()
             if verdict:
                 feedback_verdicts[verdict] += 1
+            elif review_result:
+                feedback_pending_count += 1
             benchmark_label = str(review_feedback.get("benchmark_label") or "").strip()
             if benchmark_label:
                 benchmark_labels[benchmark_label] += 1
@@ -2961,6 +3028,7 @@ class GitHubToMEPBridgeService:
         useful_count = int(feedback_verdicts.get("useful") or 0)
         avg_quality_score = round(sum(quality_scores) / len(quality_scores), 2) if quality_scores else 0.0
         useful_rate = round(useful_count / feedback_count, 4) if feedback_count else None
+        label_coverage = round(feedback_count / (feedback_count + feedback_pending_count), 4) if (feedback_count + feedback_pending_count) else None
         return {
             "total_trials": len(items),
             "published_count": published_count,
@@ -2973,6 +3041,8 @@ class GitHubToMEPBridgeService:
             "benchmark_labels": dict(sorted(benchmark_labels.items())),
             "target_aliases": dict(sorted(target_aliases.items())),
             "feedback_count": feedback_count,
+            "feedback_pending_count": feedback_pending_count,
+            "feedback_label_coverage": label_coverage,
             "feedback_useful_rate": useful_rate,
         }
 
@@ -3170,13 +3240,21 @@ def create_app(
         target_alias: Optional[str] = None,
         benchmark_label: Optional[str] = None,
         verdict: Optional[str] = None,
+        needs_feedback: Optional[bool] = None,
     ) -> dict[str, Any]:
         return bridge_service.list_review_trials(
             limit=limit,
             target_alias=target_alias,
             benchmark_label=benchmark_label,
             verdict=verdict,
+            needs_feedback=needs_feedback,
         )
+
+    @app.get("/bridge/review-benchmarks")
+    async def bridge_review_benchmarks(
+        suite: Optional[str] = None,
+    ) -> dict[str, Any]:
+        return bridge_service.list_review_benchmarks(suite=suite)
 
     @app.post("/bridge/review-trials/{bridge_id}/feedback")
     async def bridge_review_feedback(

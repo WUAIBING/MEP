@@ -1035,11 +1035,33 @@ class TestGitHubToMEPBridge(unittest.TestCase):
         self.assertEqual(item["action"], "approved")
         self.assertEqual(item["review_result"]["resolved_action"], "approved")
         self.assertTrue(item["review_result"]["published"])
+        self.assertTrue(item["feedback_required"])
+        self.assertFalse(item["feedback_recorded"])
+        self.assertEqual(item["feedback_status"], "pending")
         self.assertEqual(item["review_result"]["head_sha"], "headsha123")
         self.assertEqual(item["review_result"]["ci_state"], "green")
         self.assertEqual(payload["summary"]["total_trials"], 1)
         self.assertEqual(payload["summary"]["published_count"], 1)
         self.assertEqual(payload["summary"]["resolved_actions"], {"approved": 1})
+        self.assertEqual(payload["summary"]["feedback_pending_count"], 1)
+        self.assertEqual(payload["summary"]["feedback_label_coverage"], 0.0)
+
+    def test_review_benchmarks_endpoint_returns_seeded_catalog(self):
+        response = self.client.get("/bridge/review-benchmarks")
+        self.assertEqual(response.status_code, 200, response.text)
+        payload = response.json()
+        self.assertGreaterEqual(payload["count"], 5)
+        self.assertIn("phase6_precision", payload["suites"])
+        first_ids = {item["id"] for item in payload["items"]}
+        self.assertIn("docs_only_precision", first_ids)
+
+        filtered_response = self.client.get("/bridge/review-benchmarks?suite=phase6_precision")
+        self.assertEqual(filtered_response.status_code, 200, filtered_response.text)
+        filtered = filtered_response.json()
+        self.assertEqual(
+            {item["suite"] for item in filtered["items"]},
+            {"phase6_precision"},
+        )
 
     def test_review_trials_feedback_endpoint_records_feedback_and_summary(self):
         checks_payload = {
@@ -1193,6 +1215,8 @@ class TestGitHubToMEPBridge(unittest.TestCase):
         self.assertEqual(payload["summary"]["feedback_verdicts"]["useful"], 1)
         self.assertEqual(payload["summary"]["benchmark_labels"]["phase6c"], 1)
         self.assertEqual(payload["summary"]["feedback_count"], 1)
+        self.assertEqual(payload["summary"]["feedback_pending_count"], 1)
+        self.assertEqual(payload["summary"]["feedback_label_coverage"], 0.5)
         self.assertEqual(payload["summary"]["feedback_useful_rate"], 1.0)
 
         filtered_response = self.client.get(
@@ -1203,6 +1227,13 @@ class TestGitHubToMEPBridge(unittest.TestCase):
         self.assertEqual(filtered["count"], 1)
         self.assertEqual(filtered["items"][0]["bridge_id"], approved_bridge_id)
         self.assertEqual(filtered["items"][0]["review_feedback"]["verdict"], "useful")
+
+        pending_response = self.client.get("/bridge/review-trials?limit=5&needs_feedback=true")
+        self.assertEqual(pending_response.status_code, 200, pending_response.text)
+        pending_payload = pending_response.json()
+        self.assertEqual(pending_payload["count"], 1)
+        self.assertEqual(pending_payload["items"][0]["bridge_id"], suppressed_bridge_id)
+        self.assertEqual(pending_payload["items"][0]["feedback_status"], "pending")
 
     def test_review_feedback_endpoint_requires_valid_feedback_token(self):
         self._set_pr_review_package(
