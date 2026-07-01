@@ -459,6 +459,9 @@ class TestGitHubToMEPBridge(unittest.TestCase):
         self.assertEqual(github_inputs["risk_pack"]["changed_identifiers"], ["write_state", "test_review_package"])
         self.assertIn("persistence", github_inputs["risk_pack"]["risk_tags"])
         self.assertEqual(github_inputs["risk_pack"]["deleted_tests"], [])
+        self.assertEqual(github_inputs["hunk_contexts"][0]["filename"], "hub/db.py")
+        self.assertEqual(github_inputs["hunk_contexts"][0]["hunk_header"], "@@ -1,3 +1,8 @@")
+        self.assertIn("+def write_state()", github_inputs["hunk_contexts"][0]["changed_lines"][0])
         self.assertEqual(github_inputs["coalesced_delivery_ids"], ["delivery-package"])
         self.assertEqual(github_inputs["event_sequence"], 1)
         self.assertEqual(github_inputs["changed_files"][0]["filename"], "hub/db.py")
@@ -469,6 +472,7 @@ class TestGitHubToMEPBridge(unittest.TestCase):
         self.assertIn("Touched tests:", instructions)
         self.assertIn("Risk tags: persistence", instructions)
         self.assertIn("Deterministic risk pack:", instructions)
+        self.assertIn("Hunk-centered context pack:", instructions)
         self.assertIn("Changed identifiers: write_state, test_review_package", instructions)
 
     def test_pr_review_package_detects_singular_test_path_and_security_tag(self):

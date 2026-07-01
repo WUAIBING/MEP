@@ -58,6 +58,11 @@ def _review_run_checks_enabled() -> bool:
     return _env_truthy("MEP_REVIEW_RUN_CHECKS", "0")
 
 
+def _review_trusted_associations() -> set[str]:
+    raw = os.getenv("MEP_REVIEW_TRUSTED_ASSOCIATIONS", "OWNER,MEMBER,COLLABORATOR")
+    return {item.strip().upper() for item in raw.split(",") if item.strip()}
+
+
 def _is_adapter_error(text: str) -> bool:
     """Detect adapter failures that must never be published as a real review.
 
@@ -1038,33 +1043,147 @@ class WorkspaceManager:
             return None
         return candidate
 
+    @staticmethod
+    def _is_test_path(path: str) -> bool:
+        lowered = str(path or "").replace("\\", "/").strip().lower()
+        if not lowered:
+            return False
+        basename = lowered.rsplit("/", 1)[-1]
+        return (
+            lowered.startswith("tests/")
+            or lowered.startswith("test/")
+            or "/tests/" in lowered
+            or "/test/" in lowered
+            or basename.startswith("test_")
+            or basename.endswith("_test.py")
+            or ".test." in basename
+            or ".spec." in basename
+        )
+
+    @staticmethod
+    def _line_numbered_snippet(
+        content: str,
+        focus_terms: list[str],
+        *,
+        max_snippets: int = 3,
+        context_radius: int = 3,
+    ) -> list[str]:
+        if not content.strip():
+            return []
+        lines = content.splitlines()
+        normalized_terms = [term.strip() for term in focus_terms if term and term.strip()]
+        if not normalized_terms:
+            return []
+        windows: list[tuple[int, int]] = []
+        for idx, raw_line in enumerate(lines):
+            line = raw_line.strip()
+            if not line:
+                continue
+            lowered = raw_line.lower()
+            matched = any(term.lower() in lowered for term in normalized_terms)
+            if not matched:
+                continue
+            start = max(0, idx - context_radius)
+            end = min(len(lines), idx + context_radius + 1)
+            if windows and start <= windows[-1][1]:
+                windows[-1] = (windows[-1][0], max(windows[-1][1], end))
+            else:
+                windows.append((start, end))
+            if len(windows) >= max_snippets:
+                break
+        snippets: list[str] = []
+        for start, end in windows:
+            block_lines = [f"{line_no + 1}: {lines[line_no]}" for line_no in range(start, end)]
+            snippets.append("\n".join(block_lines).rstrip())
+        return snippets
+
+    @classmethod
+    def _focused_context_terms(
+        cls,
+        path: str,
+        *,
+        touched_tests: list[str],
+        risk_pack: Optional[dict[str, Any]],
+    ) -> list[str]:
+        risk_pack = risk_pack if isinstance(risk_pack, dict) else {}
+        identifiers = [
+            str(item).strip()
+            for item in (risk_pack.get("changed_identifiers") or [])
+            if str(item).strip()
+        ]
+        if cls._is_test_path(path):
+            basename = os.path.basename(path)
+            candidates = identifiers + [basename, basename.replace(".py", "")]
+            return [item for item in candidates if item]
+        primary = [
+            str(item).strip()
+            for item in (risk_pack.get("touched_non_test_paths") or [])
+            if str(item).strip()
+        ]
+        candidates = identifiers + primary + list(touched_tests[:2])
+        return [item for item in candidates if item]
+
     def build_review_context(
         self,
         workspace_path: str,
         touched_paths: list[str],
         *,
+        touched_tests: Optional[list[str]] = None,
+        risk_pack: Optional[dict[str, Any]] = None,
         max_files: int = 12,
         max_file_chars: int = 20000,
         max_chars: int = 60000,
     ) -> str:
-        """Embed the full contents of changed files from the checked-out PR head.
-
-        Earlier revisions only embedded ~700 chars per file across 3 files, which
-        starved the reviewer of context and caused it to mistake its own
-        truncated input for defects in the code. Providing whole files (within a
-        generous budget) lets the model reason about the real change.
-        """
+        """Build a ranked local context pack around the changed hunks, then fall back to full files."""
         if not workspace_path or not isinstance(touched_paths, list):
             return ""
+        touched_tests = touched_tests if isinstance(touched_tests, list) else []
+        review_targets: list[str] = []
+        for item in [*touched_paths, *touched_tests]:
+            text = str(item or "").strip()
+            if text and text not in review_targets:
+                review_targets.append(text)
         sections = [
             f"Local workspace path: {workspace_path}",
-            "Full contents of changed files at the PR head commit (authoritative source for your review):",
+            "Hunk-centered local context pack from the PR head commit (authoritative source for your review):",
         ]
         remaining = max_chars
         added = 0
-        for path in touched_paths:
+        snippet_paths: set[str] = set()
+        for path in review_targets:
             if added >= max_files or remaining <= 400:
                 break
+            resolved = self._resolve_repo_file(workspace_path, str(path or ""))
+            if not resolved or not os.path.isfile(resolved):
+                continue
+            try:
+                with open(resolved, "r", encoding="utf-8", errors="replace") as handle:
+                    content = handle.read()
+            except OSError:
+                continue
+            if not content.strip():
+                continue
+            focus_terms = self._focused_context_terms(
+                str(path or ""),
+                touched_tests=touched_tests,
+                risk_pack=risk_pack,
+            )
+            snippets = self._line_numbered_snippet(content, focus_terms)
+            if snippets:
+                block = f"### {path}\n" + "\n\n".join(f"```text\n{snippet}\n```" for snippet in snippets)
+                if len(block) <= remaining:
+                    sections.append(block)
+                    remaining -= len(block) + 2
+                    added += 1
+                    snippet_paths.add(str(path))
+                    continue
+        if remaining > 400:
+            sections.append("Full contents fallback for changed files at the PR head commit:")
+        for path in review_targets:
+            if added >= max_files or remaining <= 400:
+                break
+            if str(path) in snippet_paths:
+                continue
             resolved = self._resolve_repo_file(workspace_path, str(path or ""))
             if not resolved or not os.path.isfile(resolved):
                 continue
@@ -1149,6 +1268,19 @@ class WorkspaceManager:
             if path and os.path.isfile(path):
                 resolved.append(text)
         return resolved
+
+    def verification_policy_note(self, task_data: dict[str, Any]) -> str:
+        github_inputs = _review_github_inputs(task_data)
+        association = str(github_inputs.get("author_association") or "").strip().upper()
+        if not association:
+            return ""
+        if association in _review_trusted_associations():
+            return ""
+        return (
+            "Automated verification checks were skipped because this PR was triggered by an "
+            f"untrusted contributor association (`{association}`). Treat the diff and workspace "
+            "context as read-only evidence unless a trusted maintainer reruns the review."
+        )
 
     def build_verification_report(
         self,
@@ -1897,17 +2029,23 @@ class RuntimeNode:
                         self.workspace.build_review_context,
                         workspace_path,
                         touched_paths,
+                        touched_tests=touched_tests,
+                        risk_pack=github_inputs.get("risk_pack"),
                     )
                     if workspace_context:
                         instructions = f"{instructions}\n\nAdditional local workspace context:\n{workspace_context}"
-                    verification_report = await asyncio.to_thread(
-                        self.workspace.build_verification_report,
-                        workspace_path,
-                        touched_paths,
-                        touched_tests,
-                    )
-                    if verification_report:
-                        instructions = f"{instructions}\n\n{verification_report}"
+                    verification_note = self.workspace.verification_policy_note(adapter_task_data)
+                    if verification_note:
+                        instructions = f"{instructions}\n\n{verification_note}"
+                    else:
+                        verification_report = await asyncio.to_thread(
+                            self.workspace.build_verification_report,
+                            workspace_path,
+                            touched_paths,
+                            touched_tests,
+                        )
+                        if verification_report:
+                            instructions = f"{instructions}\n\n{verification_report}"
                 else:
                     print(f"[mep workspace] sync failed: {path_or_err}")
                     # We continue anyway, but the adapter might be working on stale code

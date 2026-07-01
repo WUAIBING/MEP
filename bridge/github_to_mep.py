@@ -1281,6 +1281,7 @@ class GitHubToMEPBridgeService:
             "risk_tags",
             "reviewability",
             "risk_pack",
+            "hunk_contexts",
         ):
             value = review_package.get(key)
             if value not in (None, "", [], {}):
@@ -1316,6 +1317,42 @@ class GitHubToMEPBridgeService:
         if compact_files:
             compact["changed_files"] = compact_files
         return compact
+
+    @staticmethod
+    def _build_hunk_contexts(changed_file_entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        contexts: list[dict[str, Any]] = []
+        for entry in changed_file_entries:
+            if not isinstance(entry, dict):
+                continue
+            filename = str(entry.get("filename") or "").strip()
+            patch_text = str(entry.get("patch") or "").strip()
+            if not filename or not patch_text:
+                continue
+            hunk_header = ""
+            changed_lines: list[str] = []
+            for line in patch_text.splitlines():
+                if line.startswith("@@") and not hunk_header:
+                    hunk_header = line.strip()
+                    continue
+                if line.startswith(("+++", "---")):
+                    continue
+                if line.startswith(("+", "-")):
+                    clipped = line[:160].rstrip()
+                    changed_lines.append(clipped)
+                if len(changed_lines) >= 3:
+                    break
+            if not hunk_header and not changed_lines:
+                continue
+            contexts.append(
+                {
+                    "filename": filename,
+                    "hunk_header": hunk_header,
+                    "changed_lines": changed_lines,
+                }
+            )
+            if len(contexts) >= 8:
+                break
+        return contexts
 
     @staticmethod
     def _is_test_path(path: str) -> bool:
@@ -1647,6 +1684,7 @@ class GitHubToMEPBridgeService:
                 touched_tests=touched_tests,
                 risk_tags=risk_tags,
             )
+            hunk_contexts = self._build_hunk_contexts(changed_file_entries)
             if touched_paths:
                 sections.append("Touched paths:\n" + "\n".join(f"- {path}" for path in touched_paths[:8]))
             if touched_tests:
@@ -1672,6 +1710,27 @@ class GitHubToMEPBridgeService:
                 )
             if risk_pack_lines:
                 sections.append("Deterministic risk pack:\n" + "\n".join(risk_pack_lines))
+            hunk_lines: list[str] = []
+            for context in hunk_contexts:
+                if not isinstance(context, dict):
+                    continue
+                filename = str(context.get("filename") or "").strip()
+                if not filename:
+                    continue
+                line = f"- {filename}"
+                header = str(context.get("hunk_header") or "").strip()
+                if header:
+                    line += f" {header}"
+                changed_lines = [
+                    str(item).strip()
+                    for item in (context.get("changed_lines") or [])
+                    if str(item).strip()
+                ]
+                if changed_lines:
+                    line += "\n  " + "\n  ".join(changed_lines)
+                hunk_lines.append(line)
+            if hunk_lines:
+                sections.append("Hunk-centered context pack:\n" + "\n".join(hunk_lines))
             reviewability = self._classify_reviewability(
                 touched_paths=touched_paths,
                 touched_tests=touched_tests,
@@ -1726,6 +1785,7 @@ class GitHubToMEPBridgeService:
             "touched_tests": touched_tests,
             "risk_tags": risk_tags,
             "risk_pack": risk_pack,
+            "hunk_contexts": hunk_contexts,
             "reviewability": reviewability,
             "changed_files": changed_file_entries,
             "instructions_context": "\n\n".join(section for section in sections if section.strip()),
