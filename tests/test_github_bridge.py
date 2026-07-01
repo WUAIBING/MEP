@@ -1736,6 +1736,12 @@ class TestGitHubToMEPBridge(unittest.TestCase):
         self.assertEqual(status_response.status_code, 200, status_response.text)
         self.assertEqual(len(self.github_session.posts), 1)
         self.assertTrue(self.github_session.posts[0]["url"].endswith("/repos/WUAIBING/MEP/pulls/149/reviews"))
+        review_payload = self.github_session.posts[0]["json"]
+        self.assertEqual(review_payload["event"], "COMMENT")
+        self.assertEqual(review_payload["comments"][0]["path"], "node/mep_runtime.py")
+        self.assertEqual(review_payload["comments"][0]["line"], 226)
+        self.assertEqual(review_payload["comments"][0]["side"], "RIGHT")
+        self.assertIn("Import guard using `find_spec` may be redundant.", review_payload["comments"][0]["body"])
 
     def test_status_callback_suppresses_summary_with_paths_but_no_code_evidence(self):
         self._set_pr_review_package(
