@@ -4,6 +4,7 @@ import json
 import os
 import tempfile
 import unittest
+from typing import Optional
 from unittest.mock import AsyncMock, patch
 
 from node.identity import MEPIdentity
@@ -337,7 +338,15 @@ class TestRuntimeBidPolicy(unittest.TestCase):
 
 class TestRuntimeReviewPrompts(unittest.TestCase):
     @staticmethod
-    def _bridge_review_task_data(intent_type: str = "code.review.request") -> dict:
+    def _bridge_review_task_data(
+        intent_type: str = "code.review.request",
+        *,
+        changed_identifiers: Optional[list[str]] = None,
+    ) -> dict:
+        identifiers = changed_identifiers or [
+            "_record_pending_task_poll_failure",
+            "last_poll_status",
+        ]
         return {
             "id": "task_bridge_review",
             "bounty": 0.0,
@@ -365,6 +374,9 @@ class TestRuntimeReviewPrompts(unittest.TestCase):
                                 "number": 246,
                                 "touched_paths": ["bridge/github_to_mep.py"],
                                 "touched_tests": ["tests/test_github_bridge.py"],
+                                "risk_pack": {
+                                    "changed_identifiers": identifiers
+                                },
                             },
                         },
                     },
@@ -433,7 +445,9 @@ class TestRuntimeReviewPrompts(unittest.TestCase):
 
     def test_deepseek_adapter_uses_reviewer_prompt_for_bridge_review_tasks(self):
         adapter = mep_runtime.DeepSeekAdapter(api_key="secret-key", model="deepseek-chat")
-        task_data = self._bridge_review_task_data()
+        task_data = self._bridge_review_task_data(
+            changed_identifiers=["preserve_coalesced_targets", "coalesced_targets"]
+        )
         fake_responses = [
             _FakeResponse(
                 200,
@@ -462,6 +476,7 @@ class TestRuntimeReviewPrompts(unittest.TestCase):
                                     '{"summary":"Checked the bridge diff.","observation":"The metadata wiring stays backward-compatible.",'
                                     '"touched_paths":["bridge/github_to_mep.py"],'
                                     '"tests_reviewed":["tests/test_github_bridge.py"],'
+                                    '"verified_identifiers":["preserve_coalesced_targets"],'
                                     '"findings":'
                                     '[{"file":"bridge/github_to_mep.py","issue":"Preserve coalesced targets",'
                                     '"rationale":"Otherwise the second mention can overwrite the first target during the coalesce window."}],'
@@ -488,6 +503,8 @@ class TestRuntimeReviewPrompts(unittest.TestCase):
         self.assertIn("candidate-generation pass", first_system_prompt)
         self.assertIn("return ONLY a JSON object", second_system_prompt)
         self.assertIn("This is the verification pass.", second_system_prompt)
+        self.assertIn("set `file` to one of the supplied touched paths", second_system_prompt)
+        self.assertIn("exact changed-line identifier in `verified_identifiers`", second_system_prompt)
         self.assertIn("Candidate risks to verify before publishing any finding", second_user_payload)
 
     def test_deepseek_adapter_filters_weak_review_findings(self):
@@ -540,7 +557,10 @@ class TestRuntimeReviewPrompts(unittest.TestCase):
                 '"findings":[],"approval_recommendation":"approve"}'
             ),
             max_chars=1000,
-            task_data=self._bridge_review_task_data(intent_type="code.review.approve"),
+            task_data=self._bridge_review_task_data(
+                intent_type="code.review.approve",
+                changed_identifiers=["_score_review_quality", "_approval_quality_failure"],
+            ),
         )
 
         self.assertIn("## Review Summary", rendered)
@@ -567,6 +587,47 @@ class TestRuntimeReviewPrompts(unittest.TestCase):
         self.assertIn("Risk areas checked: trial persistence, endpoint decoding", rendered)
         self.assertIn("Checks performed: verified suppression and publish paths mention `review_result_json`, checked `/bridge/review-trials` returns stored review metadata", rendered)
         self.assertIn("Why no finding: The new writes and reads stay consistent across both persistence paths, so the telemetry path looks low-risk.", rendered)
+
+    def test_structured_review_drops_findings_without_allowed_changed_identifiers(self):
+        rendered = mep_runtime._render_structured_review_with_task_data(  # noqa: SLF001
+            (
+                '{"summary":"Checked the bridge diff.","observation":"The coalesce path still needs a concrete proof point.",'
+                '"touched_paths":["bridge/github_to_mep.py"],'
+                '"tests_reviewed":["tests/test_github_bridge.py"],'
+                '"verified_identifiers":["imagined_guard"],'
+                '"findings":[{"file":"bridge/github_to_mep.py","issue":"Preserve coalesced targets",'
+                '"rationale":"Otherwise the second mention can overwrite the first target during the coalesce window."}],'
+                '"approval_recommendation":"comment"}'
+            ),
+            max_chars=1000,
+            task_data=self._bridge_review_task_data(),
+        )
+
+        self.assertIn("## Review Summary", rendered)
+        self.assertNotIn("## Review Findings", rendered)
+        self.assertNotIn("Preserve coalesced targets", rendered)
+        self.assertNotIn("Changed identifiers verified:", rendered)
+
+    def test_structured_review_drops_findings_for_untouched_files(self):
+        rendered = mep_runtime._render_structured_review_with_task_data(  # noqa: SLF001
+            (
+                '{"summary":"Checked the bridge diff.","observation":"The real change stays scoped to the bridge entrypoint.",'
+                '"touched_paths":["bridge/other_file.py"],'
+                '"tests_reviewed":["tests/test_other_file.py"],'
+                '"verified_identifiers":["_record_pending_task_poll_failure"],'
+                '"findings":[{"file":"bridge/not_touched.py","issue":"Unexpected side effect",'
+                '"rationale":"This claim points at a file that is not part of the supplied diff."}],'
+                '"approval_recommendation":"comment"}'
+            ),
+            max_chars=1000,
+            task_data=self._bridge_review_task_data(),
+        )
+
+        self.assertIn("## Review Summary", rendered)
+        self.assertNotIn("## Review Findings", rendered)
+        self.assertNotIn("Unexpected side effect", rendered)
+        self.assertIn("Touched paths reviewed: `bridge/github_to_mep.py`", rendered)
+        self.assertIn("Tests reviewed: `tests/test_github_bridge.py`", rendered)
 
     def test_extract_review_candidates_deduplicates_and_cleans_items(self):
         candidates = mep_runtime._extract_review_candidates(  # noqa: SLF001
