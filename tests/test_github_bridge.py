@@ -1743,6 +1743,112 @@ class TestGitHubToMEPBridge(unittest.TestCase):
         self.assertEqual(review_payload["comments"][0]["side"], "RIGHT")
         self.assertIn("Import guard using `find_spec` may be redundant.", review_payload["comments"][0]["body"])
 
+    def test_patch_added_line_number_requires_focus_term_match(self):
+        patch = (
+            "@@ -10,2 +10,3 @@\n"
+            " context\n"
+            "-old_call()\n"
+            "+new_call()\n"
+            "+other_line()\n"
+        )
+
+        self.assertEqual(
+            self.service._patch_added_line_number(patch, "The `new_call` check is wrong"),
+            11,
+        )
+        self.assertIsNone(
+            self.service._patch_added_line_number(patch, "The `missing_identifier` check is wrong")
+        )
+        self.assertIsNone(
+            self.service._patch_added_line_number(patch, "This finding has no backticked identifier")
+        )
+
+    def test_status_callback_skips_inline_comment_when_identifier_does_not_match_patch(self):
+        self._set_pr_review_package(
+            [
+                {
+                    "filename": "node/mep_runtime.py",
+                    "status": "modified",
+                    "additions": 4,
+                    "deletions": 1,
+                    "changes": 5,
+                    "patch": (
+                        "@@ -221,1 +221,4 @@\n"
+                        "-    from ws_connect import ws_connect\n"
+                        "+    from importlib.util import find_spec\n"
+                        '+    if find_spec("websockets") is None:\n'
+                        '+        raise ImportError("websockets not available")\n'
+                        "+    from ws_connect import ws_connect\n"
+                    ),
+                },
+            ],
+            pr_body="Adds an import guard before wiring the shared websocket helper.",
+        )
+        response = self._post_webhook(
+            _issue_comment_payload("@Hub-Sentinel review this PR", delivery_number=150),
+            delivery_id="delivery-unmapped-inline-finding",
+        )
+        self.assertEqual(response.status_code, 200)
+        bridge_id = response.json()["bridge_id"]
+        self._flush_context(response.json()["context_id"])
+
+        token = self.service._generate_status_token(bridge_id, "node_target")
+        status_response = self.client.post(
+            "/bridge/status",
+            json={
+                "bridge_id": bridge_id,
+                "status": "completed",
+                "target_node_id": "node_target",
+                "task_id": "task-unmapped-inline-finding",
+                "detail": (
+                    "## Review Findings\n\n"
+                    "1. **Missing identifier mapping is unsafe.** (`node/mep_runtime.py`): "
+                    "The `missing_identifier` check is wrong and should not land on an unrelated added line.\n\n"
+                    "Touched paths reviewed: `node/mep_runtime.py`"
+                ),
+            },
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        self.assertEqual(status_response.status_code, 200, status_response.text)
+        self.assertEqual(len(self.github_session.posts), 0)
+        self.assertEqual(self.service.github_writeback_metrics["last_suppressed_reason"], "ungrounded_finding")
+
+    def test_inline_review_comments_skips_ambiguous_path_reference(self):
+        review_package = {
+            "touched_paths": ["pkg_one/helpers.py", "pkg_two/helpers.py"],
+            "changed_files": [
+                {
+                    "filename": "pkg_one/helpers.py",
+                    "patch": "@@ -1,0 +1,2 @@\n+def missing_call():\n+    return 1\n",
+                },
+                {
+                    "filename": "pkg_two/helpers.py",
+                    "patch": "@@ -1,0 +1,2 @@\n+def missing_call():\n+    return 2\n",
+                },
+            ],
+        }
+
+        comments = self.service._inline_review_comments(
+            (
+                "## Review Findings\n\n"
+                "1. **Helper path may be wrong.** (`helpers.py`): "
+                "The `missing_call` symbol changes semantics across both helper modules."
+            ),
+            review_package,
+        )
+
+        self.assertEqual(comments, [])
+        self.assertEqual(self.service.github_writeback_metrics["inline_comment_ambiguous_paths"], 1)
+
+    def test_inline_review_comments_records_parse_miss_for_unparseable_findings_heading(self):
+        comments = self.service._inline_review_comments(
+            "## Review Findings\n\n- malformed finding that does not follow the numbered markdown contract",
+            {},
+        )
+
+        self.assertEqual(comments, [])
+        self.assertEqual(self.service.github_writeback_metrics["inline_comment_parse_misses"], 1)
+
     def test_status_callback_suppresses_summary_with_paths_but_no_code_evidence(self):
         self._set_pr_review_package(
             [

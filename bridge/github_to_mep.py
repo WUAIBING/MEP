@@ -766,6 +766,11 @@ class TelegramNotifier:
 
 class GitHubToMEPBridgeService:
     MAX_RETRIES = 2
+    INLINE_REVIEW_MAX_FINDINGS = 2
+    INLINE_REVIEW_MAX_COMMENTS = 2
+    INLINE_REVIEW_ISSUE_MAX_CHARS = 200
+    INLINE_REVIEW_RATIONALE_MAX_CHARS = 500
+    INLINE_REVIEW_FILE_MAX_CHARS = 160
 
     def __init__(
         self,
@@ -789,6 +794,9 @@ class GitHubToMEPBridgeService:
             "comments_published": 0,
             "suppressed_weak_reviews": 0,
             "suppressed_approvals": 0,
+            "inline_comment_parse_misses": 0,
+            "inline_comment_ambiguous_paths": 0,
+            "inline_comment_unmapped_lines": 0,
             "last_action": None,
             "last_detail_preview": None,
             "last_suppressed_reason": None,
@@ -2674,21 +2682,43 @@ class GitHubToMEPBridgeService:
             match = pattern.match(line)
             if not match:
                 continue
-            issue = cls._normalize_feedback_text(match.group("issue"), max_chars=200)
-            rationale = cls._normalize_feedback_text(match.group("rationale"), max_chars=500)
-            file_name = cls._normalize_feedback_text(match.group("file"), max_chars=160)
+            issue = cls._normalize_feedback_text(match.group("issue"), max_chars=cls.INLINE_REVIEW_ISSUE_MAX_CHARS)
+            rationale = cls._normalize_feedback_text(
+                match.group("rationale"),
+                max_chars=cls.INLINE_REVIEW_RATIONALE_MAX_CHARS,
+            )
+            file_name = cls._normalize_feedback_text(match.group("file"), max_chars=cls.INLINE_REVIEW_FILE_MAX_CHARS)
             if not issue:
                 continue
             findings.append({"issue": issue, "rationale": rationale, "file": file_name})
-            if len(findings) >= 2:
+            if len(findings) >= cls.INLINE_REVIEW_MAX_FINDINGS:
                 break
         return findings
 
     @staticmethod
-    def _patch_added_line_number(patch_text: str, finding_text: str) -> Optional[int]:
+    def _detail_expects_structured_findings(detail: Optional[str]) -> bool:
+        text = str(detail or "").strip()
+        if not text:
+            return False
+        if "## Review Findings" in text:
+            return True
+        return bool(re.search(r"^\s*\d+\.\s+\*\*", text, re.MULTILINE))
+
+    @staticmethod
+    def _line_matches_focus_term(line_text: str, term: str) -> bool:
+        normalized_term = str(term or "").strip().lower()
+        if not normalized_term:
+            return False
+        if re.fullmatch(r"[a-z0-9_]+", normalized_term):
+            pattern = rf"(?<![a-z0-9_]){re.escape(normalized_term)}(?![a-z0-9_])"
+            return re.search(pattern, line_text) is not None
+        return normalized_term in line_text
+    @classmethod
+    def _patch_added_line_number(cls, patch_text: str, finding_text: str) -> Optional[int]:
         current_right: Optional[int] = None
-        fallback_line: Optional[int] = None
         focus_terms = [term.lower() for term in re.findall(r"`([^`]+)`", finding_text or "") if term.strip()]
+        if not focus_terms:
+            return None
         for raw_line in str(patch_text or "").splitlines():
             if raw_line.startswith("@@"):
                 match = re.search(r"\+(\d+)", raw_line)
@@ -2698,20 +2728,24 @@ class GitHubToMEPBridgeService:
                 continue
             if raw_line.startswith("+"):
                 line_text = raw_line[1:].lower()
-                if fallback_line is None:
-                    fallback_line = current_right
-                if focus_terms and any(term in line_text for term in focus_terms):
+                if any(cls._line_matches_focus_term(line_text, term) for term in focus_terms):
                     return current_right
                 current_right += 1
                 continue
             if raw_line.startswith("-"):
                 continue
             current_right += 1
-        return fallback_line
+        return None
 
     def _inline_review_comments(self, detail: Optional[str], review_package: dict[str, Any]) -> list[dict[str, Any]]:
         findings = self._extract_structured_findings(detail)
         if not findings:
+            if self._detail_expects_structured_findings(detail):
+                self.github_writeback_metrics["inline_comment_parse_misses"] += 1
+                print(
+                    "[bridge] inline comment extraction produced no structured findings "
+                    f"detail={self._detail_preview(detail) or '<empty>'}"
+                )
             return []
         expected_paths = [
             str(item).strip()
@@ -2727,13 +2761,25 @@ class GitHubToMEPBridgeService:
             matched_paths = self._match_path_reference(file_hint, expected_paths)
             if not matched_paths:
                 continue
-            target_path = sorted(matched_paths)[0]
+            if len(matched_paths) != 1:
+                self.github_writeback_metrics["inline_comment_ambiguous_paths"] += 1
+                print(
+                    "[bridge] skipped inline comment due to ambiguous path reference "
+                    f"file_hint={file_hint!r} matched_paths={sorted(matched_paths)!r}"
+                )
+                continue
+            target_path = next(iter(matched_paths))
             patch_text = str((patches_by_path.get(target_path) or {}).get("full") or "")
             line_number = self._patch_added_line_number(
                 patch_text,
                 f"{finding.get('issue') or ''} {finding.get('rationale') or ''}",
             )
             if not line_number:
+                self.github_writeback_metrics["inline_comment_unmapped_lines"] += 1
+                print(
+                    "[bridge] skipped inline comment because no changed line matched the finding "
+                    f"path={target_path!r} finding={finding.get('issue')!r}"
+                )
                 continue
             body_lines = [f"**{finding['issue']}**"]
             rationale = str(finding.get("rationale") or "").strip()
@@ -2748,7 +2794,7 @@ class GitHubToMEPBridgeService:
                     "body": "\n".join(body_lines).strip(),
                 }
             )
-        return comments[:2]
+        return comments[: self.INLINE_REVIEW_MAX_COMMENTS]
 
     def _target_alias_for_execution(self, execution: dict[str, Any]) -> str:
         return str(execution.get("target_alias") or self.config.target_alias or "").strip()
