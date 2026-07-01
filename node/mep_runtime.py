@@ -63,6 +63,10 @@ def _review_trusted_associations() -> set[str]:
     return {item.strip().upper() for item in raw.split(",") if item.strip()}
 
 
+def _review_allow_external_checks() -> bool:
+    return _env_truthy("MEP_REVIEW_ALLOW_EXTERNAL_CHECKS", "0")
+
+
 def _is_adapter_error(text: str) -> bool:
     """Detect adapter failures that must never be published as a real review.
 
@@ -1273,6 +1277,8 @@ class WorkspaceManager:
         github_inputs = _review_github_inputs(task_data)
         association = str(github_inputs.get("author_association") or "").strip().upper()
         if not association:
+            return ""
+        if _review_allow_external_checks():
             return ""
         if association in _review_trusted_associations():
             return ""

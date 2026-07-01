@@ -2662,6 +2662,94 @@ class GitHubToMEPBridgeService:
             return {}
         return decoded if isinstance(decoded, dict) else {}
 
+    @classmethod
+    def _extract_structured_findings(cls, detail: Optional[str]) -> list[dict[str, str]]:
+        findings: list[dict[str, str]] = []
+        if not detail:
+            return findings
+        pattern = re.compile(
+            r"^\s*\d+\.\s+\*\*(?P<issue>.+?)\*\*(?:\s+\(`(?P<file>[^`]+)`\))?:\s*(?P<rationale>.+?)\s*$"
+        )
+        for line in str(detail).splitlines():
+            match = pattern.match(line)
+            if not match:
+                continue
+            issue = cls._normalize_feedback_text(match.group("issue"), max_chars=200)
+            rationale = cls._normalize_feedback_text(match.group("rationale"), max_chars=500)
+            file_name = cls._normalize_feedback_text(match.group("file"), max_chars=160)
+            if not issue:
+                continue
+            findings.append({"issue": issue, "rationale": rationale, "file": file_name})
+            if len(findings) >= 2:
+                break
+        return findings
+
+    @staticmethod
+    def _patch_added_line_number(patch_text: str, finding_text: str) -> Optional[int]:
+        current_right: Optional[int] = None
+        fallback_line: Optional[int] = None
+        focus_terms = [term.lower() for term in re.findall(r"`([^`]+)`", finding_text or "") if term.strip()]
+        for raw_line in str(patch_text or "").splitlines():
+            if raw_line.startswith("@@"):
+                match = re.search(r"\+(\d+)", raw_line)
+                current_right = int(match.group(1)) if match else None
+                continue
+            if current_right is None or raw_line.startswith(("+++", "---")):
+                continue
+            if raw_line.startswith("+"):
+                line_text = raw_line[1:].lower()
+                if fallback_line is None:
+                    fallback_line = current_right
+                if focus_terms and any(term in line_text for term in focus_terms):
+                    return current_right
+                current_right += 1
+                continue
+            if raw_line.startswith("-"):
+                continue
+            current_right += 1
+        return fallback_line
+
+    def _inline_review_comments(self, detail: Optional[str], review_package: dict[str, Any]) -> list[dict[str, Any]]:
+        findings = self._extract_structured_findings(detail)
+        if not findings:
+            return []
+        expected_paths = [
+            str(item).strip()
+            for item in (review_package.get("touched_paths") or [])
+            if str(item).strip()
+        ]
+        patches_by_path = self._patch_text_by_path(review_package)
+        comments: list[dict[str, Any]] = []
+        for finding in findings:
+            file_hint = str(finding.get("file") or "").strip()
+            if not file_hint:
+                continue
+            matched_paths = self._match_path_reference(file_hint, expected_paths)
+            if not matched_paths:
+                continue
+            target_path = sorted(matched_paths)[0]
+            patch_text = str((patches_by_path.get(target_path) or {}).get("full") or "")
+            line_number = self._patch_added_line_number(
+                patch_text,
+                f"{finding.get('issue') or ''} {finding.get('rationale') or ''}",
+            )
+            if not line_number:
+                continue
+            body_lines = [f"**{finding['issue']}**"]
+            rationale = str(finding.get("rationale") or "").strip()
+            if rationale:
+                body_lines.append("")
+                body_lines.append(rationale)
+            comments.append(
+                {
+                    "path": target_path,
+                    "line": int(line_number),
+                    "side": "RIGHT",
+                    "body": "\n".join(body_lines).strip(),
+                }
+            )
+        return comments[:2]
+
     def _target_alias_for_execution(self, execution: dict[str, Any]) -> str:
         return str(execution.get("target_alias") or self.config.target_alias or "").strip()
 
@@ -2696,13 +2784,23 @@ class GitHubToMEPBridgeService:
         response.raise_for_status()
 
     def _submit_github_review(
-        self, repo_full_name: str, number: int, event: str, body: str, github_token: str
+        self,
+        repo_full_name: str,
+        number: int,
+        event: str,
+        body: str,
+        github_token: str,
+        *,
+        comments: Optional[list[dict[str, Any]]] = None,
     ) -> None:
         if not github_token:
             raise HTTPException(status_code=500, detail="Bridge configuration missing: GitHub writeback token")
+        payload: dict[str, Any] = {"event": event, "body": body}
+        if comments:
+            payload["comments"] = comments
         response = self.github_session.post(
             f"https://api.github.com/repos/{repo_full_name}/pulls/{number}/reviews",
-            json={"event": event, "body": body},
+            json=payload,
             headers={
                 "Accept": "application/vnd.github+json",
                 "Authorization": f"Bearer {github_token}",
@@ -2792,7 +2890,17 @@ class GitHubToMEPBridgeService:
             target_alias=str(execution.get("target_alias") or "").strip() or None,
         )
         if review_action:
-            self._submit_github_review(repo_full_name, number, review_events[action], body, github_token)
+            inline_comments: list[dict[str, Any]] = []
+            if action != "approved":
+                inline_comments = self._inline_review_comments(update.detail, snapshot.get("review_package") or {})
+            self._submit_github_review(
+                repo_full_name,
+                number,
+                review_events[action],
+                body,
+                github_token,
+                comments=inline_comments,
+            )
             self._record_github_writeback_publish(action, review_action=True)
             review_result = self._build_review_trial_result(
                 execution,

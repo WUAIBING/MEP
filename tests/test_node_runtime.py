@@ -912,6 +912,75 @@ class TestRuntimeWebSocketLoop(unittest.TestCase):
         )
         complete_mock.assert_called_once_with("task_bridge_review", "reply")
 
+    def test_process_task_skips_verification_for_untrusted_contributor_by_default(self):
+        node = _runtime_node()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            os.makedirs(os.path.join(tmpdir, "bridge"), exist_ok=True)
+            with open(os.path.join(tmpdir, "bridge", "github_to_mep.py"), "w", encoding="utf-8") as handle:
+                handle.write("def live_sync_context():\n    return True\n")
+
+            task_data = TestRuntimeReviewPrompts._bridge_review_task_data()
+            payload = json.loads(task_data["payload"])
+            payload["task"]["inputs"]["github"].update(
+                {
+                    "repo_clone_url": "https://github.com/example/repo.git",
+                    "head_sha": "abc12345",
+                    "head_ref": "feature/test",
+                    "author_association": "CONTRIBUTOR",
+                }
+            )
+            task_data["payload"] = json.dumps(payload)
+
+            with (
+                patch.object(node.workspace, "sync_pr_workspace", return_value=(True, tmpdir)),
+                patch.object(node.workspace, "build_review_context", return_value="Local workspace path: tmpdir"),
+                patch.object(node.workspace, "build_verification_report", return_value="should not run") as verify_mock,
+                patch.object(node.adapter, "generate_reply", return_value="reply") as adapter_mock,
+                patch.object(node, "complete"),
+            ):
+                asyncio.run(node.process_task(task_data))
+
+        self.assertFalse(verify_mock.called)
+        instructions = adapter_mock.call_args.args[0]
+        self.assertIn("Automated verification checks were skipped", instructions)
+        self.assertIn("CONTRIBUTOR", instructions)
+
+    def test_process_task_allows_external_verification_when_explicitly_enabled(self):
+        node = _runtime_node()
+        with (
+            tempfile.TemporaryDirectory() as tmpdir,
+            patch.dict(os.environ, {"MEP_REVIEW_ALLOW_EXTERNAL_CHECKS": "1"}),
+        ):
+            os.makedirs(os.path.join(tmpdir, "bridge"), exist_ok=True)
+            with open(os.path.join(tmpdir, "bridge", "github_to_mep.py"), "w", encoding="utf-8") as handle:
+                handle.write("def live_sync_context():\n    return True\n")
+
+            task_data = TestRuntimeReviewPrompts._bridge_review_task_data()
+            payload = json.loads(task_data["payload"])
+            payload["task"]["inputs"]["github"].update(
+                {
+                    "repo_clone_url": "https://github.com/example/repo.git",
+                    "head_sha": "abc12345",
+                    "head_ref": "feature/test",
+                    "author_association": "CONTRIBUTOR",
+                }
+            )
+            task_data["payload"] = json.dumps(payload)
+
+            with (
+                patch.object(node.workspace, "sync_pr_workspace", return_value=(True, tmpdir)),
+                patch.object(node.workspace, "build_review_context", return_value="Local workspace path: tmpdir"),
+                patch.object(node.workspace, "build_verification_report", return_value="Automated verification run") as verify_mock,
+                patch.object(node.adapter, "generate_reply", return_value="reply") as adapter_mock,
+                patch.object(node, "complete"),
+            ):
+                asyncio.run(node.process_task(task_data))
+
+        self.assertTrue(verify_mock.called)
+        instructions = adapter_mock.call_args.args[0]
+        self.assertIn("Automated verification run", instructions)
+        self.assertNotIn("Automated verification checks were skipped", instructions)
+
     def test_process_task_live_bridge_sends_frame_and_settles_when_call_is_accepted(self):
         node = _runtime_node()
         node.live_call_enabled = True
