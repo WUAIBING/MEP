@@ -863,7 +863,13 @@ class TestRuntimeWebSocketLoop(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             os.makedirs(os.path.join(tmpdir, "bridge"), exist_ok=True)
             with open(os.path.join(tmpdir, "bridge", "github_to_mep.py"), "w", encoding="utf-8") as handle:
-                handle.write("def live_sync_context():\n    return True\n")
+                handle.write(
+                    "def untouched_helper():\n    return False\n\n"
+                    "def live_sync_context():\n    state_value = True\n    return state_value\n"
+                )
+            os.makedirs(os.path.join(tmpdir, "tests"), exist_ok=True)
+            with open(os.path.join(tmpdir, "tests", "test_bridge_sync.py"), "w", encoding="utf-8") as handle:
+                handle.write("def test_live_sync_context():\n    assert True\n")
 
             task_data = TestRuntimeReviewPrompts._bridge_review_task_data()
             payload = json.loads(task_data["payload"])
@@ -872,6 +878,11 @@ class TestRuntimeWebSocketLoop(unittest.TestCase):
                     "repo_clone_url": "https://github.com/example/repo.git",
                     "head_sha": "abc12345",
                     "head_ref": "feature/test",
+                    "touched_tests": ["tests/test_bridge_sync.py"],
+                    "risk_pack": {
+                        "changed_identifiers": ["live_sync_context", "state_value"],
+                        "touched_non_test_paths": ["bridge/github_to_mep.py"],
+                    },
                 }
             )
             task_data["payload"] = json.dumps(payload)
@@ -892,7 +903,9 @@ class TestRuntimeWebSocketLoop(unittest.TestCase):
         instructions, adapter_task_data = adapter_mock.call_args.args
         self.assertIn("Additional local workspace context:", instructions)
         self.assertIn("Local workspace path:", instructions)
+        self.assertIn("Hunk-centered local context pack", instructions)
         self.assertIn("live_sync_context", instructions)
+        self.assertIn("test_live_sync_context", instructions)
         self.assertEqual(
             adapter_task_data["task"]["inputs"]["github"]["local_workspace_path"],
             tmpdir,
@@ -1274,10 +1287,38 @@ class TestWorkspaceReviewContext(unittest.TestCase):
             wm = mep_runtime.WorkspaceManager(tmp)
             ctx = wm.build_review_context(tmp, ["bridge/big.py"])
 
-        self.assertIn("Full contents of changed files", ctx)
+        self.assertIn("Full contents fallback for changed files", ctx)
         self.assertIn("line_0 = 0", ctx)
         # The tail of a >700 char file must be present: earlier excerpt logic clipped it.
         self.assertIn("line_199 = 199", ctx)
+
+    def test_build_review_context_prioritizes_changed_identifiers_and_tests(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            os.makedirs(os.path.join(tmp, "bridge"), exist_ok=True)
+            os.makedirs(os.path.join(tmp, "tests"), exist_ok=True)
+            with open(os.path.join(tmp, "bridge", "github_to_mep.py"), "w", encoding="utf-8") as handle:
+                handle.write(
+                    "def untouched_helper():\n    return False\n\n"
+                    "def build_review_context():\n    focus_value = 'ready'\n    return focus_value\n"
+                )
+            with open(os.path.join(tmp, "tests", "test_bridge_review.py"), "w", encoding="utf-8") as handle:
+                handle.write("def test_build_review_context():\n    assert True\n")
+
+            wm = mep_runtime.WorkspaceManager(tmp)
+            ctx = wm.build_review_context(
+                tmp,
+                ["bridge/github_to_mep.py", "tests/test_bridge_review.py"],
+                touched_tests=["tests/test_bridge_review.py"],
+                risk_pack={
+                    "changed_identifiers": ["build_review_context", "focus_value"],
+                    "touched_non_test_paths": ["bridge/github_to_mep.py"],
+                },
+            )
+
+        self.assertIn("Hunk-centered local context pack", ctx)
+        self.assertIn("build_review_context", ctx)
+        self.assertIn("focus_value", ctx)
+        self.assertIn("test_build_review_context", ctx)
 
     def test_build_verification_report_disabled_by_default(self):
         with (
