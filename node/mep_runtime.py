@@ -444,6 +444,54 @@ def _task_is_approval_review(task_data: dict[str, Any]) -> bool:
     return _review_intent_type(task_data) == "code.review.approve"
 
 
+def _review_lenses_for_task(task_data: dict[str, Any]) -> list[str]:
+    github_inputs = _review_github_inputs(task_data)
+    touched_paths = _clean_review_list(github_inputs.get("touched_paths"), max_items=8, max_chars=120)
+    touched_tests = _clean_review_list(github_inputs.get("touched_tests"), max_items=6, max_chars=120)
+    risk_pack = github_inputs.get("risk_pack")
+    risk_pack = risk_pack if isinstance(risk_pack, dict) else {}
+
+    signal_parts: list[str] = []
+    for collection in (
+        touched_paths,
+        touched_tests,
+        _clean_review_list(risk_pack.get("changed_identifiers"), max_items=12, max_chars=80),
+        _clean_review_list(risk_pack.get("touched_non_test_paths"), max_items=8, max_chars=120),
+    ):
+        signal_parts.extend(collection)
+    signal_blob = " ".join(part.lower() for part in signal_parts if part)
+
+    lenses: list[str] = []
+
+    def _add_lens(label: str) -> None:
+        if label and label not in lenses:
+            lenses.append(label)
+
+    _add_lens("correctness/regression around the changed behavior")
+    if touched_tests:
+        _add_lens("test alignment and edge-case coverage for the changed behavior")
+    else:
+        _add_lens("missing or misaligned test coverage for the changed behavior")
+
+    if any(token in signal_blob for token in ("auth", "token", "permission", "signature", "webhook", "bridge", "github", "identity", "verify", "approval")):
+        _add_lens("security/trust-boundary regressions and approval safety")
+    if any(token in signal_blob for token in ("async", "await", "lock", "queue", "session", "retry", "timeout", "poll", "heartbeat", "call_relay", "ws", "websocket")):
+        _add_lens("state transitions, retry paths, async sequencing, or concurrency hazards")
+    if any(token in signal_blob for token in ("db", "schema", "migration", "storage", "persist", "json", "serialize", "deserialize", "ledger", "backfill", "model")):
+        _add_lens("data persistence, migration, compatibility, or serialization drift")
+    if any(path.lower().startswith("bridge/") for path in touched_paths):
+        _add_lens("automation/writeback safety and path-to-action mismatches")
+    if len(lenses) < 4:
+        _add_lens("API contract, validation, and fallback-path drift")
+    return lenses[:5]
+
+
+def _candidate_priority_rank(priority: str) -> int:
+    normalized = str(priority or "").strip().lower()
+    order = {"critical": 0, "high": 1, "medium": 2, "low": 3}
+    return order.get(normalized, order["medium"])
+
+
 def _clean_review_list(values: Any, *, max_items: int, max_chars: int) -> list[str]:
     if not isinstance(values, list):
         return []
@@ -544,8 +592,11 @@ def _candidate_system_prompt_for_task(task_data: dict[str, Any], *, review_max_c
         "You are the candidate-generation pass for a MEP GitHub code review. "
         "Scan the supplied PR context, diff excerpts, risk pack, workspace context, and verification output. "
         "Return ONLY a JSON object with this schema: "
-        '{"risk_candidates": [{"file": string, "claim": string, "reason": string}], "coverage": [string]}. '
-        "Generate at most 3 candidate risks. Each candidate must be concrete, tied to a changed file, and phrased as a potential bug or regression worth verifying. "
+        '{"risk_candidates": [{"file": string, "category": string, "priority": "high" | "medium" | "low", "claim": string, "reason": string, "evidence": [string]}], "coverage": [string]}. '
+        "Generate at most 4 candidate risks. Use the supplied review lenses to diversify the search space. "
+        "Prefer at most one candidate per lens, rank the highest-impact candidate first, and bias toward correctness, trust-boundary, state-transition, rollback, migration, and test-gap risks over style comments. "
+        "Each candidate must be concrete, tied to a changed file, and phrased as a potential bug or regression worth verifying. "
+        "Use `evidence` for 1-3 exact identifiers, tests, or changed behaviors from the supplied context that make the hypothesis worth verifying. "
         "Do not summarize the PR. Do not give praise. Do not include chain-of-thought. "
         "If nothing looks risky enough to verify, return an empty `risk_candidates` list and use `coverage` to note what you inspected."
     )
@@ -559,6 +610,8 @@ def _verification_system_prompt_for_task(task_data: dict[str, Any], *, review_ma
         f"{base} This is the verification pass. The user message may include provisional candidate risks from an earlier pass. "
         "Treat those candidates as hypotheses only. Promote a candidate into `findings` only when the supplied diff, workspace context, tests, or verification output directly support it. "
         "For every published finding, set `file` to one of the supplied touched paths and include at least one exact changed-line identifier in `verified_identifiers` that supports the claim. "
+        "Prefer the single highest-impact verified finding over multiple medium-signal findings. Publish a second finding only when it is independent, well-supported, and similarly important. "
+        "Downgrade or discard candidates that are weakly evidenced, redundant with a stronger finding, or true but too low-value to be a meaningful review comment. "
         "Reject any candidate that relies only on nearby file context, naming similarity, or speculation. "
         "If no candidate survives verification, keep `findings` empty, explain the checks you performed, and explicitly state why no finding is warranted."
     )
@@ -635,26 +688,61 @@ def _extract_review_candidates(text: str) -> list[dict[str, str]]:
     raw_candidates = parsed.get("risk_candidates")
     if not isinstance(raw_candidates, list):
         return []
-    cleaned: list[dict[str, str]] = []
+    cleaned: list[tuple[int, dict[str, Any]]] = []
     seen: set[tuple[str, str]] = set()
-    for item in raw_candidates[:3]:
+    for index, item in enumerate(raw_candidates[:4]):
         if not isinstance(item, dict):
             continue
         file_name = _clean_review_label(item.get("file"), max_chars=120)
+        category = _clean_review_label(item.get("category"), max_chars=80) or "correctness/regression"
+        priority = _clean_review_label(item.get("priority"), max_chars=20).lower() or "medium"
+        if priority not in {"critical", "high", "medium", "low"}:
+            priority = "medium"
         claim = _clean_review_text(item.get("claim"), max_chars=220)
         reason = _clean_review_text(item.get("reason"), max_chars=240)
+        evidence = _clean_review_list(item.get("evidence"), max_items=3, max_chars=120)
         if not claim:
             continue
         key = (file_name.lower(), claim.lower())
         if key in seen:
             continue
         seen.add(key)
-        cleaned.append({"file": file_name, "claim": claim, "reason": reason})
-    return cleaned
+        cleaned.append(
+            (
+                index,
+                {
+                    "file": file_name,
+                    "category": category,
+                    "priority": priority,
+                    "claim": claim,
+                    "reason": reason,
+                    "evidence": evidence,
+                },
+            )
+        )
+    cleaned.sort(key=lambda entry: (_candidate_priority_rank(entry[1]["priority"]), entry[0]))
+    return [entry[1] for entry in cleaned]
 
 
-def _candidate_payload_for_verification(payload: str, candidates: list[dict[str, str]]) -> str:
+def _payload_with_review_lenses(payload: str, review_lenses: list[str]) -> str:
     base = (payload or "").strip()
+    if not review_lenses:
+        return base
+    lenses_json = json.dumps({"review_lenses": review_lenses}, ensure_ascii=True)
+    return (
+        f"{base}\n\n"
+        "Review lenses to cover before publishing:\n"
+        f"{lenses_json}"
+    ).strip()
+
+
+def _candidate_payload_for_verification(
+    payload: str,
+    candidates: list[dict[str, Any]],
+    *,
+    review_lenses: list[str],
+) -> str:
+    base = _payload_with_review_lenses(payload, review_lenses)
     if not candidates:
         return base
     candidate_json = json.dumps({"risk_candidates": candidates}, ensure_ascii=True)
@@ -672,9 +760,11 @@ def _run_two_pass_review(
     review_max_chars: int,
     invoke_model: Any,
 ) -> str:
-    candidate_reply = invoke_model(_candidate_system_prompt_for_task(task_data, review_max_chars=review_max_chars), payload)
+    review_lenses = _review_lenses_for_task(task_data)
+    candidate_payload = _payload_with_review_lenses(payload, review_lenses)
+    candidate_reply = invoke_model(_candidate_system_prompt_for_task(task_data, review_max_chars=review_max_chars), candidate_payload)
     candidates = _extract_review_candidates(candidate_reply)
-    verification_payload = _candidate_payload_for_verification(payload, candidates)
+    verification_payload = _candidate_payload_for_verification(payload, candidates, review_lenses=review_lenses)
     final_reply = invoke_model(_verification_system_prompt_for_task(task_data, review_max_chars=review_max_chars), verification_payload)
     rendered = _render_structured_review_with_task_data(final_reply, max_chars=review_max_chars, task_data=task_data)
     if rendered:
