@@ -2540,6 +2540,66 @@ class GitHubToMEPBridgeService:
                 return True, "summary_without_risk_coverage"
         return False, "concrete"
 
+    @staticmethod
+    def _cleanup_review_detail(detail: str) -> str:
+        cleaned = str(detail or "").replace("\r\n", "\n").strip()
+        cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+        return cleaned.strip()
+
+    @classmethod
+    def _sanitize_review_detail_for_reason(cls, detail: Optional[str], reason: Optional[str]) -> str:
+        text = str(detail or "").strip()
+        if not text or not reason:
+            return text
+        sanitized = text
+        if reason in {"generic_observation", "observation_in_context_only"}:
+            sanitized = re.sub(r"(?im)^\s*Observation:\s*.+(?:\n|$)", "", sanitized)
+        elif reason in {"ungrounded_finding", "finding_in_context_only", "speculative_finding"}:
+            sanitized = re.sub(r"(?im)^\s*\d+\.\s+\*\*.+(?:\n|$)", "", sanitized)
+            sanitized = re.sub(r"(?im)^##\s*Review Findings\b", "## Review Summary", sanitized, count=1)
+        elif reason == "summary_without_changed_behavior_evidence":
+            sanitized = re.sub(r"(?im)^\s*Why no finding:\s*.+(?:\n|$)", "", sanitized)
+        return cls._cleanup_review_detail(sanitized)
+
+    def _attempt_review_writeback_salvage(
+        self,
+        execution: dict[str, Any],
+        detail: Optional[str],
+        *,
+        action: str,
+        suppression_reason: Optional[str],
+    ) -> Optional[tuple[str, dict[str, Any], int, list[str]]]:
+        if action == "approved":
+            return None
+        sanitized = self._sanitize_review_detail_for_reason(detail, suppression_reason)
+        if not sanitized or sanitized == str(detail or "").strip():
+            return None
+        snapshot = self._build_review_snapshot(execution, sanitized)
+        suppress, reason = self._classify_review_writeback_detail(
+            execution,
+            sanitized,
+            snapshot=snapshot,
+            action=action,
+        )
+        score, reasons = self._score_review_quality(snapshot, action=action)
+        if suppress:
+            reviewability = snapshot.get("reviewability") or {}
+            reviewability_bucket = str(reviewability.get("bucket") or "standard").strip().lower()
+            anchored_paths = snapshot.get("anchored_paths") or set()
+            has_findings = bool(snapshot.get("has_findings"))
+            checks_performed = snapshot.get("checks_performed") or []
+            risk_areas_checked = snapshot.get("risk_areas_checked") or []
+            why_no_finding = str(snapshot.get("why_no_finding") or "").strip()
+            if (
+                reviewability_bucket == "standard"
+                and anchored_paths
+                and not has_findings
+                and (checks_performed or risk_areas_checked or why_no_finding)
+            ):
+                return sanitized, snapshot, score, reasons
+            return None
+        return sanitized, snapshot, score, reasons
+
     def _record_github_writeback_attempt(self, action: str, detail: Optional[str]) -> None:
         metrics = self.github_writeback_metrics
         metrics["attempts"] += 1
@@ -2897,11 +2957,12 @@ class GitHubToMEPBridgeService:
         review_action = entity_type == "pr" and action in review_events
         self._record_github_writeback_attempt(action, update.detail)
         review_result: Optional[dict[str, Any]] = None
+        detail_to_publish = update.detail
         if review_action:
-            snapshot = self._build_review_snapshot(execution, update.detail)
+            snapshot = self._build_review_snapshot(execution, detail_to_publish)
             suppress, reason = self._classify_review_writeback_detail(
                 execution,
-                update.detail,
+                detail_to_publish,
                 snapshot=snapshot,
                 action=action,
             )
@@ -2910,6 +2971,18 @@ class GitHubToMEPBridgeService:
             if not suppress and action == "approved":
                 reason = self._approval_quality_failure(snapshot, score)
                 suppress = reason is not None
+            if suppress:
+                salvaged = self._attempt_review_writeback_salvage(
+                    execution,
+                    detail_to_publish,
+                    action=action,
+                    suppression_reason=reason,
+                )
+                if salvaged is not None:
+                    detail_to_publish, snapshot, score, reasons = salvaged
+                    suppress = False
+                    reason = None
+                    self._record_review_quality(score, reasons)
             if suppress:
                 review_result = self._build_review_trial_result(
                     execution,
@@ -2932,13 +3005,13 @@ class GitHubToMEPBridgeService:
         body = self._render_github_writeback_body(
             str(execution.get("bridge_id") or update.bridge_id),
             action,
-            update.detail,
+            detail_to_publish,
             target_alias=str(execution.get("target_alias") or "").strip() or None,
         )
         if review_action:
             inline_comments: list[dict[str, Any]] = []
             if action != "approved":
-                inline_comments = self._inline_review_comments(update.detail, snapshot.get("review_package") or {})
+                inline_comments = self._inline_review_comments(detail_to_publish, snapshot.get("review_package") or {})
             self._submit_github_review(
                 repo_full_name,
                 number,

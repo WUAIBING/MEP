@@ -1613,6 +1613,65 @@ class TestGitHubToMEPBridge(unittest.TestCase):
         self.assertEqual(len(self.github_session.posts), 0)
         self.assertEqual(self.service.github_writeback_metrics["last_suppressed_reason"], "generic_observation")
 
+    def test_status_callback_salvages_generic_observation_into_publishable_summary(self):
+        self._set_pr_review_package(
+            [
+                {
+                    "filename": "hub/auth.py",
+                    "status": "modified",
+                    "patch": (
+                        "@@ -88,0 +88,7 @@\n"
+                        "+def verify_signature(payload: str, signature: str) -> bool:\n"
+                        "+    nonce = _evict_expired_nonces()\n"
+                    ),
+                },
+                {
+                    "filename": "hub/models.py",
+                    "status": "modified",
+                    "patch": (
+                        "@@ -10,0 +10,5 @@\n"
+                        "+class NodeRegistration(BaseModel):\n"
+                        "+    validator = field_validator('callback_url')\n"
+                    ),
+                },
+            ],
+            pr_body="Adds replay protection and validator hardening.",
+        )
+        response = self._post_webhook(
+            _issue_comment_payload("@Hub-Sentinel review this PR", delivery_number=245),
+            delivery_id="delivery-salvage-generic-observation",
+        )
+        self.assertEqual(response.status_code, 200)
+        bridge_id = response.json()["bridge_id"]
+        self._flush_context(response.json()["context_id"])
+
+        token = self.service._generate_status_token(bridge_id, "node_target")
+        status_response = self.client.post(
+            "/bridge/status",
+            json={
+                "bridge_id": bridge_id,
+                "status": "completed",
+                "target_node_id": "node_target",
+                "task_id": "task-salvage-generic-observation",
+                "detail": (
+                    "## Review Summary\n\n"
+                    "The PR adds replay-protection and validation hardening across the authentication and model layers.\n\n"
+                    "Observation: The change looks coherent and follows the surrounding style.\n\n"
+                    "Touched paths reviewed: `hub/auth.py`, `hub/models.py`\n\n"
+                    "Risk areas checked: replay protection, validator coverage\n\n"
+                    "Checks performed: reviewed the changed diff for `hub/auth.py` and `hub/models.py`, checked the new `verify_signature` and `NodeRegistration` paths\n\n"
+                    "Why no finding: The added `verify_signature` and `NodeRegistration` validation paths look internally consistent with the changed behavior."
+                ),
+            },
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        self.assertEqual(status_response.status_code, 200, status_response.text)
+        self.assertEqual(len(self.github_session.posts), 1)
+        review_payload = self.github_session.posts[0]["json"]
+        self.assertEqual(review_payload["event"], "COMMENT")
+        self.assertIn("## Review Summary", review_payload["body"])
+        self.assertEqual(self.service.github_writeback_metrics["last_suppressed_reason"], None)
+
     def test_status_callback_suppresses_finding_conflicting_with_patch_evidence(self):
         self._set_pr_review_package(
             [
@@ -1673,6 +1732,68 @@ class TestGitHubToMEPBridge(unittest.TestCase):
         self.assertEqual(status_response.status_code, 200, status_response.text)
         self.assertEqual(len(self.github_session.posts), 0)
         self.assertEqual(self.service.github_writeback_metrics["last_suppressed_reason"], "ungrounded_finding")
+
+    def test_status_callback_salvages_ungrounded_finding_into_publishable_summary(self):
+        self._set_pr_review_package(
+            [
+                {
+                    "filename": "hub/db.py",
+                    "status": "modified",
+                    "patch": (
+                        "@@ -120,0 +120,8 @@\n"
+                        "+def get_pending_tasks_for_provider(provider: str):\n"
+                        "+    conn = _get_conn()\n"
+                        "+    return _select_pending(conn, provider)\n"
+                    ),
+                },
+                {
+                    "filename": "tests/test_hub_api.py",
+                    "status": "modified",
+                    "patch": (
+                        "@@ -779,0 +779,6 @@\n"
+                        '+response = client.get("/tasks/pending/provider")\n'
+                        "+self.assertEqual(response.status_code, 200)\n"
+                    ),
+                },
+            ],
+            pr_body="Adds provider pending-task retrieval and focused endpoint coverage.",
+        )
+        response = self._post_webhook(
+            _issue_comment_payload("@Hub-Sentinel review this PR", delivery_number=246),
+            delivery_id="delivery-salvage-ungrounded-finding",
+        )
+        self.assertEqual(response.status_code, 200)
+        bridge_id = response.json()["bridge_id"]
+        self._flush_context(response.json()["context_id"])
+
+        token = self.service._generate_status_token(bridge_id, "node_target")
+        status_response = self.client.post(
+            "/bridge/status",
+            json={
+                "bridge_id": bridge_id,
+                "status": "completed",
+                "target_node_id": "node_target",
+                "task_id": "task-salvage-ungrounded-finding",
+                "detail": (
+                    "## Review Findings\n\n"
+                    "The PR adds provider pending-task retrieval and endpoint coverage.\n\n"
+                    "Touched paths reviewed: `hub/db.py`, `tests/test_hub_api.py`\n\n"
+                    "Risk areas checked: connection lifecycle, endpoint coverage\n\n"
+                    "Checks performed: reviewed the changed diff for `hub/db.py`, checked the new `get_pending_tasks_for_provider` path and test coverage\n\n"
+                    "Why no finding: The changed `get_pending_tasks_for_provider` flow and coverage look consistent aside from the unsupported claim below.\n\n"
+                    "1. **Authentication is missing from the provider endpoint.** (`hub/db.py`): The patch adds a provider helper without any `verify_request` dependency."
+                ),
+            },
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        self.assertEqual(status_response.status_code, 200, status_response.text)
+        self.assertEqual(len(self.github_session.posts), 1)
+        review_payload = self.github_session.posts[0]["json"]
+        self.assertEqual(review_payload["event"], "COMMENT")
+        self.assertIn("## Review Summary", review_payload["body"])
+        self.assertNotIn("## Review Findings", review_payload["body"])
+        self.assertNotIn("1. **Authentication is missing", review_payload["body"])
+        self.assertEqual(self.service.github_writeback_metrics["last_suppressed_reason"], None)
 
     def test_status_callback_allows_finding_grounded_to_touched_path_and_patch(self):
         self._set_pr_review_package(
