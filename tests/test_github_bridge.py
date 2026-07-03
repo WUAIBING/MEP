@@ -1050,10 +1050,13 @@ class TestGitHubToMEPBridge(unittest.TestCase):
         response = self.client.get("/bridge/review-benchmarks")
         self.assertEqual(response.status_code, 200, response.text)
         payload = response.json()
-        self.assertGreaterEqual(payload["count"], 5)
+        self.assertGreaterEqual(payload["count"], 6)
         self.assertIn("phase6_precision", payload["suites"])
+        self.assertIn("phase8_stability", payload["suites"])
+        self.assertEqual(payload["phase8_stability_targets"]["max_non_green_approval_publish_count"], 0)
         first_ids = {item["id"] for item in payload["items"]}
         self.assertIn("docs_only_precision", first_ids)
+        self.assertIn("stability_guardrails", first_ids)
 
         filtered_response = self.client.get("/bridge/review-benchmarks?suite=phase6_precision")
         self.assertEqual(filtered_response.status_code, 200, filtered_response.text)
@@ -1062,6 +1065,125 @@ class TestGitHubToMEPBridge(unittest.TestCase):
             {item["suite"] for item in filtered["items"]},
             {"phase6_precision"},
         )
+
+    def test_review_trial_summary_reports_phase8_stability_guardrails(self):
+        summary = self.service._summarize_review_trials(  # noqa: SLF001
+            [
+                {
+                    "intent_type": "code.review.request",
+                    "review_result": {
+                        "attempted_action": "reviewed",
+                        "resolved_action": "reviewed",
+                        "published": True,
+                        "suppressed": False,
+                        "quality_score": 8,
+                        "reviewability_bucket": "standard",
+                        "ci_state": "green",
+                        "intent_type": "code.review.request",
+                    },
+                },
+                {
+                    "intent_type": "code.review.request",
+                    "review_result": {
+                        "attempted_action": "reviewed",
+                        "resolved_action": "suppressed",
+                        "published": False,
+                        "suppressed": True,
+                        "quality_score": 8,
+                        "reviewability_bucket": "low_signal",
+                        "ci_state": "green",
+                        "intent_type": "code.review.request",
+                    },
+                },
+                {
+                    "intent_type": "code.review.approve",
+                    "review_result": {
+                        "attempted_action": "approved",
+                        "resolved_action": "approved",
+                        "published": True,
+                        "suppressed": False,
+                        "quality_score": 9,
+                        "reviewability_bucket": "standard",
+                        "ci_state": "green",
+                        "intent_type": "code.review.approve",
+                    },
+                },
+                {
+                    "intent_type": "code.review.approve",
+                    "review_result": {
+                        "attempted_action": "approved",
+                        "resolved_action": "suppressed",
+                        "published": False,
+                        "suppressed": True,
+                        "quality_score": 9,
+                        "reviewability_bucket": "standard",
+                        "ci_state": "failing",
+                        "intent_type": "code.review.approve",
+                    },
+                },
+            ]
+        )
+
+        stability = summary["phase8_stability"]
+        self.assertEqual(stability["standard_review_publish_rate"], 1.0)
+        self.assertEqual(stability["low_signal_review_suppression_rate"], 1.0)
+        self.assertEqual(stability["green_approval_publish_rate"], 1.0)
+        self.assertEqual(stability["non_green_approval_suppression_rate"], 1.0)
+        self.assertEqual(stability["quality_score_bands"], {"9_plus": 2, "8": 2, "below_8": 0})
+        self.assertEqual(stability["stability_alerts"], [])
+        self.assertTrue(stability["meets_phase8_guardrails"])
+
+    def test_review_trial_summary_flags_phase8_stability_regressions(self):
+        summary = self.service._summarize_review_trials(  # noqa: SLF001
+            [
+                {
+                    "intent_type": "code.review.request",
+                    "review_result": {
+                        "attempted_action": "reviewed",
+                        "resolved_action": "suppressed",
+                        "published": False,
+                        "suppressed": True,
+                        "quality_score": 7,
+                        "reviewability_bucket": "standard",
+                        "ci_state": "green",
+                        "intent_type": "code.review.request",
+                    },
+                },
+                {
+                    "intent_type": "code.review.request",
+                    "review_result": {
+                        "attempted_action": "reviewed",
+                        "resolved_action": "reviewed",
+                        "published": True,
+                        "suppressed": False,
+                        "quality_score": 8,
+                        "reviewability_bucket": "low_signal",
+                        "ci_state": "green",
+                        "intent_type": "code.review.request",
+                    },
+                },
+                {
+                    "intent_type": "code.review.approve",
+                    "review_result": {
+                        "attempted_action": "approved",
+                        "resolved_action": "approved",
+                        "published": True,
+                        "suppressed": False,
+                        "quality_score": 8,
+                        "reviewability_bucket": "standard",
+                        "ci_state": "failing",
+                        "intent_type": "code.review.approve",
+                    },
+                },
+            ]
+        )
+
+        stability = summary["phase8_stability"]
+        self.assertFalse(stability["meets_phase8_guardrails"])
+        self.assertIn("standard_reviews_suppressed", stability["stability_alerts"])
+        self.assertIn("low_signal_reviews_published", stability["stability_alerts"])
+        self.assertIn("non_green_approvals_published", stability["stability_alerts"])
+        self.assertIn("avg_quality_below_phase8_target", stability["stability_alerts"])
 
     def test_review_trials_feedback_endpoint_records_feedback_and_summary(self):
         checks_payload = {

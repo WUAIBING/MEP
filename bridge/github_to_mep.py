@@ -69,7 +69,23 @@ REVIEW_BENCHMARK_SCENARIOS = [
         "goal": "Track PRs seeded with known regressions so missed findings are labeled and measured against baseline.",
         "expected_focus": ["missed_issue", "recall", "risk_pack"],
     },
+    {
+        "id": "stability_guardrails",
+        "suite": "phase8_stability",
+        "title": "Behavior stability guardrails",
+        "goal": "Keep standard reviews publishable, docs-only reviews suppressible, and approval behavior stable across green vs non-green CI.",
+        "expected_focus": ["stability", "consistency", "approval_safety", "suppression_precision"],
+    },
 ]
+PHASE8_STABILITY_TARGETS = {
+    "min_standard_review_publish_rate": 1.0,
+    "max_standard_review_suppressed_count": 0,
+    "max_low_signal_review_publish_count": 0,
+    "min_low_signal_suppression_rate": 1.0,
+    "min_green_approval_publish_rate": 1.0,
+    "max_non_green_approval_publish_count": 0,
+    "min_avg_quality_score": 8.0,
+}
 _WEAK_GITHUB_REVIEW_PATTERNS = [
     r"\blooks good\b",
     r"\blooks correct\b",
@@ -3159,6 +3175,7 @@ class GitHubToMEPBridgeService:
             "count": len(items),
             "items": items,
             "suites": dict(sorted(suites.items())),
+            "phase8_stability_targets": dict(PHASE8_STABILITY_TARGETS),
         }
 
     @staticmethod
@@ -3222,6 +3239,17 @@ class GitHubToMEPBridgeService:
         retry_queued_count = 0
         feedback_pending_count = 0
         quality_scores: list[int] = []
+        standard_review_trials = 0
+        standard_review_published_count = 0
+        standard_review_suppressed_count = 0
+        low_signal_review_trials = 0
+        low_signal_review_suppressed_count = 0
+        low_signal_review_published_count = 0
+        green_approval_trials = 0
+        green_approval_published_count = 0
+        non_green_approval_trials = 0
+        non_green_approval_suppressed_count = 0
+        non_green_approval_published_count = 0
         for item in items:
             target_alias = str(item.get("target_alias") or "").strip()
             if target_alias:
@@ -3243,6 +3271,37 @@ class GitHubToMEPBridgeService:
             quality_score = review_result.get("quality_score")
             if isinstance(quality_score, (int, float)):
                 quality_scores.append(int(quality_score))
+            attempted_action = str(review_result.get("attempted_action") or "").strip().lower()
+            intent_type = str(review_result.get("intent_type") or item.get("intent_type") or "").strip().lower()
+            reviewability_bucket = str(review_result.get("reviewability_bucket") or "standard").strip().lower()
+            ci_state = str(review_result.get("ci_state") or "none").strip().lower()
+            published = bool(review_result.get("published"))
+            suppressed = bool(review_result.get("suppressed"))
+            is_approval_trial = attempted_action == "approved" or intent_type.endswith(".approve")
+            if is_approval_trial:
+                if ci_state == "green":
+                    green_approval_trials += 1
+                    if published:
+                        green_approval_published_count += 1
+                elif ci_state in {"pending", "failing"}:
+                    non_green_approval_trials += 1
+                    if suppressed:
+                        non_green_approval_suppressed_count += 1
+                    if published:
+                        non_green_approval_published_count += 1
+            elif review_result:
+                if reviewability_bucket == "low_signal":
+                    low_signal_review_trials += 1
+                    if suppressed:
+                        low_signal_review_suppressed_count += 1
+                    if published:
+                        low_signal_review_published_count += 1
+                else:
+                    standard_review_trials += 1
+                    if published:
+                        standard_review_published_count += 1
+                    if suppressed:
+                        standard_review_suppressed_count += 1
             verdict = str(review_feedback.get("verdict") or "").strip().lower()
             if verdict:
                 feedback_verdicts[verdict] += 1
@@ -3254,14 +3313,65 @@ class GitHubToMEPBridgeService:
         feedback_count = sum(feedback_verdicts.values())
         useful_count = int(feedback_verdicts.get("useful") or 0)
         avg_quality_score = round(sum(quality_scores) / len(quality_scores), 2) if quality_scores else 0.0
+        min_quality_score = min(quality_scores) if quality_scores else None
+        max_quality_score = max(quality_scores) if quality_scores else None
         useful_rate = round(useful_count / feedback_count, 4) if feedback_count else None
         label_coverage = round(feedback_count / (feedback_count + feedback_pending_count), 4) if (feedback_count + feedback_pending_count) else None
+        quality_bands = {
+            "9_plus": sum(1 for score in quality_scores if score >= 9),
+            "8": sum(1 for score in quality_scores if score == 8),
+            "below_8": sum(1 for score in quality_scores if score < 8),
+        }
+
+        def _rate(numerator: int, denominator: int) -> Optional[float]:
+            return round(numerator / denominator, 4) if denominator else None
+
+        standard_review_publish_rate = _rate(standard_review_published_count, standard_review_trials)
+        low_signal_review_suppression_rate = _rate(low_signal_review_suppressed_count, low_signal_review_trials)
+        green_approval_publish_rate = _rate(green_approval_published_count, green_approval_trials)
+        non_green_approval_suppression_rate = _rate(non_green_approval_suppressed_count, non_green_approval_trials)
+
+        stability_alerts: list[str] = []
+        if standard_review_suppressed_count:
+            stability_alerts.append("standard_reviews_suppressed")
+        if low_signal_review_published_count:
+            stability_alerts.append("low_signal_reviews_published")
+        if green_approval_trials and green_approval_published_count < green_approval_trials:
+            stability_alerts.append("green_approvals_not_published")
+        if non_green_approval_published_count:
+            stability_alerts.append("non_green_approvals_published")
+        if quality_scores and avg_quality_score < float(PHASE8_STABILITY_TARGETS["min_avg_quality_score"]):
+            stability_alerts.append("avg_quality_below_phase8_target")
+        consistency_summary = {
+            "standard_review_trials": standard_review_trials,
+            "standard_review_published_count": standard_review_published_count,
+            "standard_review_suppressed_count": standard_review_suppressed_count,
+            "standard_review_publish_rate": standard_review_publish_rate,
+            "low_signal_review_trials": low_signal_review_trials,
+            "low_signal_review_suppressed_count": low_signal_review_suppressed_count,
+            "low_signal_review_published_count": low_signal_review_published_count,
+            "low_signal_review_suppression_rate": low_signal_review_suppression_rate,
+            "green_approval_trials": green_approval_trials,
+            "green_approval_published_count": green_approval_published_count,
+            "green_approval_publish_rate": green_approval_publish_rate,
+            "non_green_approval_trials": non_green_approval_trials,
+            "non_green_approval_suppressed_count": non_green_approval_suppressed_count,
+            "non_green_approval_published_count": non_green_approval_published_count,
+            "non_green_approval_suppression_rate": non_green_approval_suppression_rate,
+            "quality_score_bands": quality_bands,
+            "quality_score_min": min_quality_score,
+            "quality_score_max": max_quality_score,
+            "stability_alerts": stability_alerts,
+            "meets_phase8_guardrails": not stability_alerts,
+        }
         return {
             "total_trials": len(items),
             "published_count": published_count,
             "suppressed_count": suppressed_count,
             "retry_queued_count": retry_queued_count,
             "avg_quality_score": avg_quality_score,
+            "quality_score_min": min_quality_score,
+            "quality_score_max": max_quality_score,
             "resolved_actions": dict(sorted(resolved_actions.items())),
             "suppression_reasons": dict(sorted(suppression_reasons.items())),
             "feedback_verdicts": dict(sorted(feedback_verdicts.items())),
@@ -3271,6 +3381,7 @@ class GitHubToMEPBridgeService:
             "feedback_pending_count": feedback_pending_count,
             "feedback_label_coverage": label_coverage,
             "feedback_useful_rate": useful_rate,
+            "phase8_stability": consistency_summary,
         }
 
     async def _issue_retry_task(self, execution: dict[str, Any], reason: Optional[str]) -> bool:
