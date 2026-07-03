@@ -12,6 +12,7 @@ import uuid
 from collections import Counter
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from typing import Any, Optional
 
 import requests
@@ -40,6 +41,7 @@ REVIEW_BENCHMARK_SCENARIOS = [
         "title": "Docs-only suppression precision",
         "goal": "Verify that docs-only PRs are suppressed unless the reviewer cites a concrete behavioral issue.",
         "expected_focus": ["low_signal", "suppression", "no_finding"],
+        "fixture_issue_numbers": [131],
     },
     {
         "id": "config_env_precision",
@@ -61,6 +63,7 @@ REVIEW_BENCHMARK_SCENARIOS = [
         "title": "Approval evidence safety",
         "goal": "Require approvals to cite changed-line identifiers, touched tests, and green CI before publishing APPROVE.",
         "expected_focus": ["approval", "ci_gate", "changed_identifiers"],
+        "fixture_issue_numbers": [109, 123],
     },
     {
         "id": "missed_issue_recall",
@@ -68,6 +71,7 @@ REVIEW_BENCHMARK_SCENARIOS = [
         "title": "Known-risk recall",
         "goal": "Track PRs seeded with known regressions so missed findings are labeled and measured against baseline.",
         "expected_focus": ["missed_issue", "recall", "risk_pack"],
+        "fixture_issue_numbers": [101, 244],
     },
     {
         "id": "stability_guardrails",
@@ -75,6 +79,7 @@ REVIEW_BENCHMARK_SCENARIOS = [
         "title": "Behavior stability guardrails",
         "goal": "Keep standard reviews publishable, docs-only reviews suppressible, and approval behavior stable across green vs non-green CI.",
         "expected_focus": ["stability", "consistency", "approval_safety", "suppression_precision"],
+        "fixture_issue_numbers": [101, 244, 131, 109, 123],
     },
 ]
 PHASE8_STABILITY_TARGETS = {
@@ -330,6 +335,16 @@ class BridgeReviewFeedbackUpdate(BaseModel):
     benchmark_label: Optional[str] = Field(default=None, max_length=120)
     verdict: Optional[str] = Field(default=None, max_length=64)
     notes: Optional[str] = Field(default=None, max_length=2000)
+
+
+class BridgeReviewBatchLabelUpdate(BaseModel):
+    scenario_id: Optional[str] = Field(default=None, max_length=120)
+    label_prefix: Optional[str] = Field(default=None, max_length=80)
+    issue_numbers: Optional[list[int]] = Field(default=None, min_length=1, max_length=50)
+    target_alias: Optional[str] = Field(default=None, max_length=120)
+    verdict: Optional[str] = Field(default=None, max_length=64)
+    notes: Optional[str] = Field(default=None, max_length=2000)
+    search_limit: int = Field(default=100, ge=1, le=200)
 
 
 class BridgeRegistrationPendingApprovalError(RuntimeError):
@@ -3154,13 +3169,17 @@ class GitHubToMEPBridgeService:
                 continue
             if needs_feedback is False and not feedback_recorded:
                 continue
-            materialized = dict(item)
-            materialized["feedback_required"] = feedback_required
-            materialized["feedback_recorded"] = feedback_recorded
-            materialized["feedback_status"] = "labeled" if feedback_recorded else ("pending" if feedback_required else "not_applicable")
-            filtered.append(materialized)
+            filtered.append(self._materialize_review_trial(item))
+        total_count = len(filtered)
         items = filtered[: max(1, min(int(limit), 200))]
-        return {"status": "ok", "count": len(items), "items": items, "summary": self._summarize_review_trials(items)}
+        summary_items = filtered if normalized_label else items
+        return {
+            "status": "ok",
+            "count": len(items),
+            "total_count": total_count,
+            "items": items,
+            "summary": self._summarize_review_trials(summary_items),
+        }
 
     def list_review_benchmarks(self, *, suite: Optional[str] = None) -> dict[str, Any]:
         normalized_suite = self._normalize_feedback_text(suite, max_chars=120)
@@ -3184,6 +3203,13 @@ class GitHubToMEPBridgeService:
         return text[:max_chars]
 
     @staticmethod
+    def _normalize_benchmark_label_prefix(value: Optional[str], *, max_chars: int) -> str:
+        lowered = str(value or "").strip().lower()
+        normalized = re.sub(r"[^a-z0-9._-]+", "_", lowered)
+        normalized = re.sub(r"_+", "_", normalized).strip("._-")
+        return normalized[:max_chars]
+
+    @staticmethod
     def _normalize_feedback_verdict(value: Optional[str]) -> str:
         normalized = re.sub(r"[\s_-]+", "_", str(value or "")).strip().lower()
         allowed = {"useful", "not_useful", "false_positive", "missed_issue"}
@@ -3193,6 +3219,36 @@ class GitHubToMEPBridgeService:
             allowed_text = ", ".join(sorted(allowed))
             raise HTTPException(status_code=400, detail=f"Unsupported review feedback verdict. Allowed: {allowed_text}")
         return normalized
+
+    @classmethod
+    def _build_benchmark_run_label(cls, prefix: str) -> str:
+        normalized_prefix = cls._normalize_benchmark_label_prefix(prefix, max_chars=80)
+        if not normalized_prefix:
+            raise HTTPException(status_code=400, detail="Benchmark label prefix must include letters or numbers")
+        suffix = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        max_prefix_chars = max(1, 120 - len(suffix) - 1)
+        trimmed_prefix = normalized_prefix[:max_prefix_chars].rstrip("._-") or "benchmark_run"
+        return f"{trimmed_prefix}_{suffix}"
+
+    @staticmethod
+    def _materialize_review_trial(item: dict[str, Any]) -> dict[str, Any]:
+        materialized = dict(item)
+        review_result = materialized.get("review_result") or {}
+        feedback = materialized.get("review_feedback") or {}
+        feedback_recorded = bool(str(feedback.get("verdict") or "").strip())
+        feedback_required = bool(review_result)
+        materialized["feedback_required"] = feedback_required
+        materialized["feedback_recorded"] = feedback_recorded
+        materialized["feedback_status"] = "labeled" if feedback_recorded else ("pending" if feedback_required else "not_applicable")
+        return materialized
+
+    @classmethod
+    def _get_benchmark_scenario(cls, scenario_id: str) -> dict[str, Any]:
+        normalized_scenario_id = cls._normalize_feedback_text(scenario_id, max_chars=120)
+        for scenario in REVIEW_BENCHMARK_SCENARIOS:
+            if str(scenario.get("id") or "").strip() == normalized_scenario_id:
+                return dict(scenario)
+        raise HTTPException(status_code=404, detail=f"Unknown benchmark scenario: {normalized_scenario_id}")
 
     def record_review_feedback(self, bridge_id: str, update: BridgeReviewFeedbackUpdate, token: str) -> dict[str, Any]:
         self._verify_feedback_token(token)
@@ -3226,6 +3282,82 @@ class GitHubToMEPBridgeService:
             feedback["notes"] = str(existing.get("notes"))
         self.store.update_execution(bridge_id, review_feedback=feedback)
         return {"status": "ok", "bridge_id": bridge_id, "review_feedback": feedback}
+
+    def label_review_trials_batch(self, update: BridgeReviewBatchLabelUpdate, token: str) -> dict[str, Any]:
+        self._verify_feedback_token(token)
+        scenario_id = self._normalize_feedback_text(update.scenario_id, max_chars=120)
+        manual_issue_numbers = sorted({int(issue) for issue in (update.issue_numbers or []) if int(issue) > 0})
+        if scenario_id and manual_issue_numbers:
+            raise HTTPException(status_code=400, detail="Specify either scenario_id or issue_numbers, not both")
+        scenario: Optional[dict[str, Any]] = None
+        if scenario_id:
+            scenario = self._get_benchmark_scenario(scenario_id)
+            issue_numbers = [
+                int(issue)
+                for issue in scenario.get("fixture_issue_numbers") or []
+                if isinstance(issue, int) and issue > 0
+            ]
+            if not issue_numbers:
+                raise HTTPException(status_code=409, detail=f"Benchmark scenario {scenario_id} has no configured fixture issues")
+            label_prefix = self._normalize_feedback_text(update.label_prefix, max_chars=80) or scenario_id
+        else:
+            issue_numbers = manual_issue_numbers
+            label_prefix = self._normalize_feedback_text(update.label_prefix, max_chars=80)
+            if not label_prefix:
+                raise HTTPException(status_code=400, detail="label_prefix is required when scenario_id is not provided")
+        if not issue_numbers:
+            raise HTTPException(status_code=400, detail="issue_numbers must include at least one positive PR number")
+        normalized_target = _normalize_alias_key(update.target_alias)
+        verdict = self._normalize_feedback_verdict(update.verdict)
+        notes = self._normalize_feedback_text(update.notes, max_chars=2000)
+        benchmark_label = self._build_benchmark_run_label(label_prefix)
+        items = self.store.list_recent_review_trials(limit=update.search_limit)
+        latest_by_issue: dict[int, dict[str, Any]] = {}
+        for item in items:
+            issue_number = int(item.get("issue_number") or 0)
+            if issue_number not in issue_numbers or issue_number in latest_by_issue:
+                continue
+            if normalized_target and _normalize_alias_key(str(item.get("target_alias") or "")) != normalized_target:
+                continue
+            latest_by_issue[issue_number] = item
+        missing_issue_numbers = [issue for issue in issue_numbers if issue not in latest_by_issue]
+        if not latest_by_issue:
+            raise HTTPException(status_code=404, detail="No matching review trials found for the requested issues")
+
+        labeled_items: list[dict[str, Any]] = []
+        for issue_number in issue_numbers:
+            item = latest_by_issue.get(issue_number)
+            if item is None:
+                continue
+            existing = item.get("review_feedback") or {}
+            feedback: dict[str, Any] = {
+                "recorded_at": float(existing.get("recorded_at") or time.time()),
+                "updated_at": time.time(),
+                "benchmark_label": benchmark_label,
+            }
+            if verdict:
+                feedback["verdict"] = verdict
+            elif existing.get("verdict"):
+                feedback["verdict"] = str(existing.get("verdict"))
+            if notes:
+                feedback["notes"] = notes
+            elif existing.get("notes"):
+                feedback["notes"] = str(existing.get("notes"))
+            self.store.update_execution(str(item.get("bridge_id") or ""), review_feedback=feedback)
+            labeled_item = dict(item)
+            labeled_item["review_feedback"] = feedback
+            labeled_items.append(self._materialize_review_trial(labeled_item))
+
+        return {
+            "status": "ok",
+            "scenario_id": scenario_id or None,
+            "benchmark_label": benchmark_label,
+            "count": len(labeled_items),
+            "resolved_issue_numbers": issue_numbers,
+            "missing_issue_numbers": missing_issue_numbers,
+            "items": labeled_items,
+            "summary": self._summarize_review_trials(labeled_items),
+        }
 
     @staticmethod
     def _summarize_review_trials(items: list[dict[str, Any]]) -> dict[str, Any]:
@@ -3605,6 +3737,17 @@ def create_app(
         if not token and authorization and authorization.lower().startswith("bearer "):
             token = authorization.split(" ", 1)[1].strip()
         return bridge_service.record_review_feedback(bridge_id, update, token or "")
+
+    @app.post("/bridge/review-trials/batch-label")
+    async def bridge_review_batch_label(
+        update: BridgeReviewBatchLabelUpdate,
+        authorization: Optional[str] = Header(default=None),
+        x_bridge_feedback_token: Optional[str] = Header(default=None),
+    ) -> dict[str, Any]:
+        token = x_bridge_feedback_token
+        if not token and authorization and authorization.lower().startswith("bearer "):
+            token = authorization.split(" ", 1)[1].strip()
+        return bridge_service.label_review_trials_batch(update, token or "")
 
     return app
 

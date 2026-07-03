@@ -21,6 +21,7 @@ from bridge.github_to_mep import (  # noqa: E402
     BridgeStore,
     DefaultMEPSubmissionClient,
     GitHubToMEPBridgeService,
+    NormalizedGitHubEvent,
     create_app,
 )
 
@@ -1057,6 +1058,8 @@ class TestGitHubToMEPBridge(unittest.TestCase):
         first_ids = {item["id"] for item in payload["items"]}
         self.assertIn("docs_only_precision", first_ids)
         self.assertIn("stability_guardrails", first_ids)
+        phase8_item = next(item for item in payload["items"] if item["id"] == "stability_guardrails")
+        self.assertEqual(phase8_item["fixture_issue_numbers"], [101, 244, 131, 109, 123])
 
         filtered_response = self.client.get("/bridge/review-benchmarks?suite=phase6_precision")
         self.assertEqual(filtered_response.status_code, 200, filtered_response.text)
@@ -1324,10 +1327,22 @@ class TestGitHubToMEPBridge(unittest.TestCase):
         self.assertEqual(feedback_payload["review_feedback"]["benchmark_label"], "phase6c")
         self.assertEqual(feedback_payload["review_feedback"]["verdict"], "useful")
 
+        suppressed_feedback_response = self.client.post(
+            f"/bridge/review-trials/{suppressed_bridge_id}/feedback",
+            json={
+                "benchmark_label": "phase6c",
+                "verdict": "not_useful",
+                "notes": "Docs-only suppression stayed correctly fail-closed.",
+            },
+            headers={"Authorization": f"Bearer {self.config.status_secret}"},
+        )
+        self.assertEqual(suppressed_feedback_response.status_code, 200, suppressed_feedback_response.text)
+
         trials_response = self.client.get("/bridge/review-trials?limit=5")
         self.assertEqual(trials_response.status_code, 200, trials_response.text)
         payload = trials_response.json()
         self.assertEqual(payload["count"], 2)
+        self.assertEqual(payload["total_count"], 2)
         self.assertEqual(payload["summary"]["total_trials"], 2)
         self.assertEqual(payload["summary"]["published_count"], 1)
         self.assertEqual(payload["summary"]["suppressed_count"], 1)
@@ -1335,11 +1350,22 @@ class TestGitHubToMEPBridge(unittest.TestCase):
         self.assertEqual(payload["summary"]["resolved_actions"]["suppressed"], 1)
         self.assertEqual(payload["summary"]["suppression_reasons"]["low_signal_no_finding"], 1)
         self.assertEqual(payload["summary"]["feedback_verdicts"]["useful"], 1)
-        self.assertEqual(payload["summary"]["benchmark_labels"]["phase6c"], 1)
-        self.assertEqual(payload["summary"]["feedback_count"], 1)
-        self.assertEqual(payload["summary"]["feedback_pending_count"], 1)
-        self.assertEqual(payload["summary"]["feedback_label_coverage"], 0.5)
-        self.assertEqual(payload["summary"]["feedback_useful_rate"], 1.0)
+        self.assertEqual(payload["summary"]["feedback_verdicts"]["not_useful"], 1)
+        self.assertEqual(payload["summary"]["benchmark_labels"]["phase6c"], 2)
+        self.assertEqual(payload["summary"]["feedback_count"], 2)
+        self.assertEqual(payload["summary"]["feedback_pending_count"], 0)
+        self.assertEqual(payload["summary"]["feedback_label_coverage"], 1.0)
+        self.assertEqual(payload["summary"]["feedback_useful_rate"], 0.5)
+
+        label_filtered_response = self.client.get("/bridge/review-trials?limit=1&benchmark_label=phase6c")
+        self.assertEqual(label_filtered_response.status_code, 200, label_filtered_response.text)
+        label_filtered = label_filtered_response.json()
+        self.assertEqual(label_filtered["count"], 1)
+        self.assertEqual(label_filtered["total_count"], 2)
+        self.assertEqual(label_filtered["summary"]["total_trials"], 2)
+        self.assertEqual(label_filtered["summary"]["published_count"], 1)
+        self.assertEqual(label_filtered["summary"]["suppressed_count"], 1)
+        self.assertEqual(label_filtered["summary"]["benchmark_labels"]["phase6c"], 2)
 
         filtered_response = self.client.get(
             "/bridge/review-trials?limit=5&target_alias=Hub-Sentinel&benchmark_label=phase6c&verdict=useful"
@@ -1347,15 +1373,133 @@ class TestGitHubToMEPBridge(unittest.TestCase):
         self.assertEqual(filtered_response.status_code, 200, filtered_response.text)
         filtered = filtered_response.json()
         self.assertEqual(filtered["count"], 1)
+        self.assertEqual(filtered["total_count"], 1)
         self.assertEqual(filtered["items"][0]["bridge_id"], approved_bridge_id)
         self.assertEqual(filtered["items"][0]["review_feedback"]["verdict"], "useful")
 
         pending_response = self.client.get("/bridge/review-trials?limit=5&needs_feedback=true")
         self.assertEqual(pending_response.status_code, 200, pending_response.text)
         pending_payload = pending_response.json()
-        self.assertEqual(pending_payload["count"], 1)
-        self.assertEqual(pending_payload["items"][0]["bridge_id"], suppressed_bridge_id)
-        self.assertEqual(pending_payload["items"][0]["feedback_status"], "pending")
+        self.assertEqual(pending_payload["count"], 0)
+        self.assertEqual(pending_payload["total_count"], 0)
+
+    def test_review_trials_batch_label_endpoint_labels_latest_trial_per_issue(self):
+        def _seed_trial(
+            *,
+            bridge_id: str,
+            issue_number: int,
+            intent_type: str,
+            action: str,
+            published: bool,
+            suppressed: bool,
+            quality_score: int,
+            suppression_reason: Optional[str] = None,
+        ) -> None:
+            event = NormalizedGitHubEvent(
+                delivery_id=f"delivery-{bridge_id}",
+                source_event="issue_comment",
+                source_action="created",
+                repo_full_name="WUAIBING/MEP",
+                entity_type="pr",
+                number=issue_number,
+                title=f"PR {issue_number}",
+                url=f"https://example.test/pr/{issue_number}",
+                actor_login="moltbot",
+                author_association="COLLABORATOR",
+                context_id=f"github-WUAIBING-MEP-pr-{issue_number}-{bridge_id}",
+                imperative_verb="review" if intent_type == "code.review.request" else "approve",
+                intent_type=intent_type,
+                instructions="seeded test execution",
+                raw_trigger_text="@Hub-Sentinel review this PR",
+                github_inputs={"pull_request": {"number": issue_number}},
+            )
+            self.store.create_execution(
+                event,
+                bridge_id,
+                "node_target",
+                target_alias="Hub-Sentinel",
+                instructions=event.instructions,
+            )
+            self.store.update_execution(
+                bridge_id,
+                status="completed",
+                action=action,
+                review_result={
+                    "resolved_action": action,
+                    "published": published,
+                    "suppressed": suppressed,
+                    "retry_queued": False,
+                    "quality_score": quality_score,
+                    "suppression_reason": suppression_reason,
+                },
+            )
+
+        _seed_trial(
+            bridge_id="br-old-101",
+            issue_number=101,
+            intent_type="code.review.request",
+            action="suppressed",
+            published=False,
+            suppressed=True,
+            quality_score=6,
+            suppression_reason="generic_observation",
+        )
+        time.sleep(0.01)
+        _seed_trial(
+            bridge_id="br-new-101",
+            issue_number=101,
+            intent_type="code.review.request",
+            action="reviewed",
+            published=True,
+            suppressed=False,
+            quality_score=9,
+        )
+        time.sleep(0.01)
+        _seed_trial(
+            bridge_id="br-131",
+            issue_number=131,
+            intent_type="code.review.request",
+            action="suppressed",
+            published=False,
+            suppressed=True,
+            quality_score=7,
+            suppression_reason="low_signal_no_finding",
+        )
+
+        response = self.client.post(
+            "/bridge/review-trials/batch-label",
+            json={
+                "scenario_id": "stability_guardrails",
+                "target_alias": "Hub-Sentinel",
+            },
+            headers={"Authorization": f"Bearer {self.config.status_secret}"},
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        payload = response.json()
+        self.assertEqual(payload["count"], 2)
+        self.assertEqual(payload["scenario_id"], "stability_guardrails")
+        self.assertEqual(payload["resolved_issue_numbers"], [101, 244, 131, 109, 123])
+        self.assertEqual(payload["missing_issue_numbers"], [244, 109, 123])
+        self.assertTrue(payload["benchmark_label"].startswith("stability_guardrails_"))
+        self.assertEqual(payload["summary"]["total_trials"], 2)
+        self.assertEqual(payload["summary"]["published_count"], 1)
+        self.assertEqual(payload["summary"]["suppressed_count"], 1)
+        self.assertEqual(payload["summary"]["benchmark_labels"][payload["benchmark_label"]], 2)
+        self.assertEqual({item["bridge_id"] for item in payload["items"]}, {"br-new-101", "br-131"})
+
+        old_execution = self.store.get_execution("br-old-101")
+        self.assertEqual(old_execution["review_feedback"], {})
+        new_execution = self.store.get_execution("br-new-101")
+        self.assertEqual(new_execution["review_feedback"]["benchmark_label"], payload["benchmark_label"])
+
+        filtered_response = self.client.get(f"/bridge/review-trials?limit=1&benchmark_label={payload['benchmark_label']}")
+        self.assertEqual(filtered_response.status_code, 200, filtered_response.text)
+        filtered = filtered_response.json()
+        self.assertEqual(filtered["count"], 1)
+        self.assertEqual(filtered["total_count"], 2)
+        self.assertEqual(filtered["summary"]["total_trials"], 2)
+        self.assertEqual(filtered["summary"]["published_count"], 1)
+        self.assertEqual(filtered["summary"]["suppressed_count"], 1)
 
     def test_review_feedback_endpoint_requires_valid_feedback_token(self):
         self._set_pr_review_package(
