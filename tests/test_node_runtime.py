@@ -342,11 +342,15 @@ class TestRuntimeReviewPrompts(unittest.TestCase):
         intent_type: str = "code.review.request",
         *,
         changed_identifiers: Optional[list[str]] = None,
+        touched_paths: Optional[list[str]] = None,
+        touched_tests: Optional[list[str]] = None,
     ) -> dict:
         identifiers = changed_identifiers or [
             "_record_pending_task_poll_failure",
             "last_poll_status",
         ]
+        github_touched_paths = touched_paths or ["bridge/github_to_mep.py"]
+        github_touched_tests = touched_tests if touched_tests is not None else ["tests/test_github_bridge.py"]
         return {
             "id": "task_bridge_review",
             "bounty": 0.0,
@@ -372,8 +376,8 @@ class TestRuntimeReviewPrompts(unittest.TestCase):
                                 "repo_full_name": "WUAIBING/MEP",
                                 "entity_type": "pr",
                                 "number": 246,
-                                "touched_paths": ["bridge/github_to_mep.py"],
-                                "touched_tests": ["tests/test_github_bridge.py"],
+                                "touched_paths": github_touched_paths,
+                                "touched_tests": github_touched_tests,
                                 "risk_pack": {
                                     "changed_identifiers": identifiers
                                 },
@@ -546,10 +550,12 @@ class TestRuntimeReviewPrompts(unittest.TestCase):
         with patch("node.mep_runtime.requests.post", return_value=fake_response):
             reply = adapter.generate_reply("Review this PR", task_data)
 
-        self.assertEqual(
-            reply,
-            "## Review Summary\n\nReviewed the provided diff context and did not identify a concrete issue that is directly supported by the supplied patch excerpts.\n\nTouched paths reviewed: `bridge/github_to_mep.py`\n\nTests reviewed: `tests/test_github_bridge.py`.",
-        )
+        self.assertIn("## Review Summary", reply)
+        self.assertIn("Touched paths reviewed: `bridge/github_to_mep.py`", reply)
+        self.assertIn("Tests reviewed: `tests/test_github_bridge.py`", reply)
+        self.assertIn("Risk areas checked:", reply)
+        self.assertIn("Checks performed:", reply)
+        self.assertIn("Why no finding:", reply)
 
     def test_structured_review_falls_back_to_github_inputs_for_paths_and_tests(self):
         rendered = mep_runtime._render_structured_review_with_task_data(  # noqa: SLF001
@@ -604,6 +610,46 @@ class TestRuntimeReviewPrompts(unittest.TestCase):
         self.assertIn("Checks performed: verified suppression and publish paths mention `review_result_json`, checked `/bridge/review-trials` returns stored review metadata", rendered)
         self.assertIn("Why no finding: The new writes and reads stay consistent across both persistence paths, so the telemetry path looks low-risk.", rendered)
 
+    def test_structured_review_fills_no_finding_defaults_from_task_data(self):
+        rendered = mep_runtime._render_structured_review_with_task_data(  # noqa: SLF001
+            (
+                '{"summary":"The replay-protection and validation changes look scoped and coherent.",'
+                '"touched_paths":["hub/auth.py","hub/db.py","hub/models.py"],'
+                '"findings":[],"approval_recommendation":"comment"}'
+            ),
+            max_chars=1000,
+            task_data=self._bridge_review_task_data(
+                changed_identifiers=["verify_signature", "_evict_expired_nonces", "NodeRegistration"],
+                touched_paths=["hub/auth.py", "hub/db.py", "hub/models.py", "hub/requirements.txt"],
+                touched_tests=[],
+            ),
+        )
+
+        self.assertIn("## Review Summary", rendered)
+        self.assertIn("Touched paths reviewed: `hub/auth.py`, `hub/db.py`, `hub/models.py`", rendered)
+        self.assertIn("Risk areas checked:", rendered)
+        self.assertIn("Checks performed:", rendered)
+        self.assertIn("Why no finding:", rendered)
+        self.assertIn("Changed identifiers verified: `verify_signature`, `_evict_expired_nonces`, `NodeRegistration`", rendered)
+
+    def test_structured_review_synthesizes_grounded_summary_from_non_json_reply(self):
+        rendered = mep_runtime._render_structured_review_with_task_data(  # noqa: SLF001
+            "The replay-protection and dependency-pin changes look low-risk after review.",
+            max_chars=1000,
+            task_data=self._bridge_review_task_data(
+                changed_identifiers=["verify_signature", "_evict_expired_nonces"],
+                touched_paths=["hub/auth.py", "hub/db.py", "hub/models.py", "hub/requirements.txt"],
+                touched_tests=[],
+            ),
+        )
+
+        self.assertIn("## Review Summary", rendered)
+        self.assertIn("Touched paths reviewed: `hub/auth.py`, `hub/db.py`, `hub/models.py`, `hub/requirements.txt`", rendered)
+        self.assertIn("Risk areas checked:", rendered)
+        self.assertIn("Checks performed:", rendered)
+        self.assertIn("Why no finding:", rendered)
+        self.assertIn("Changed identifiers verified: `verify_signature`, `_evict_expired_nonces`", rendered)
+
     def test_structured_review_drops_findings_without_allowed_changed_identifiers(self):
         rendered = mep_runtime._render_structured_review_with_task_data(  # noqa: SLF001
             (
@@ -622,7 +668,7 @@ class TestRuntimeReviewPrompts(unittest.TestCase):
         self.assertIn("## Review Summary", rendered)
         self.assertNotIn("## Review Findings", rendered)
         self.assertNotIn("Preserve coalesced targets", rendered)
-        self.assertNotIn("Changed identifiers verified:", rendered)
+        self.assertIn("verified changed identifiers `_record_pending_task_poll_failure`, `last_poll_status`", rendered)
 
     def test_structured_review_drops_findings_for_untouched_files(self):
         rendered = mep_runtime._render_structured_review_with_task_data(  # noqa: SLF001

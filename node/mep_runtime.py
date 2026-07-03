@@ -798,6 +798,133 @@ def _is_weak_review_text(text: str) -> bool:
     return any(re.search(pattern, lowered) for pattern in _WEAK_REVIEW_PATTERNS)
 
 
+def _default_review_risk_areas(task_data: Optional[dict[str, Any]]) -> list[str]:
+    lenses = _review_lenses_for_task(task_data or {})
+    cleaned: list[str] = []
+    for lens in lenses:
+        text = _clean_review_label(lens, max_chars=100)
+        if not text:
+            continue
+        if text not in cleaned:
+            cleaned.append(text)
+        if len(cleaned) >= 4:
+            break
+    return cleaned
+
+
+def _default_review_checks(
+    *,
+    touched_paths: list[str],
+    tests_reviewed: list[str],
+    verified_identifiers: list[str],
+    task_data: Optional[dict[str, Any]],
+) -> list[str]:
+    checks: list[str] = []
+    if touched_paths:
+        rendered_paths = ", ".join(f"`{path}`" for path in touched_paths[:3])
+        checks.append(f"reviewed the changed diff for {rendered_paths}")
+    if verified_identifiers:
+        rendered_ids = ", ".join(f"`{name}`" for name in verified_identifiers[:3])
+        checks.append(f"verified changed identifiers {rendered_ids} against the supplied review context")
+    if tests_reviewed:
+        rendered_tests = ", ".join(f"`{path}`" for path in tests_reviewed[:2])
+        checks.append(f"checked relevant changed tests {rendered_tests}")
+    github_inputs = _review_github_inputs(task_data or {})
+    ci_checks = github_inputs.get("ci_checks")
+    if isinstance(ci_checks, dict) and ci_checks.get("has_checks"):
+        state = _clean_review_label(ci_checks.get("state"), max_chars=40)
+        if state:
+            checks.append(f"noted GitHub checks were `{state}` at review time")
+    return checks[:4]
+
+
+def _default_no_finding_reason(
+    *,
+    touched_paths: list[str],
+    verified_identifiers: list[str],
+    tests_reviewed: list[str],
+) -> str:
+    evidence_bits: list[str] = []
+    if verified_identifiers:
+        evidence_bits.append(", ".join(f"`{name}`" for name in verified_identifiers[:3]))
+    elif touched_paths:
+        evidence_bits.append(", ".join(f"`{path}`" for path in touched_paths[:2]))
+    if tests_reviewed:
+        evidence_bits.append(", ".join(f"`{path}`" for path in tests_reviewed[:2]))
+    if evidence_bits:
+        return (
+            "No concrete correctness, regression, or missing-validation issue was supported after checking "
+            + " and ".join(evidence_bits)
+            + "."
+        )
+    return "No concrete correctness, regression, or missing-validation issue was directly supported by the supplied diff."
+
+
+def _default_review_summary(
+    *,
+    touched_paths: list[str],
+    verified_identifiers: list[str],
+) -> str:
+    if verified_identifiers:
+        rendered_ids = ", ".join(f"`{name}`" for name in verified_identifiers[:3])
+        return f"Reviewed the changed behavior around {rendered_ids} and did not find a concrete issue supported by the diff."
+    if touched_paths:
+        rendered_paths = ", ".join(f"`{path}`" for path in touched_paths[:3])
+        return f"Reviewed the changed diff for {rendered_paths} and did not find a concrete issue supported by the supplied patch."
+    return "Reviewed the provided diff context and did not identify a concrete issue directly supported by the supplied patch excerpts."
+
+
+def _render_default_structured_review(
+    *,
+    task_data: Optional[dict[str, Any]],
+    max_chars: int,
+    summary_hint: str = "",
+) -> str:
+    github_inputs = _review_github_inputs(task_data or {})
+    touched_paths = _clean_review_list(github_inputs.get("touched_paths"), max_items=4, max_chars=120)
+    tests_reviewed = _clean_review_list(github_inputs.get("touched_tests"), max_items=3, max_chars=120)
+    risk_pack = github_inputs.get("risk_pack")
+    verified_identifiers = (
+        _clean_review_list(risk_pack.get("changed_identifiers"), max_items=3, max_chars=80)
+        if isinstance(risk_pack, dict)
+        else []
+    )
+    risk_areas_checked = _default_review_risk_areas(task_data)
+    checks_performed = _default_review_checks(
+        touched_paths=touched_paths,
+        tests_reviewed=tests_reviewed,
+        verified_identifiers=verified_identifiers,
+        task_data=task_data,
+    )
+    why_no_finding = _default_no_finding_reason(
+        touched_paths=touched_paths,
+        verified_identifiers=verified_identifiers,
+        tests_reviewed=tests_reviewed,
+    )
+    summary = _clean_review_text(summary_hint, max_chars=500)
+    if _is_weak_review_text(summary):
+        summary = ""
+    if not summary:
+        summary = _default_review_summary(
+            touched_paths=touched_paths,
+            verified_identifiers=verified_identifiers,
+        )
+    sections = ["## Review Summary", summary]
+    if touched_paths:
+        sections.append("Touched paths reviewed: " + ", ".join(f"`{path}`" for path in touched_paths))
+    if tests_reviewed:
+        sections.append("Tests reviewed: " + ", ".join(f"`{path}`" for path in tests_reviewed))
+    if risk_areas_checked:
+        sections.append("Risk areas checked: " + ", ".join(risk_areas_checked))
+    if checks_performed:
+        sections.append("Checks performed: " + ", ".join(checks_performed))
+    if why_no_finding:
+        sections.append(f"Why no finding: {why_no_finding}")
+    if verified_identifiers:
+        sections.append("Changed identifiers verified: " + ", ".join(f"`{name}`" for name in verified_identifiers))
+    return _finalize_model_reply("\n\n".join(sections), max_chars=max_chars)
+
+
 def _finalize_model_reply(text: str, *, max_chars: int) -> str:
     cleaned = (text or "").strip()
     if not cleaned:
@@ -840,7 +967,12 @@ def _render_structured_review_with_task_data(
     task_data: Optional[dict[str, Any]],
 ) -> str:
     parsed = _extract_first_json_object(text)
+    approval_mode = _task_is_approval_review(task_data or {})
     if not isinstance(parsed, dict):
+        if _is_adapter_error(text) or approval_mode:
+            return ""
+        return _render_default_structured_review(task_data=task_data, max_chars=max_chars, summary_hint=text)
+    if _is_adapter_error(text):
         return ""
     github_inputs = _review_github_inputs(task_data or {})
     allowed_paths = _clean_review_list(github_inputs.get("touched_paths"), max_items=4, max_chars=120)
@@ -871,11 +1003,11 @@ def _render_structured_review_with_task_data(
         tests_reviewed = allowed_tests
     risk_areas_checked = _clean_review_list(parsed.get("risk_areas_checked"), max_items=4, max_chars=100)
     checks_performed = _clean_review_list(parsed.get("checks_performed"), max_items=4, max_chars=120)
+    verified_identifiers = _clean_review_list(parsed.get("verified_identifiers"), max_items=4, max_chars=80)
+    verified_identifiers = _filter_review_list_to_allowed(verified_identifiers, allowed_identifiers)
     why_no_finding = _clean_review_text(parsed.get("why_no_finding"), max_chars=400)
     if _is_weak_review_text(why_no_finding):
         why_no_finding = ""
-    verified_identifiers = _clean_review_list(parsed.get("verified_identifiers"), max_items=4, max_chars=80)
-    verified_identifiers = _filter_review_list_to_allowed(verified_identifiers, allowed_identifiers)
     findings_raw = parsed.get("findings")
     findings: list[str] = []
     allowed_path_keys = {item.lower(): item for item in allowed_paths}
@@ -902,6 +1034,29 @@ def _render_structured_review_with_task_data(
                 findings.append(f"**{issue}**: {rationale or 'Check this logic.'}")
     if findings and allowed_identifiers and not verified_identifiers:
         findings = []
+    if not approval_mode and not findings:
+        if not verified_identifiers:
+            verified_identifiers = allowed_identifiers[:3]
+        if not risk_areas_checked:
+            risk_areas_checked = _default_review_risk_areas(task_data)
+        if not checks_performed:
+            checks_performed = _default_review_checks(
+                touched_paths=touched_paths,
+                tests_reviewed=tests_reviewed,
+                verified_identifiers=verified_identifiers,
+                task_data=task_data,
+            )
+        if not why_no_finding:
+            why_no_finding = _default_no_finding_reason(
+                touched_paths=touched_paths,
+                verified_identifiers=verified_identifiers,
+                tests_reviewed=tests_reviewed,
+            )
+        if not summary:
+            summary = _default_review_summary(
+                touched_paths=touched_paths,
+                verified_identifiers=verified_identifiers,
+            )
     sections: list[str] = []
     if findings:
         sections.append("## Review Findings")
