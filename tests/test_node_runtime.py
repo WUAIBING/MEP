@@ -443,6 +443,14 @@ class TestRuntimeReviewPrompts(unittest.TestCase):
         self.assertIn("checks are pending or failing", prompt)
         self.assertIn("Diff restatement without risk coverage is not a sufficient review", prompt)
 
+    def test_review_lenses_include_bridge_safety_focus(self):
+        lenses = mep_runtime._review_lenses_for_task(self._bridge_review_task_data())  # noqa: SLF001
+
+        self.assertIn("correctness/regression around the changed behavior", lenses)
+        self.assertIn("test alignment and edge-case coverage for the changed behavior", lenses)
+        self.assertIn("security/trust-boundary regressions and approval safety", lenses)
+        self.assertIn("automation/writeback safety and path-to-action mismatches", lenses)
+
     def test_deepseek_adapter_uses_reviewer_prompt_for_bridge_review_tasks(self):
         adapter = mep_runtime.DeepSeekAdapter(api_key="secret-key", model="deepseek-chat")
         task_data = self._bridge_review_task_data(
@@ -458,7 +466,9 @@ class TestRuntimeReviewPrompts(unittest.TestCase):
                                 "content": (
                                     '{"risk_candidates":['
                                     '{"file":"bridge/github_to_mep.py","claim":"Coalesced targets can be overwritten during the window.",'
-                                    '"reason":"The candidate pass noticed multiple target writes in the same bridge flow."}'
+                                    '"category":"automation/writeback safety","priority":"high",'
+                                    '"reason":"The candidate pass noticed multiple target writes in the same bridge flow.",'
+                                    '"evidence":["preserve_coalesced_targets","coalesced_targets"]}'
                                     '],"coverage":["bridge metadata coalescing"]}'
                                 )
                             }
@@ -498,13 +508,19 @@ class TestRuntimeReviewPrompts(unittest.TestCase):
         self.assertIn("Tests reviewed: `tests/test_github_bridge.py`", reply)
         self.assertEqual(post_mock.call_count, 2)
         first_system_prompt = post_mock.call_args_list[0].kwargs["json"]["messages"][0]["content"]
+        first_user_payload = post_mock.call_args_list[0].kwargs["json"]["messages"][1]["content"]
         second_system_prompt = post_mock.call_args_list[1].kwargs["json"]["messages"][0]["content"]
         second_user_payload = post_mock.call_args_list[1].kwargs["json"]["messages"][1]["content"]
         self.assertIn("candidate-generation pass", first_system_prompt)
+        self.assertIn("Prefer at most one candidate per lens", first_system_prompt)
+        self.assertIn("highest-impact candidate first", first_system_prompt)
+        self.assertIn("Review lenses to cover before publishing", first_user_payload)
         self.assertIn("return ONLY a JSON object", second_system_prompt)
         self.assertIn("This is the verification pass.", second_system_prompt)
         self.assertIn("set `file` to one of the supplied touched paths", second_system_prompt)
         self.assertIn("exact changed-line identifier in `verified_identifiers`", second_system_prompt)
+        self.assertIn("single highest-impact verified finding", second_system_prompt)
+        self.assertIn("Review lenses to cover before publishing", second_user_payload)
         self.assertIn("Candidate risks to verify before publishing any finding", second_user_payload)
 
     def test_deepseek_adapter_filters_weak_review_findings(self):
@@ -633,8 +649,8 @@ class TestRuntimeReviewPrompts(unittest.TestCase):
         candidates = mep_runtime._extract_review_candidates(  # noqa: SLF001
             (
                 '{"risk_candidates":['
-                '{"file":"bridge/github_to_mep.py","claim":"Coalesce window can overwrite the first target","reason":"Multiple writes share the same metadata bucket"},'
-                '{"file":"bridge/github_to_mep.py","claim":"Coalesce window can overwrite the first target","reason":"duplicate"},'
+                '{"file":"bridge/github_to_mep.py","category":"automation/writeback safety","priority":"high","claim":"Coalesce window can overwrite the first target","reason":"Multiple writes share the same metadata bucket","evidence":["preserve_coalesced_targets"]},'
+                '{"file":"bridge/github_to_mep.py","category":"automation/writeback safety","priority":"low","claim":"Coalesce window can overwrite the first target","reason":"duplicate","evidence":["preserve_coalesced_targets"]},'
                 '{"file":"","claim":"  ","reason":"empty"}'
                 ']}'
             )
@@ -645,11 +661,28 @@ class TestRuntimeReviewPrompts(unittest.TestCase):
             [
                 {
                     "file": "bridge/github_to_mep.py",
+                    "category": "automation/writeback safety",
+                    "priority": "high",
                     "claim": "Coalesce window can overwrite the first target.",
                     "reason": "Multiple writes share the same metadata bucket.",
+                    "evidence": ["preserve_coalesced_targets"],
                 }
             ],
         )
+
+    def test_extract_review_candidates_ranks_high_priority_first(self):
+        candidates = mep_runtime._extract_review_candidates(  # noqa: SLF001
+            (
+                '{"risk_candidates":['
+                '{"file":"bridge/github_to_mep.py","category":"test gap","priority":"low","claim":"Missing edge-case coverage","reason":"No regression test covers the fallback branch"},'
+                '{"file":"bridge/github_to_mep.py","category":"security/trust-boundary","priority":"high","claim":"Approval path can publish before the stronger guard runs","reason":"The changed branch still accepts the optimistic action first","evidence":["_approval_quality_failure"]}'
+                ']}'
+            )
+        )
+
+        self.assertEqual(candidates[0]["priority"], "high")
+        self.assertEqual(candidates[0]["category"], "security/trust-boundary")
+        self.assertEqual(candidates[0]["evidence"], ["_approval_quality_failure"])
 
 
 class TestRuntimeWebSocketLoop(unittest.TestCase):
