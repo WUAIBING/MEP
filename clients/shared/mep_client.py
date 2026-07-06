@@ -52,13 +52,23 @@ class MEPClient:
         *,
         payload_uri: Optional[str] = None,
         secret_data: Optional[str] = None,
+        expected_output: Optional[dict[str, Any]] = None,
+        intent_type: str = "analysis.request",
+        intent_priority: Optional[str] = None,
+        task_title: Optional[str] = None,
+        task_inputs: Optional[dict[str, Any]] = None,
     ) -> dict:
         body = build_task_envelope(
             self.node_id,
             payload,
             bounty,
+            intent_type=intent_type,
+            intent_priority=intent_priority,
             target_node=target_node,
             target_capability=model_requirement,
+            expected_output=expected_output,
+            task_title=task_title,
+            task_inputs=task_inputs,
             payload_uri=payload_uri,
             secret_data=secret_data,
         )
@@ -72,6 +82,92 @@ class MEPClient:
             timeout=20,
         )
         return {"status_code": response.status_code, "json": response.json()}
+
+    @staticmethod
+    def _repo_audit_instructions(
+        repo_url: str,
+        *,
+        audit_type: str,
+        ref: Optional[str],
+        max_findings: int,
+        artifact_preference: str,
+    ) -> str:
+        lines = [
+            f"Run a {audit_type} repo audit for {repo_url}.",
+            f"Return at most {max_findings} high-signal findings ranked by developer impact.",
+            "Keep the inline summary concise and evidence-backed.",
+        ]
+        if ref:
+            lines.insert(1, f"Audit the repo state at ref {ref}.")
+        if artifact_preference == "inline_only":
+            lines.append("Return the audit inline without relying on external artifacts.")
+        elif artifact_preference == "artifact_preferred":
+            lines.append("Use an external artifact for the full report when needed and include its URI.")
+        else:
+            lines.append("Return an inline summary first and include a result URI only when the report is large.")
+        return " ".join(lines)
+
+    async def submit_repo_audit(
+        self,
+        repo_url: str,
+        *,
+        audit_type: str = "full_repo_audit",
+        ref: Optional[str] = None,
+        max_findings: int = 5,
+        inline_summary_max_chars: int = 6000,
+        artifact_preference: str = "inline_first",
+        bounty: float = 0.0,
+        target_node: Optional[str] = None,
+        target_capability: str = "repo_audit",
+    ) -> dict:
+        normalized_repo_url = str(repo_url or "").strip()
+        if not normalized_repo_url:
+            raise ValueError("repo_url must be a non-empty string")
+        normalized_audit_type = str(audit_type or "").strip() or "full_repo_audit"
+        if max_findings < 1:
+            raise ValueError("max_findings must be at least 1")
+        if inline_summary_max_chars < 500:
+            raise ValueError("inline_summary_max_chars must be at least 500")
+        normalized_artifact_preference = str(artifact_preference or "").strip().lower() or "inline_first"
+        if normalized_artifact_preference not in {"inline_only", "inline_first", "artifact_preferred"}:
+            raise ValueError("artifact_preference must be inline_only, inline_first, or artifact_preferred")
+
+        instructions = self._repo_audit_instructions(
+            normalized_repo_url,
+            audit_type=normalized_audit_type,
+            ref=ref,
+            max_findings=max_findings,
+            artifact_preference=normalized_artifact_preference,
+        )
+        task_inputs = {
+            "repo_audit": {
+                "repo_url": normalized_repo_url,
+                "audit_type": normalized_audit_type,
+                "max_findings": max_findings,
+                "artifact_preference": normalized_artifact_preference,
+                "inline_summary_max_chars": inline_summary_max_chars,
+            }
+        }
+        if ref:
+            task_inputs["repo_audit"]["ref"] = str(ref).strip()
+        expected_output = {
+            "result_type": "repo_audit_result",
+            "format": "json",
+            "artifact_allowed": normalized_artifact_preference != "inline_only",
+            "inline_summary_max_chars": inline_summary_max_chars,
+        }
+        task_title = f"Repo audit: {normalized_repo_url}"
+        return await self.submit_task(
+            instructions,
+            bounty,
+            model_requirement=target_capability,
+            target_node=target_node,
+            expected_output=expected_output,
+            intent_type="repo_audit.request",
+            intent_priority="high",
+            task_title=task_title,
+            task_inputs=task_inputs,
+        )
 
     async def cancel_task(self, task_id: str) -> dict:
         body = {"task_id": task_id}

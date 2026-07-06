@@ -7,9 +7,12 @@ def build_task_envelope(
     bounty: float,
     *,
     intent_type: str = "analysis.request",
+    intent_priority: Optional[str] = None,
     target_node: Optional[str] = None,
     target_capability: Optional[str] = None,
     expected_output: Optional[dict] = None,
+    task_title: Optional[str] = None,
+    task_inputs: Optional[dict] = None,
     payload_uri: Optional[str] = None,
     secret_data: Optional[str] = None,
 ) -> dict:
@@ -38,6 +41,12 @@ def build_task_envelope(
             "payment_direction": payment_direction,
         },
     }
+    if intent_priority:
+        body["intent"]["priority"] = intent_priority
+    if task_title:
+        body["task"]["title"] = task_title
+    if task_inputs:
+        body["task"]["inputs"] = task_inputs
     if target_node or target_capability:
         body["routing"] = {}
         if target_node:

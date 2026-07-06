@@ -586,6 +586,84 @@ def _task_expected_output(task: TaskCreate) -> dict:
     return {}
 
 
+def _task_source(task: TaskCreate, consumer_id: str) -> dict:
+    if isinstance(task.source, dict):
+        source = dict(task.source)
+        source_node_id = source.get("node_id")
+        if not isinstance(source_node_id, str) or not source_node_id.strip():
+            source["node_id"] = consumer_id
+        else:
+            source["node_id"] = source_node_id.strip()
+        return source
+    return {"node_id": consumer_id}
+
+
+def _task_intent(task: TaskCreate) -> dict:
+    if isinstance(task.intent, dict) and task.intent:
+        return dict(task.intent)
+    return {"type": "analysis.request"}
+
+
+def _task_structured_body(task: TaskCreate, payload: str) -> dict:
+    task_body = dict(task.task) if isinstance(task.task, dict) else {}
+    task_body["instructions"] = payload
+    task_body["expected_output"] = _task_expected_output(task)
+    return task_body
+
+
+def _task_data_from_row(task_row: dict, *, status: Optional[str] = None, provider_id: Optional[str] = None) -> dict:
+    payload = str(task_row.get("payload") or "")
+    consumer_id = str(task_row.get("consumer_id") or "")
+    hydrated: dict[str, Any] = {}
+    envelope_raw = task_row.get("envelope_json")
+    if isinstance(envelope_raw, str) and envelope_raw.strip():
+        try:
+            parsed = json.loads(envelope_raw)
+        except (ValueError, TypeError):
+            parsed = None
+        if isinstance(parsed, dict):
+            hydrated = dict(parsed)
+
+    hydrated["id"] = task_row["task_id"]
+    hydrated["consumer_id"] = consumer_id
+    hydrated["payload"] = payload
+    hydrated["bounty"] = task_row.get("bounty")
+    hydrated["status"] = status or task_row.get("status") or "bidding"
+    hydrated["target_node"] = task_row.get("target_node")
+    hydrated["model_requirement"] = task_row.get("model_requirement")
+    hydrated["verifier_type"] = task_row.get("verifier_type")
+    hydrated["expires_in_seconds"] = task_row.get("expires_in_seconds")
+    hydrated["payload_uri"] = task_row.get("payload_uri")
+    hydrated["secret_data"] = task_row.get("result_payload")
+    effective_provider_id = provider_id if provider_id is not None else task_row.get("provider_id")
+    if effective_provider_id:
+        hydrated["provider_id"] = effective_provider_id
+    else:
+        hydrated.pop("provider_id", None)
+
+    source = hydrated.get("source")
+    if not isinstance(source, dict):
+        hydrated["source"] = {"node_id": consumer_id}
+    else:
+        source_node_id = source.get("node_id")
+        if not isinstance(source_node_id, str) or not source_node_id.strip():
+            source["node_id"] = consumer_id
+
+    intent = hydrated.get("intent")
+    if not isinstance(intent, dict) or not intent:
+        hydrated["intent"] = {"type": "analysis.request"}
+
+    task_body = hydrated.get("task")
+    if not isinstance(task_body, dict):
+        task_body = {}
+    task_body["instructions"] = payload
+    expected_output = task_body.get("expected_output")
+    if not isinstance(expected_output, dict):
+        task_body["expected_output"] = {}
+    hydrated["task"] = task_body
+    return hydrated
+
+
 def _task_economics(task: TaskCreate) -> dict:
     if isinstance(task.economics, dict):
         economics = dict(task.economics)
@@ -1446,19 +1524,7 @@ async def _sweep_assigned_timeouts():
                         log_audit("DATA_TIMEOUT_REFUND", buyer_id, refunded, new_balance, task["task_id"])
                 if not db.requeue_task_if_assigned(task["task_id"], now):
                     continue
-                task_data = {
-                    "id": task["task_id"],
-                    "consumer_id": task["consumer_id"],
-                    "payload": task["payload"],
-                    "bounty": task["bounty"],
-                    "status": "bidding",
-                    "target_node": task["target_node"],
-                    "model_requirement": task["model_requirement"],
-                    "verifier_type": task.get("verifier_type"),
-                    "expires_in_seconds": task.get("expires_in_seconds"),
-                    "payload_uri": task.get("payload_uri"),
-                    "secret_data": task.get("result_payload")
-                }
+                task_data = _task_data_from_row(task, status="bidding", provider_id=None)
                 async with task_lock:
                     active_tasks[task["task_id"]] = task_data
                 model_requirement = _normalize_model_requirement(task["model_requirement"])
@@ -2231,12 +2297,9 @@ async def submit_task(
         "payload": payload,
         "bounty": bounty,
         "status": "bidding",
-        "source": task.source or {"node_id": consumer_id},
-        "intent": task.intent or {"type": "analysis.request"},
-        "task": {
-            "instructions": payload,
-            "expected_output": _task_expected_output(task),
-        },
+        "source": _task_source(task, consumer_id),
+        "intent": _task_intent(task),
+        "task": _task_structured_body(task, payload),
         "economics": economics,
         "target_node": target_node,
         "model_requirement": target_capability,
@@ -2259,6 +2322,10 @@ async def submit_task(
         expires_in_seconds=task.expires_in_seconds,
         verifier_type=verifier_type,
     )
+    try:
+        db.set_task_envelope(task_id, json.dumps(task_data))
+    except Exception as exc:
+        log_event("task_envelope_error", f"Failed to persist task envelope {task_id[:8]}: {exc}", task_id=task_id)
     async with task_lock:
         active_tasks[task_id] = task_data
 
@@ -2476,6 +2543,10 @@ async def place_bid(bid: TaskBid, authenticated_node: str = Depends(verify_reque
         consumer_id = task["consumer_id"]
         model_requirement = task.get("model_requirement")
         payload_uri = task.get("payload_uri")
+        task_body = dict(task["task"]) if isinstance(task.get("task"), dict) else {"instructions": payload, "expected_output": {}}
+        source = dict(task["source"]) if isinstance(task.get("source"), dict) else {"node_id": consumer_id}
+        intent = dict(task["intent"]) if isinstance(task.get("intent"), dict) else {"type": "analysis.request"}
+        economics = dict(task["economics"]) if isinstance(task.get("economics"), dict) else {}
 
     log_event("bid_accepted", f"Task {bid.task_id[:8]} assigned to {bid.provider_id}", task_id=bid.task_id, provider_id=bid.provider_id, bounty=bounty)
 
@@ -2486,6 +2557,10 @@ async def place_bid(bid: TaskBid, authenticated_node: str = Depends(verify_reque
         "model_requirement": model_requirement,
         "payload_uri": payload_uri,
         "secret_data": task.get("secret_data", task.get("result_payload")),
+        "source": source,
+        "intent": intent,
+        "task": task_body,
+        "economics": economics,
         "assignment_score": assignment_profile["assignment_score"]
     }
 
@@ -2621,7 +2696,11 @@ async def complete_task(
 async def get_pending_tasks(node_id: str, authenticated_node: str = Depends(verify_request)):
     if authenticated_node != node_id:
         raise HTTPException(status_code=403, detail="Cannot view pending tasks for another node")
-    tasks = db.get_pending_tasks_for_provider(node_id)
+    tasks = []
+    for row in db.get_pending_tasks_for_provider(node_id):
+        task_data = _task_data_from_row(row)
+        task_data["task_id"] = task_data["id"]
+        tasks.append(task_data)
     return {"node_id": node_id, "tasks": tasks, "count": len(tasks)}
 
 
@@ -3449,36 +3528,9 @@ def _build_queued_dm_event(row: dict, node_id: str, payload: str) -> dict:
     delivery shape. Prefers the persisted full envelope (byte-identical to live);
     falls back to reconstruction for legacy rows queued before envelope capture.
     """
-    envelope_raw = row.get("envelope_json")
-    if envelope_raw:
-        try:
-            data = json.loads(envelope_raw)
-            if isinstance(data, dict):
-                data["status"] = "assigned"
-                data["provider_id"] = node_id
-                return data
-        except (ValueError, TypeError):
-            pass
-    # Fallback: reconstruct the live-shaped envelope from the stored columns and
-    # the same defaults the submit path applies for a zero-bounty DM.
-    consumer_id = row.get("consumer_id")
-    return {
-        "id": row["task_id"],
-        "consumer_id": consumer_id,
-        "payload": payload,
-        "bounty": row.get("bounty"),
-        "status": "assigned",
-        "source": {"node_id": consumer_id},
-        "intent": {"type": "analysis.request"},
-        "task": {"instructions": payload, "expected_output": {}},
-        "economics": {},
-        "target_node": node_id,
-        "provider_id": node_id,
-        "model_requirement": row.get("model_requirement"),
-        "expires_in_seconds": row.get("expires_in_seconds"),
-        "payload_uri": row.get("payload_uri"),
-        "secret_data": row.get("result_payload"),
-    }
+    hydrated_row = dict(row)
+    hydrated_row["payload"] = payload
+    return _task_data_from_row(hydrated_row, status="assigned", provider_id=node_id)
 
 async def _flush_queued_dms(node_id: str, websocket: WebSocket) -> None:
     """Deliver store-and-forward DMs queued while node_id was offline.

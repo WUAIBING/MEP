@@ -51,3 +51,46 @@ def test_build_task_envelope_for_chat_and_data_markets():
         "payment_direction": "receiver_to_sender",
     }
     assert data["secret_data"] == "encrypted-data"
+
+
+def test_build_task_envelope_preserves_structured_task_metadata():
+    body = build_task_envelope(
+        "node_consumer",
+        "Audit this repository.",
+        0.0,
+        intent_type="repo_audit.request",
+        intent_priority="high",
+        target_capability="repo_audit",
+        expected_output={
+            "result_type": "repo_audit_result",
+            "format": "json",
+            "artifact_allowed": True,
+        },
+        task_title="Repo audit: github.com/WUAIBING/MEP",
+        task_inputs={
+            "repo_audit": {
+                "repo_url": "github.com/WUAIBING/MEP",
+                "audit_type": "architecture_audit",
+                "max_findings": 5,
+            }
+        },
+    )
+
+    assert body["intent"] == {"type": "repo_audit.request", "priority": "high"}
+    assert body["task"] == {
+        "instructions": "Audit this repository.",
+        "expected_output": {
+            "result_type": "repo_audit_result",
+            "format": "json",
+            "artifact_allowed": True,
+        },
+        "title": "Repo audit: github.com/WUAIBING/MEP",
+        "inputs": {
+            "repo_audit": {
+                "repo_url": "github.com/WUAIBING/MEP",
+                "audit_type": "architecture_audit",
+                "max_findings": 5,
+            }
+        },
+    }
+    assert body["routing"] == {"target_capability": "repo_audit"}
