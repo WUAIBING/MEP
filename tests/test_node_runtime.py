@@ -1710,13 +1710,19 @@ class TestWorkspaceReviewContext(unittest.TestCase):
                 {
                     "summary": "Audited the workspace-backed repo context.",
                     "repo_overview": "Reviewed README and runtime entrypoints.",
+                    "coverage_summary": "Checked the workspace inventory and runtime bootstrap path only.",
                     "checks_performed": ["checked tracked file inventory", "read runtime entrypoint"],
                     "risk_areas_checked": ["runtime entrypoints", "repo contract drift"],
                     "findings": [
                         {
                             "file": "node/mep_runtime.py",
-                            "issue": "Runtime sync path should fail closed on missing workspace context",
-                            "rationale": "This file controls the audit workspace bootstrap path.",
+                            "title": "Runtime sync path should fail closed on missing workspace context",
+                            "category": "correctness",
+                            "severity": "high",
+                            "confidence": "high",
+                            "developer_impact": "Otherwise the audit can publish an ungrounded result after a partial bootstrap failure.",
+                            "evidence": "This file controls the audit workspace bootstrap path.",
+                            "next_step": "Keep refusing repo_audit tasks whenever the workspace bootstrap or inventory load is incomplete.",
                         },
                         {
                             "file": "config.json",
@@ -1732,6 +1738,77 @@ class TestWorkspaceReviewContext(unittest.TestCase):
 
         self.assertIn("node/mep_runtime.py", rendered)
         self.assertNotIn("config.json", rendered)
+        self.assertIn("Coverage summary: Checked the workspace inventory and runtime bootstrap path only.", rendered)
+        self.assertIn("[high/high] Runtime sync path should fail closed on missing workspace context", rendered)
+
+    def test_render_structured_repo_audit_demotes_low_confidence_notes_to_observations(self):
+        task_data = {
+            "intent": {"type": "repo_audit.request"},
+            "task": {
+                "inputs": {
+                    "repo_audit": {
+                        "repo_url": "github.com/WUAIBING/MEP",
+                        "ref": "main",
+                        "inventory_paths": ["README.md", "node/mep_runtime.py"],
+                    }
+                }
+            },
+        }
+        rendered = mep_runtime._render_structured_repo_audit_with_task_data(  # noqa: SLF001
+            json.dumps(
+                {
+                    "summary": "Audited the workspace-backed repo context.",
+                    "repo_overview": "Reviewed README and runtime entrypoints.",
+                    "findings": [
+                        {
+                            "file": "README.md",
+                            "title": "README wording may drift from runtime behavior",
+                            "category": "documentation",
+                            "severity": "low",
+                            "confidence": "low",
+                            "developer_impact": "This is mostly a maintenance concern rather than a correctness blocker.",
+                            "evidence": "The repository overview wording is broader than the runtime-specific safeguards reviewed here.",
+                            "next_step": "Refresh the README only when the audited runtime contract changes again.",
+                        }
+                    ],
+                }
+            ),
+            max_chars=4000,
+            task_data=task_data,
+        )
+
+        self.assertIn("## Repo Audit Summary", rendered)
+        self.assertIn("Observations: `README.md`: This is mostly a maintenance concern rather than a correctness blocker.", rendered)
+        self.assertNotIn("[low/low]", rendered)
+
+    def test_render_structured_repo_audit_adds_default_coverage_summary_when_missing(self):
+        task_data = {
+            "intent": {"type": "repo_audit.request"},
+            "task": {
+                "inputs": {
+                    "repo_audit": {
+                        "repo_url": "github.com/WUAIBING/MEP",
+                        "ref": "main",
+                        "inventory_paths": ["README.md", "node/mep_runtime.py"],
+                    }
+                }
+            },
+        }
+        rendered = mep_runtime._render_structured_repo_audit_with_task_data(  # noqa: SLF001
+            json.dumps(
+                {
+                    "summary": "Audited the workspace-backed repo context.",
+                    "repo_overview": "Reviewed README and runtime entrypoints.",
+                    "findings": [],
+                    "why_no_finding": "No grounded high-signal issue survived the evidence bar.",
+                }
+            ),
+            max_chars=4000,
+            task_data=task_data,
+        )
+
+        self.assertIn("Coverage summary:", rendered)
+        self.assertIn("only published findings that stayed grounded", rendered)
 
     def test_clean_check_env_uses_allowlist_and_throwaway_home(self):
         with patch.dict(
