@@ -422,6 +422,20 @@ def _task_requires_review_prompt(task_data: dict[str, Any]) -> bool:
     }
 
 
+def _repo_audit_inputs(task_data: dict[str, Any]) -> dict[str, Any]:
+    interbot_message = _interbot_message_from_task_data(task_data)
+    task: Any = task_data.get("task")
+    if not isinstance(task, dict) and isinstance(interbot_message, dict):
+        task = interbot_message.get("task")
+    inputs = task.get("inputs") if isinstance(task, dict) else None
+    repo_audit = inputs.get("repo_audit") if isinstance(inputs, dict) else None
+    return repo_audit if isinstance(repo_audit, dict) else {}
+
+
+def _task_requires_repo_audit_prompt(task_data: dict[str, Any]) -> bool:
+    return _review_intent_type(task_data) == "repo_audit.request" and bool(_repo_audit_inputs(task_data))
+
+
 def _review_github_inputs(task_data: dict[str, Any]) -> dict[str, Any]:
     interbot_message = _interbot_message_from_task_data(task_data)
     task: Any = task_data.get("task")
@@ -535,6 +549,45 @@ def _system_prompt_for_task(
     generic_max_chars: int,
     review_max_chars: int,
 ) -> str:
+    if _task_requires_repo_audit_prompt(task_data):
+        repo_audit = _repo_audit_inputs(task_data)
+        repo_url = _clean_review_label(repo_audit.get("repo_url"), max_chars=200) or "the supplied repository"
+        ref = _clean_review_label(repo_audit.get("ref"), max_chars=120)
+        workspace_path = _clean_review_label(repo_audit.get("local_workspace_path"), max_chars=220)
+        inventory_paths = _clean_review_list(repo_audit.get("inventory_paths"), max_items=300, max_chars=160)
+        workspace_hint = ""
+        if workspace_path:
+            workspace_hint = (
+                f" A checked-out local workspace is available at `{workspace_path}`. The user message may include an "
+                "authoritative repo inventory and selected file contents from that workspace; treat only that material as "
+                "ground truth."
+            )
+        inventory_hint = ""
+        if inventory_paths:
+            inventory_hint = (
+                f" The authoritative repo inventory currently contains {len(inventory_paths)} tracked files. "
+                "Every finding must cite one file from that supplied inventory; if you cannot verify a concrete issue "
+                "against those files, return zero findings."
+            )
+        ref_hint = f" at ref `{ref}`" if ref else ""
+        return (
+            f"You are a senior repository auditor reviewing {repo_url}{ref_hint}. "
+            "Return ONLY a JSON object with this schema: "
+            '{"summary": string, "repo_overview": string, "risk_areas_checked": [string], '
+            '"checks_performed": [string], "why_no_finding": string, '
+            '"findings": [{"file": string, "issue": string, "rationale": string}], '
+            '"artifact_recommended": boolean}. '
+            "Publish at most 5 findings, ranked by developer impact. "
+            "Use `repo_overview` for a concise factual description of the repository areas you actually inspected. "
+            "Use `checks_performed` for 1-5 concrete verification steps you performed against the supplied inventory, file contents, or verification output. "
+            "Use `risk_areas_checked` for 1-5 concrete risk themes you audited. "
+            "Only publish a finding when the supplied repo context directly supports it. "
+            "Do not invent files, endpoints, dependencies, or artifacts that are not present in the supplied repo context. "
+            "Do not rely on web knowledge, generic security checklists, or assumptions about unseen code. "
+            "If you cannot verify a concrete finding from the supplied workspace material, keep `findings` empty and explain why in `why_no_finding`. "
+            "Do not include chain-of-thought or any text outside the JSON object. "
+            f"Keep the response within {review_max_chars} characters.{workspace_hint}{inventory_hint}"
+        )
     if _task_requires_review_prompt(task_data):
         github_inputs = _review_github_inputs(task_data)
         approval_mode = _task_is_approval_review(task_data)
@@ -960,12 +1013,159 @@ def _render_structured_review(text: str, *, max_chars: int) -> str:
     return _render_structured_review_with_task_data(text, max_chars=max_chars, task_data=None)
 
 
+def _default_repo_audit_summary(
+    *,
+    repo_url: str,
+    ref: str,
+    inventory_paths: list[str],
+) -> str:
+    scope = repo_url or "the supplied repository"
+    if ref:
+        scope = f"{scope} @ {ref}"
+    if inventory_paths:
+        return f"Audited {scope} against the checked-out local workspace inventory and did not verify a concrete issue from the supplied evidence."
+    return f"Could not verify a concrete repository finding for {scope} because no authoritative workspace inventory was supplied."
+
+
+def _default_repo_audit_checks(
+    *,
+    repo_url: str,
+    ref: str,
+    inventory_paths: list[str],
+) -> list[str]:
+    checks: list[str] = []
+    if repo_url:
+        if ref:
+            checks.append(f"checked out `{repo_url}` at ref `{ref}`")
+        else:
+            checks.append(f"checked out `{repo_url}` in a local audit workspace")
+    if inventory_paths:
+        sample = ", ".join(f"`{path}`" for path in inventory_paths[:3])
+        checks.append(f"verified findings only against the supplied tracked-file inventory, including {sample}")
+    else:
+        checks.append("refused to publish findings without an authoritative tracked-file inventory")
+    return checks[:4]
+
+
+def _render_default_repo_audit(
+    *,
+    task_data: Optional[dict[str, Any]],
+    max_chars: int,
+    summary_hint: str = "",
+) -> str:
+    repo_audit = _repo_audit_inputs(task_data or {})
+    repo_url = _clean_review_label(repo_audit.get("repo_url"), max_chars=200)
+    ref = _clean_review_label(repo_audit.get("ref"), max_chars=120)
+    inventory_paths = _clean_review_list(repo_audit.get("inventory_paths"), max_items=300, max_chars=160)
+    summary = _clean_review_text(summary_hint, max_chars=500)
+    if _is_weak_review_text(summary):
+        summary = ""
+    if not summary:
+        summary = _default_repo_audit_summary(repo_url=repo_url, ref=ref, inventory_paths=inventory_paths)
+    checks_performed = _default_repo_audit_checks(repo_url=repo_url, ref=ref, inventory_paths=inventory_paths)
+    why_no_finding = (
+        "No published finding survived verification against the checked-out workspace inventory and supplied file excerpts."
+        if inventory_paths
+        else "No authoritative local workspace inventory was available, so findings were withheld instead of speculating."
+    )
+    sections = ["## Repo Audit Summary", summary]
+    if repo_url:
+        scope = f"`{repo_url}`"
+        if ref:
+            scope += f" @ `{ref}`"
+        sections.append(f"Repository scope: {scope}")
+    if inventory_paths:
+        sections.append("Tracked files verified: " + ", ".join(f"`{path}`" for path in inventory_paths[:8]))
+    if checks_performed:
+        sections.append("Checks performed: " + ", ".join(checks_performed))
+    sections.append(f"Why no finding: {why_no_finding}")
+    return _finalize_model_reply("\n\n".join(sections), max_chars=max_chars)
+
+
+def _render_structured_repo_audit_with_task_data(
+    text: str,
+    *,
+    max_chars: int,
+    task_data: Optional[dict[str, Any]],
+) -> str:
+    parsed = _extract_first_json_object(text)
+    if not isinstance(parsed, dict):
+        if _is_adapter_error(text):
+            return ""
+        return _render_default_repo_audit(task_data=task_data, max_chars=max_chars, summary_hint=text)
+    if _is_adapter_error(text):
+        return ""
+    repo_audit = _repo_audit_inputs(task_data or {})
+    repo_url = _clean_review_label(repo_audit.get("repo_url"), max_chars=200)
+    ref = _clean_review_label(repo_audit.get("ref"), max_chars=120)
+    inventory_paths = _clean_review_list(repo_audit.get("inventory_paths"), max_items=300, max_chars=160)
+    allowed_path_keys = {item.lower(): item for item in inventory_paths}
+    summary = _clean_review_text(parsed.get("summary"), max_chars=500)
+    if _is_weak_review_text(summary):
+        summary = ""
+    repo_overview = _clean_review_text(parsed.get("repo_overview"), max_chars=500)
+    if _is_weak_review_text(repo_overview):
+        repo_overview = ""
+    risk_areas_checked = _clean_review_list(parsed.get("risk_areas_checked"), max_items=5, max_chars=100)
+    checks_performed = _clean_review_list(parsed.get("checks_performed"), max_items=5, max_chars=140)
+    why_no_finding = _clean_review_text(parsed.get("why_no_finding"), max_chars=400)
+    if _is_weak_review_text(why_no_finding):
+        why_no_finding = ""
+    findings: list[str] = []
+    findings_raw = parsed.get("findings")
+    if isinstance(findings_raw, list):
+        for item in findings_raw[:5]:
+            if not isinstance(item, dict):
+                continue
+            file_name = _clean_review_label(item.get("file"), max_chars=160)
+            matched = allowed_path_keys.get(file_name.lower()) if file_name else None
+            if not matched:
+                continue
+            issue = _clean_review_text(item.get("issue"), max_chars=200)
+            rationale = _clean_review_text(item.get("rationale"), max_chars=420)
+            combined = f"{issue} {rationale}".strip()
+            if not issue or _is_weak_review_text(combined):
+                continue
+            findings.append(f"**{issue}** (`{matched}`): {rationale or 'Check this path.'}")
+    if not summary:
+        summary = _default_repo_audit_summary(repo_url=repo_url, ref=ref, inventory_paths=inventory_paths)
+    if not checks_performed:
+        checks_performed = _default_repo_audit_checks(repo_url=repo_url, ref=ref, inventory_paths=inventory_paths)
+    if not findings and not why_no_finding:
+        why_no_finding = (
+            "No finding remained after filtering claims to files that exist in the checked-out workspace inventory."
+            if inventory_paths
+            else "No authoritative tracked-file inventory was available, so findings were withheld."
+        )
+    sections = ["## Repo Audit Findings" if findings else "## Repo Audit Summary", summary]
+    if repo_url:
+        scope = f"`{repo_url}`"
+        if ref:
+            scope += f" @ `{ref}`"
+        sections.append(f"Repository scope: {scope}")
+    if repo_overview:
+        sections.append(f"Repository overview: {repo_overview}")
+    if inventory_paths:
+        sections.append("Tracked files verified: " + ", ".join(f"`{path}`" for path in inventory_paths[:8]))
+    if risk_areas_checked:
+        sections.append("Risk areas checked: " + ", ".join(risk_areas_checked))
+    if checks_performed:
+        sections.append("Checks performed: " + ", ".join(checks_performed))
+    if why_no_finding:
+        sections.append(f"Why no finding: {why_no_finding}")
+    for index, finding in enumerate(findings, start=1):
+        sections.append(f"{index}. {finding}")
+    return _finalize_model_reply("\n\n".join(sections), max_chars=max_chars)
+
+
 def _render_structured_review_with_task_data(
     text: str,
     *,
     max_chars: int,
     task_data: Optional[dict[str, Any]],
 ) -> str:
+    if _task_requires_repo_audit_prompt(task_data or {}):
+        return _render_structured_repo_audit_with_task_data(text, max_chars=max_chars, task_data=task_data)
     parsed = _extract_first_json_object(text)
     approval_mode = _task_is_approval_review(task_data or {})
     if not isinstance(parsed, dict):
@@ -1125,6 +1325,25 @@ class AIAdapter:
 
         try:
             review_max = _review_max_chars()
+            if _task_requires_repo_audit_prompt(task_data):
+                prompt = (
+                    f"{_system_prompt_for_task(task_data, generic_max_chars=300, review_max_chars=review_max)}\n\n"
+                    f"Task: {payload}\n\nReply:"
+                )
+                result = subprocess.run(
+                    ["ollama", "run", self.model, prompt],
+                    capture_output=True,
+                    text=True,
+                    timeout=90,
+                )
+                rendered = _render_structured_repo_audit_with_task_data(
+                    result.stdout or "",
+                    max_chars=review_max,
+                    task_data=task_data,
+                )
+                if rendered:
+                    return rendered
+                return f"[AI adapter] empty response from {self.model}"
             if _task_requires_review_prompt(task_data):
                 def _invoke(system_prompt: str, user_payload: str) -> str:
                     prompt = f"{system_prompt}\n\nTask: {user_payload}\n\nReply:"
@@ -1200,6 +1419,24 @@ class DeepSeekAdapter:
                 if not reply:
                     reply = str(message.get("reasoning_content") or "").strip()
                 return reply
+
+            if _task_requires_repo_audit_prompt(task_data):
+                reply = _invoke(
+                    _system_prompt_for_task(
+                        task_data,
+                        generic_max_chars=500,
+                        review_max_chars=review_max,
+                    ),
+                    payload,
+                )
+                rendered = _render_structured_repo_audit_with_task_data(
+                    reply,
+                    max_chars=review_max,
+                    task_data=task_data,
+                )
+                if rendered:
+                    return rendered
+                return "[DeepSeek] review response was empty"
 
             if _task_requires_review_prompt(task_data):
                 result = _run_two_pass_review(
@@ -1278,6 +1515,173 @@ class WorkspaceManager:
             return False, f"checkout failed: {out}"
 
         return True, workspace_path
+
+    @staticmethod
+    def _normalize_repo_clone_url(repo_url: str) -> str:
+        cleaned = str(repo_url or "").strip()
+        if not cleaned:
+            return ""
+        if "://" in cleaned or cleaned.startswith("git@"):
+            return cleaned
+        if cleaned.startswith("github.com/") or cleaned.startswith("www.github.com/"):
+            normalized = cleaned.removeprefix("www.")
+            if not normalized.startswith("github.com/"):
+                normalized = normalized.split("/", 1)[-1]
+                normalized = f"github.com/{normalized}"
+            if not normalized.endswith(".git"):
+                normalized += ".git"
+            return f"https://{normalized}"
+        return cleaned
+
+    @staticmethod
+    def _workspace_slug(repo_url: str) -> str:
+        cleaned = str(repo_url or "").strip().lower()
+        if cleaned.endswith(".git"):
+            cleaned = cleaned[:-4]
+        cleaned = re.sub(r"^[a-z]+://", "", cleaned)
+        cleaned = cleaned.replace("git@", "")
+        cleaned = cleaned.replace(":", "/")
+        cleaned = re.sub(r"[^a-z0-9._/-]+", "-", cleaned)
+        cleaned = cleaned.strip("/").replace("/", "__")
+        return cleaned or "repo_audit"
+
+    def sync_repo_audit_workspace(self, repo_url: str, ref: Optional[str] = None) -> tuple[bool, str]:
+        normalized_repo_url = self._normalize_repo_clone_url(repo_url)
+        if not normalized_repo_url:
+            return False, "repo_url is empty"
+        workspace_path = os.path.join(self.base_dir, "repo-audit", self._workspace_slug(normalized_repo_url))
+        os.makedirs(os.path.dirname(workspace_path), exist_ok=True)
+        if not os.path.exists(os.path.join(workspace_path, ".git")):
+            print(f"[mep repo_audit] cloning {normalized_repo_url} into {workspace_path}")
+            code, out = self._run_git(os.path.dirname(workspace_path), ["clone", normalized_repo_url, os.path.basename(workspace_path)])
+            if code != 0:
+                return False, f"clone failed: {out}"
+        print(f"[mep repo_audit] fetching workspace for {normalized_repo_url}")
+        code, out = self._run_git(workspace_path, ["fetch", "--all", "--tags"])
+        if code != 0:
+            return False, f"fetch failed: {out}"
+        target_ref = str(ref or "").strip()
+        checkout_candidates = [target_ref] if target_ref else []
+        if target_ref and not target_ref.startswith("origin/"):
+            checkout_candidates.append(f"origin/{target_ref}")
+        if not checkout_candidates:
+            checkout_candidates = ["origin/HEAD"]
+        last_error = ""
+        for candidate in checkout_candidates:
+            code, out = self._run_git(workspace_path, ["checkout", "--force", candidate])
+            if code == 0:
+                return True, workspace_path
+            last_error = out
+        return False, f"checkout failed: {last_error}"
+
+    @staticmethod
+    def _repo_audit_priority(path: str) -> tuple[int, int, str]:
+        normalized = str(path or "").replace("\\", "/").strip()
+        lowered = normalized.lower()
+        basename = lowered.rsplit("/", 1)[-1]
+        if basename in {"readme.md", "readme"}:
+            return (0, len(normalized), normalized)
+        if basename in {"pyproject.toml", "package.json", "requirements.txt", "dockerfile"}:
+            return (1, len(normalized), normalized)
+        if lowered.startswith(".github/workflows/"):
+            return (2, len(normalized), normalized)
+        if lowered.startswith(("bridge/", "node/", "hub/", "clients/", "tests/")):
+            return (3, len(normalized), normalized)
+        depth = lowered.count("/")
+        return (4 + min(depth, 5), len(normalized), normalized)
+
+    @staticmethod
+    def _is_repo_audit_text_path(path: str) -> bool:
+        lowered = str(path or "").lower()
+        text_suffixes = (
+            ".md",
+            ".txt",
+            ".py",
+            ".toml",
+            ".json",
+            ".yml",
+            ".yaml",
+            ".ini",
+            ".cfg",
+            ".sh",
+            ".ps1",
+            ".ts",
+            ".tsx",
+            ".js",
+            ".jsx",
+            ".sql",
+        )
+        return lowered.endswith(text_suffixes) or "/" not in lowered
+
+    def build_repo_audit_context(
+        self,
+        workspace_path: str,
+        *,
+        max_inventory_paths: int = 300,
+        max_files: int = 10,
+        max_file_chars: int = 6000,
+        max_chars: int = 50000,
+    ) -> tuple[str, list[str]]:
+        if not workspace_path or not os.path.isdir(workspace_path):
+            return "", []
+        inventory: list[str] = []
+        code, out = self._run_git(workspace_path, ["ls-files"])
+        if code == 0:
+            inventory = [line.strip().replace("\\", "/") for line in out.splitlines() if line.strip()]
+        if not inventory:
+            for root, _dirs, files in os.walk(workspace_path):
+                if ".git" in root.split(os.sep):
+                    continue
+                for name in files:
+                    absolute = os.path.join(root, name)
+                    relative = os.path.relpath(absolute, workspace_path).replace("\\", "/")
+                    inventory.append(relative)
+        deduped_inventory: list[str] = []
+        seen_paths: set[str] = set()
+        for path in sorted(inventory, key=self._repo_audit_priority):
+            if path in seen_paths:
+                continue
+            seen_paths.add(path)
+            deduped_inventory.append(path)
+        inventory = deduped_inventory[:max_inventory_paths]
+        if not inventory:
+            return "", []
+        sections = [
+            f"Local workspace path: {workspace_path}",
+            "Tracked file inventory from the checked-out repository (authoritative scope for this audit):",
+            "\n".join(f"- {path}" for path in inventory),
+        ]
+        remaining = max_chars - sum(len(section) + 2 for section in sections)
+        if remaining <= 400:
+            return "\n\n".join(sections), inventory
+        added = 0
+        for path in inventory:
+            if added >= max_files or remaining <= 400:
+                break
+            if not self._is_repo_audit_text_path(path):
+                continue
+            resolved = self._resolve_repo_file(workspace_path, path)
+            if not resolved or not os.path.isfile(resolved):
+                continue
+            try:
+                with open(resolved, "r", encoding="utf-8", errors="replace") as handle:
+                    content = handle.read()
+            except OSError:
+                continue
+            if not content.strip():
+                continue
+            body = content[:max_file_chars].rstrip()
+            block = f"### {path}\n```\n{body}\n```"
+            if len(content) > max_file_chars:
+                block += "\n[note: file body truncated for input budget; rely only on visible content here]"
+            if len(block) > remaining:
+                continue
+            if added == 0:
+                sections.append("Selected authoritative file contents for the repo audit:")
+            sections.append(block)
+            remaining -= len(block) + 2
+            added += 1
+        return "\n\n".join(sections), inventory
 
     @staticmethod
     def _resolve_repo_file(workspace_path: str, relative_path: str) -> Optional[str]:
@@ -2256,12 +2660,15 @@ class RuntimeNode:
         if MEPClient is not None:
             instructions, interbot_message = MEPClient.extract_interbot_instructions(payload)
         workspace_path = ""
+        task = task_data.get("task") if isinstance(task_data.get("task"), dict) else {}
+        if not task and isinstance(interbot_message, dict) and isinstance(interbot_message.get("task"), dict):
+            task = copy.deepcopy(interbot_message.get("task"))
+        inputs = task.get("inputs") if isinstance(task.get("inputs"), dict) else {}
+        github_inputs = dict(inputs.get("github") or {}) if isinstance(inputs.get("github"), dict) else {}
+        repo_audit_inputs = dict(inputs.get("repo_audit") or {}) if isinstance(inputs.get("repo_audit"), dict) else {}
 
         # Phase 4: Sync workspace if this is a GitHub PR task
         if interbot_message:
-            task = interbot_message.get("task") if isinstance(interbot_message.get("task"), dict) else {}
-            inputs = task.get("inputs") if isinstance(task.get("inputs"), dict) else {}
-            github_inputs = dict(inputs.get("github") or {}) if isinstance(inputs.get("github"), dict) else {}
             repo_url = github_inputs.get("repo_clone_url")
             head_sha = github_inputs.get("head_sha")
             head_ref = github_inputs.get("head_ref")
@@ -2301,16 +2708,41 @@ class RuntimeNode:
                     print(f"[mep workspace] sync failed: {path_or_err}")
                     # We continue anyway, but the adapter might be working on stale code
 
-            task_copy = copy.deepcopy(task) if isinstance(task, dict) else {}
-            inputs_copy = copy.deepcopy(inputs) if isinstance(inputs, dict) else {}
-            inputs_copy["github"] = github_inputs
-            if inputs_copy:
-                task_copy["inputs"] = inputs_copy
-            if task_copy:
-                adapter_task_data["task"] = task_copy
             intent = interbot_message.get("intent")
             if isinstance(intent, dict):
                 adapter_task_data["intent"] = copy.deepcopy(intent)
+
+        repo_url = str(repo_audit_inputs.get("repo_url") or "").strip()
+        repo_ref = str(repo_audit_inputs.get("ref") or "").strip()
+        if repo_url:
+            print(f"[mep repo_audit] auto-syncing for task={task_id[:8]} repo={repo_url}")
+            ok, path_or_err = await asyncio.to_thread(self.workspace.sync_repo_audit_workspace, repo_url, repo_ref or None)
+            if ok:
+                repo_workspace_path = path_or_err
+                repo_audit_inputs["local_workspace_path"] = repo_workspace_path
+                audit_context, inventory_paths = await asyncio.to_thread(
+                    self.workspace.build_repo_audit_context,
+                    repo_workspace_path,
+                )
+                if inventory_paths:
+                    repo_audit_inputs["inventory_paths"] = inventory_paths
+                if audit_context:
+                    instructions = f"{instructions}\n\nAuthoritative local repo audit context:\n{audit_context}"
+            else:
+                print(f"[mep repo_audit] sync failed: {path_or_err}")
+                self.complete(task_id, f"[repo audit] workspace sync failed: {path_or_err}")
+                return
+
+        task_copy = copy.deepcopy(task) if isinstance(task, dict) else {}
+        inputs_copy = copy.deepcopy(inputs) if isinstance(inputs, dict) else {}
+        if github_inputs:
+            inputs_copy["github"] = github_inputs
+        if repo_audit_inputs:
+            inputs_copy["repo_audit"] = repo_audit_inputs
+        if inputs_copy:
+            task_copy["inputs"] = inputs_copy
+        if task_copy:
+            adapter_task_data["task"] = task_copy
 
         result = self.adapter.generate_reply(instructions, adapter_task_data)
 
