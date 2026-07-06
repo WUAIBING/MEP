@@ -6,10 +6,13 @@ services:
     ports:
       - "8000:8000"
     volumes:
-      - ./hub_data:/app/logs
+      - ${MEP_HUB_LOGS_DIR:-./hub_data}:/app/logs
     environment:
       - TZ=UTC
       - MEP_DATABASE_URL=${MEP_DATABASE_URL:?Set MEP_DATABASE_URL}
+      - MEP_BUILD_SHA=${MEP_BUILD_SHA:-dev}
+      - MEP_BUILD_TIME=${MEP_BUILD_TIME:-unknown}
+      - MEP_DEPLOY_SOURCE=${MEP_DEPLOY_SOURCE:-docker-compose}
     depends_on:
       - postgres
 

@@ -69,6 +69,18 @@ mesh_lock = asyncio.Lock()
 CALL_RELAY_ENABLED = os.getenv("MEP_CALL_RELAY_ENABLED", "1") not in ("0", "false", "False")
 
 
+def _hub_build_info() -> dict[str, str]:
+    build_sha = str(os.getenv("MEP_BUILD_SHA", "unknown") or "unknown").strip() or "unknown"
+    build_time = str(os.getenv("MEP_BUILD_TIME", "unknown") or "unknown").strip() or "unknown"
+    deploy_source = str(os.getenv("MEP_DEPLOY_SOURCE", "unknown") or "unknown").strip() or "unknown"
+    return {
+        "app_version": app.version,
+        "build_sha": build_sha,
+        "build_time": build_time,
+        "deploy_source": deploy_source,
+    }
+
+
 async def _call_relay_send(node_id: str, message: dict) -> bool:
     """Deliver a call.* event to a node's current live socket (used by CallRelay)."""
     ws = connected_nodes.get(node_id)
@@ -1683,6 +1695,15 @@ async def start_timeout_worker():
     await _reconcile_live_registry_presence()
     asyncio.create_task(_assignment_timeout_worker())
     asyncio.create_task(_maintenance_worker())
+    build_info = _hub_build_info()
+    log_event(
+        "hub_build_info",
+        f"Hub build {build_info['build_sha']} ({build_info['deploy_source']})",
+        app_version=build_info["app_version"],
+        build_sha=build_info["build_sha"],
+        build_time=build_info["build_time"],
+        deploy_source=build_info["deploy_source"],
+    )
     if REQUIRE_TLS:
         log_event("transport_policy", "TLS enforcement enabled", require_tls=True, trust_proxy_proto=TRUST_PROXY_PROTO)
     else:
@@ -3041,6 +3062,18 @@ async def health_check():
     }
 
 
+@app.get("/version")
+async def hub_version():
+    build_info = _hub_build_info()
+    return {
+        "status": "ok",
+        "app_version": build_info["app_version"],
+        "build_sha": build_info["build_sha"],
+        "build_time": build_info["build_time"],
+        "deploy_source": build_info["deploy_source"],
+    }
+
+
 # ---------------------------------------------------------------------------
 # Diagnostic Endpoint — tiered approach (per Hermes DM discussion)
 # ---------------------------------------------------------------------------
@@ -3465,6 +3498,7 @@ async def anti_loop_reset(channel: Optional[str] = None, x_mep_admin_key: Option
 
 @app.get("/", response_class=HTMLResponse)
 async def hub_landing(request: Request):
+    build_info = _hub_build_info()
     async with node_lock:
         online_count = len(connected_nodes)
     async with task_lock:
@@ -3508,7 +3542,7 @@ async def hub_landing(request: Request):
 <body>
   <div class="card">
     <div class="label">Welcome to MEP Hub 0</div>
-    <div>Version {app.version} Uptime {uptime} Status {status}</div>
+    <div>Version {build_info["app_version"]} Uptime {uptime} Status {status}</div>
     <div class="row">
       <div>
         <div class="kpi">{online_count}</div>
@@ -3526,6 +3560,10 @@ async def hub_landing(request: Request):
     <div class="section">
       <div class="label">Docs</div>
       <div><a href="https://github.com/WUAIBING/MEP/blob/main/README.md">GitHub README</a></div>
+    </div>
+    <div class="section">
+      <div class="label">Build</div>
+      <div class="mono">SHA={build_info["build_sha"]}<br>Time={build_info["build_time"]}<br>Source={build_info["deploy_source"]}<br>Version URL={base_url}/version</div>
     </div>
     <div class="section">
       <div class="label">How to connect</div>

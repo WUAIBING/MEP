@@ -118,6 +118,26 @@ class TestHealthEndpoint(unittest.TestCase):
         data = resp.json()
         self.assertEqual(data["status"], "ok")
         self.assertIn("metrics", data)
+
+    def test_version_reports_build_metadata_from_environment(self):
+        with mock.patch.dict(
+            os.environ,
+            {
+                "MEP_BUILD_SHA": "abc123def",
+                "MEP_BUILD_TIME": "2026-07-06T13:30:00Z",
+                "MEP_DEPLOY_SOURCE": "scripts/deploy_hub.sh",
+            },
+            clear=False,
+        ):
+            resp = client.get("/version")
+
+        self.assertEqual(resp.status_code, 200)
+        data = resp.json()
+        self.assertEqual(data["status"], "ok")
+        self.assertEqual(data["app_version"], app.version)
+        self.assertEqual(data["build_sha"], "abc123def")
+        self.assertEqual(data["build_time"], "2026-07-06T13:30:00Z")
+        self.assertEqual(data["deploy_source"], "scripts/deploy_hub.sh")
 
 
 class TestRegistration(unittest.TestCase):
@@ -948,6 +968,43 @@ class TestThreeMarketSpecConformance(unittest.TestCase):
         self.assertEqual(task["task"]["inputs"]["repo_audit"]["repo_url"], "github.com/WUAIBING/MEP")
         self.assertEqual(task["task"]["expected_output"]["result_type"], "repo_audit_result")
         self.assertEqual(task["intent"], {"type": "repo_audit.request"})
+
+    def test_live_targeted_delivery_preserves_structured_repo_audit_metadata(self):
+        sender_priv, sender_pub, sender_id = _make_identity()
+        _, target_pub, target_id = _make_identity()
+        _register(sender_pub)
+        _register(target_pub)
+
+        live_ws = _FakeWebSocket()
+        main.connected_nodes[target_id] = live_ws
+        try:
+            task_id = self._submit_spec_task(
+                sender_priv,
+                sender_id,
+                instructions="Audit github.com/WUAIBING/MEP.",
+                bounty_ns=0,
+                market="chat",
+                payment_direction="none",
+                target_node=target_id,
+                target_capability="repo_audit",
+                intent_type="repo_audit.request",
+                expected_output={"result_type": "repo_audit_result", "format": "json"},
+                task_title="Repo audit: github.com/WUAIBING/MEP",
+                task_inputs={"repo_audit": {"repo_url": "github.com/WUAIBING/MEP", "max_findings": 5}},
+            )
+        finally:
+            main.connected_nodes.pop(target_id, None)
+
+        self.assertEqual(len(live_ws.sent), 1)
+        event = live_ws.sent[0]
+        self.assertEqual(event["event"], "new_task")
+        task = event["data"]
+        self.assertEqual(task["id"], task_id)
+        self.assertEqual(task["intent"], {"type": "repo_audit.request"})
+        self.assertEqual(task["model_requirement"], "repo_audit")
+        self.assertEqual(task["task"]["title"], "Repo audit: github.com/WUAIBING/MEP")
+        self.assertEqual(task["task"]["expected_output"]["result_type"], "repo_audit_result")
+        self.assertEqual(task["task"]["inputs"]["repo_audit"]["repo_url"], "github.com/WUAIBING/MEP")
 
     def test_bid_response_preserves_structured_task_metadata(self):
         consumer_priv, consumer_pub, consumer_id = _make_identity()
