@@ -617,15 +617,21 @@ def _system_prompt_for_task(
         return (
             f"You are a senior repository auditor reviewing {repo_url}{ref_hint}. "
             "Return ONLY a JSON object with this schema: "
-            '{"summary": string, "repo_overview": string, "risk_areas_checked": [string], '
-            '"checks_performed": [string], "why_no_finding": string, '
-            '"findings": [{"file": string, "issue": string, "rationale": string}], '
+            '{"summary": string, "repo_overview": string, "coverage_summary": string, '
+            '"risk_areas_checked": [string], "checks_performed": [string], "why_no_finding": string, '
+            '"findings": [{"file": string, "title": string, "category": string, "severity": "high|medium|low", '
+            '"confidence": "high|medium|low", "developer_impact": string, "evidence": string, "next_step": string}], '
+            '"observations": [{"file": string, "note": string}], '
             '"artifact_recommended": boolean}. '
             "Publish at most 5 findings, ranked by developer impact. "
+            "Use `findings` only for high-signal issues that a developer should fix now or on the next change in that area. "
+            "Put lower-signal hygiene notes, uncertainty, or weakly actionable comments into `observations` instead of `findings`. "
             "Use `repo_overview` for a concise factual description of the repository areas you actually inspected. "
+            "Use `coverage_summary` to state what parts of the checked-out workspace you actually inspected and what was not deeply reviewed. "
             "Use `checks_performed` for 1-5 concrete verification steps you performed against the supplied inventory, file contents, or verification output. "
             "Use `risk_areas_checked` for 1-5 concrete risk themes you audited. "
             "Only publish a finding when the supplied repo context directly supports it. "
+            "Every published finding must name the impacted file, explain the developer impact, cite concrete evidence from the supplied repo context, and give one short next step. "
             "Do not invent files, endpoints, dependencies, or artifacts that are not present in the supplied repo context. "
             "Do not rely on web knowledge, generic security checklists, or assumptions about unseen code. "
             "If you cannot verify a concrete finding from the supplied workspace material, keep `findings` empty and explain why in `why_no_finding`. "
@@ -1091,6 +1097,55 @@ def _default_repo_audit_checks(
     return checks[:4]
 
 
+def _default_repo_audit_coverage_summary(
+    *,
+    repo_url: str,
+    ref: str,
+    inventory_paths: list[str],
+) -> str:
+    scope = repo_url or "the supplied repository"
+    if ref:
+        scope = f"{scope} @ {ref}"
+    if inventory_paths:
+        return (
+            f"Checked the local workspace for {scope} against {len(inventory_paths)} tracked files and only "
+            "published findings that stayed grounded in that supplied inventory and selected file contents."
+        )
+    return f"Coverage stayed fail-closed for {scope} because no authoritative local workspace inventory was available."
+
+
+def _normalize_repo_audit_severity(value: Any) -> str:
+    severity = _clean_review_label(value, max_chars=20).lower()
+    if severity in {"critical", "high"}:
+        return "high"
+    if severity in {"medium", "moderate"}:
+        return "medium"
+    if severity in {"low", "minor", "info", "informational"}:
+        return "low"
+    return "medium"
+
+
+def _normalize_repo_audit_confidence(value: Any) -> str:
+    confidence = _clean_review_label(value, max_chars=20).lower()
+    if confidence in {"high", "strong"}:
+        return "high"
+    if confidence in {"medium", "moderate"}:
+        return "medium"
+    if confidence in {"low", "weak"}:
+        return "low"
+    return "medium"
+
+
+def _repo_audit_finding_sort_key(finding: dict[str, str]) -> tuple[int, int, str]:
+    severity_rank = {"high": 0, "medium": 1, "low": 2}
+    confidence_rank = {"high": 0, "medium": 1, "low": 2}
+    return (
+        severity_rank.get(finding.get("severity", "medium"), 1),
+        confidence_rank.get(finding.get("confidence", "medium"), 1),
+        finding.get("file", ""),
+    )
+
+
 def _render_default_repo_audit(
     *,
     task_data: Optional[dict[str, Any]],
@@ -1101,6 +1156,7 @@ def _render_default_repo_audit(
     repo_url = _clean_review_label(repo_audit.get("repo_url"), max_chars=200)
     ref = _clean_review_label(repo_audit.get("ref"), max_chars=120)
     inventory_paths = _clean_review_list(repo_audit.get("inventory_paths"), max_items=300, max_chars=160)
+    coverage_summary = _default_repo_audit_coverage_summary(repo_url=repo_url, ref=ref, inventory_paths=inventory_paths)
     summary = _clean_review_text(summary_hint, max_chars=500)
     if _is_weak_review_text(summary):
         summary = ""
@@ -1120,6 +1176,7 @@ def _render_default_repo_audit(
         sections.append(f"Repository scope: {scope}")
     if inventory_paths:
         sections.append("Tracked files verified: " + ", ".join(f"`{path}`" for path in inventory_paths[:8]))
+    sections.append(f"Coverage summary: {coverage_summary}")
     if checks_performed:
         sections.append("Checks performed: " + ", ".join(checks_performed))
     sections.append(f"Why no finding: {why_no_finding}")
@@ -1144,6 +1201,9 @@ def _render_structured_repo_audit_with_task_data(
     ref = _clean_review_label(repo_audit.get("ref"), max_chars=120)
     inventory_paths = _clean_review_list(repo_audit.get("inventory_paths"), max_items=300, max_chars=160)
     allowed_path_keys = {item.lower(): item for item in inventory_paths}
+    coverage_summary = _clean_review_text(parsed.get("coverage_summary"), max_chars=420)
+    if _is_weak_review_text(coverage_summary):
+        coverage_summary = ""
     summary = _clean_review_text(parsed.get("summary"), max_chars=500)
     if _is_weak_review_text(summary):
         summary = ""
@@ -1155,7 +1215,9 @@ def _render_structured_repo_audit_with_task_data(
     why_no_finding = _clean_review_text(parsed.get("why_no_finding"), max_chars=400)
     if _is_weak_review_text(why_no_finding):
         why_no_finding = ""
-    findings: list[str] = []
+    rendered_findings: list[str] = []
+    rendered_observations: list[str] = []
+    findings_for_sort: list[dict[str, str]] = []
     findings_raw = parsed.get("findings")
     if isinstance(findings_raw, list):
         for item in findings_raw[:5]:
@@ -1165,23 +1227,73 @@ def _render_structured_repo_audit_with_task_data(
             matched = allowed_path_keys.get(file_name.lower()) if file_name else None
             if not matched:
                 continue
-            issue = _clean_review_text(item.get("issue"), max_chars=200)
-            rationale = _clean_review_text(item.get("rationale"), max_chars=420)
-            combined = f"{issue} {rationale}".strip()
-            if not issue or _is_weak_review_text(combined):
+            title = _clean_review_text(item.get("title") or item.get("issue"), max_chars=180)
+            category = _clean_review_label(item.get("category"), max_chars=60)
+            severity = _normalize_repo_audit_severity(item.get("severity"))
+            confidence = _normalize_repo_audit_confidence(item.get("confidence"))
+            developer_impact = _clean_review_text(
+                item.get("developer_impact") or item.get("impact") or item.get("rationale"),
+                max_chars=240,
+            )
+            evidence = _clean_review_text(item.get("evidence") or item.get("rationale"), max_chars=260)
+            next_step = _clean_review_text(item.get("next_step"), max_chars=220)
+            combined = f"{title} {developer_impact} {evidence} {next_step}".strip()
+            if not title or _is_weak_review_text(combined):
                 continue
-            findings.append(f"**{issue}** (`{matched}`): {rationale or 'Check this path.'}")
+            note = (
+                developer_impact
+                or evidence
+                or next_step
+                or "Grounded note from the checked-out workspace."
+            )
+            if severity == "low" or confidence == "low":
+                rendered_observations.append(f"`{matched}`: {note}")
+                continue
+            finding_bits = [f"**[{severity}/{confidence}] {title}** (`{matched}`)"]
+            if category:
+                finding_bits.append(f"Category: {category}.")
+            if developer_impact:
+                finding_bits.append(f"Developer impact: {developer_impact}")
+            if evidence:
+                finding_bits.append(f"Evidence: {evidence}")
+            if next_step:
+                finding_bits.append(f"Next step: {next_step}")
+            findings_for_sort.append(
+                {
+                    "severity": severity,
+                    "confidence": confidence,
+                    "file": matched,
+                    "rendered": " ".join(finding_bits).strip(),
+                }
+            )
+    findings_for_sort.sort(key=_repo_audit_finding_sort_key)
+    rendered_findings.extend(entry["rendered"] for entry in findings_for_sort[:5])
+    observations_raw = parsed.get("observations")
+    if isinstance(observations_raw, list):
+        for item in observations_raw[:4]:
+            if not isinstance(item, dict):
+                continue
+            file_name = _clean_review_label(item.get("file"), max_chars=160)
+            matched = allowed_path_keys.get(file_name.lower()) if file_name else None
+            if not matched:
+                continue
+            note = _clean_review_text(item.get("note"), max_chars=260)
+            if not note or _is_weak_review_text(note):
+                continue
+            rendered_observations.append(f"`{matched}`: {note}")
     if not summary:
         summary = _default_repo_audit_summary(repo_url=repo_url, ref=ref, inventory_paths=inventory_paths)
+    if not coverage_summary:
+        coverage_summary = _default_repo_audit_coverage_summary(repo_url=repo_url, ref=ref, inventory_paths=inventory_paths)
     if not checks_performed:
         checks_performed = _default_repo_audit_checks(repo_url=repo_url, ref=ref, inventory_paths=inventory_paths)
-    if not findings and not why_no_finding:
+    if not rendered_findings and not why_no_finding:
         why_no_finding = (
-            "No finding remained after filtering claims to files that exist in the checked-out workspace inventory."
+            "No top finding remained after filtering to grounded, high-signal claims with concrete developer impact."
             if inventory_paths
             else "No authoritative tracked-file inventory was available, so findings were withheld."
         )
-    sections = ["## Repo Audit Findings" if findings else "## Repo Audit Summary", summary]
+    sections = ["## Repo Audit Findings" if rendered_findings else "## Repo Audit Summary", summary]
     if repo_url:
         scope = f"`{repo_url}`"
         if ref:
@@ -1189,6 +1301,7 @@ def _render_structured_repo_audit_with_task_data(
         sections.append(f"Repository scope: {scope}")
     if repo_overview:
         sections.append(f"Repository overview: {repo_overview}")
+    sections.append(f"Coverage summary: {coverage_summary}")
     if inventory_paths:
         sections.append("Tracked files verified: " + ", ".join(f"`{path}`" for path in inventory_paths[:8]))
     if risk_areas_checked:
@@ -1197,8 +1310,10 @@ def _render_structured_repo_audit_with_task_data(
         sections.append("Checks performed: " + ", ".join(checks_performed))
     if why_no_finding:
         sections.append(f"Why no finding: {why_no_finding}")
-    for index, finding in enumerate(findings, start=1):
+    for index, finding in enumerate(rendered_findings, start=1):
         sections.append(f"{index}. {finding}")
+    if rendered_observations:
+        sections.append("Observations: " + " | ".join(rendered_observations[:3]))
     return _finalize_model_reply("\n\n".join(sections), max_chars=max_chars)
 
 
