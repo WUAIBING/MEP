@@ -70,9 +70,9 @@ CALL_RELAY_ENABLED = os.getenv("MEP_CALL_RELAY_ENABLED", "1") not in ("0", "fals
 
 
 def _hub_build_info() -> dict[str, str]:
-    build_sha = str(os.getenv("MEP_BUILD_SHA", "unknown") or "unknown").strip() or "unknown"
-    build_time = str(os.getenv("MEP_BUILD_TIME", "unknown") or "unknown").strip() or "unknown"
-    deploy_source = str(os.getenv("MEP_DEPLOY_SOURCE", "unknown") or "unknown").strip() or "unknown"
+    build_sha = str(os.getenv("MEP_BUILD_SHA", "")).strip() or "unknown"
+    build_time = str(os.getenv("MEP_BUILD_TIME", "")).strip() or "unknown"
+    deploy_source = str(os.getenv("MEP_DEPLOY_SOURCE", "")).strip() or "unknown"
     return {
         "app_version": app.version,
         "build_sha": build_sha,

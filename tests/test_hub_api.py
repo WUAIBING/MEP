@@ -138,6 +138,24 @@ class TestHealthEndpoint(unittest.TestCase):
         self.assertEqual(data["build_sha"], "abc123def")
         self.assertEqual(data["build_time"], "2026-07-06T13:30:00Z")
         self.assertEqual(data["deploy_source"], "scripts/deploy_hub.sh")
+
+    def test_version_falls_back_when_build_metadata_is_missing_or_blank(self):
+        with mock.patch.dict(
+            os.environ,
+            {
+                "MEP_BUILD_SHA": "",
+                "MEP_BUILD_TIME": "   ",
+                "MEP_DEPLOY_SOURCE": "",
+            },
+            clear=False,
+        ):
+            resp = client.get("/version")
+
+        self.assertEqual(resp.status_code, 200)
+        data = resp.json()
+        self.assertEqual(data["build_sha"], "unknown")
+        self.assertEqual(data["build_time"], "unknown")
+        self.assertEqual(data["deploy_source"], "unknown")
 
 
 class TestRegistration(unittest.TestCase):
