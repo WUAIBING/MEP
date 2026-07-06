@@ -611,6 +611,32 @@ def _task_structured_body(task: TaskCreate, payload: str) -> dict:
     return task_body
 
 
+def _task_requires_envelope_persistence(task: TaskCreate) -> bool:
+    source = task.source if isinstance(task.source, dict) else {}
+    if any(str(key) != "node_id" for key in source.keys()):
+        return True
+
+    intent = task.intent if isinstance(task.intent, dict) else {}
+    if intent:
+        if str(intent.get("type") or "").strip() != "analysis.request":
+            return True
+        if any(str(key) != "type" for key in intent.keys()):
+            return True
+
+    task_body = task.task if isinstance(task.task, dict) else {}
+    if task_body:
+        if any(str(key) not in {"instructions", "expected_output"} for key in task_body.keys()):
+            return True
+        expected_output = task_body.get("expected_output")
+        if isinstance(expected_output, dict) and expected_output:
+            return True
+
+    if isinstance(task.economics, dict) and task.economics:
+        return True
+
+    return False
+
+
 def _task_data_from_row(task_row: dict, *, status: Optional[str] = None, provider_id: Optional[str] = None) -> dict:
     payload = str(task_row.get("payload") or "")
     consumer_id = str(task_row.get("consumer_id") or "")
@@ -2322,9 +2348,28 @@ async def submit_task(
         expires_in_seconds=task.expires_in_seconds,
         verifier_type=verifier_type,
     )
+    require_envelope_persistence = _task_requires_envelope_persistence(task)
     try:
         db.set_task_envelope(task_id, json.dumps(task_data))
     except Exception as exc:
+        if require_envelope_persistence:
+            cancel_time = time.time()
+            cancelled = db.cancel_task_if_open(task_id, cancel_time)
+            refunded = None
+            if bounty > 0:
+                refunded = db.refund_escrow(task_id, cancel_time)
+                if refunded:
+                    refund_balance = db.get_balance(consumer_id)
+                    log_audit("ESCROW_REFUND", consumer_id, refunded, refund_balance, task_id)
+            log_event(
+                "task_envelope_error",
+                f"Failed to persist structured task envelope {task_id[:8]}: {exc}",
+                task_id=task_id,
+                fail_closed=True,
+                cancelled=cancelled,
+                refunded=refunded,
+            )
+            raise HTTPException(status_code=500, detail="Failed to persist structured task envelope")
         log_event("task_envelope_error", f"Failed to persist task envelope {task_id[:8]}: {exc}", task_id=task_id)
     async with task_lock:
         active_tasks[task_id] = task_data
