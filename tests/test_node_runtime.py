@@ -1057,6 +1057,77 @@ class TestRuntimeWebSocketLoop(unittest.TestCase):
         adapter_mock.assert_not_called()
         complete_mock.assert_called_once_with("task_repo_audit_fail", "[repo audit] workspace sync failed: fetch failed")
 
+    def test_process_task_fails_closed_when_repo_audit_contract_lacks_inputs(self):
+        node = _runtime_node()
+        task_data = {
+            "id": "task_repo_audit_missing_inputs",
+            "bounty": 0.0,
+            "payload": "Run a repo audit for github.com/WUAIBING/MEP.",
+            "model_requirement": "repo_audit",
+            "task": {
+                "instructions": "Run a repo audit for github.com/WUAIBING/MEP.",
+                "title": "Repo audit: github.com/WUAIBING/MEP",
+                "expected_output": {"result_type": "repo_audit_result"},
+            },
+        }
+
+        with (
+            patch.object(node.workspace, "sync_repo_audit_workspace") as sync_mock,
+            patch.object(node.adapter, "generate_reply") as adapter_mock,
+            patch.object(node, "complete") as complete_mock,
+        ):
+            asyncio.run(node.process_task(task_data))
+
+        sync_mock.assert_not_called()
+        adapter_mock.assert_not_called()
+        complete_mock.assert_called_once_with(
+            "task_repo_audit_missing_inputs",
+            "[repo audit] missing structured repo_audit inputs; refusing ungrounded audit",
+        )
+
+    def test_process_task_fails_closed_when_repo_audit_context_has_no_inventory(self):
+        node = _runtime_node()
+        task_data = {
+            "id": "task_repo_audit_no_inventory",
+            "bounty": 0.0,
+            "payload": "Run a repo audit for github.com/WUAIBING/MEP.",
+            "intent": {"type": "repo_audit.request"},
+            "task": {
+                "instructions": "Run a repo audit for github.com/WUAIBING/MEP.",
+                "inputs": {"repo_audit": {"repo_url": "github.com/WUAIBING/MEP", "ref": "main"}},
+            },
+        }
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with (
+                patch.object(node.workspace, "sync_repo_audit_workspace", return_value=(True, tmpdir)) as sync_mock,
+                patch.object(node.workspace, "build_repo_audit_context", return_value=("Local workspace path: tmpdir", [])) as context_mock,
+                patch.object(node.adapter, "generate_reply") as adapter_mock,
+                patch.object(node, "complete") as complete_mock,
+            ):
+                asyncio.run(node.process_task(task_data))
+
+        sync_mock.assert_called_once_with("github.com/WUAIBING/MEP", "main")
+        context_mock.assert_called_once_with(tmpdir)
+        adapter_mock.assert_not_called()
+        complete_mock.assert_called_once_with(
+            "task_repo_audit_no_inventory",
+            "[repo audit] workspace context missing: tracked-file inventory unavailable",
+        )
+
+    def test_repo_audit_prompt_recovers_when_intent_is_missing_but_contract_survives(self):
+        task_data = {
+            "model_requirement": "repo_audit",
+            "task": {
+                "title": "Repo audit: github.com/WUAIBING/MEP",
+                "expected_output": {"result_type": "repo_audit_result"},
+                "inputs": {"repo_audit": {"repo_url": "github.com/WUAIBING/MEP"}},
+            },
+        }
+
+        self.assertTrue(mep_runtime._task_requires_repo_audit_contract(task_data))  # noqa: SLF001
+        self.assertTrue(mep_runtime._task_requires_repo_audit_prompt(task_data))  # noqa: SLF001
+
     def test_process_task_skips_verification_for_untrusted_contributor_by_default(self):
         node = _runtime_node()
         with tempfile.TemporaryDirectory() as tmpdir:
