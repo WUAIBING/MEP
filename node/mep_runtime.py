@@ -432,8 +432,52 @@ def _repo_audit_inputs(task_data: dict[str, Any]) -> dict[str, Any]:
     return repo_audit if isinstance(repo_audit, dict) else {}
 
 
+def _task_title(task_data: dict[str, Any]) -> str:
+    interbot_message = _interbot_message_from_task_data(task_data)
+    task: Any = task_data.get("task")
+    if not isinstance(task, dict) and isinstance(interbot_message, dict):
+        task = interbot_message.get("task")
+    return str(task.get("title") or "").strip() if isinstance(task, dict) else ""
+
+
+def _task_expected_output(task_data: dict[str, Any]) -> dict[str, Any]:
+    interbot_message = _interbot_message_from_task_data(task_data)
+    task: Any = task_data.get("task")
+    if not isinstance(task, dict) and isinstance(interbot_message, dict):
+        task = interbot_message.get("task")
+    expected_output = task.get("expected_output") if isinstance(task, dict) else None
+    return expected_output if isinstance(expected_output, dict) else {}
+
+
+def _task_model_requirement(task_data: dict[str, Any]) -> str:
+    return str(task_data.get("model_requirement") or "").strip().lower()
+
+
+def _task_requires_repo_audit_contract(task_data: dict[str, Any]) -> bool:
+    if _review_intent_type(task_data) == "repo_audit.request":
+        return True
+    if _task_model_requirement(task_data) == "repo_audit":
+        return True
+    if _task_title(task_data).lower().startswith("repo audit:"):
+        return True
+    expected_output = _task_expected_output(task_data)
+    return str(expected_output.get("result_type") or "").strip().lower() == "repo_audit_result"
+
+
 def _task_requires_repo_audit_prompt(task_data: dict[str, Any]) -> bool:
-    return _review_intent_type(task_data) == "repo_audit.request" and bool(_repo_audit_inputs(task_data))
+    return _task_requires_repo_audit_contract(task_data) and bool(_repo_audit_inputs(task_data))
+
+
+def _repo_audit_contract_failure(task_data: dict[str, Any]) -> Optional[str]:
+    if not _task_requires_repo_audit_contract(task_data):
+        return None
+    repo_audit = _repo_audit_inputs(task_data)
+    if not repo_audit:
+        return "[repo audit] missing structured repo_audit inputs; refusing ungrounded audit"
+    repo_url = str(repo_audit.get("repo_url") or "").strip()
+    if not repo_url:
+        return "[repo audit] repo_url missing from structured repo_audit inputs"
+    return None
 
 
 def _review_github_inputs(task_data: dict[str, Any]) -> dict[str, Any]:
@@ -2666,6 +2710,21 @@ class RuntimeNode:
         inputs = task.get("inputs") if isinstance(task.get("inputs"), dict) else {}
         github_inputs = dict(inputs.get("github") or {}) if isinstance(inputs.get("github"), dict) else {}
         repo_audit_inputs = dict(inputs.get("repo_audit") or {}) if isinstance(inputs.get("repo_audit"), dict) else {}
+        repo_audit_required = _task_requires_repo_audit_contract(task_data)
+        if repo_audit_required:
+            print(
+                "[mep repo_audit] task contract "
+                f"task={task_id[:8]} "
+                f"intent={_review_intent_type(task_data) or '-'} "
+                f"model_requirement={_task_model_requirement(task_data) or '-'} "
+                f"title={_task_title(task_data)[:120] or '-'} "
+                f"has_repo_inputs={bool(repo_audit_inputs)}"
+            )
+            failure = _repo_audit_contract_failure(task_data)
+            if failure:
+                print(f"[mep repo_audit] refusing task={task_id[:8]} reason={failure}")
+                self.complete(task_id, failure)
+                return
 
         # Phase 4: Sync workspace if this is a GitHub PR task
         if interbot_message:
@@ -2724,10 +2783,18 @@ class RuntimeNode:
                     self.workspace.build_repo_audit_context,
                     repo_workspace_path,
                 )
-                if inventory_paths:
-                    repo_audit_inputs["inventory_paths"] = inventory_paths
-                if audit_context:
-                    instructions = f"{instructions}\n\nAuthoritative local repo audit context:\n{audit_context}"
+                if not inventory_paths:
+                    detail = "[repo audit] workspace context missing: tracked-file inventory unavailable"
+                    print(f"[mep repo_audit] refusing task={task_id[:8]} reason={detail}")
+                    self.complete(task_id, detail)
+                    return
+                repo_audit_inputs["inventory_paths"] = inventory_paths
+                if not audit_context:
+                    detail = "[repo audit] workspace context missing: authoritative repo audit context unavailable"
+                    print(f"[mep repo_audit] refusing task={task_id[:8]} reason={detail}")
+                    self.complete(task_id, detail)
+                    return
+                instructions = f"{instructions}\n\nAuthoritative local repo audit context:\n{audit_context}"
             else:
                 print(f"[mep repo_audit] sync failed: {path_or_err}")
                 self.complete(task_id, f"[repo audit] workspace sync failed: {path_or_err}")
@@ -2743,6 +2810,25 @@ class RuntimeNode:
             task_copy["inputs"] = inputs_copy
         if task_copy:
             adapter_task_data["task"] = task_copy
+        if repo_audit_required and not _review_intent_type(adapter_task_data):
+            adapter_task_data["intent"] = {"type": "repo_audit.request"}
+        if repo_audit_required:
+            failure = _repo_audit_contract_failure(adapter_task_data)
+            if failure:
+                print(f"[mep repo_audit] refusing normalized task={task_id[:8]} reason={failure}")
+                self.complete(task_id, failure)
+                return
+            normalized_repo_audit = _repo_audit_inputs(adapter_task_data)
+            if not str(normalized_repo_audit.get("local_workspace_path") or "").strip():
+                detail = "[repo audit] local workspace path missing after task normalization"
+                print(f"[mep repo_audit] refusing normalized task={task_id[:8]} reason={detail}")
+                self.complete(task_id, detail)
+                return
+            if not _clean_review_list(normalized_repo_audit.get("inventory_paths"), max_items=300, max_chars=160):
+                detail = "[repo audit] tracked-file inventory missing after task normalization"
+                print(f"[mep repo_audit] refusing normalized task={task_id[:8]} reason={detail}")
+                self.complete(task_id, detail)
+                return
 
         result = self.adapter.generate_reply(instructions, adapter_task_data)
 
