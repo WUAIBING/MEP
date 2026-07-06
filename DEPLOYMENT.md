@@ -190,14 +190,30 @@ docker-compose ps
 
 ## Step 10: Update the Hub
 
+Use one clean deployment checkout for the live Hub. Do not build production from an old hand-maintained folder with local edits, or the live Hub can drift away from the merged repo code.
+
 When new versions are released:
 
 ```bash
 cd ~/mep-hub/MEP
-git pull origin main
-docker-compose down
-docker-compose build --no-cache
-docker-compose up -d
+git fetch origin
+export MEP_HUB_LOGS_DIR=~/mep-hub/MEP/hub_data
+./scripts/deploy_hub.sh origin/main
+```
+
+The deploy script does four things:
+
+1. Refuses to deploy from a dirty working tree
+2. Resolves the exact target commit SHA and checks it out
+3. Rebuilds and restarts only `mep-hub`
+4. Calls `http://127.0.0.1:8000/version` and verifies the live Hub reports the same `build_sha`
+
+Set `MEP_HUB_LOGS_DIR` when you deploy from a clean checkout but want to keep using the existing production log volume.
+
+You can also deploy an exact merged commit instead of `origin/main`:
+
+```bash
+./scripts/deploy_hub.sh 0bac07cc65da3b878971abebbfb95a239cd757d3
 ```
 
 ---
