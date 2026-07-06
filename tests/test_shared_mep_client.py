@@ -108,6 +108,58 @@ class TestSharedMEPClient(unittest.TestCase):
         )
         self.assertEqual(body["secret_data"], "encrypted-data")
 
+    def test_submit_repo_audit_builds_structured_repo_audit_request(self):
+        with (
+            patch("clients.shared.mep_client.MEPIdentity", return_value=_FakeIdentity()),
+            patch("clients.shared.mep_client.requests.Session") as session_cls,
+        ):
+            session = session_cls.return_value
+            session.post.return_value = _FakeResponse()
+            client = MEPClient("unused.pem")
+
+            response = asyncio.run(
+                client.submit_repo_audit(
+                    "github.com/WUAIBING/MEP",
+                    audit_type="architecture_audit",
+                    ref="main",
+                    max_findings=7,
+                    inline_summary_max_chars=7000,
+                    artifact_preference="artifact_preferred",
+                    target_node="node_repo_bot",
+                )
+            )
+
+        self.assertEqual(response["json"]["task_id"], "task_123456")
+        body = json.loads(session.post.call_args.kwargs["data"])
+        self.assertEqual(body["intent"], {"type": "repo_audit.request", "priority": "high"})
+        self.assertEqual(body["routing"], {"target_node_id": "node_repo_bot", "target_capability": "repo_audit"})
+        self.assertEqual(body["task"]["title"], "Repo audit: github.com/WUAIBING/MEP")
+        self.assertEqual(
+            body["task"]["inputs"],
+            {
+                "repo_audit": {
+                    "repo_url": "github.com/WUAIBING/MEP",
+                    "audit_type": "architecture_audit",
+                    "max_findings": 7,
+                    "artifact_preference": "artifact_preferred",
+                    "inline_summary_max_chars": 7000,
+                    "ref": "main",
+                }
+            },
+        )
+        self.assertEqual(
+            body["task"]["expected_output"],
+            {
+                "result_type": "repo_audit_result",
+                "format": "json",
+                "artifact_allowed": True,
+                "inline_summary_max_chars": 7000,
+            },
+        )
+        self.assertIn("architecture_audit repo audit", body["task"]["instructions"])
+        self.assertIn("ref main", body["task"]["instructions"])
+        self.assertIn("include its URI", body["task"]["instructions"])
+
     def test_submit_task_preserves_200_error_body(self):
         response_body = {"status": "error", "detail": "Target node not currently connected to Hub"}
         with (

@@ -11,6 +11,7 @@ import sys
 import time
 import tempfile
 import unittest
+from unittest import mock
 
 # Point hub DB at a temp file so tests don't pollute anything
 _test_db = os.path.join(tempfile.gettempdir(), "mep_test_hub.db")
@@ -564,13 +565,17 @@ class TestThreeMarketSpecConformance(unittest.TestCase):
         target_node: str | None = None,
         target_capability: str | None = None,
         secret_data: str | None = None,
+        intent_type: str = "conformance.request",
+        expected_output: dict | None = None,
+        task_title: str | None = None,
+        task_inputs: dict | None = None,
     ) -> str:
         payload = {
             "source": {"node_id": node_id},
-            "intent": {"type": "conformance.request"},
+            "intent": {"type": intent_type},
             "task": {
                 "instructions": instructions,
-                "expected_output": {"result_type": "text"},
+                "expected_output": expected_output or {"result_type": "text"},
             },
             "economics": {
                 "bounty_ns": bounty_ns,
@@ -579,6 +584,10 @@ class TestThreeMarketSpecConformance(unittest.TestCase):
                 "payment_direction": payment_direction,
             },
         }
+        if task_title:
+            payload["task"]["title"] = task_title
+        if task_inputs:
+            payload["task"]["inputs"] = task_inputs
         routing = {}
         if target_node:
             routing["target_node_id"] = target_node
@@ -681,6 +690,104 @@ class TestThreeMarketSpecConformance(unittest.TestCase):
         self.assertEqual(fake_ws.sent[0]["data"]["id"], task_id)
         self.assertEqual(client.get(f"/balance/{sender_id}").json()["balance_seconds"], sender_before)
 
+    def test_targeted_task_delivery_preserves_structured_task_metadata(self):
+        sender_priv, sender_pub, sender_id = _make_identity()
+        _, target_pub, target_id = _make_identity()
+        _register(sender_pub)
+        _register(target_pub)
+
+        fake_ws = _FakeWebSocket()
+        main.connected_nodes[target_id] = fake_ws
+        try:
+            task_id = self._submit_spec_task(
+                sender_priv,
+                sender_id,
+                instructions="Audit github.com/WUAIBING/MEP.",
+                bounty_ns=0,
+                market="chat",
+                payment_direction="none",
+                target_node=target_id,
+                target_capability="repo_audit",
+                intent_type="repo_audit.request",
+                expected_output={
+                    "result_type": "repo_audit_result",
+                    "format": "json",
+                    "artifact_allowed": True,
+                    "inline_summary_max_chars": 6000,
+                },
+                task_title="Repo audit: github.com/WUAIBING/MEP",
+                task_inputs={
+                    "repo_audit": {
+                        "repo_url": "github.com/WUAIBING/MEP",
+                        "audit_type": "full_repo_audit",
+                        "max_findings": 5,
+                    }
+                },
+            )
+        finally:
+            main.connected_nodes.pop(target_id, None)
+
+        event_data = fake_ws.sent[0]["data"]
+        self.assertEqual(event_data["id"], task_id)
+        self.assertEqual(event_data["intent"], {"type": "repo_audit.request"})
+        self.assertEqual(event_data["task"]["title"], "Repo audit: github.com/WUAIBING/MEP")
+        self.assertEqual(
+            event_data["task"]["inputs"],
+            {
+                "repo_audit": {
+                    "repo_url": "github.com/WUAIBING/MEP",
+                    "audit_type": "full_repo_audit",
+                    "max_findings": 5,
+                }
+            },
+        )
+        self.assertEqual(event_data["task"]["expected_output"]["result_type"], "repo_audit_result")
+        stored = db.get_task(task_id)
+        persisted_envelope = json.loads(stored["envelope_json"])
+        self.assertEqual(persisted_envelope["task"]["title"], "Repo audit: github.com/WUAIBING/MEP")
+        self.assertEqual(persisted_envelope["model_requirement"], "repo_audit")
+
+    def test_structured_task_submit_fails_closed_when_envelope_persistence_fails(self):
+        consumer_priv, consumer_pub, consumer_id = _make_identity()
+        _register(consumer_pub)
+
+        consumer_before = client.get(f"/balance/{consumer_id}").json()["balance_seconds"]
+        active_before = len(db.get_active_tasks())
+        payload = {
+            "source": {"node_id": consumer_id},
+            "intent": {"type": "repo_audit.request", "priority": "high"},
+            "task": {
+                "instructions": "Audit github.com/WUAIBING/MEP.",
+                "expected_output": {
+                    "result_type": "repo_audit_result",
+                    "format": "json",
+                },
+                "title": "Repo audit: github.com/WUAIBING/MEP",
+                "inputs": {
+                    "repo_audit": {
+                        "repo_url": "github.com/WUAIBING/MEP",
+                        "audit_type": "full_repo_audit",
+                    }
+                },
+            },
+            "economics": {
+                "bounty_ns": 1_000_000_000,
+                "currency": "MEP_NS",
+                "market": "compute",
+                "payment_direction": "sender_to_receiver",
+            },
+        }
+
+        task_payload = json.dumps(payload)
+        headers = _auth_headers(consumer_priv, consumer_id, task_payload)
+        with mock.patch.object(main.db, "set_task_envelope", side_effect=RuntimeError("boom")):
+            resp = client.post("/tasks/submit", content=task_payload, headers=headers)
+
+        self.assertEqual(resp.status_code, 500, resp.text)
+        self.assertEqual(resp.json()["detail"], "Failed to persist structured task envelope")
+        self.assertEqual(client.get(f"/balance/{consumer_id}").json()["balance_seconds"], consumer_before)
+        self.assertEqual(len(db.get_active_tasks()), active_before)
+
     def test_spec_data_market_receiver_pays_sender_for_secret_data(self):
         seller_priv, seller_pub, seller_id = _make_identity()
         buyer_priv, buyer_pub, buyer_id = _make_identity()
@@ -805,6 +912,71 @@ class TestThreeMarketSpecConformance(unittest.TestCase):
         self.assertEqual(body["tasks"][0]["provider_id"], target_id)
         self.assertEqual(body["tasks"][0]["status"], "assigned")
 
+    def test_pending_tasks_endpoint_preserves_structured_task_metadata(self):
+        sender_priv, sender_pub, sender_id = _make_identity()
+        target_priv, target_pub, target_id = _make_identity()
+        _register(sender_pub)
+        _register(target_pub)
+
+        live_ws = _FakeWebSocket()
+        main.connected_nodes[target_id] = live_ws
+        try:
+            resp = self._submit_spec_task(
+                sender_priv,
+                sender_id,
+                instructions="Audit github.com/WUAIBING/MEP.",
+                bounty_ns=0,
+                market="chat",
+                payment_direction="none",
+                target_node=target_id,
+                target_capability="repo_audit",
+                intent_type="repo_audit.request",
+                expected_output={"result_type": "repo_audit_result", "format": "json"},
+                task_title="Repo audit: github.com/WUAIBING/MEP",
+                task_inputs={"repo_audit": {"repo_url": "github.com/WUAIBING/MEP", "max_findings": 5}},
+            )
+        finally:
+            main.connected_nodes.pop(target_id, None)
+
+        pending = client.get(f"/tasks/pending/{target_id}", headers=_auth_headers(target_priv, target_id, ""))
+        self.assertEqual(pending.status_code, 200, pending.text)
+        body = pending.json()
+        self.assertEqual(body["count"], 1)
+        task = body["tasks"][0]
+        self.assertEqual(task["task_id"], resp)
+        self.assertEqual(task["task"]["title"], "Repo audit: github.com/WUAIBING/MEP")
+        self.assertEqual(task["task"]["inputs"]["repo_audit"]["repo_url"], "github.com/WUAIBING/MEP")
+        self.assertEqual(task["task"]["expected_output"]["result_type"], "repo_audit_result")
+        self.assertEqual(task["intent"], {"type": "repo_audit.request"})
+
+    def test_bid_response_preserves_structured_task_metadata(self):
+        consumer_priv, consumer_pub, consumer_id = _make_identity()
+        provider_priv, provider_pub, provider_id = _make_identity()
+        _register(consumer_pub)
+        _register(provider_pub)
+
+        task_id = self._submit_spec_task(
+            consumer_priv,
+            consumer_id,
+            instructions="Audit github.com/WUAIBING/MEP.",
+            bounty_ns=1_000_000_000,
+            market="compute",
+            payment_direction="sender_to_receiver",
+            target_capability="repo_audit",
+            intent_type="repo_audit.request",
+            expected_output={"result_type": "repo_audit_result", "format": "json"},
+            task_title="Repo audit: github.com/WUAIBING/MEP",
+            task_inputs={"repo_audit": {"repo_url": "github.com/WUAIBING/MEP", "audit_type": "full_repo_audit"}},
+        )
+
+        bid_data = self._bid(provider_priv, provider_id, task_id)
+        self.assertEqual(bid_data["task"]["title"], "Repo audit: github.com/WUAIBING/MEP")
+        self.assertEqual(bid_data["task"]["inputs"]["repo_audit"]["audit_type"], "full_repo_audit")
+        self.assertEqual(bid_data["task"]["expected_output"]["result_type"], "repo_audit_result")
+        self.assertEqual(bid_data["intent"], {"type": "repo_audit.request"})
+        self.assertEqual(bid_data["source"], {"node_id": consumer_id})
+        self.assertEqual(bid_data["economics"]["market"], "compute")
+
     def test_queued_dm_flush_matches_live_targeted_shape(self):
         """A queued DM must be flushed with the same new_task event contract as a
         live targeted delivery, so offline recipients are not handed a thinner
@@ -848,6 +1020,58 @@ class TestThreeMarketSpecConformance(unittest.TestCase):
         # source.node_id (used for reply routing) must survive store-and-forward.
         self.assertEqual(flushed_data["source"]["node_id"], sender_id)
         self.assertEqual(flushed_data["task"]["expected_output"], live_data["task"]["expected_output"])
+
+    def test_queued_dm_flush_preserves_structured_task_metadata(self):
+        import asyncio
+
+        sender_priv, sender_pub, sender_id = _make_identity()
+        _, target_pub, target_id = _make_identity()
+        _register(sender_pub)
+        _register(target_pub)
+        main.connected_nodes.pop(target_id, None)
+
+        task_payload = json.dumps(
+            {
+                "source": {"node_id": sender_id},
+                "intent": {"type": "repo_audit.request"},
+                "task": {
+                    "instructions": "Audit github.com/WUAIBING/MEP.",
+                    "title": "Repo audit: github.com/WUAIBING/MEP",
+                    "inputs": {
+                        "repo_audit": {
+                            "repo_url": "github.com/WUAIBING/MEP",
+                            "audit_type": "architecture_audit",
+                            "max_findings": 5,
+                        }
+                    },
+                    "expected_output": {
+                        "result_type": "repo_audit_result",
+                        "format": "json",
+                    },
+                },
+                "economics": {
+                    "bounty_ns": 0,
+                    "currency": "MEP_NS",
+                    "market": "chat",
+                    "payment_direction": "none",
+                },
+                "routing": {"target_node_id": target_id, "target_capability": "repo_audit"},
+            }
+        )
+        headers = _auth_headers(sender_priv, sender_id, task_payload)
+        resp = client.post("/tasks/submit", content=task_payload, headers=headers)
+        self.assertEqual(resp.status_code, 200, resp.text)
+        self.assertEqual(resp.json()["status"], "queued")
+
+        flush_ws = _FakeWebSocket()
+        asyncio.run(main._flush_queued_dms(target_id, flush_ws))
+
+        flushed_data = flush_ws.sent[0]["data"]
+        self.assertEqual(flushed_data["intent"], {"type": "repo_audit.request"})
+        self.assertEqual(flushed_data["task"]["title"], "Repo audit: github.com/WUAIBING/MEP")
+        self.assertEqual(flushed_data["task"]["inputs"]["repo_audit"]["audit_type"], "architecture_audit")
+        self.assertEqual(flushed_data["task"]["expected_output"]["result_type"], "repo_audit_result")
+        self.assertEqual(flushed_data["model_requirement"], "repo_audit")
 
     def test_dm_queue_full_rejected(self):
         sender_priv, sender_pub, sender_id = _make_identity()
