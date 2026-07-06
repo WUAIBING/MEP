@@ -1636,6 +1636,62 @@ class TestWorkspaceReviewContext(unittest.TestCase):
         self.assertIn("README.md", ctx)
         self.assertIn("runtime_main", ctx)
 
+    def test_sync_repo_audit_workspace_fetches_target_ref_without_all_tags(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            wm = mep_runtime.WorkspaceManager(tmp)
+            workspace_path = os.path.join(
+                tmp,
+                "repo-audit",
+                wm._workspace_slug("https://github.com/WUAIBING/MEP.git"),  # noqa: SLF001
+            )
+            os.makedirs(os.path.join(workspace_path, ".git"), exist_ok=True)
+            calls: list[tuple[str, list[str], int]] = []
+
+            def fake_run_git(cwd, args, *, timeout_seconds=60):
+                calls.append((cwd, list(args), timeout_seconds))
+                if args[:4] == ["fetch", "--no-tags", "origin", "main"]:
+                    return 0, "fetched"
+                if args[:3] == ["checkout", "--force", "FETCH_HEAD"]:
+                    return 0, "checked out"
+                return 0, ""
+
+            with patch.object(wm, "_run_git", side_effect=fake_run_git):
+                ok, path = wm.sync_repo_audit_workspace("github.com/WUAIBING/MEP", "main")
+
+        self.assertTrue(ok)
+        self.assertEqual(path, workspace_path)
+        self.assertEqual(calls[0][1], ["fetch", "--no-tags", "origin", "main"])
+        self.assertEqual(calls[1][1], ["checkout", "--force", "FETCH_HEAD"])
+        self.assertTrue(all("--all" not in args and "--tags" not in args for _cwd, args, _timeout in calls))
+
+    def test_sync_repo_audit_workspace_uses_repo_audit_git_timeout_env(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            wm = mep_runtime.WorkspaceManager(tmp)
+            workspace_path = os.path.join(
+                tmp,
+                "repo-audit",
+                wm._workspace_slug("https://github.com/WUAIBING/MEP.git"),  # noqa: SLF001
+            )
+            os.makedirs(os.path.join(workspace_path, ".git"), exist_ok=True)
+            calls: list[tuple[str, list[str], int]] = []
+
+            def fake_run_git(cwd, args, *, timeout_seconds=60):
+                calls.append((cwd, list(args), timeout_seconds))
+                if args[:3] == ["checkout", "--force", "FETCH_HEAD"]:
+                    return 0, "checked out"
+                return 0, "ok"
+
+            with (
+                patch.dict(os.environ, {"MEP_REPO_AUDIT_GIT_TIMEOUT_SECONDS": "240"}),
+                patch.object(wm, "_run_git", side_effect=fake_run_git),
+            ):
+                ok, path = wm.sync_repo_audit_workspace("github.com/WUAIBING/MEP", "main")
+
+        self.assertTrue(ok)
+        self.assertEqual(path, workspace_path)
+        self.assertTrue(calls)
+        self.assertTrue(all(timeout == 240 for _cwd, _args, timeout in calls))
+
     def test_render_structured_repo_audit_filters_findings_to_inventory(self):
         task_data = {
             "intent": {"type": "repo_audit.request"},

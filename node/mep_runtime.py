@@ -1515,7 +1515,7 @@ class WorkspaceManager:
         self.base_dir = os.path.abspath(base_dir)
         os.makedirs(self.base_dir, exist_ok=True)
 
-    def _run_git(self, cwd: str, args: list[str]) -> tuple[int, str]:
+    def _run_git(self, cwd: str, args: list[str], *, timeout_seconds: int = 60) -> tuple[int, str]:
         try:
             result = subprocess.run(
                 ["git", *args],
@@ -1523,7 +1523,7 @@ class WorkspaceManager:
                 capture_output=True,
                 text=True,
                 check=False,
-                timeout=60,
+                timeout=timeout_seconds,
             )
             return result.returncode, (result.stdout + result.stderr).strip()
         except Exception as exc:  # noqa: BLE001
@@ -1593,26 +1593,60 @@ class WorkspaceManager:
         normalized_repo_url = self._normalize_repo_clone_url(repo_url)
         if not normalized_repo_url:
             return False, "repo_url is empty"
+        git_timeout_seconds = _env_positive_int("MEP_REPO_AUDIT_GIT_TIMEOUT_SECONDS", 180)
+        target_ref = str(ref or "").strip()
+        fetch_ref = target_ref.removeprefix("origin/") if target_ref.startswith("origin/") else target_ref
         workspace_path = os.path.join(self.base_dir, "repo-audit", self._workspace_slug(normalized_repo_url))
         os.makedirs(os.path.dirname(workspace_path), exist_ok=True)
         if not os.path.exists(os.path.join(workspace_path, ".git")):
             print(f"[mep repo_audit] cloning {normalized_repo_url} into {workspace_path}")
-            code, out = self._run_git(os.path.dirname(workspace_path), ["clone", normalized_repo_url, os.path.basename(workspace_path)])
+            clone_args = ["clone", "--no-tags"]
+            if fetch_ref:
+                clone_args.extend(["--single-branch", "--branch", fetch_ref])
+            clone_args.extend([normalized_repo_url, os.path.basename(workspace_path)])
+            code, out = self._run_git(
+                os.path.dirname(workspace_path),
+                clone_args,
+                timeout_seconds=git_timeout_seconds,
+            )
             if code != 0:
-                return False, f"clone failed: {out}"
-        print(f"[mep repo_audit] fetching workspace for {normalized_repo_url}")
-        code, out = self._run_git(workspace_path, ["fetch", "--all", "--tags"])
-        if code != 0:
-            return False, f"fetch failed: {out}"
-        target_ref = str(ref or "").strip()
-        checkout_candidates = [target_ref] if target_ref else []
+                if fetch_ref:
+                    fallback_clone_args = ["clone", "--no-tags", normalized_repo_url, os.path.basename(workspace_path)]
+                    code, out = self._run_git(
+                        os.path.dirname(workspace_path),
+                        fallback_clone_args,
+                        timeout_seconds=git_timeout_seconds,
+                    )
+                if code != 0:
+                    return False, f"clone failed: {out}"
+        fetch_plans: list[list[str]] = []
+        if fetch_ref:
+            fetch_plans.append(["fetch", "--no-tags", "origin", fetch_ref])
+        fetch_plans.append(["fetch", "--no-tags", "origin"])
+        last_fetch_error = ""
+        for fetch_args in fetch_plans:
+            print(f"[mep repo_audit] fetching workspace for {normalized_repo_url} with {' '.join(fetch_args[1:])}")
+            code, out = self._run_git(workspace_path, fetch_args, timeout_seconds=git_timeout_seconds)
+            if code == 0:
+                last_fetch_error = ""
+                break
+            last_fetch_error = out
+        if last_fetch_error:
+            return False, f"fetch failed: {last_fetch_error}"
+        checkout_candidates = ["FETCH_HEAD"] if target_ref else []
+        if target_ref:
+            checkout_candidates.append(target_ref)
         if target_ref and not target_ref.startswith("origin/"):
             checkout_candidates.append(f"origin/{target_ref}")
         if not checkout_candidates:
             checkout_candidates = ["origin/HEAD"]
         last_error = ""
         for candidate in checkout_candidates:
-            code, out = self._run_git(workspace_path, ["checkout", "--force", candidate])
+            code, out = self._run_git(
+                workspace_path,
+                ["checkout", "--force", candidate],
+                timeout_seconds=git_timeout_seconds,
+            )
             if code == 0:
                 return True, workspace_path
             last_error = out
