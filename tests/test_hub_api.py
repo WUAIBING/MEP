@@ -1,6 +1,6 @@
 """
 
-Hub API smoke tests — exercises the full task lifecycle using FastAPI TestClient.
+Hub API smoke tests 鈥?exercises the full task lifecycle using FastAPI TestClient.
 
 No running server or Postgres needed; uses SQLite backend automatically.
 
@@ -49,7 +49,7 @@ from cryptography.hazmat.primitives import serialization  # noqa: E402
 
 
 
-# Import hub app AFTER env vars are set — db import triggers init_db()
+# Import hub app AFTER env vars are set 鈥?db import triggers init_db()
 
 import db  # noqa: E402, F401
 
