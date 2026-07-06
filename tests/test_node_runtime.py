@@ -991,6 +991,72 @@ class TestRuntimeWebSocketLoop(unittest.TestCase):
         )
         complete_mock.assert_called_once_with("task_bridge_review", "reply")
 
+    def test_process_task_appends_synced_repo_audit_context_and_inventory(self):
+        node = _runtime_node()
+        task_data = {
+            "id": "task_repo_audit",
+            "bounty": 0.0,
+            "payload": "Run a repo audit for github.com/WUAIBING/MEP.",
+            "intent": {"type": "repo_audit.request"},
+            "task": {
+                "instructions": "Run a repo audit for github.com/WUAIBING/MEP.",
+                "inputs": {
+                    "repo_audit": {
+                        "repo_url": "github.com/WUAIBING/MEP",
+                        "ref": "main",
+                        "audit_type": "full_repo_audit",
+                    }
+                },
+            },
+        }
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with (
+                patch.object(node.workspace, "sync_repo_audit_workspace", return_value=(True, tmpdir)) as sync_mock,
+                patch.object(
+                    node.workspace,
+                    "build_repo_audit_context",
+                    return_value=("Local workspace path: tmpdir\n- README.md", ["README.md", "node/mep_runtime.py"]),
+                ) as context_mock,
+                patch.object(node.adapter, "generate_reply", return_value="repo audit reply") as adapter_mock,
+                patch.object(node, "complete") as complete_mock,
+            ):
+                asyncio.run(node.process_task(task_data))
+
+        sync_mock.assert_called_once_with("github.com/WUAIBING/MEP", "main")
+        context_mock.assert_called_once_with(tmpdir)
+        instructions, adapter_task_data = adapter_mock.call_args.args
+        self.assertIn("Authoritative local repo audit context:", instructions)
+        self.assertIn("README.md", instructions)
+        repo_audit_inputs = adapter_task_data["task"]["inputs"]["repo_audit"]
+        self.assertEqual(repo_audit_inputs["local_workspace_path"], tmpdir)
+        self.assertEqual(repo_audit_inputs["inventory_paths"], ["README.md", "node/mep_runtime.py"])
+        complete_mock.assert_called_once_with("task_repo_audit", "repo audit reply")
+
+    def test_process_task_fails_closed_when_repo_audit_workspace_sync_fails(self):
+        node = _runtime_node()
+        task_data = {
+            "id": "task_repo_audit_fail",
+            "bounty": 0.0,
+            "payload": "Run a repo audit for github.com/WUAIBING/MEP.",
+            "intent": {"type": "repo_audit.request"},
+            "task": {
+                "instructions": "Run a repo audit for github.com/WUAIBING/MEP.",
+                "inputs": {"repo_audit": {"repo_url": "github.com/WUAIBING/MEP", "ref": "main"}},
+            },
+        }
+
+        with (
+            patch.object(node.workspace, "sync_repo_audit_workspace", return_value=(False, "fetch failed")) as sync_mock,
+            patch.object(node.adapter, "generate_reply") as adapter_mock,
+            patch.object(node, "complete") as complete_mock,
+        ):
+            asyncio.run(node.process_task(task_data))
+
+        sync_mock.assert_called_once_with("github.com/WUAIBING/MEP", "main")
+        adapter_mock.assert_not_called()
+        complete_mock.assert_called_once_with("task_repo_audit_fail", "[repo audit] workspace sync failed: fetch failed")
+
     def test_process_task_skips_verification_for_untrusted_contributor_by_default(self):
         node = _runtime_node()
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1478,6 +1544,67 @@ class TestWorkspaceReviewContext(unittest.TestCase):
                 wm.build_verification_report(tmp, ["node/x.py"], ["tests/test_x.py"]),
                 "",
             )
+
+    def test_build_repo_audit_context_returns_inventory_and_key_files(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            os.makedirs(os.path.join(tmp, "node"), exist_ok=True)
+            with open(os.path.join(tmp, "README.md"), "w", encoding="utf-8") as handle:
+                handle.write("# MEP\n")
+            with open(os.path.join(tmp, "node", "mep_runtime.py"), "w", encoding="utf-8") as handle:
+                handle.write("def runtime_main():\n    return 'ok'\n")
+            wm = mep_runtime.WorkspaceManager(tmp)
+            with patch.object(
+                wm,
+                "_run_git",
+                return_value=(0, "README.md\nnode/mep_runtime.py\n"),
+            ):
+                ctx, inventory = wm.build_repo_audit_context(tmp)
+
+        self.assertEqual(inventory, ["README.md", "node/mep_runtime.py"])
+        self.assertIn("Tracked file inventory", ctx)
+        self.assertIn("README.md", ctx)
+        self.assertIn("runtime_main", ctx)
+
+    def test_render_structured_repo_audit_filters_findings_to_inventory(self):
+        task_data = {
+            "intent": {"type": "repo_audit.request"},
+            "task": {
+                "inputs": {
+                    "repo_audit": {
+                        "repo_url": "github.com/WUAIBING/MEP",
+                        "ref": "main",
+                        "inventory_paths": ["README.md", "node/mep_runtime.py"],
+                    }
+                }
+            },
+        }
+        rendered = mep_runtime._render_structured_repo_audit_with_task_data(  # noqa: SLF001
+            json.dumps(
+                {
+                    "summary": "Audited the workspace-backed repo context.",
+                    "repo_overview": "Reviewed README and runtime entrypoints.",
+                    "checks_performed": ["checked tracked file inventory", "read runtime entrypoint"],
+                    "risk_areas_checked": ["runtime entrypoints", "repo contract drift"],
+                    "findings": [
+                        {
+                            "file": "node/mep_runtime.py",
+                            "issue": "Runtime sync path should fail closed on missing workspace context",
+                            "rationale": "This file controls the audit workspace bootstrap path.",
+                        },
+                        {
+                            "file": "config.json",
+                            "issue": "Hardcoded API keys",
+                            "rationale": "This file does not exist and should be filtered out.",
+                        },
+                    ],
+                }
+            ),
+            max_chars=4000,
+            task_data=task_data,
+        )
+
+        self.assertIn("node/mep_runtime.py", rendered)
+        self.assertNotIn("config.json", rendered)
 
     def test_clean_check_env_uses_allowlist_and_throwaway_home(self):
         with patch.dict(
