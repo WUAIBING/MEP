@@ -618,20 +618,26 @@ def _system_prompt_for_task(
             f"You are a senior repository auditor reviewing {repo_url}{ref_hint}. "
             "Return ONLY a JSON object with this schema: "
             '{"summary": string, "repo_overview": string, "coverage_summary": string, '
+            '"files_deep_read": [string], "areas_not_deeply_reviewed": [string], '
             '"risk_areas_checked": [string], "checks_performed": [string], "why_no_finding": string, '
             '"findings": [{"file": string, "title": string, "category": string, "severity": "high|medium|low", '
-            '"confidence": "high|medium|low", "developer_impact": string, "evidence": string, "next_step": string}], '
+            '"confidence": "high|medium|low", "invariant": string, "failure_mode": string, "proof_type": string, '
+            '"fix_priority": "fix_now|next_change|later", "developer_impact": string, "evidence": string, "next_step": string}], '
+            '"near_misses": [{"file": string, "title": string, "reason_not_published": string}], '
             '"observations": [{"file": string, "note": string}], '
             '"artifact_recommended": boolean}. '
             "Publish at most 5 findings, ranked by developer impact. "
             "Use `findings` only for high-signal issues that a developer should fix now or on the next change in that area. "
+            "Every finding must be invariant-backed: state the expected invariant, the concrete failure mode, the proof type, and the fix priority. "
             "Put lower-signal hygiene notes, uncertainty, or weakly actionable comments into `observations` instead of `findings`. "
             "Use `repo_overview` for a concise factual description of the repository areas you actually inspected. "
-            "Use `coverage_summary` to state what parts of the checked-out workspace you actually inspected and what was not deeply reviewed. "
+            "Use `files_deep_read` for the exact tracked files you actually read closely, and `areas_not_deeply_reviewed` for the important areas you did not inspect deeply. "
+            "Keep `coverage_summary` tightly grounded in those structured coverage fields; do not claim broad coverage you cannot support. "
             "Use `checks_performed` for 1-5 concrete verification steps you performed against the supplied inventory, file contents, or verification output. "
             "Use `risk_areas_checked` for 1-5 concrete risk themes you audited. "
             "Only publish a finding when the supplied repo context directly supports it. "
             "Every published finding must name the impacted file, explain the developer impact, cite concrete evidence from the supplied repo context, and give one short next step. "
+            "If a candidate issue is plausible but did not clear the publication bar, put it in `near_misses` with a short reason instead of promoting it to a finding. "
             "Do not invent files, endpoints, dependencies, or artifacts that are not present in the supplied repo context. "
             "Do not rely on web knowledge, generic security checklists, or assumptions about unseen code. "
             "If you cannot verify a concrete finding from the supplied workspace material, keep `findings` empty and explain why in `why_no_finding`. "
@@ -1102,10 +1108,26 @@ def _default_repo_audit_coverage_summary(
     repo_url: str,
     ref: str,
     inventory_paths: list[str],
+    files_deep_read: Optional[list[str]] = None,
+    areas_not_deeply_reviewed: Optional[list[str]] = None,
 ) -> str:
     scope = repo_url or "the supplied repository"
     if ref:
         scope = f"{scope} @ {ref}"
+    deep_read = files_deep_read or []
+    shallow = areas_not_deeply_reviewed or []
+    coverage_bits: list[str] = []
+    if deep_read:
+        coverage_bits.append("Deep read: " + ", ".join(f"`{path}`" for path in deep_read[:6]))
+    if shallow:
+        coverage_bits.append("Not deeply reviewed: " + ", ".join(shallow[:4]))
+    if coverage_bits:
+        prefix = (
+            f"Checked the local workspace for {scope} against {len(inventory_paths)} tracked files."
+            if inventory_paths
+            else f"Checked the local workspace for {scope}."
+        )
+        return prefix + " " + " ".join(coverage_bits)
     if inventory_paths:
         return (
             f"Checked the local workspace for {scope} against {len(inventory_paths)} tracked files and only "
@@ -1136,12 +1158,37 @@ def _normalize_repo_audit_confidence(value: Any) -> str:
     return "medium"
 
 
+def _normalize_repo_audit_fix_priority(value: Any) -> str:
+    priority = _clean_review_label(value, max_chars=24).lower()
+    if priority in {"fix_now", "now", "immediate"}:
+        return "fix_now"
+    if priority in {"next_change", "next-change", "next"}:
+        return "next_change"
+    if priority in {"later", "backlog"}:
+        return "later"
+    return "next_change"
+
+
+def _normalize_repo_audit_proof_type(value: Any) -> str:
+    proof_type = _clean_review_label(value, max_chars=40).lower()
+    allowed = {
+        "code_path",
+        "cross_file_interaction",
+        "test_gap",
+        "config_deploy_mismatch",
+        "inventory_grounding",
+    }
+    return proof_type if proof_type in allowed else "code_path"
+
+
 def _repo_audit_finding_sort_key(finding: dict[str, str]) -> tuple[int, int, str]:
     severity_rank = {"high": 0, "medium": 1, "low": 2}
     confidence_rank = {"high": 0, "medium": 1, "low": 2}
+    priority_rank = {"fix_now": 0, "next_change": 1, "later": 2}
     return (
         severity_rank.get(finding.get("severity", "medium"), 1),
         confidence_rank.get(finding.get("confidence", "medium"), 1),
+        priority_rank.get(finding.get("fix_priority", "next_change"), 1),
         finding.get("file", ""),
     )
 
@@ -1156,7 +1203,11 @@ def _render_default_repo_audit(
     repo_url = _clean_review_label(repo_audit.get("repo_url"), max_chars=200)
     ref = _clean_review_label(repo_audit.get("ref"), max_chars=120)
     inventory_paths = _clean_review_list(repo_audit.get("inventory_paths"), max_items=300, max_chars=160)
-    coverage_summary = _default_repo_audit_coverage_summary(repo_url=repo_url, ref=ref, inventory_paths=inventory_paths)
+    coverage_summary = _default_repo_audit_coverage_summary(
+        repo_url=repo_url,
+        ref=ref,
+        inventory_paths=inventory_paths,
+    )
     summary = _clean_review_text(summary_hint, max_chars=500)
     if _is_weak_review_text(summary):
         summary = ""
@@ -1204,6 +1255,9 @@ def _render_structured_repo_audit_with_task_data(
     coverage_summary = _clean_review_text(parsed.get("coverage_summary"), max_chars=420)
     if _is_weak_review_text(coverage_summary):
         coverage_summary = ""
+    files_deep_read_raw = _clean_review_list(parsed.get("files_deep_read"), max_items=12, max_chars=160)
+    files_deep_read = [allowed_path_keys[item.lower()] for item in files_deep_read_raw if item.lower() in allowed_path_keys]
+    areas_not_deeply_reviewed = _clean_review_list(parsed.get("areas_not_deeply_reviewed"), max_items=6, max_chars=120)
     summary = _clean_review_text(parsed.get("summary"), max_chars=500)
     if _is_weak_review_text(summary):
         summary = ""
@@ -1216,6 +1270,7 @@ def _render_structured_repo_audit_with_task_data(
     if _is_weak_review_text(why_no_finding):
         why_no_finding = ""
     rendered_findings: list[str] = []
+    rendered_near_misses: list[str] = []
     rendered_observations: list[str] = []
     findings_for_sort: list[dict[str, str]] = []
     findings_raw = parsed.get("findings")
@@ -1231,27 +1286,36 @@ def _render_structured_repo_audit_with_task_data(
             category = _clean_review_label(item.get("category"), max_chars=60)
             severity = _normalize_repo_audit_severity(item.get("severity"))
             confidence = _normalize_repo_audit_confidence(item.get("confidence"))
+            invariant = _clean_review_text(item.get("invariant"), max_chars=180)
+            failure_mode = _clean_review_text(item.get("failure_mode"), max_chars=220)
+            proof_type = _normalize_repo_audit_proof_type(item.get("proof_type"))
+            fix_priority = _normalize_repo_audit_fix_priority(item.get("fix_priority"))
             developer_impact = _clean_review_text(
                 item.get("developer_impact") or item.get("impact") or item.get("rationale"),
                 max_chars=240,
             )
             evidence = _clean_review_text(item.get("evidence") or item.get("rationale"), max_chars=260)
             next_step = _clean_review_text(item.get("next_step"), max_chars=220)
-            combined = f"{title} {developer_impact} {evidence} {next_step}".strip()
-            if not title or _is_weak_review_text(combined):
-                continue
             note = (
                 developer_impact
                 or evidence
                 or next_step
                 or "Grounded note from the checked-out workspace."
             )
+            combined = f"{title} {invariant} {failure_mode} {developer_impact} {evidence} {next_step}".strip()
+            if not title or _is_weak_review_text(f"{title} {note}".strip()):
+                continue
             if severity == "low" or confidence == "low":
                 rendered_observations.append(f"`{matched}`: {note}")
                 continue
-            finding_bits = [f"**[{severity}/{confidence}] {title}** (`{matched}`)"]
+            if not invariant or not failure_mode or _is_weak_review_text(combined):
+                continue
+            finding_bits = [f"**[{severity}/{confidence}/{fix_priority}] {title}** (`{matched}`)"]
             if category:
                 finding_bits.append(f"Category: {category}.")
+            finding_bits.append(f"Invariant: {invariant}")
+            finding_bits.append(f"Failure mode: {failure_mode}")
+            finding_bits.append(f"Proof: {proof_type}")
             if developer_impact:
                 finding_bits.append(f"Developer impact: {developer_impact}")
             if evidence:
@@ -1262,12 +1326,27 @@ def _render_structured_repo_audit_with_task_data(
                 {
                     "severity": severity,
                     "confidence": confidence,
+                    "fix_priority": fix_priority,
                     "file": matched,
                     "rendered": " ".join(finding_bits).strip(),
                 }
             )
     findings_for_sort.sort(key=_repo_audit_finding_sort_key)
     rendered_findings.extend(entry["rendered"] for entry in findings_for_sort[:5])
+    near_misses_raw = parsed.get("near_misses")
+    if isinstance(near_misses_raw, list):
+        for item in near_misses_raw[:4]:
+            if not isinstance(item, dict):
+                continue
+            file_name = _clean_review_label(item.get("file"), max_chars=160)
+            matched = allowed_path_keys.get(file_name.lower()) if file_name else None
+            if not matched:
+                continue
+            title = _clean_review_text(item.get("title"), max_chars=160).rstrip(".:; ")
+            reason = _clean_review_text(item.get("reason_not_published"), max_chars=220)
+            if not title or not reason or _is_weak_review_text(f"{title} {reason}"):
+                continue
+            rendered_near_misses.append(f"`{matched}` - {title}: {reason}")
     observations_raw = parsed.get("observations")
     if isinstance(observations_raw, list):
         for item in observations_raw[:4]:
@@ -1284,12 +1363,18 @@ def _render_structured_repo_audit_with_task_data(
     if not summary:
         summary = _default_repo_audit_summary(repo_url=repo_url, ref=ref, inventory_paths=inventory_paths)
     if not coverage_summary:
-        coverage_summary = _default_repo_audit_coverage_summary(repo_url=repo_url, ref=ref, inventory_paths=inventory_paths)
+        coverage_summary = _default_repo_audit_coverage_summary(
+            repo_url=repo_url,
+            ref=ref,
+            inventory_paths=inventory_paths,
+            files_deep_read=files_deep_read,
+            areas_not_deeply_reviewed=areas_not_deeply_reviewed,
+        )
     if not checks_performed:
         checks_performed = _default_repo_audit_checks(repo_url=repo_url, ref=ref, inventory_paths=inventory_paths)
     if not rendered_findings and not why_no_finding:
         why_no_finding = (
-            "No top finding remained after filtering to grounded, high-signal claims with concrete developer impact."
+            "No top finding remained after filtering to grounded, invariant-backed claims with concrete developer impact."
             if inventory_paths
             else "No authoritative tracked-file inventory was available, so findings were withheld."
         )
@@ -1302,6 +1387,10 @@ def _render_structured_repo_audit_with_task_data(
     if repo_overview:
         sections.append(f"Repository overview: {repo_overview}")
     sections.append(f"Coverage summary: {coverage_summary}")
+    if files_deep_read:
+        sections.append("Files deep read: " + ", ".join(f"`{path}`" for path in files_deep_read[:6]))
+    if areas_not_deeply_reviewed:
+        sections.append("Areas not deeply reviewed: " + ", ".join(areas_not_deeply_reviewed[:4]))
     if inventory_paths:
         sections.append("Tracked files verified: " + ", ".join(f"`{path}`" for path in inventory_paths[:8]))
     if risk_areas_checked:
@@ -1312,6 +1401,8 @@ def _render_structured_repo_audit_with_task_data(
         sections.append(f"Why no finding: {why_no_finding}")
     for index, finding in enumerate(rendered_findings, start=1):
         sections.append(f"{index}. {finding}")
+    if rendered_near_misses:
+        sections.append("Near misses: " + " | ".join(rendered_near_misses[:3]))
     if rendered_observations:
         sections.append("Observations: " + " | ".join(rendered_observations[:3]))
     return _finalize_model_reply("\n\n".join(sections), max_chars=max_chars)
