@@ -1714,6 +1714,86 @@ class DeepSeekAdapter:
             return f"[DeepSeek] error: {exc}"
 
 
+@dataclass
+class OpenAICompatibleAdapter:
+    """Real AI adapter using an OpenAI-compatible chat completions endpoint."""
+
+    api_key: str = ""
+    model: str = "gpt-4o-mini"
+    base_url: str = "https://api.openai.com/v1"
+    provider_name: str = "openai-compatible"
+
+    def _endpoint(self) -> str:
+        return self.base_url.rstrip("/") + "/chat/completions"
+
+    def generate_reply(self, payload: str, task_data: dict[str, Any]) -> str:
+        review_max = _review_max_chars()
+        try:
+            def _invoke(system_prompt: str, user_payload: str) -> str:
+                resp = requests.post(
+                    self._endpoint(),
+                    headers={
+                        "Authorization": f"Bearer {self.api_key}",
+                        "Content-Type": "application/json",
+                    },
+                    json={
+                        "model": self.model,
+                        "messages": [
+                            {"role": "system", "content": system_prompt},
+                            {"role": "user", "content": user_payload},
+                        ],
+                        "max_tokens": _env_positive_int("MEP_AI_MAX_TOKENS", 4000),
+                        "temperature": 0.1,
+                    },
+                    timeout=_env_positive_int("MEP_AI_TIMEOUT_SECONDS", 120),
+                )
+                if resp.status_code != 200:
+                    return f"[{self.provider_name}] API error {resp.status_code}: {resp.text[:200]}"
+                message = resp.json()["choices"][0]["message"]
+                reply = str(message.get("content") or "").strip()
+                if not reply:
+                    reply = str(message.get("reasoning_content") or "").strip()
+                return reply
+
+            if _task_requires_repo_audit_prompt(task_data):
+                reply = _invoke(
+                    _system_prompt_for_task(
+                        task_data,
+                        generic_max_chars=500,
+                        review_max_chars=review_max,
+                    ),
+                    payload,
+                )
+                rendered = _render_structured_repo_audit_with_task_data(
+                    reply,
+                    max_chars=review_max,
+                    task_data=task_data,
+                )
+                if rendered:
+                    return rendered
+                return f"[{self.provider_name}] review response was empty"
+
+            if _task_requires_review_prompt(task_data):
+                result = _run_two_pass_review(
+                    task_data=task_data,
+                    payload=payload,
+                    review_max_chars=review_max,
+                    invoke_model=_invoke,
+                )
+                if result:
+                    return result
+                return f"[{self.provider_name}] review response was empty"
+
+            reply = _invoke(_system_prompt_for_task(task_data, generic_max_chars=300, review_max_chars=review_max), payload)
+            if not reply:
+                return f"[{self.provider_name}] reply was empty"
+            return reply
+        except requests.Timeout:
+            return f"[{self.provider_name}] {self.model} timed out"
+        except Exception as exc:  # noqa: BLE001
+            return f"[{self.provider_name}] error: {exc}"
+
+
 class WorkspaceManager:
     """Manages autonomous workspace synchronization (Git fetch/checkout)."""
 
@@ -3305,6 +3385,24 @@ def cmd_run(args: argparse.Namespace) -> int:
                 model=os.getenv("MEP_AI_MODEL", "deepseek-chat"),
             )
             print(f"[mep run] adapter=deepseek model={adapter.model}")
+    elif args.adapter == "openai":
+        api_key = (os.getenv("OPENAI_COMPAT_API_KEY") or os.getenv("MIMO_API_KEY") or "").strip()
+        base_url = (os.getenv("OPENAI_COMPAT_BASE_URL") or "").strip()
+        if not api_key or not base_url:
+            if _strict_adapter_mode():
+                print("[mep run] OPENAI_COMPAT_API_KEY/MIMO_API_KEY or OPENAI_COMPAT_BASE_URL not set; strict adapter mode refusing mock fallback")
+                return 2
+            print("[mep run] OpenAI-compatible adapter config not set, falling back to mock")
+            adapter = MockAdapter()
+        else:
+            provider_name = (os.getenv("OPENAI_COMPAT_PROVIDER_NAME") or "openai-compatible").strip() or "openai-compatible"
+            adapter = OpenAICompatibleAdapter(
+                api_key=api_key,
+                base_url=base_url,
+                model=os.getenv("MEP_AI_MODEL", "gpt-4o-mini"),
+                provider_name=provider_name,
+            )
+            print(f"[mep run] adapter=openai provider={provider_name} model={adapter.model} base_url={base_url}")
     elif args.adapter == "ollama":
         adapter = AIAdapter(model=os.getenv("MEP_AI_MODEL", "tinyllama"))
         print(f"[mep run] adapter=ollama model={adapter.model}")
@@ -3368,7 +3466,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Path to provider private key (defaults to repo-local .mep/{node_id}.pem after discovery/provisioning).",
     )
-    parser.add_argument("--adapter", default="mock", choices=["mock", "ollama", "deepseek"], help="Provider adapter.")
+    parser.add_argument("--adapter", default="mock", choices=["mock", "ollama", "deepseek", "openai"], help="Provider adapter.")
 
     sub = parser.add_subparsers(dest="command", required=True)
 

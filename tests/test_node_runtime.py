@@ -241,9 +241,11 @@ class TestRuntimeUx(unittest.TestCase):
 
         deepseek_args = parser.parse_args(["--adapter", "deepseek", "run"])
         ollama_args = parser.parse_args(["--adapter", "ollama", "status"])
+        openai_args = parser.parse_args(["--adapter", "openai", "run"])
 
         self.assertEqual(deepseek_args.adapter, "deepseek")
         self.assertEqual(ollama_args.adapter, "ollama")
+        self.assertEqual(openai_args.adapter, "openai")
 
     def test_run_with_deepseek_without_api_key_falls_back_to_mock_adapter(self):
         args = argparse.Namespace(
@@ -308,6 +310,81 @@ class TestRuntimeUx(unittest.TestCase):
         adapter = runtime_cls.call_args.kwargs["adapter"]
         self.assertIsInstance(adapter, mep_runtime.DeepSeekAdapter)
         self.assertEqual(adapter.model, "deepseek-chat")
+
+    def test_run_with_openai_without_config_falls_back_to_mock_adapter(self):
+        args = argparse.Namespace(
+            hub_url="http://hub",
+            ws_url="ws://hub",
+            key_path="C:/tmp/test_key.pem",
+            adapter="openai",
+            alias="Elsaws Bot",
+        )
+        fake_runtime = _FakeRuntime()
+        with (
+            patch.dict("os.environ", {}, clear=True),
+            patch("node.mep_runtime._ensure_key_parent"),
+            patch("node.mep_runtime.MEPIdentity", return_value=_FakeIdentity()),
+            patch("node.mep_runtime._resolve_runtime_alias", return_value="Elsaws Bot"),
+            patch("node.mep_runtime.RuntimeNode", return_value=fake_runtime) as runtime_cls,
+            patch("node.mep_runtime.asyncio.run", side_effect=lambda coro: (coro.close(), 0)[1]),
+        ):
+            code = mep_runtime.cmd_run(args)
+
+        self.assertEqual(code, 0)
+        self.assertIsInstance(runtime_cls.call_args.kwargs["adapter"], mep_runtime.MockAdapter)
+
+    def test_run_with_strict_openai_without_config_fails_closed(self):
+        args = argparse.Namespace(
+            hub_url="http://hub",
+            ws_url="ws://hub",
+            key_path="C:/tmp/test_key.pem",
+            adapter="openai",
+            alias="Elsaws Bot",
+        )
+        with (
+            patch.dict("os.environ", {"MEP_STRICT_ADAPTERS": "true"}, clear=True),
+            patch("node.mep_runtime._ensure_key_parent"),
+            patch("node.mep_runtime.RuntimeNode") as runtime_cls,
+        ):
+            code = mep_runtime.cmd_run(args)
+
+        self.assertEqual(code, 2)
+        runtime_cls.assert_not_called()
+
+    def test_run_with_openai_config_uses_openai_compatible_adapter(self):
+        args = argparse.Namespace(
+            hub_url="http://hub",
+            ws_url="ws://hub",
+            key_path="C:/tmp/test_key.pem",
+            adapter="openai",
+            alias="Elsaws Bot",
+        )
+        fake_runtime = _FakeRuntime()
+        with (
+            patch.dict(
+                "os.environ",
+                {
+                    "MIMO_API_KEY": "secret-key",
+                    "OPENAI_COMPAT_BASE_URL": "https://api.xiaomimimo.com/v1",
+                    "MEP_AI_MODEL": "mimo-v2.5-pro",
+                    "OPENAI_COMPAT_PROVIDER_NAME": "mimo",
+                },
+                clear=True,
+            ),
+            patch("node.mep_runtime._ensure_key_parent"),
+            patch("node.mep_runtime.MEPIdentity", return_value=_FakeIdentity()),
+            patch("node.mep_runtime._resolve_runtime_alias", return_value="Elsaws Bot"),
+            patch("node.mep_runtime.RuntimeNode", return_value=fake_runtime) as runtime_cls,
+            patch("node.mep_runtime.asyncio.run", side_effect=lambda coro: (coro.close(), 0)[1]),
+        ):
+            code = mep_runtime.cmd_run(args)
+
+        self.assertEqual(code, 0)
+        adapter = runtime_cls.call_args.kwargs["adapter"]
+        self.assertIsInstance(adapter, mep_runtime.OpenAICompatibleAdapter)
+        self.assertEqual(adapter.model, "mimo-v2.5-pro")
+        self.assertEqual(adapter.base_url, "https://api.xiaomimimo.com/v1")
+        self.assertEqual(adapter.provider_name, "mimo")
 
 
 class TestRuntimeBidPolicy(unittest.TestCase):
