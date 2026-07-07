@@ -2062,6 +2062,53 @@ class TestWorkspaceReviewContext(unittest.TestCase):
             rendered,
         )
 
+    def test_render_structured_repo_audit_withholds_findings_when_files_deep_read_is_missing(self):
+        task_data = {
+            "intent": {"type": "repo_audit.request"},
+            "task": {
+                "inputs": {
+                    "repo_audit": {
+                        "repo_url": "github.com/WUAIBING/MEP",
+                        "ref": "main",
+                        "inventory_paths": ["README.md", "node/mep_runtime.py"],
+                    }
+                }
+            },
+        }
+        rendered = mep_runtime._render_structured_repo_audit_with_task_data(  # noqa: SLF001
+            json.dumps(
+                {
+                    "summary": "Audited the workspace-backed repo context.",
+                    "repo_overview": "Reviewed runtime bootstrap and publish gating.",
+                    "findings": [
+                        {
+                            "file": "node/mep_runtime.py",
+                            "title": "Runtime sync path should fail closed on missing workspace context",
+                            "category": "correctness",
+                            "severity": "high",
+                            "confidence": "high",
+                            "invariant": "Repo audit must fail closed if workspace grounding is incomplete.",
+                            "failure_mode": "A partial bootstrap can still reach result publication without an authoritative inventory.",
+                            "proof_type": "code_path",
+                            "fix_priority": "fix_now",
+                            "developer_impact": "Otherwise the audit can publish an ungrounded result after a partial bootstrap failure.",
+                            "evidence": "sync_repo_audit_workspace and _repo_audit_contract_failure gate the publish path.",
+                            "next_step": "Keep refusing repo_audit tasks whenever the workspace bootstrap or inventory load is incomplete.",
+                        }
+                    ],
+                }
+            ),
+            max_chars=4000,
+            task_data=task_data,
+        )
+
+        self.assertIn("## Repo Audit Summary", rendered)
+        self.assertNotIn("[high/high/fix_now] Runtime sync path should fail closed on missing workspace context", rendered)
+        self.assertIn(
+            "Near misses: `node/mep_runtime.py` - Runtime sync path should fail closed on missing workspace context: The claim was withheld because the file was not listed in files_deep_read.",
+            rendered,
+        )
+
     def test_render_structured_repo_audit_adds_default_coverage_summary_when_missing(self):
         task_data = {
             "intent": {"type": "repo_audit.request"},
