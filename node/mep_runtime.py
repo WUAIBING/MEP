@@ -544,6 +544,39 @@ def _review_lenses_for_task(task_data: dict[str, Any]) -> list[str]:
     return lenses[:5]
 
 
+def _repo_audit_lenses_for_task(task_data: dict[str, Any]) -> list[str]:
+    repo_audit = _repo_audit_inputs(task_data)
+    repo_url = _clean_review_label(repo_audit.get("repo_url"), max_chars=200).lower()
+    inventory_paths = _clean_review_list(repo_audit.get("inventory_paths"), max_items=300, max_chars=160)
+    inventory_blob = " ".join(path.lower() for path in inventory_paths)
+    signal_blob = f"{repo_url} {inventory_blob}".strip()
+
+    lenses: list[str] = []
+
+    def _add_lens(label: str) -> None:
+        if label and label not in lenses:
+            lenses.append(label)
+
+    _add_lens("fail-closed correctness around audit contracts, missing inputs, or fallback paths")
+    _add_lens("cross-file state or metadata drift that can break real execution paths")
+
+    if any(token in signal_blob for token in ("github_to_mep", "bridge/", "approval", "ci", "pull", "review")):
+        _add_lens("automation/writeback safety, approval gating, and path-to-action mismatches")
+    if any(token in signal_blob for token in ("mep_runtime", "repo-audit", "workspace", "inventory", "runtime", "node/")):
+        _add_lens("workspace grounding, runtime honesty, and inventory-backed publication")
+    if any(token in signal_blob for token in ("hub/main.py", "hub/db.py", "core/ledger", "ledger", "economics", "bounty")):
+        _add_lens("ledger, persistence, or state-integrity drift across storage and execution")
+    if any(token in signal_blob for token in ("hub/auth.py", "node/identity.py", "signature", "auth", "identity", "verify")):
+        _add_lens("auth, identity, malformed-input handling, and trust-boundary regressions")
+    if any(token in signal_blob for token in ("deployment", "docker-compose", "version", "build", "scripts/deploy")):
+        _add_lens("deploy provenance, version drift, and config/runtime mismatch")
+    if any("/test" in token or token.startswith("tests/") or token.endswith("_test.py") for token in inventory_paths):
+        _add_lens("test coverage or verification gaps around high-risk behaviors")
+    if len(lenses) < 5:
+        _add_lens("config, migration, or compatibility drift that can break the next change")
+    return lenses[:6]
+
+
 def _candidate_priority_rank(priority: str) -> int:
     normalized = str(priority or "").strip().lower()
     order = {"critical": 0, "high": 1, "medium": 2, "low": 3}
@@ -599,6 +632,7 @@ def _system_prompt_for_task(
         ref = _clean_review_label(repo_audit.get("ref"), max_chars=120)
         workspace_path = _clean_review_label(repo_audit.get("local_workspace_path"), max_chars=220)
         inventory_paths = _clean_review_list(repo_audit.get("inventory_paths"), max_items=300, max_chars=160)
+        audit_lenses = _repo_audit_lenses_for_task(task_data)
         workspace_hint = ""
         if workspace_path:
             workspace_hint = (
@@ -613,6 +647,13 @@ def _system_prompt_for_task(
                 "Every finding must cite one file from that supplied inventory; if you cannot verify a concrete issue "
                 "against those files, return zero findings."
             )
+        audit_lenses_hint = (
+            "Before generic security scanning, pressure-test these repository-specific audit lenses in priority order: "
+            + "; ".join(audit_lenses[:5])
+            + ". "
+            if audit_lenses
+            else ""
+        )
         ref_hint = f" at ref `{ref}`" if ref else ""
         return (
             f"You are a senior repository auditor reviewing {repo_url}{ref_hint}. "
@@ -638,6 +679,7 @@ def _system_prompt_for_task(
             "Only publish a finding when the supplied repo context directly supports it. "
             "Every published finding must name the impacted file, explain the developer impact, cite concrete evidence from the supplied repo context, and give one short next step. "
             "If a candidate issue is plausible but did not clear the publication bar, put it in `near_misses` with a short reason instead of promoting it to a finding. "
+            f"{audit_lenses_hint}"
             "Do not invent files, endpoints, dependencies, or artifacts that are not present in the supplied repo context. "
             "Do not rely on web knowledge, generic security checklists, or assumptions about unseen code. "
             "If you cannot verify a concrete finding from the supplied workspace material, keep `findings` empty and explain why in `why_no_finding`. "
@@ -883,6 +925,82 @@ def _candidate_payload_for_verification(
     ).strip()
 
 
+def _extract_repo_audit_candidates(text: str, *, allowed_paths: list[str]) -> list[dict[str, Any]]:
+    parsed = _extract_first_json_object(text)
+    if not isinstance(parsed, dict):
+        return []
+    raw_candidates = parsed.get("risk_candidates")
+    if not isinstance(raw_candidates, list):
+        return []
+    allowed_map = {path.lower(): path for path in allowed_paths}
+    cleaned: list[tuple[int, dict[str, Any]]] = []
+    seen: set[tuple[str, str]] = set()
+    for index, item in enumerate(raw_candidates[:4]):
+        if not isinstance(item, dict):
+            continue
+        file_name = _clean_review_label(item.get("file"), max_chars=160)
+        matched = allowed_map.get(file_name.lower()) if file_name else None
+        if not matched:
+            continue
+        category = _clean_review_label(item.get("category"), max_chars=80) or "correctness"
+        priority = _clean_review_label(item.get("priority"), max_chars=20).lower() or "medium"
+        if priority not in {"critical", "high", "medium", "low"}:
+            priority = "medium"
+        claim = _clean_review_text(item.get("claim"), max_chars=240)
+        reason = _clean_review_text(item.get("reason"), max_chars=260)
+        evidence = _clean_review_list(item.get("evidence"), max_items=3, max_chars=120)
+        if not claim:
+            continue
+        key = (matched.lower(), claim.lower())
+        if key in seen:
+            continue
+        seen.add(key)
+        cleaned.append(
+            (
+                index,
+                {
+                    "file": matched,
+                    "category": category,
+                    "priority": priority,
+                    "claim": claim,
+                    "reason": reason,
+                    "evidence": evidence,
+                },
+            )
+        )
+    cleaned.sort(key=lambda entry: (_candidate_priority_rank(entry[1]["priority"]), entry[0]))
+    return [entry[1] for entry in cleaned]
+
+
+def _payload_with_repo_audit_lenses(payload: str, repo_audit_lenses: list[str]) -> str:
+    base = (payload or "").strip()
+    if not repo_audit_lenses:
+        return base
+    lenses_json = json.dumps({"repo_audit_lenses": repo_audit_lenses}, ensure_ascii=True)
+    return (
+        f"{base}\n\n"
+        "Repo-audit lenses to cover before publishing:\n"
+        f"{lenses_json}"
+    ).strip()
+
+
+def _candidate_payload_for_repo_audit_verification(
+    payload: str,
+    candidates: list[dict[str, Any]],
+    *,
+    repo_audit_lenses: list[str],
+) -> str:
+    base = _payload_with_repo_audit_lenses(payload, repo_audit_lenses)
+    if not candidates:
+        return base
+    candidate_json = json.dumps({"risk_candidates": candidates}, ensure_ascii=True)
+    return (
+        f"{base}\n\n"
+        "Candidate repo-audit risks to verify before publishing any finding:\n"
+        f"{candidate_json}"
+    ).strip()
+
+
 def _run_two_pass_review(
     *,
     task_data: dict[str, Any],
@@ -903,6 +1021,75 @@ def _run_two_pass_review(
     if finalized:
         return finalized
     return final_reply[:review_max_chars].rstrip() or "[review runtime] review response was empty"
+
+
+def _candidate_system_prompt_for_repo_audit(task_data: dict[str, Any], *, review_max_chars: int) -> str:
+    if not _task_requires_repo_audit_prompt(task_data):
+        return _system_prompt_for_task(task_data, generic_max_chars=500, review_max_chars=review_max_chars)
+    return (
+        "You are the candidate-generation pass for a MEP repository audit. "
+        "Scan the supplied checked-out workspace context, tracked-file inventory, selected file contents, and any verification output. "
+        "Return ONLY a JSON object with this schema: "
+        '{"risk_candidates": [{"file": string, "category": string, "priority": "high" | "medium" | "low", "claim": string, "reason": string, "evidence": [string]}], "coverage": [string]}. '
+        "Generate at most 4 candidate risks. Use the supplied repo-audit lenses to diversify the search space. "
+        "Prefer at most one candidate per lens, rank the highest-impact candidate first, and bias toward fail-closed correctness, cross-file drift, trust-boundary errors, deploy mismatch, ledger integrity, and missing verification over hygiene notes. "
+        "Each candidate must be concrete, tied to one tracked file from the supplied inventory, and phrased as a plausible developer-facing failure worth verifying. "
+        "Use `evidence` for 1-3 exact identifiers, files, or changed behaviors from the supplied workspace context that make the hypothesis worth verifying. "
+        "Do not summarize the repo. Do not give praise. Do not include chain-of-thought. "
+        "If nothing looks risky enough to verify, return an empty `risk_candidates` list and use `coverage` to note what you inspected."
+    )
+
+
+def _verification_system_prompt_for_repo_audit(task_data: dict[str, Any], *, review_max_chars: int) -> str:
+    base = _system_prompt_for_task(task_data, generic_max_chars=500, review_max_chars=review_max_chars)
+    if not _task_requires_repo_audit_prompt(task_data):
+        return base
+    return (
+        f"{base} This is the verification pass. The user message may include provisional candidate risks from an earlier pass. "
+        "Treat those candidates as hypotheses only. Promote a candidate into `findings` only when the supplied workspace context directly supports it. "
+        "For every published finding, set `file` to one tracked file from the supplied inventory and make the finding invariant-backed, failure-specific, and developer-impactful. "
+        "Prefer one to three high-value verified findings over a longer list of generic concerns. "
+        "Downgrade or discard candidates that are weakly evidenced, hygiene-only, redundant, or not specific enough to change developer behavior. "
+        "Reject any candidate that relies on unseen code, generic security folklore, or broad claims about the whole repository. "
+        "If no candidate survives verification, keep `findings` empty, keep `near_misses` for the strongest rejected candidates, and make `why_no_finding` explain why the surviving workspace evidence did not clear the publication bar."
+    )
+
+
+def _run_two_pass_repo_audit(
+    *,
+    task_data: dict[str, Any],
+    payload: str,
+    review_max_chars: int,
+    invoke_model: Any,
+) -> str:
+    inventory_paths = _clean_review_list(
+        _repo_audit_inputs(task_data).get("inventory_paths"),
+        max_items=300,
+        max_chars=160,
+    )
+    repo_audit_lenses = _repo_audit_lenses_for_task(task_data)
+    candidate_payload = _payload_with_repo_audit_lenses(payload, repo_audit_lenses)
+    candidate_reply = invoke_model(
+        _candidate_system_prompt_for_repo_audit(task_data, review_max_chars=review_max_chars),
+        candidate_payload,
+    )
+    candidates = _extract_repo_audit_candidates(candidate_reply, allowed_paths=inventory_paths)
+    verification_payload = _candidate_payload_for_repo_audit_verification(
+        payload,
+        candidates,
+        repo_audit_lenses=repo_audit_lenses,
+    )
+    final_reply = invoke_model(
+        _verification_system_prompt_for_repo_audit(task_data, review_max_chars=review_max_chars),
+        verification_payload,
+    )
+    rendered = _render_structured_repo_audit_with_task_data(final_reply, max_chars=review_max_chars, task_data=task_data)
+    if rendered:
+        return rendered
+    finalized = _finalize_model_reply(final_reply, max_chars=review_max_chars)
+    if finalized:
+        return finalized
+    return final_reply[:review_max_chars].rstrip() or "[repo_audit runtime] review response was empty"
 
 
 _WEAK_REVIEW_PATTERNS = [
@@ -1149,6 +1336,20 @@ def _default_repo_audit_checks(
     return checks[:4]
 
 
+def _default_repo_audit_risk_areas(task_data: Optional[dict[str, Any]]) -> list[str]:
+    lenses = _repo_audit_lenses_for_task(task_data or {})
+    cleaned: list[str] = []
+    for lens in lenses:
+        text = _clean_review_label(lens, max_chars=100)
+        if not text:
+            continue
+        if text not in cleaned:
+            cleaned.append(text)
+        if len(cleaned) >= 5:
+            break
+    return cleaned
+
+
 def _default_repo_audit_coverage_summary(
     *,
     repo_url: str,
@@ -1260,6 +1461,7 @@ def _render_default_repo_audit(
     if not summary:
         summary = _default_repo_audit_summary(repo_url=repo_url, ref=ref, inventory_paths=inventory_paths)
     checks_performed = _default_repo_audit_checks(repo_url=repo_url, ref=ref, inventory_paths=inventory_paths)
+    risk_areas_checked = _default_repo_audit_risk_areas(task_data)
     why_no_finding = (
         "No published finding survived verification against the checked-out workspace inventory and supplied file excerpts."
         if inventory_paths
@@ -1274,6 +1476,8 @@ def _render_default_repo_audit(
     if inventory_paths:
         sections.append("Tracked files verified: " + ", ".join(f"`{path}`" for path in inventory_paths[:8]))
     sections.append(f"Coverage summary: {coverage_summary}")
+    if risk_areas_checked:
+        sections.append("Risk areas checked: " + ", ".join(risk_areas_checked))
     if checks_performed:
         sections.append("Checks performed: " + ", ".join(checks_performed))
     sections.append(f"Why no finding: {why_no_finding}")
@@ -1636,23 +1840,24 @@ class AIAdapter:
         try:
             review_max = _review_max_chars()
             if _task_requires_repo_audit_prompt(task_data):
-                prompt = (
-                    f"{_system_prompt_for_task(task_data, generic_max_chars=300, review_max_chars=review_max)}\n\n"
-                    f"Task: {payload}\n\nReply:"
-                )
-                result = subprocess.run(
-                    ["ollama", "run", self.model, prompt],
-                    capture_output=True,
-                    text=True,
-                    timeout=90,
-                )
-                rendered = _render_structured_repo_audit_with_task_data(
-                    result.stdout or "",
-                    max_chars=review_max,
+                def _invoke(system_prompt: str, user_payload: str) -> str:
+                    prompt = f"{system_prompt}\n\nTask: {user_payload}\n\nReply:"
+                    result = subprocess.run(
+                        ["ollama", "run", self.model, prompt],
+                        capture_output=True,
+                        text=True,
+                        timeout=90,
+                    )
+                    return (result.stdout or "").strip()
+
+                result = _run_two_pass_repo_audit(
                     task_data=task_data,
+                    payload=payload,
+                    review_max_chars=review_max,
+                    invoke_model=_invoke,
                 )
-                if rendered:
-                    return rendered
+                if result:
+                    return result
                 return f"[AI adapter] empty response from {self.model}"
             if _task_requires_review_prompt(task_data):
                 def _invoke(system_prompt: str, user_payload: str) -> str:
@@ -1731,21 +1936,14 @@ class DeepSeekAdapter:
                 return reply
 
             if _task_requires_repo_audit_prompt(task_data):
-                reply = _invoke(
-                    _system_prompt_for_task(
-                        task_data,
-                        generic_max_chars=500,
-                        review_max_chars=review_max,
-                    ),
-                    payload,
-                )
-                rendered = _render_structured_repo_audit_with_task_data(
-                    reply,
-                    max_chars=review_max,
+                result = _run_two_pass_repo_audit(
                     task_data=task_data,
+                    payload=payload,
+                    review_max_chars=review_max,
+                    invoke_model=_invoke,
                 )
-                if rendered:
-                    return rendered
+                if result:
+                    return result
                 return "[DeepSeek] review response was empty"
 
             if _task_requires_review_prompt(task_data):
@@ -1816,21 +2014,14 @@ class OpenAICompatibleAdapter:
                 return reply
 
             if _task_requires_repo_audit_prompt(task_data):
-                reply = _invoke(
-                    _system_prompt_for_task(
-                        task_data,
-                        generic_max_chars=500,
-                        review_max_chars=review_max,
-                    ),
-                    payload,
-                )
-                rendered = _render_structured_repo_audit_with_task_data(
-                    reply,
-                    max_chars=review_max,
+                result = _run_two_pass_repo_audit(
                     task_data=task_data,
+                    payload=payload,
+                    review_max_chars=review_max,
+                    invoke_model=_invoke,
                 )
-                if rendered:
-                    return rendered
+                if result:
+                    return result
                 return f"[{self.provider_name}] review response was empty"
 
             if _task_requires_review_prompt(task_data):
