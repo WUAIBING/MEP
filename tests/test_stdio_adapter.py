@@ -17,6 +17,24 @@ class TestStdioAdapter(unittest.IsolatedAsyncioTestCase):
         adapter = StdioAdapter("codex", "codex-agent", "unused.pem")
         return adapter, client
 
+    async def test_run_in_noninteractive_keepalive_mode_skips_stdin_loop(self):
+        with patch.dict(os.environ, {"MEP_NONINTERACTIVE_KEEPALIVE": "true"}):
+            adapter, client = self._make_adapter()
+        client.register = AsyncMock()
+        client.listen_results = AsyncMock(return_value=None)
+        client.stop = unittest.mock.Mock()
+
+        with (
+            patch("builtins.input", side_effect=AssertionError("stdin should not be read")),
+            patch("builtins.print") as print_mock,
+        ):
+            await adapter.run()
+
+        client.register.assert_awaited_once()
+        client.listen_results.assert_awaited_once()
+        client.stop.assert_called_once()
+        print_mock.assert_any_call("[codex] noninteractive keepalive enabled; stdin loop disabled")
+
     async def test_handle_result_stores_structured_interbot_payload(self):
         adapter, client = self._make_adapter()
         payload = json.dumps(
