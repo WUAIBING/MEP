@@ -667,6 +667,52 @@ class TestRuntimeReviewPrompts(unittest.TestCase):
         self.assertIn("Changed identifiers verified: `_score_review_quality`, `_approval_quality_failure`", rendered)
         self.assertIn("Tests reviewed: `tests/test_github_bridge.py`", rendered)
 
+    def test_approval_bridge_action_downgrades_when_rendered_review_still_has_findings(self):
+        task_data = self._bridge_review_task_data(
+            intent_type="code.review.approve",
+            changed_identifiers=["_score_review_quality", "_approval_quality_failure"],
+        )
+        detail = (
+            "## Review Findings\n\n"
+            "The approval path still has a blocker.\n\n"
+            "Touched paths reviewed: `bridge/github_to_mep.py`\n\n"
+            "Tests reviewed: `tests/test_github_bridge.py`\n\n"
+            "Changed identifiers verified: `_score_review_quality`, `_approval_quality_failure`\n\n"
+            "1. **Keep approval gated** (`bridge/github_to_mep.py`): A finding still survives verification."
+        )
+
+        action = mep_runtime.RuntimeNode._bridge_status_action(  # noqa: SLF001
+            mep_runtime._interbot_message_from_task_data(task_data),  # noqa: SLF001
+            detail=detail,
+            task_data=task_data,
+        )
+
+        self.assertEqual(action, "reviewed")
+
+    def test_approval_bridge_action_keeps_approved_for_grounded_no_finding_review(self):
+        task_data = self._bridge_review_task_data(
+            intent_type="code.review.approve",
+            changed_identifiers=["_score_review_quality", "_approval_quality_failure"],
+        )
+        detail = (
+            "## Review Summary\n\n"
+            "Verified the approval gate stays low-risk.\n\n"
+            "Touched paths reviewed: `bridge/github_to_mep.py`\n\n"
+            "Tests reviewed: `tests/test_github_bridge.py`\n\n"
+            "Risk areas checked: approval gating, changed-line anchoring\n\n"
+            "Checks performed: traced approval suppression branches, compared changed identifiers against the diff\n\n"
+            "Changed identifiers verified: `_score_review_quality`, `_approval_quality_failure`\n\n"
+            "Why no finding: The changed-line evidence and test-aware approval gate stay aligned, so no concrete blocker remains."
+        )
+
+        action = mep_runtime.RuntimeNode._bridge_status_action(  # noqa: SLF001
+            mep_runtime._interbot_message_from_task_data(task_data),  # noqa: SLF001
+            detail=detail,
+            task_data=task_data,
+        )
+
+        self.assertEqual(action, "approved")
+
     def test_structured_review_renders_risk_coverage_for_no_finding_reviews(self):
         rendered = mep_runtime._render_structured_review_with_task_data(  # noqa: SLF001
             (
@@ -949,7 +995,7 @@ class TestRuntimeWebSocketLoop(unittest.TestCase):
         self.assertEqual(adapter_task_data["intent"]["type"], "chat.request")
         complete_mock.assert_called_once_with("task_interbot", "reply")
 
-    def test_process_task_reports_bridge_status_when_github_bridge_metadata_is_present(self):
+    def test_process_task_downgrades_plaintext_approval_to_reviewed_bridge_status(self):
         node = _runtime_node()
         task_data = {
             "id": "task_bridge_status",
@@ -991,9 +1037,36 @@ class TestRuntimeWebSocketLoop(unittest.TestCase):
         self.assertEqual(request_mock.call_args.args, ("POST", "https://bridge.example.test/bridge/status"))
         self.assertEqual(request_mock.call_args.kwargs["json_body"]["bridge_id"], "br-123")
         self.assertEqual(request_mock.call_args.kwargs["json_body"]["status"], "completed")
-        self.assertEqual(request_mock.call_args.kwargs["json_body"]["action"], "approved")
+        self.assertEqual(request_mock.call_args.kwargs["json_body"]["action"], "reviewed")
         self.assertEqual(request_mock.call_args.kwargs["json_body"]["detail"], "Looks good to me.")
         self.assertEqual(request_mock.call_args.kwargs["headers"]["Authorization"], "Bearer status-token")
+
+    def test_process_task_keeps_grounded_approval_as_approved_bridge_status(self):
+        node = _runtime_node()
+        detail = (
+            "## Review Summary\n\n"
+            "Verified the approval gate stays low-risk.\n\n"
+            "Touched paths reviewed: `bridge/github_to_mep.py`\n\n"
+            "Tests reviewed: `tests/test_github_bridge.py`\n\n"
+            "Risk areas checked: approval gating, changed-line anchoring\n\n"
+            "Checks performed: traced approval suppression branches, compared changed identifiers against the diff\n\n"
+            "Changed identifiers verified: `_score_review_quality`, `_approval_quality_failure`\n\n"
+            "Why no finding: The changed-line evidence and test-aware approval gate stay aligned, so no concrete blocker remains."
+        )
+        task_data = TestRuntimeReviewPrompts._bridge_review_task_data(  # noqa: SLF001
+            intent_type="code.review.approve",
+            changed_identifiers=["_score_review_quality", "_approval_quality_failure"],
+        )
+        with (
+            patch.object(node.adapter, "generate_reply", return_value=detail),
+            patch.object(node, "complete") as complete_mock,
+            patch("node.mep_runtime._safe_request", return_value=(200, {}, "")) as request_mock,
+        ):
+            asyncio.run(node.process_task(task_data))
+
+        complete_mock.assert_called_once_with("task_bridge_review", detail)
+        request_mock.assert_called_once()
+        self.assertEqual(request_mock.call_args.kwargs["json_body"]["action"], "approved")
 
     def test_process_task_reports_failed_status_when_adapter_errors_on_review(self):
         node = _runtime_node()

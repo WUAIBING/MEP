@@ -705,6 +705,7 @@ def _system_prompt_for_task(
                 " Approval mode is active. Only use `approval_recommendation: \"approve\"` when you can cite at least two exact identifiers from changed lines "
                 "in `verified_identifiers`, mention the changed tests when any are provided, and explicitly state the scope is low-risk. "
                 "If the supplied PR checks are pending or failing, use `comment` instead of `approve`. "
+                "If any finding survives verification, use `comment` instead of `approve`. "
                 "If you cannot satisfy that evidence bar, use `comment` instead of `approve`."
             )
         return (
@@ -770,7 +771,8 @@ def _verification_system_prompt_for_task(task_data: dict[str, Any], *, review_ma
         "Reject any candidate that relies only on nearby file context, naming similarity, or speculation. "
         "If no candidate survives verification, keep `findings` empty, explain the checks you performed, and explicitly state why no finding is warranted. "
         "For that no-finding case, still return a grounded review: populate `touched_paths` from the real diff, populate `verified_identifiers` from changed lines when available, "
-        "and make `summary`, `observation`, and `why_no_finding` cite the reviewed changed behavior instead of generic praise."
+        "and make `summary`, `observation`, and `why_no_finding` cite the reviewed changed behavior instead of generic praise. "
+        "In approval mode, any surviving finding must force `approval_recommendation` away from `approve`."
     )
 
 
@@ -851,6 +853,41 @@ def _review_text_has_anchor(text: str, *, touched_paths: list[str], identifiers:
         if token and token in lowered:
             return True
     return False
+
+
+def _approval_detail_supports_publishable_approval(
+    detail: Optional[str],
+    *,
+    task_data: Optional[dict[str, Any]],
+) -> bool:
+    text = str(detail or "").strip()
+    if not text:
+        return False
+    if "## Review Findings" in text:
+        return False
+    if "Touched paths reviewed:" not in text or "Why no finding:" not in text:
+        return False
+    github_inputs = _review_github_inputs(task_data or {})
+    touched_tests = _clean_review_list(github_inputs.get("touched_tests"), max_items=3, max_chars=120)
+    risk_pack = github_inputs.get("risk_pack")
+    changed_identifiers = (
+        _clean_review_list(risk_pack.get("changed_identifiers"), max_items=8, max_chars=80)
+        if isinstance(risk_pack, dict)
+        else []
+    )
+    touched_paths = _clean_review_list(github_inputs.get("touched_paths"), max_items=4, max_chars=120)
+    if touched_tests and "Tests reviewed:" not in text:
+        return False
+    if changed_identifiers:
+        if "Changed identifiers verified:" not in text:
+            return False
+        if not _review_text_has_anchor(
+            text,
+            touched_paths=touched_paths,
+            identifiers=changed_identifiers,
+        ):
+            return False
+    return True
 
 
 def _extract_review_candidates(text: str) -> list[dict[str, str]]:
@@ -2679,12 +2716,19 @@ class RuntimeNode:
         return bridge_metadata
 
     @staticmethod
-    def _bridge_status_action(interbot_message: Optional[dict[str, Any]]) -> Optional[str]:
+    def _bridge_status_action(
+        interbot_message: Optional[dict[str, Any]],
+        *,
+        detail: Optional[str] = None,
+        task_data: Optional[dict[str, Any]] = None,
+    ) -> Optional[str]:
         if not isinstance(interbot_message, dict):
             return None
         intent = interbot_message.get("intent")
         intent_type = intent.get("type") if isinstance(intent, dict) else None
         if intent_type == "code.review.approve":
+            if not _approval_detail_supports_publishable_approval(detail, task_data=task_data):
+                return "reviewed"
             return "approved"
         if intent_type == "code.review.request":
             return "reviewed"
@@ -2698,6 +2742,7 @@ class RuntimeNode:
         self,
         interbot_message: Optional[dict[str, Any]],
         *,
+        task_data: Optional[dict[str, Any]],
         task_id: str,
         status: str,
         detail: Optional[str],
@@ -2715,7 +2760,7 @@ class RuntimeNode:
         }
         if isinstance(conversation, dict) and isinstance(conversation.get("context_id"), str):
             payload["context_id"] = conversation["context_id"]
-        action = self._bridge_status_action(interbot_message)
+        action = self._bridge_status_action(interbot_message, detail=detail, task_data=task_data)
         if action and status == "completed":
             payload["action"] = action
         if detail:
@@ -3409,12 +3454,13 @@ class RuntimeNode:
         # the bridge does not publish a decision built on error text.
         if (
             interbot_message is not None
-            and self._bridge_status_action(interbot_message) is not None
+            and self._bridge_status_action(interbot_message, detail=result, task_data=task_data) is not None
             and _is_adapter_error(result)
         ):
             self.complete(task_id, result)
             self._report_bridge_status(
                 interbot_message,
+                task_data=task_data,
                 task_id=task_id,
                 status="failed",
                 detail=f"Reviewer runtime produced no publishable review; adapter error: {result[:1000]}",
@@ -3426,6 +3472,7 @@ class RuntimeNode:
             if bridged:
                 self._report_bridge_status(
                     interbot_message,
+                    task_data=task_data,
                     task_id=task_id,
                     status="completed",
                     detail=result,
@@ -3440,6 +3487,7 @@ class RuntimeNode:
             self.complete(task_id, self._dm_fallback_settlement(task_id, dm_response))
             self._report_bridge_status(
                 interbot_message,
+                task_data=task_data,
                 task_id=task_id,
                 status="completed",
                 detail=result,
@@ -3448,6 +3496,7 @@ class RuntimeNode:
         self.complete(task_id, result)
         self._report_bridge_status(
             interbot_message,
+            task_data=task_data,
             task_id=task_id,
             status="completed",
             detail=result,
