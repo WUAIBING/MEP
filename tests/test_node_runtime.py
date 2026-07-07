@@ -507,6 +507,7 @@ class TestRuntimeReviewPrompts(unittest.TestCase):
         self.assertIn('"why_no_finding": string', prompt)
         self.assertIn('"approval_recommendation"', prompt)
         self.assertIn("highest-value correctness, regression, edge-case", prompt)
+        self.assertIn("always anchor the output to the actual diff", prompt)
 
     def test_approval_review_prompt_requires_verified_identifiers_and_test_awareness(self):
         task_data = self._bridge_review_task_data(intent_type="code.review.approve")
@@ -708,6 +709,30 @@ class TestRuntimeReviewPrompts(unittest.TestCase):
         self.assertIn("Checks performed:", rendered)
         self.assertIn("Why no finding:", rendered)
         self.assertIn("Changed identifiers verified: `verify_signature`, `_evict_expired_nonces`, `NodeRegistration`", rendered)
+
+    def test_structured_review_rewrites_generic_no_finding_text_to_grounded_anchors(self):
+        rendered = mep_runtime._render_structured_review_with_task_data(  # noqa: SLF001
+            (
+                '{"summary":"The patch looks good overall.",'
+                '"observation":"The change is well-structured.",'
+                '"why_no_finding":"No issues found after review.",'
+                '"findings":[],"approval_recommendation":"comment"}'
+            ),
+            max_chars=1000,
+            task_data=self._bridge_review_task_data(
+                changed_identifiers=["verify_signature", "_evict_expired_nonces"],
+                touched_paths=["hub/auth.py", "hub/db.py"],
+                touched_tests=["tests/test_hub_api.py"],
+            ),
+        )
+
+        self.assertIn("## Review Summary", rendered)
+        self.assertIn("Touched paths reviewed: `hub/auth.py`, `hub/db.py`", rendered)
+        self.assertIn("Tests reviewed: `tests/test_hub_api.py`", rendered)
+        self.assertIn("Changed identifiers verified: `verify_signature`, `_evict_expired_nonces`", rendered)
+        self.assertIn("The patch looks good overall.", rendered)
+        self.assertIn("Observation: The change is well-structured.", rendered)
+        self.assertIn("Why no finding: No issues found after review.", rendered)
 
     def test_structured_review_synthesizes_grounded_summary_from_non_json_reply(self):
         rendered = mep_runtime._render_structured_review_with_task_data(  # noqa: SLF001
