@@ -681,6 +681,10 @@ def _system_prompt_for_task(
             "When findings are empty, `why_no_finding` must explain why the changed behavior looks safe based on those checks; do not use it for generic praise. "
             "Use `verified_identifiers` for exact function/variable/class names copied from changed lines in the supplied diff or workspace excerpts. "
             "Prefer real touched files and tests from the supplied GitHub inputs for `touched_paths` and `tests_reviewed`. "
+            "For no-finding reviews, always anchor the output to the actual diff: include at least one touched path in `touched_paths`, "
+            "include 1-3 exact changed-line identifiers in `verified_identifiers` when the review context provides them, "
+            "and make `summary`, `observation`, and `why_no_finding` explicitly about that changed behavior rather than generic quality praise. "
+            "If you mention code behavior in `observation` or `why_no_finding`, tie it to the same touched path or changed identifiers. "
             "Only include a finding when it is directly supported by the provided diff, file list, PR description, or patch excerpts. "
             "Do not speculate about unseen code, do not ask for more context, and do not include chain-of-thought or any text outside the JSON object. "
             "If the change looks good, keep findings empty, use summary to state the overall conclusion, list the risk areas and checks you covered, explain why no finding is warranted, keep observation concrete, and set approval_recommendation to approve or comment. "
@@ -722,7 +726,9 @@ def _verification_system_prompt_for_task(task_data: dict[str, Any], *, review_ma
         "Prefer the single highest-impact verified finding over multiple medium-signal findings. Publish a second finding only when it is independent, well-supported, and similarly important. "
         "Downgrade or discard candidates that are weakly evidenced, redundant with a stronger finding, or true but too low-value to be a meaningful review comment. "
         "Reject any candidate that relies only on nearby file context, naming similarity, or speculation. "
-        "If no candidate survives verification, keep `findings` empty, explain the checks you performed, and explicitly state why no finding is warranted."
+        "If no candidate survives verification, keep `findings` empty, explain the checks you performed, and explicitly state why no finding is warranted. "
+        "For that no-finding case, still return a grounded review: populate `touched_paths` from the real diff, populate `verified_identifiers` from changed lines when available, "
+        "and make `summary`, `observation`, and `why_no_finding` cite the reviewed changed behavior instead of generic praise."
     )
 
 
@@ -788,6 +794,21 @@ def _clean_review_label(value: Any, *, max_chars: int) -> str:
     if len(text) > max_chars:
         text = text[:max_chars].rstrip()
     return text.rstrip(".,;: ")
+
+
+def _review_text_has_anchor(text: str, *, touched_paths: list[str], identifiers: list[str]) -> bool:
+    lowered = str(text or "").strip().lower()
+    if not lowered:
+        return False
+    for path in touched_paths:
+        token = str(path or "").strip().lower()
+        if token and token in lowered:
+            return True
+    for identifier in identifiers:
+        token = str(identifier or "").strip().lower()
+        if token and token in lowered:
+            return True
+    return False
 
 
 def _extract_review_candidates(text: str) -> list[dict[str, str]]:
@@ -981,6 +1002,31 @@ def _default_review_summary(
         rendered_paths = ", ".join(f"`{path}`" for path in touched_paths[:3])
         return f"Reviewed the changed diff for {rendered_paths} and did not find a concrete issue supported by the supplied patch."
     return "Reviewed the provided diff context and did not identify a concrete issue directly supported by the supplied patch excerpts."
+
+
+def _default_review_observation(
+    *,
+    touched_paths: list[str],
+    verified_identifiers: list[str],
+    tests_reviewed: list[str],
+) -> str:
+    if verified_identifiers and touched_paths:
+        rendered_ids = ", ".join(f"`{name}`" for name in verified_identifiers[:2])
+        rendered_path = f"`{touched_paths[0]}`"
+        if tests_reviewed:
+            rendered_test = f"`{tests_reviewed[0]}`"
+            return (
+                f"{rendered_ids} stay scoped to {rendered_path}, and the changed test context in {rendered_test} "
+                "supports the reviewed low-risk path."
+            )
+        return f"{rendered_ids} stay scoped to {rendered_path} in the reviewed diff, so the change looks contained."
+    if touched_paths:
+        rendered_path = f"`{touched_paths[0]}`"
+        if tests_reviewed:
+            rendered_test = f"`{tests_reviewed[0]}`"
+            return f"The reviewed diff in {rendered_path} stays consistent with the changed test coverage in {rendered_test}."
+        return f"The reviewed diff in {rendered_path} stays scoped and does not show a concrete regression trigger."
+    return ""
 
 
 def _render_default_structured_review(
@@ -1507,6 +1553,18 @@ def _render_structured_review_with_task_data(
                 touched_paths=touched_paths,
                 verified_identifiers=verified_identifiers,
             )
+        if not observation and not summary and (touched_paths or verified_identifiers):
+            observation = _default_review_observation(
+                touched_paths=touched_paths,
+                verified_identifiers=verified_identifiers,
+                tests_reviewed=tests_reviewed,
+            )
+    elif not approval_mode:
+        if not summary and touched_paths:
+            summary = _default_review_summary(
+                touched_paths=touched_paths,
+                verified_identifiers=verified_identifiers,
+            )
     sections: list[str] = []
     if findings:
         sections.append("## Review Findings")
@@ -1522,10 +1580,10 @@ def _render_structured_review_with_task_data(
             sections.append("Risk areas checked: " + ", ".join(risk_areas_checked))
         if checks_performed:
             sections.append("Checks performed: " + ", ".join(checks_performed))
-        if why_no_finding:
-            sections.append(f"Why no finding: {why_no_finding}")
         if verified_identifiers:
             sections.append("Changed identifiers verified: " + ", ".join(f"`{name}`" for name in verified_identifiers))
+        if why_no_finding:
+            sections.append(f"Why no finding: {why_no_finding}")
         for index, finding in enumerate(findings, start=1):
             sections.append(f"{index}. {finding}")
     elif summary:
@@ -1541,10 +1599,10 @@ def _render_structured_review_with_task_data(
             sections.append("Risk areas checked: " + ", ".join(risk_areas_checked))
         if checks_performed:
             sections.append("Checks performed: " + ", ".join(checks_performed))
-        if why_no_finding:
-            sections.append(f"Why no finding: {why_no_finding}")
         if verified_identifiers:
             sections.append("Changed identifiers verified: " + ", ".join(f"`{name}`" for name in verified_identifiers))
+        if why_no_finding:
+            sections.append(f"Why no finding: {why_no_finding}")
     else:
         sections.append("## Review Summary")
         sections.append(
@@ -1558,6 +1616,8 @@ def _render_structured_review_with_task_data(
             sections.append("Risk areas checked: " + ", ".join(risk_areas_checked))
         if checks_performed:
             sections.append("Checks performed: " + ", ".join(checks_performed))
+        if verified_identifiers:
+            sections.append("Changed identifiers verified: " + ", ".join(f"`{name}`" for name in verified_identifiers))
         if why_no_finding:
             sections.append(f"Why no finding: {why_no_finding}")
     rendered = "\n\n".join(section for section in sections if section.strip())
