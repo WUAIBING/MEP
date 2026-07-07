@@ -1047,6 +1047,112 @@ class TestGitHubToMEPBridge(unittest.TestCase):
         self.assertEqual(payload["summary"]["feedback_pending_count"], 1)
         self.assertEqual(payload["summary"]["feedback_label_coverage"], 0.0)
 
+    def test_completed_status_callback_persists_final_state_in_single_write(self):
+        response = self._post_webhook(
+            _issue_comment_payload("@Hub-Sentinel review this PR", delivery_number=248),
+            delivery_id="delivery-completed-atomic",
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        bridge_id = response.json()["bridge_id"]
+        self._flush_context(response.json()["context_id"])
+
+        token = self.service._generate_status_token(bridge_id, "node_target")
+        with patch.object(
+            self.service,
+            "_write_back_to_github",
+            return_value=("reviewed", None, {"published": True, "suppressed": False}),
+        ) as writeback_mock, patch.object(
+            self.store,
+            "update_execution",
+            wraps=self.store.update_execution,
+        ) as update_mock:
+            status_response = self.client.post(
+                "/bridge/status",
+                json={
+                    "bridge_id": bridge_id,
+                    "status": "completed",
+                    "target_node_id": "node_target",
+                    "task_id": "task-completed-atomic",
+                    "action": "reviewed",
+                    "detail": "Grounded final review body.",
+                },
+                headers={"Authorization": f"Bearer {token}"},
+            )
+
+        self.assertEqual(status_response.status_code, 200, status_response.text)
+        writeback_mock.assert_called_once()
+        self.assertEqual(update_mock.call_count, 1)
+        self.assertEqual(update_mock.call_args.args[0], bridge_id)
+        self.assertEqual(update_mock.call_args.kwargs["status"], "completed")
+        self.assertEqual(update_mock.call_args.kwargs["task_id"], "task-completed-atomic")
+        self.assertEqual(update_mock.call_args.kwargs["action"], "reviewed")
+        self.assertTrue(update_mock.call_args.kwargs["review_result"]["published"])
+        self.assertEqual(
+            update_mock.call_args.kwargs["review_result"],
+            {
+                "published": True,
+                "suppressed": False,
+                "resolved_action": "reviewed",
+                "retry_queued": False,
+                "retry_count": 0,
+            },
+        )
+
+        execution = self.store.get_execution(bridge_id)
+        assert execution is not None
+        self.assertEqual(execution["status"], "completed")
+        self.assertEqual(execution["task_id"], "task-completed-atomic")
+        self.assertEqual(execution["action"], "reviewed")
+        self.assertEqual(
+            execution["review_result"],
+            {
+                "published": True,
+                "suppressed": False,
+                "resolved_action": "reviewed",
+                "retry_queued": False,
+                "retry_count": 0,
+            },
+        )
+
+    def test_completed_status_callback_preserves_retrying_execution_state(self):
+        response = self._post_webhook(
+            _issue_comment_payload("@Hub-Sentinel review this PR", delivery_number=247),
+            delivery_id="delivery-completed-retrying-state",
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        bridge_id = response.json()["bridge_id"]
+        self._flush_context(response.json()["context_id"])
+
+        token = self.service._generate_status_token(bridge_id, "node_target")
+        status_response = self.client.post(
+            "/bridge/status",
+            json={
+                "bridge_id": bridge_id,
+                "status": "completed",
+                "target_node_id": "node_target",
+                "task_id": "task-completed-retrying",
+                "detail": "Too short review",
+            },
+            headers={"Authorization": f"Bearer {token}"},
+        )
+
+        self.assertEqual(status_response.status_code, 200, status_response.text)
+        self.assertEqual(len(self.github_session.posts), 0)
+        self.assertEqual(len(self.submission.calls), 2)
+        self.assertIn("action: retrying", self.notifier.calls[-1]["text"])
+
+        execution = self.store.get_execution(bridge_id)
+        assert execution is not None
+        self.assertEqual(execution["status"], "queued")
+        self.assertEqual(execution["task_id"], "task-2")
+        self.assertEqual(execution["action"], "retrying")
+        self.assertEqual(execution["retry_count"], 1)
+        self.assertEqual(execution["review_result"]["resolved_action"], "retrying")
+        self.assertTrue(execution["review_result"]["retry_queued"])
+        self.assertEqual(execution["review_result"]["retry_count"], 1)
+        self.assertTrue(execution["review_result"]["suppressed"])
+        self.assertFalse(execution["review_result"]["published"])
+
     def test_review_benchmarks_endpoint_returns_seeded_catalog(self):
         response = self.client.get("/bridge/review-benchmarks")
         self.assertEqual(response.status_code, 200, response.text)
