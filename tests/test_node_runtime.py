@@ -1971,6 +1971,142 @@ class TestWorkspaceReviewContext(unittest.TestCase):
         self.assertIn("Deep read: `node/mep_runtime.py`", rendered)
         self.assertIn("Not deeply reviewed: deployment scripts", rendered)
 
+    def test_default_repo_audit_renderer_includes_repo_specific_risk_areas(self):
+        task_data = {
+            "intent": {"type": "repo_audit.request"},
+            "task": {
+                "inputs": {
+                    "repo_audit": {
+                        "repo_url": "github.com/WUAIBING/MEP",
+                        "ref": "main",
+                        "inventory_paths": ["hub/db.py", "node/mep_runtime.py", "bridge/github_to_mep.py"],
+                    }
+                }
+            },
+        }
+
+        rendered = mep_runtime._render_default_repo_audit(  # noqa: SLF001
+            task_data=task_data,
+            max_chars=4000,
+        )
+
+        self.assertIn("Risk areas checked:", rendered)
+        self.assertIn("fail-closed correctness around audit contracts", rendered)
+        self.assertIn("automation/writeback safety, approval gating", rendered)
+
+    def test_extract_repo_audit_candidates_filters_to_inventory_and_priority(self):
+        reply = json.dumps(
+            {
+                "risk_candidates": [
+                    {
+                        "file": "config.json",
+                        "category": "security",
+                        "priority": "critical",
+                        "claim": "Fake config issue",
+                        "reason": "Should be dropped because the file is not in inventory.",
+                        "evidence": ["config.json"],
+                    },
+                    {
+                        "file": "node/mep_runtime.py",
+                        "category": "correctness",
+                        "priority": "high",
+                        "claim": "Fail-open path may publish without grounding",
+                        "reason": "The runtime owns repo-audit workspace bootstrap and publish gating.",
+                        "evidence": ["sync_repo_audit_workspace", "_repo_audit_contract_failure"],
+                    },
+                    {
+                        "file": "hub/db.py",
+                        "category": "ledger",
+                        "priority": "medium",
+                        "claim": "Balance mutation may drift across storage paths",
+                        "reason": "The storage code touches ledger updates in multiple code paths.",
+                        "evidence": ["hub/db.py"],
+                    },
+                ]
+            }
+        )
+
+        candidates = mep_runtime._extract_repo_audit_candidates(  # noqa: SLF001
+            reply,
+            allowed_paths=["hub/db.py", "node/mep_runtime.py"],
+        )
+
+        self.assertEqual([item["file"] for item in candidates], ["node/mep_runtime.py", "hub/db.py"])
+        self.assertEqual(candidates[0]["priority"], "high")
+        self.assertEqual(candidates[0]["claim"], "Fail-open path may publish without grounding.")
+
+    def test_deepseek_adapter_uses_two_pass_repo_audit_flow(self):
+        adapter = mep_runtime.DeepSeekAdapter(api_key="secret-key", model="deepseek-chat")
+        task_data = {
+            "intent": {"type": "repo_audit.request"},
+            "task": {
+                "inputs": {
+                    "repo_audit": {
+                        "repo_url": "github.com/WUAIBING/MEP",
+                        "ref": "main",
+                        "local_workspace_path": "/tmp/mep-audit",
+                        "inventory_paths": ["hub/db.py", "node/mep_runtime.py"],
+                    }
+                }
+            },
+        }
+        fake_responses = [
+            _FakeResponse(
+                200,
+                {
+                    "choices": [
+                        {
+                            "message": {
+                                "content": (
+                                    '{"risk_candidates":['
+                                    '{"file":"node/mep_runtime.py","category":"correctness","priority":"high",'
+                                    '"claim":"Fail-open audit path may publish without grounding",'
+                                    '"reason":"Workspace bootstrap and publish gating live in the same runtime file.",'
+                                    '"evidence":["sync_repo_audit_workspace","_repo_audit_contract_failure"]}'
+                                    '],"coverage":["repo audit runtime and contract path"]}'
+                                )
+                            }
+                        }
+                    ]
+                },
+            ),
+            _FakeResponse(
+                200,
+                {
+                    "choices": [
+                        {
+                            "message": {
+                                "content": (
+                                    '{"summary":"Audited the repo-audit runtime path.","repo_overview":"Reviewed the runtime bootstrap path.",'
+                                    '"files_deep_read":["node/mep_runtime.py"],'
+                                    '"risk_areas_checked":["workspace grounding"],'
+                                    '"checks_performed":["verified the runtime only publishes from tracked inventory"],'
+                                    '"why_no_finding":"The grounded workspace evidence did not prove a concrete fail-open publish path.",'
+                                    '"findings":[],"near_misses":[{"file":"node/mep_runtime.py","title":"Fail-open audit path may publish without grounding",'
+                                    '"reason_not_published":"The candidate remained plausible but did not clear the published-evidence bar from the supplied workspace excerpts."}],'
+                                    '"observations":[],"artifact_recommended":false}'
+                                )
+                            }
+                        }
+                    ]
+                },
+            ),
+        ]
+
+        with patch("node.mep_runtime.requests.post", side_effect=fake_responses) as post_mock:
+            reply = adapter.generate_reply("Audit the repository", task_data)
+
+        self.assertIn("## Repo Audit Summary", reply)
+        self.assertIn("Risk areas checked: workspace grounding", reply)
+        self.assertIn("Near misses: `node/mep_runtime.py` - Fail-open audit path may publish without grounding", reply)
+        self.assertEqual(post_mock.call_count, 2)
+        first_system_prompt = post_mock.call_args_list[0].kwargs["json"]["messages"][0]["content"]
+        second_system_prompt = post_mock.call_args_list[1].kwargs["json"]["messages"][0]["content"]
+        second_user_payload = post_mock.call_args_list[1].kwargs["json"]["messages"][1]["content"]
+        self.assertIn("candidate-generation pass for a MEP repository audit", first_system_prompt)
+        self.assertIn("This is the verification pass.", second_system_prompt)
+        self.assertIn("Candidate repo-audit risks to verify before publishing any finding", second_user_payload)
+
     def test_clean_check_env_uses_allowlist_and_throwaway_home(self):
         with patch.dict(
             os.environ,
