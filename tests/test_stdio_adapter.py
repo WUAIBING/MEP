@@ -1,3 +1,4 @@
+import asyncio
 import json
 import os
 import tempfile
@@ -40,6 +41,36 @@ class TestStdioAdapter(unittest.IsolatedAsyncioTestCase):
         print_mock.assert_any_call(
             "[codex] stored structured dm result task_review_request context=pr154-review"
         )
+
+    async def test_run_keeps_listener_alive_without_stdin_when_noninteractive(self):
+        adapter, client = self._make_adapter()
+        adapter.noninteractive_keepalive = True
+        listener_started = asyncio.Event()
+        listener_released = asyncio.Event()
+
+        async def _fake_listener(_result_cb, _event_cb):
+            listener_started.set()
+            await listener_released.wait()
+
+        client.register = AsyncMock()
+        client.listen_results = AsyncMock(side_effect=_fake_listener)
+
+        with patch("builtins.input", side_effect=AssertionError("input should not be called")), patch(
+            "builtins.print"
+        ) as print_mock:
+            run_task = asyncio.create_task(adapter.run())
+            await listener_started.wait()
+            await asyncio.sleep(0)
+            self.assertFalse(run_task.done())
+            run_task.cancel()
+            listener_released.set()
+            with self.assertRaises(asyncio.CancelledError):
+                await run_task
+
+        client.register.assert_awaited_once()
+        client.listen_results.assert_awaited_once()
+        client.stop.assert_called_once()
+        print_mock.assert_any_call("[codex] noninteractive keepalive enabled; stdin loop disabled")
 
     async def test_dispatch_line_structured_dm_accepts_session_safety_flags(self):
         adapter, client = self._make_adapter()
