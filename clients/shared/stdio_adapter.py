@@ -22,6 +22,12 @@ class StdioAdapter:
         self._recent_interbot_results: dict[str, dict[str, Any]] = {}
         self.live_call_enabled = os.getenv("MEP_LIVE_CALL_ENABLED", "0") not in ("0", "false", "False", "")
         self.call_auto_accept = os.getenv("MEP_CALL_AUTO_ACCEPT", "0") not in ("0", "false", "False", "")
+        self.noninteractive_keepalive = os.getenv("MEP_NONINTERACTIVE_KEEPALIVE", "0") not in (
+            "0",
+            "false",
+            "False",
+            "",
+        )
         self._call_seq_by_context: dict[str, int] = {}
 
     async def _handle_result(self, data: dict) -> None:
@@ -1163,8 +1169,12 @@ class StdioAdapter:
             "mepdmx, mepdmlist, mepdmsnapshot, mepdmhumanapproval, mepdmverdict, mepdmreplysafe, "
             "mepdata, mepcancel, mepresult, mepbalance, exit"
         )
-        loop = asyncio.get_running_loop()
         try:
+            if self.noninteractive_keepalive:
+                print(f"[{self.platform_name}] noninteractive keepalive enabled; stdin loop disabled")
+                await listener
+                return
+            loop = asyncio.get_running_loop()
             keep_going = True
             while keep_going:
                 line = await loop.run_in_executor(None, input, f"{self.platform_name}> ")
