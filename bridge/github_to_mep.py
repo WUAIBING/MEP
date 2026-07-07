@@ -3079,33 +3079,46 @@ class GitHubToMEPBridgeService:
         expected_target = claims.get("target_node_id")
         if expected_target and update.target_node_id and expected_target != update.target_node_id:
             raise HTTPException(status_code=403, detail="target_node_id mismatch")
-        self.store.update_execution(
-            update.bridge_id,
-            status=update.status,
-            task_id=update.task_id,
-            action=update.action,
-        )
-        refreshed = self.store.get_execution(update.bridge_id)
         resolved_action = update.action
-        if refreshed is None:
-            raise HTTPException(status_code=404, detail="Unknown bridge_id")
+        refreshed = execution
         if str(update.status).strip().lower() == "completed":
-            resolved_action, suppression_reason, review_result = self._write_back_to_github(refreshed, update)
+            resolved_action, suppression_reason, review_result = self._write_back_to_github(execution, update)
+            retry_queued = False
             if resolved_action == "suppressed":
-                retry_count = int(refreshed.get("retry_count") or 0)
+                retry_count = int(execution.get("retry_count") or 0)
                 if retry_count < 2 and self._suppression_reason_allows_retry(suppression_reason):  # MAX_RETRIES = 2
-                    retry_queued = await self._issue_retry_task(refreshed, suppression_reason)
+                    retry_queued = await self._issue_retry_task(execution, suppression_reason)
                     if retry_queued:
                         resolved_action = "retrying"
-            if resolved_action != update.action:
-                self.store.update_execution(update.bridge_id, action=resolved_action)
-                refreshed = self.store.get_execution(update.bridge_id) or refreshed
             if review_result is not None:
                 review_result["resolved_action"] = resolved_action
-                review_result["retry_queued"] = resolved_action == "retrying"
+                review_result["retry_queued"] = retry_queued
+                if retry_queued:
+                    refreshed = self.store.get_execution(update.bridge_id) or execution
                 review_result["retry_count"] = int(refreshed.get("retry_count") or 0)
-                self.store.update_execution(update.bridge_id, review_result=review_result)
-                refreshed = self.store.get_execution(update.bridge_id) or refreshed
+            if retry_queued:
+                self.store.update_execution(
+                    update.bridge_id,
+                    action=resolved_action,
+                    review_result=review_result,
+                )
+            else:
+                self.store.update_execution(
+                    update.bridge_id,
+                    status=update.status,
+                    task_id=update.task_id,
+                    action=resolved_action,
+                    review_result=review_result,
+                )
+            refreshed = self.store.get_execution(update.bridge_id) or refreshed
+        else:
+            self.store.update_execution(
+                update.bridge_id,
+                status=update.status,
+                task_id=update.task_id,
+                action=update.action,
+            )
+            refreshed = self.store.get_execution(update.bridge_id) or execution
         event = NormalizedGitHubEvent(
             delivery_id="",
             source_event="",
