@@ -1943,6 +1943,7 @@ class TestWorkspaceReviewContext(unittest.TestCase):
                 {
                     "summary": "Audited the workspace-backed repo context.",
                     "repo_overview": "Reviewed README and runtime entrypoints.",
+                    "files_deep_read": ["node/mep_runtime.py"],
                     "findings": [
                         {
                             "file": "README.md",
@@ -1983,6 +1984,7 @@ class TestWorkspaceReviewContext(unittest.TestCase):
                 {
                     "summary": "Audited the workspace-backed repo context.",
                     "repo_overview": "Reviewed README and runtime entrypoints.",
+                    "files_deep_read": ["node/mep_runtime.py"],
                     "findings": [
                         {
                             "file": "node/mep_runtime.py",
@@ -2011,6 +2013,54 @@ class TestWorkspaceReviewContext(unittest.TestCase):
         self.assertIn("## Repo Audit Summary", rendered)
         self.assertNotIn("Runtime sync path may be risky**", rendered)
         self.assertIn("Near misses: `node/mep_runtime.py` - Runtime sync path may be risky: The candidate did not explain a concrete invariant or failure mode from the supplied code path.", rendered)
+
+    def test_render_structured_repo_audit_requires_findings_to_name_deep_read_files(self):
+        task_data = {
+            "intent": {"type": "repo_audit.request"},
+            "task": {
+                "inputs": {
+                    "repo_audit": {
+                        "repo_url": "github.com/WUAIBING/MEP",
+                        "ref": "main",
+                        "inventory_paths": ["README.md", "node/mep_runtime.py"],
+                    }
+                }
+            },
+        }
+        rendered = mep_runtime._render_structured_repo_audit_with_task_data(  # noqa: SLF001
+            json.dumps(
+                {
+                    "summary": "Audited the workspace-backed repo context.",
+                    "repo_overview": "Reviewed README only.",
+                    "files_deep_read": ["README.md"],
+                    "findings": [
+                        {
+                            "file": "node/mep_runtime.py",
+                            "title": "Runtime sync path should fail closed on missing workspace context",
+                            "category": "correctness",
+                            "severity": "high",
+                            "confidence": "high",
+                            "invariant": "Repo audit must fail closed if workspace grounding is incomplete.",
+                            "failure_mode": "A partial bootstrap can still reach result publication without an authoritative inventory.",
+                            "proof_type": "code_path",
+                            "fix_priority": "fix_now",
+                            "developer_impact": "Otherwise the audit can publish an ungrounded result after a partial bootstrap failure.",
+                            "evidence": "sync_repo_audit_workspace and _repo_audit_contract_failure gate the publish path.",
+                            "next_step": "Keep refusing repo_audit tasks whenever the workspace bootstrap or inventory load is incomplete.",
+                        }
+                    ],
+                }
+            ),
+            max_chars=4000,
+            task_data=task_data,
+        )
+
+        self.assertIn("## Repo Audit Summary", rendered)
+        self.assertNotIn("[high/high/fix_now] Runtime sync path should fail closed on missing workspace context", rendered)
+        self.assertIn(
+            "Near misses: `node/mep_runtime.py` - Runtime sync path should fail closed on missing workspace context: The claim was withheld because the file was not listed in files_deep_read.",
+            rendered,
+        )
 
     def test_render_structured_repo_audit_adds_default_coverage_summary_when_missing(self):
         task_data = {
@@ -2108,6 +2158,31 @@ class TestWorkspaceReviewContext(unittest.TestCase):
         self.assertEqual(candidates[0]["priority"], "high")
         self.assertEqual(candidates[0]["claim"], "Fail-open path may publish without grounding.")
 
+    def test_extract_repo_audit_candidate_packet_preserves_coverage(self):
+        reply = json.dumps(
+            {
+                "risk_candidates": [
+                    {
+                        "file": "node/mep_runtime.py",
+                        "category": "correctness",
+                        "priority": "high",
+                        "claim": "Fail-open audit path may publish without grounding",
+                        "reason": "The runtime owns repo-audit workspace bootstrap and publish gating.",
+                        "evidence": ["sync_repo_audit_workspace", "_repo_audit_contract_failure"],
+                    }
+                ],
+                "coverage": ["read node/mep_runtime.py bootstrap path", "checked repo_audit publish gating"],
+            }
+        )
+
+        packet = mep_runtime._extract_repo_audit_candidate_packet(  # noqa: SLF001
+            reply,
+            allowed_paths=["node/mep_runtime.py"],
+        )
+
+        self.assertEqual(len(packet["risk_candidates"]), 1)
+        self.assertEqual(packet["coverage"], ["read node/mep_runtime.py bootstrap path", "checked repo_audit publish gating"])
+
     def test_deepseek_adapter_uses_two_pass_repo_audit_flow(self):
         adapter = mep_runtime.DeepSeekAdapter(api_key="secret-key", model="deepseek-chat")
         task_data = {
@@ -2178,7 +2253,8 @@ class TestWorkspaceReviewContext(unittest.TestCase):
         second_user_payload = post_mock.call_args_list[1].kwargs["json"]["messages"][1]["content"]
         self.assertIn("candidate-generation pass for a MEP repository audit", first_system_prompt)
         self.assertIn("This is the verification pass.", second_system_prompt)
-        self.assertIn("Candidate repo-audit risks to verify before publishing any finding", second_user_payload)
+        self.assertIn("Candidate repo-audit material to verify before publishing any finding", second_user_payload)
+        self.assertIn('"candidate_coverage"', second_user_payload)
 
     def test_clean_check_env_uses_allowlist_and_throwaway_home(self):
         with patch.dict(

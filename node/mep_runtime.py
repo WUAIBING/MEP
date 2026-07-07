@@ -962,13 +962,14 @@ def _candidate_payload_for_verification(
     ).strip()
 
 
-def _extract_repo_audit_candidates(text: str, *, allowed_paths: list[str]) -> list[dict[str, Any]]:
+def _extract_repo_audit_candidate_packet(text: str, *, allowed_paths: list[str]) -> dict[str, list[Any]]:
     parsed = _extract_first_json_object(text)
     if not isinstance(parsed, dict):
-        return []
+        return {"risk_candidates": [], "coverage": []}
     raw_candidates = parsed.get("risk_candidates")
     if not isinstance(raw_candidates, list):
-        return []
+        raw_candidates = []
+    coverage = _clean_review_list(parsed.get("coverage"), max_items=6, max_chars=140)
     allowed_map = {path.lower(): path for path in allowed_paths}
     cleaned: list[tuple[int, dict[str, Any]]] = []
     seen: set[tuple[str, str]] = set()
@@ -1006,7 +1007,11 @@ def _extract_repo_audit_candidates(text: str, *, allowed_paths: list[str]) -> li
             )
         )
     cleaned.sort(key=lambda entry: (_candidate_priority_rank(entry[1]["priority"]), entry[0]))
-    return [entry[1] for entry in cleaned]
+    return {"risk_candidates": [entry[1] for entry in cleaned], "coverage": coverage}
+
+
+def _extract_repo_audit_candidates(text: str, *, allowed_paths: list[str]) -> list[dict[str, Any]]:
+    return _extract_repo_audit_candidate_packet(text, allowed_paths=allowed_paths)["risk_candidates"]
 
 
 def _payload_with_repo_audit_lenses(payload: str, repo_audit_lenses: list[str]) -> str:
@@ -1026,14 +1031,21 @@ def _candidate_payload_for_repo_audit_verification(
     candidates: list[dict[str, Any]],
     *,
     repo_audit_lenses: list[str],
+    coverage: Optional[list[str]] = None,
 ) -> str:
     base = _payload_with_repo_audit_lenses(payload, repo_audit_lenses)
-    if not candidates:
+    if not candidates and not coverage:
         return base
-    candidate_json = json.dumps({"risk_candidates": candidates}, ensure_ascii=True)
+    packet: dict[str, Any] = {}
+    if candidates:
+        packet["risk_candidates"] = candidates
+    cleaned_coverage = _clean_review_list(coverage or [], max_items=6, max_chars=140)
+    if cleaned_coverage:
+        packet["candidate_coverage"] = cleaned_coverage
+    candidate_json = json.dumps(packet, ensure_ascii=True)
     return (
         f"{base}\n\n"
-        "Candidate repo-audit risks to verify before publishing any finding:\n"
+        "Candidate repo-audit material to verify before publishing any finding:\n"
         f"{candidate_json}"
     ).strip()
 
@@ -1072,6 +1084,7 @@ def _candidate_system_prompt_for_repo_audit(task_data: dict[str, Any], *, review
         "Prefer at most one candidate per lens, rank the highest-impact candidate first, and bias toward fail-closed correctness, cross-file drift, trust-boundary errors, deploy mismatch, ledger integrity, and missing verification over hygiene notes. "
         "Each candidate must be concrete, tied to one tracked file from the supplied inventory, and phrased as a plausible developer-facing failure worth verifying. "
         "Use `evidence` for 1-3 exact identifiers, files, or changed behaviors from the supplied workspace context that make the hypothesis worth verifying. "
+        "Use `coverage` for the exact files, code paths, or checks you already inspected closely enough to justify a deeper verification pass next. "
         "Do not summarize the repo. Do not give praise. Do not include chain-of-thought. "
         "If nothing looks risky enough to verify, return an empty `risk_candidates` list and use `coverage` to note what you inspected."
     )
@@ -1084,7 +1097,10 @@ def _verification_system_prompt_for_repo_audit(task_data: dict[str, Any], *, rev
     return (
         f"{base} This is the verification pass. The user message may include provisional candidate risks from an earlier pass. "
         "Treat those candidates as hypotheses only. Promote a candidate into `findings` only when the supplied workspace context directly supports it. "
+        "Treat any candidate coverage hints as provisional evidence about what deserves deeper reading, then turn that into grounded `files_deep_read` and `checks_performed`. "
         "For every published finding, set `file` to one tracked file from the supplied inventory and make the finding invariant-backed, failure-specific, and developer-impactful. "
+        "Every published finding file must also appear in `files_deep_read`. "
+        "Every published finding must cite at least one exact identifier, config key, test, or code path from the supplied workspace context in `evidence`; generic statements like 'this file controls the path' are not enough. "
         "Prefer one to three high-value verified findings over a longer list of generic concerns. "
         "Downgrade or discard candidates that are weakly evidenced, hygiene-only, redundant, or not specific enough to change developer behavior. "
         "Reject any candidate that relies on unseen code, generic security folklore, or broad claims about the whole repository. "
@@ -1110,11 +1126,13 @@ def _run_two_pass_repo_audit(
         _candidate_system_prompt_for_repo_audit(task_data, review_max_chars=review_max_chars),
         candidate_payload,
     )
-    candidates = _extract_repo_audit_candidates(candidate_reply, allowed_paths=inventory_paths)
+    candidate_packet = _extract_repo_audit_candidate_packet(candidate_reply, allowed_paths=inventory_paths)
+    candidates = candidate_packet["risk_candidates"]
     verification_payload = _candidate_payload_for_repo_audit_verification(
         payload,
         candidates,
         repo_audit_lenses=repo_audit_lenses,
+        coverage=candidate_packet["coverage"],
     )
     final_reply = invoke_model(
         _verification_system_prompt_for_repo_audit(task_data, review_max_chars=review_max_chars),
@@ -1594,6 +1612,12 @@ def _render_structured_repo_audit_with_task_data(
                 continue
             if severity == "low" or confidence == "low":
                 rendered_observations.append(f"`{matched}`: {note}")
+                continue
+            if matched not in files_deep_read:
+                title_for_near_miss = title.rstrip(".:; ")
+                rendered_near_misses.append(
+                    f"`{matched}` - {title_for_near_miss}: The claim was withheld because the file was not listed in files_deep_read."
+                )
                 continue
             if not invariant or not failure_mode or _is_weak_review_text(combined):
                 continue
