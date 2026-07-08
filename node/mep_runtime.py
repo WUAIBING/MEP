@@ -663,7 +663,8 @@ def _system_prompt_for_task(
             '"risk_areas_checked": [string], "checks_performed": [string], "why_no_finding": string, '
             '"findings": [{"file": string, "title": string, "category": string, "severity": "high|medium|low", '
             '"confidence": "high|medium|low", "invariant": string, "failure_mode": string, "proof_type": string, '
-            '"fix_priority": "fix_now|next_change|later", "developer_impact": string, "evidence": string, "next_step": string}], '
+            '"fix_priority": "fix_now|next_change|later", "developer_impact": string, "evidence": string, '
+            '"supporting_files": [string], "contradiction_check": string, "contradicted_by": [string], "next_step": string}], '
             '"near_misses": [{"file": string, "title": string, "reason_not_published": string}], '
             '"observations": [{"file": string, "note": string}], '
             '"artifact_recommended": boolean}. '
@@ -678,6 +679,9 @@ def _system_prompt_for_task(
             "Use `risk_areas_checked` for 1-5 concrete risk themes you audited. "
             "Only publish a finding when the supplied repo context directly supports it. "
             "Every published finding must name the impacted file, explain the developer impact, cite concrete evidence from the supplied repo context, and give one short next step. "
+            "For every high-severity finding, include `supporting_files` with the impacted file plus at least one additional deep-read file that proves the caller, guard, or enforcement path. "
+            "Use `contradiction_check` to say which neighboring guard, caller, or enforcement path you checked for contradictory evidence before publishing the claim. "
+            "If any supplied file or identifier materially weakens the claim, list it in `contradicted_by` and demote the claim into `near_misses` instead of publishing it as a finding. "
             "If a candidate issue is plausible but did not clear the publication bar, put it in `near_misses` with a short reason instead of promoting it to a finding. "
             f"{audit_lenses_hint}"
             "Do not invent files, endpoints, dependencies, or artifacts that are not present in the supplied repo context. "
@@ -1101,6 +1105,8 @@ def _verification_system_prompt_for_repo_audit(task_data: dict[str, Any], *, rev
         "For every published finding, set `file` to one tracked file from the supplied inventory and make the finding invariant-backed, failure-specific, and developer-impactful. "
         "Every published finding file must also appear in `files_deep_read`. "
         "Every published finding must cite at least one exact identifier, config key, test, or code path from the supplied workspace context in `evidence`; generic statements like 'this file controls the path' are not enough. "
+        "For every high-severity finding, include `supporting_files` with the impacted file plus at least one additional deep-read file that proves the caller, guard, or enforcement path, and fill `contradiction_check` with the contradictory guard or caller path you checked before publishing. "
+        "If `contradicted_by` is non-empty, do not publish that claim as a finding; move it to `near_misses` instead. "
         "Prefer one to three high-value verified findings over a longer list of generic concerns. "
         "Downgrade or discard candidates that are weakly evidenced, hygiene-only, redundant, or not specific enough to change developer behavior. "
         "Reject any candidate that relies on unseen code, generic security folklore, or broad claims about the whole repository. "
@@ -1495,6 +1501,26 @@ def _repo_audit_finding_sort_key(finding: dict[str, str]) -> tuple[int, int, str
     )
 
 
+def _repo_audit_supporting_files(
+    raw_values: Any,
+    *,
+    allowed_path_keys: dict[str, str],
+) -> list[str]:
+    supporting_files_raw = _clean_review_list(raw_values, max_items=6, max_chars=160)
+    supporting_files: list[str] = []
+    seen: set[str] = set()
+    for item in supporting_files_raw:
+        matched = allowed_path_keys.get(item.lower())
+        if not matched:
+            continue
+        lowered = matched.lower()
+        if lowered in seen:
+            continue
+        seen.add(lowered)
+        supporting_files.append(matched)
+    return supporting_files
+
+
 def _render_default_repo_audit(
     *,
     task_data: Optional[dict[str, Any]],
@@ -1600,6 +1626,12 @@ def _render_structured_repo_audit_with_task_data(
                 max_chars=240,
             )
             evidence = _clean_review_text(item.get("evidence") or item.get("rationale"), max_chars=260)
+            supporting_files = _repo_audit_supporting_files(
+                item.get("supporting_files"),
+                allowed_path_keys=allowed_path_keys,
+            )
+            contradiction_check = _clean_review_text(item.get("contradiction_check"), max_chars=220)
+            contradicted_by = _clean_review_list(item.get("contradicted_by"), max_items=4, max_chars=140)
             next_step = _clean_review_text(item.get("next_step"), max_chars=220)
             note = (
                 developer_impact
@@ -1621,6 +1653,27 @@ def _render_structured_repo_audit_with_task_data(
                 continue
             if not invariant or not failure_mode or _is_weak_review_text(combined):
                 continue
+            if severity == "high":
+                deep_read_supporting_files = [path for path in supporting_files if path in files_deep_read]
+                distinct_supporting_files = [path for path in deep_read_supporting_files if path != matched]
+                if not distinct_supporting_files:
+                    title_for_near_miss = title.rstrip(".:; ")
+                    rendered_near_misses.append(
+                        f"`{matched}` - {title_for_near_miss}: The claim was withheld because high-severity findings must cite at least one additional deep-read supporting file."
+                    )
+                    continue
+                if not contradiction_check or _is_weak_review_text(contradiction_check):
+                    title_for_near_miss = title.rstrip(".:; ")
+                    rendered_near_misses.append(
+                        f"`{matched}` - {title_for_near_miss}: The claim was withheld because high-severity findings must describe the contradiction check that ruled out an enforcing caller or guard."
+                    )
+                    continue
+                if contradicted_by:
+                    title_for_near_miss = title.rstrip(".:; ")
+                    rendered_near_misses.append(
+                        f"`{matched}` - {title_for_near_miss}: The claim was withheld because contradictory workspace evidence remained ({'; '.join(contradicted_by[:2])})."
+                    )
+                    continue
             finding_bits = [f"**[{severity}/{confidence}/{fix_priority}] {title}** (`{matched}`)"]
             if category:
                 finding_bits.append(f"Category: {category}.")
@@ -1631,6 +1684,13 @@ def _render_structured_repo_audit_with_task_data(
                 finding_bits.append(f"Developer impact: {developer_impact}")
             if evidence:
                 finding_bits.append(f"Evidence: {evidence}")
+            if supporting_files:
+                finding_bits.append(
+                    "Supporting files: "
+                    + ", ".join(f"`{path}`" for path in supporting_files[:4])
+                )
+            if contradiction_check:
+                finding_bits.append(f"Contradiction check: {contradiction_check}")
             if next_step:
                 finding_bits.append(f"Next step: {next_step}")
             findings_for_sort.append(
