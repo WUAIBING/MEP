@@ -1885,7 +1885,7 @@ class TestWorkspaceReviewContext(unittest.TestCase):
                 {
                     "summary": "Audited the workspace-backed repo context.",
                     "repo_overview": "Reviewed README and runtime entrypoints.",
-                    "files_deep_read": ["node/mep_runtime.py"],
+                    "files_deep_read": ["README.md", "node/mep_runtime.py"],
                     "areas_not_deeply_reviewed": ["deployment scripts"],
                     "checks_performed": ["checked tracked file inventory", "read runtime entrypoint"],
                     "risk_areas_checked": ["runtime entrypoints", "repo contract drift"],
@@ -1902,6 +1902,8 @@ class TestWorkspaceReviewContext(unittest.TestCase):
                             "fix_priority": "fix_now",
                             "developer_impact": "Otherwise the audit can publish an ungrounded result after a partial bootstrap failure.",
                             "evidence": "This file controls the audit workspace bootstrap path.",
+                            "supporting_files": ["node/mep_runtime.py", "README.md"],
+                            "contradiction_check": "Checked the repo audit task contract description in README.md for a contradictory fail-open path and did not find one.",
                             "next_step": "Keep refusing repo_audit tasks whenever the workspace bootstrap or inventory load is incomplete.",
                         },
                         {
@@ -1918,7 +1920,7 @@ class TestWorkspaceReviewContext(unittest.TestCase):
 
         self.assertIn("node/mep_runtime.py", rendered)
         self.assertNotIn("config.json", rendered)
-        self.assertIn("Files deep read: `node/mep_runtime.py`", rendered)
+        self.assertIn("Files deep read: `README.md`, `node/mep_runtime.py`", rendered)
         self.assertIn("Areas not deeply reviewed: deployment scripts", rendered)
         self.assertIn("[high/high/fix_now] Runtime sync path should fail closed on missing workspace context", rendered)
         self.assertIn("Invariant: Repo audit must fail closed if workspace grounding is incomplete.", rendered)
@@ -2059,6 +2061,107 @@ class TestWorkspaceReviewContext(unittest.TestCase):
         self.assertNotIn("[high/high/fix_now] Runtime sync path should fail closed on missing workspace context", rendered)
         self.assertIn(
             "Near misses: `node/mep_runtime.py` - Runtime sync path should fail closed on missing workspace context: The claim was withheld because the file was not listed in files_deep_read.",
+            rendered,
+        )
+
+    def test_render_structured_repo_audit_high_severity_findings_require_cross_file_support(self):
+        task_data = {
+            "intent": {"type": "repo_audit.request"},
+            "task": {
+                "inputs": {
+                    "repo_audit": {
+                        "repo_url": "github.com/WUAIBING/MEP",
+                        "ref": "main",
+                        "inventory_paths": ["README.md", "hub/main.py", "node/mep_runtime.py"],
+                    }
+                }
+            },
+        }
+        rendered = mep_runtime._render_structured_repo_audit_with_task_data(  # noqa: SLF001
+            json.dumps(
+                {
+                    "summary": "Audited the workspace-backed repo context.",
+                    "repo_overview": "Reviewed runtime bootstrap and request wiring.",
+                    "files_deep_read": ["hub/main.py", "node/mep_runtime.py"],
+                    "findings": [
+                        {
+                            "file": "node/mep_runtime.py",
+                            "title": "Runtime sync path should fail closed on missing workspace context",
+                            "category": "correctness",
+                            "severity": "high",
+                            "confidence": "high",
+                            "invariant": "Repo audit must fail closed if workspace grounding is incomplete.",
+                            "failure_mode": "A partial bootstrap can still reach result publication without an authoritative inventory.",
+                            "proof_type": "cross_file_interaction",
+                            "fix_priority": "fix_now",
+                            "developer_impact": "Otherwise the audit can publish an ungrounded result after a partial bootstrap failure.",
+                            "evidence": "sync_repo_audit_workspace prepares the workspace before the runtime publishes a result.",
+                            "supporting_files": ["node/mep_runtime.py"],
+                            "contradiction_check": "Checked the publish path for an enforcing caller but only verified the runtime file itself.",
+                            "next_step": "Keep refusing repo_audit tasks whenever the workspace bootstrap or inventory load is incomplete.",
+                        }
+                    ],
+                }
+            ),
+            max_chars=4000,
+            task_data=task_data,
+        )
+
+        self.assertIn("## Repo Audit Summary", rendered)
+        self.assertNotIn("[high/high/fix_now] Runtime sync path should fail closed on missing workspace context", rendered)
+        self.assertIn(
+            "Near misses: `node/mep_runtime.py` - Runtime sync path should fail closed on missing workspace context: The claim was withheld because high-severity findings must cite at least one additional deep-read supporting file.",
+            rendered,
+        )
+
+    def test_render_structured_repo_audit_withholds_contradicted_high_severity_finding(self):
+        task_data = {
+            "intent": {"type": "repo_audit.request"},
+            "task": {
+                "inputs": {
+                    "repo_audit": {
+                        "repo_url": "github.com/WUAIBING/MEP",
+                        "ref": "main",
+                        "inventory_paths": ["hub/auth.py", "hub/main.py", "README.md"],
+                    }
+                }
+            },
+        }
+        rendered = mep_runtime._render_structured_repo_audit_with_task_data(  # noqa: SLF001
+            json.dumps(
+                {
+                    "summary": "Audited hub auth and request verification wiring.",
+                    "repo_overview": "Reviewed auth helpers and request verification callers.",
+                    "files_deep_read": ["hub/auth.py", "hub/main.py"],
+                    "findings": [
+                        {
+                            "file": "hub/auth.py",
+                            "title": "Signature verification accepts unregistered keys",
+                            "category": "auth",
+                            "severity": "high",
+                            "confidence": "high",
+                            "invariant": "Every signed request must resolve the registered public key for the claimed node before verification.",
+                            "failure_mode": "A caller can supply an arbitrary key and still pass signature verification for another node.",
+                            "proof_type": "cross_file_interaction",
+                            "fix_priority": "fix_now",
+                            "developer_impact": "That would break node identity trust across authenticated hub requests.",
+                            "evidence": "verify_signature only verifies the supplied public key bytes.",
+                            "supporting_files": ["hub/auth.py", "hub/main.py"],
+                            "contradiction_check": "Checked verify_request in hub/main.py for a registry lookup before the auth helper is called.",
+                            "contradicted_by": ["hub/main.py verify_request loads pub_pem via db.get_pub_pem(x_mep_nodeid) before calling verify_signature"],
+                            "next_step": "Keep the registry lookup anchored in the request verification path.",
+                        }
+                    ],
+                }
+            ),
+            max_chars=4000,
+            task_data=task_data,
+        )
+
+        self.assertIn("## Repo Audit Summary", rendered)
+        self.assertNotIn("[high/high/fix_now] Signature verification accepts unregistered keys", rendered)
+        self.assertIn(
+            "Near misses: `hub/auth.py` - Signature verification accepts unregistered keys: The claim was withheld because contradictory workspace evidence remained (hub/main.py verify_request loads pub_pem via db.get_pub_pem(x_mep_nodeid) before calling verify_signature).",
             rendered,
         )
 
