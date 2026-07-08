@@ -1903,6 +1903,7 @@ class TestWorkspaceReviewContext(unittest.TestCase):
                             "developer_impact": "Otherwise the audit can publish an ungrounded result after a partial bootstrap failure.",
                             "evidence": "This file controls the audit workspace bootstrap path.",
                             "supporting_files": ["node/mep_runtime.py", "README.md"],
+                            "same_file_check": "Checked the local publish guard in node/mep_runtime.py and did not find a same-file branch that permits publication after _repo_audit_contract_failure.",
                             "contradiction_check": "Checked the repo audit task contract description in README.md for a contradictory fail-open path and did not find one.",
                             "next_step": "Keep refusing repo_audit tasks whenever the workspace bootstrap or inventory load is incomplete.",
                         },
@@ -2114,6 +2115,108 @@ class TestWorkspaceReviewContext(unittest.TestCase):
             rendered,
         )
 
+    def test_render_structured_repo_audit_high_severity_findings_require_same_file_check(self):
+        task_data = {
+            "intent": {"type": "repo_audit.request"},
+            "task": {
+                "inputs": {
+                    "repo_audit": {
+                        "repo_url": "github.com/WUAIBING/MEP",
+                        "ref": "main",
+                        "inventory_paths": ["README.md", "hub/main.py", "node/mep_runtime.py"],
+                    }
+                }
+            },
+        }
+        rendered = mep_runtime._render_structured_repo_audit_with_task_data(  # noqa: SLF001
+            json.dumps(
+                {
+                    "summary": "Audited the workspace-backed repo context.",
+                    "repo_overview": "Reviewed runtime bootstrap and publish gating.",
+                    "files_deep_read": ["README.md", "node/mep_runtime.py", "hub/main.py"],
+                    "findings": [
+                        {
+                            "file": "node/mep_runtime.py",
+                            "title": "Runtime sync path should fail closed on missing workspace context",
+                            "category": "correctness",
+                            "severity": "high",
+                            "confidence": "high",
+                            "invariant": "Repo audit must fail closed if workspace grounding is incomplete.",
+                            "failure_mode": "A partial bootstrap can still reach result publication without an authoritative inventory.",
+                            "proof_type": "cross_file_interaction",
+                            "fix_priority": "fix_now",
+                            "developer_impact": "Otherwise the audit can publish an ungrounded result after a partial bootstrap failure.",
+                            "evidence": "sync_repo_audit_workspace prepares the workspace before the runtime publishes a result.",
+                            "supporting_files": ["node/mep_runtime.py", "hub/main.py"],
+                            "contradiction_check": "Checked the caller-side publish path in hub/main.py for an enforcing guard and did not find one.",
+                            "next_step": "Keep refusing repo_audit tasks whenever the workspace bootstrap or inventory load is incomplete.",
+                        }
+                    ],
+                }
+            ),
+            max_chars=4000,
+            task_data=task_data,
+        )
+
+        self.assertIn("## Repo Audit Summary", rendered)
+        self.assertNotIn("[high/high/fix_now] Runtime sync path should fail closed on missing workspace context", rendered)
+        self.assertIn(
+            "Near misses: `node/mep_runtime.py` - Runtime sync path should fail closed on missing workspace context: The claim was withheld because high-severity findings must describe the same-file contradiction check that ruled out a nearby guard or branch.",
+            rendered,
+        )
+
+    def test_render_structured_repo_audit_withholds_same_file_contradicted_high_severity_finding(self):
+        task_data = {
+            "intent": {"type": "repo_audit.request"},
+            "task": {
+                "inputs": {
+                    "repo_audit": {
+                        "repo_url": "github.com/WUAIBING/MEP",
+                        "ref": "main",
+                        "inventory_paths": ["bridge/github_to_mep.py", "docs/external-bridge/README.md", "README.md"],
+                    }
+                }
+            },
+        }
+        rendered = mep_runtime._render_structured_repo_audit_with_task_data(  # noqa: SLF001
+            json.dumps(
+                {
+                    "summary": "Audited bridge trigger enforcement and configuration docs.",
+                    "repo_overview": "Reviewed bridge trigger gating and its documented operator controls.",
+                    "files_deep_read": ["bridge/github_to_mep.py", "docs/external-bridge/README.md"],
+                    "findings": [
+                        {
+                            "file": "bridge/github_to_mep.py",
+                            "title": "MEP_BRIDGE_MAINTAINER_ONLY is not enforced",
+                            "category": "automation/writeback safety",
+                            "severity": "high",
+                            "confidence": "high",
+                            "invariant": "Maintainer-only bridge mode must reject trigger authors whose GitHub association is not allowed.",
+                            "failure_mode": "A non-maintainer can mention the bot and still cause automated bridge task submission.",
+                            "proof_type": "cross_file_interaction",
+                            "fix_priority": "fix_now",
+                            "developer_impact": "That would let untrusted GitHub users trigger autonomous review and approval actions.",
+                            "evidence": "The maintainer-only config is documented for the external bridge runtime.",
+                            "supporting_files": ["bridge/github_to_mep.py", "docs/external-bridge/README.md"],
+                            "same_file_check": "Checked the trigger extraction path in bridge/github_to_mep.py for a local author-association guard before trigger parsing.",
+                            "same_file_contradicted_by": ["bridge/github_to_mep.py rejects disallowed author_association before extracting triggers"],
+                            "contradiction_check": "Checked the docs in docs/external-bridge/README.md for the operator-facing maintainer-only requirement.",
+                            "next_step": "Keep the author-association gate fail-closed before bot trigger extraction.",
+                        }
+                    ],
+                }
+            ),
+            max_chars=4000,
+            task_data=task_data,
+        )
+
+        self.assertIn("## Repo Audit Summary", rendered)
+        self.assertNotIn("[high/high/fix_now] MEP_BRIDGE_MAINTAINER_ONLY is not enforced", rendered)
+        self.assertIn(
+            "Near misses: `bridge/github_to_mep.py` - MEP_BRIDGE_MAINTAINER_ONLY is not enforced: The claim was withheld because same-file contradictory evidence remained (bridge/github_to_mep.py rejects disallowed author_association before extracting triggers).",
+            rendered,
+        )
+
     def test_render_structured_repo_audit_withholds_contradicted_high_severity_finding(self):
         task_data = {
             "intent": {"type": "repo_audit.request"},
@@ -2147,6 +2250,7 @@ class TestWorkspaceReviewContext(unittest.TestCase):
                             "developer_impact": "That would break node identity trust across authenticated hub requests.",
                             "evidence": "verify_signature only verifies the supplied public key bytes.",
                             "supporting_files": ["hub/auth.py", "hub/main.py"],
+                            "same_file_check": "Checked hub/auth.py for a same-file registry lookup or fallback branch before verify_signature returns.",
                             "contradiction_check": "Checked verify_request in hub/main.py for a registry lookup before the auth helper is called.",
                             "contradicted_by": ["hub/main.py verify_request loads pub_pem via db.get_pub_pem(x_mep_nodeid) before calling verify_signature"],
                             "next_step": "Keep the registry lookup anchored in the request verification path.",
