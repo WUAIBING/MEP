@@ -1,13 +1,8 @@
 import asyncio
 import json
 import sys
-import types
 from pathlib import Path
 from unittest.mock import AsyncMock
-
-manifest_stub = types.ModuleType("clients.shared.manifest")
-manifest_stub.load_manifest = lambda: None
-sys.modules.setdefault("clients.shared.manifest", manifest_stub)
 
 from clients.adapters.mep_codex_provider import CodexProvider
 from clients.shared.execution_bridge import execute_bridge_command
@@ -90,6 +85,21 @@ def test_execute_bridge_command_invokes_local_bridge(tmp_path: Path) -> None:
     assert result["file_edited"] is True
     assert result["file_path"] == "clients/adapters/mep_codex_provider.py"
     assert result["branch"] == "feat/runtime-bridge"
+
+
+def test_prepare_dm_reply_payload_requires_encryption(monkeypatch, tmp_path: Path) -> None:
+    client = MEPClient(str(tmp_path / "sender.pem"))
+    client.privacy_mode = "prefer_encrypted"
+    monkeypatch.setattr(client, "get_registry_entry", AsyncMock(return_value=None))
+
+    try:
+        asyncio.run(client.prepare_dm_reply_payload("reply", "node_peer", require_encrypted=True))
+    except ValueError as exc:
+        assert "Encrypted DM is required" in str(exc)
+    else:
+        raise AssertionError("Expected prepare_dm_reply_payload() to fail closed when encryption is required")
+
+    assert client.privacy_mode == "prefer_encrypted"
 
 
 def test_codex_provider_routes_execution_dm_to_bridge(monkeypatch, tmp_path: Path) -> None:

@@ -566,7 +566,7 @@ class MEPClient:
     async def prepare_dm_reply_payload(self, plaintext: str, peer_node_id: str, require_encrypted: bool = False) -> str:
         original_mode = self.privacy_mode
         try:
-            if require_encrypted and self.privacy_mode == PRIVACY_MODE_PLAINTEXT_ONLY:
+            if require_encrypted:
                 self.privacy_mode = PRIVACY_MODE_REQUIRE_ENCRYPTED
             return await self._prepare_dm_payload_for_target(plaintext, peer_node_id)
         finally:

@@ -1613,7 +1613,6 @@ async def submit_task(
                 status_code=400,
                 detail="Target plaintext_only cannot satisfy sender require_encrypted",
             )
-    if task.target_node and float(task.bounty) == 0.0:
         await _anti_loop_check_and_record(task.consumer_id, task.target_node, payload)
     
     if x_mep_idempotency_key:
