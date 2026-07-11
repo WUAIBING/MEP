@@ -3,7 +3,8 @@ import json
 import os
 import time
 import urllib.parse
-from typing import Awaitable, Callable, Optional
+import uuid
+from typing import Any, Awaitable, Callable, Optional
 
 import requests
 import websockets
@@ -22,6 +23,15 @@ VALID_PRIVACY_MODES = {
     PRIVACY_MODE_PREFER_ENCRYPTED,
     PRIVACY_MODE_REQUIRE_ENCRYPTED,
 }
+INTERBOT_SPEC_VERSION = "mep.interbot.v1"
+EXECUTION_RESULT_TYPE = "code_edit_status"
+DEFAULT_EXECUTION_MUST_INCLUDE = [
+    "workspace_opened",
+    "file_edited",
+    "branch",
+    "commit_sha",
+    "pr",
+]
 
 
 class MEPClient:
@@ -142,6 +152,284 @@ class MEPClient:
             timeout=20,
         )
         return {"status_code": response.status_code, "json": response.json()}
+
+    def build_interbot_message(
+        self,
+        instructions: str,
+        target_node: str,
+        *,
+        target_alias: Optional[str] = None,
+        intent_type: str = "chat.request",
+        priority: str = "normal",
+        context_id: Optional[str] = None,
+        reply_to_task_id: Optional[str] = None,
+        reply_to_message_id: Optional[str] = None,
+        turn_type: str = "chat_turn",
+        result_type: str = "text",
+        title: Optional[str] = None,
+        task_inputs: Optional[dict[str, Any]] = None,
+        expected_output_must_include: Optional[list[str]] = None,
+        constraints: Optional[dict[str, Any]] = None,
+        human_note: Optional[str] = None,
+        message_id: Optional[str] = None,
+        trace_id: Optional[str] = None,
+    ) -> dict[str, Any]:
+        message_uuid = message_id or str(uuid.uuid4())
+        conversation_context = context_id or str(uuid.uuid4())
+        task_payload: dict[str, Any] = {
+            "instructions": instructions,
+            "expected_output": {
+                "result_type": result_type,
+            },
+        }
+        if title:
+            task_payload["title"] = title
+        if task_inputs:
+            task_payload["inputs"] = dict(task_inputs)
+        if expected_output_must_include:
+            task_payload["expected_output"]["must_include"] = list(expected_output_must_include)
+        if constraints:
+            task_payload["constraints"] = dict(constraints)
+        envelope: dict[str, Any] = {
+            "spec_version": INTERBOT_SPEC_VERSION,
+            "message_id": message_uuid,
+            "trace_id": trace_id or message_uuid,
+            "timestamp_ms": int(time.time() * 1000),
+            "source": {
+                "node_id": self.node_id,
+                "alias": None,
+            },
+            "target": {
+                "node_id": target_node,
+                "alias": target_alias,
+            },
+            "conversation": {
+                "context_id": conversation_context,
+                "reply_to_task_id": reply_to_task_id,
+                "reply_to_message_id": reply_to_message_id,
+                "turn_type": turn_type,
+            },
+            "intent": {
+                "type": intent_type,
+                "priority": priority,
+            },
+            "task": task_payload,
+            "economics": {
+                "bounty_seconds": 0.0,
+                "currency": "SECONDS",
+            },
+            "delivery": {
+                "reply_mode": "new_dm",
+                "settlement_mode": "task_result",
+            },
+        }
+        if human_note:
+            envelope["human_note"] = human_note
+        return envelope
+
+    async def submit_dm(
+        self,
+        message: str,
+        target_node: str,
+        *,
+        target_alias: Optional[str] = None,
+        intent_type: str = "chat.request",
+        priority: str = "normal",
+        context_id: Optional[str] = None,
+        reply_to_task_id: Optional[str] = None,
+        reply_to_message_id: Optional[str] = None,
+        turn_type: str = "chat_turn",
+        result_type: str = "text",
+        title: Optional[str] = None,
+        task_inputs: Optional[dict[str, Any]] = None,
+        expected_output_must_include: Optional[list[str]] = None,
+        constraints: Optional[dict[str, Any]] = None,
+        human_note: Optional[str] = None,
+        message_id: Optional[str] = None,
+        trace_id: Optional[str] = None,
+    ) -> dict:
+        envelope = self.build_interbot_message(
+            message,
+            target_node,
+            target_alias=target_alias,
+            intent_type=intent_type,
+            priority=priority,
+            context_id=context_id,
+            reply_to_task_id=reply_to_task_id,
+            reply_to_message_id=reply_to_message_id,
+            turn_type=turn_type,
+            result_type=result_type,
+            title=title,
+            task_inputs=task_inputs,
+            expected_output_must_include=expected_output_must_include,
+            constraints=constraints,
+            human_note=human_note,
+            message_id=message_id,
+            trace_id=trace_id,
+        )
+        response = await self.submit_task(json.dumps(envelope), 0.0, None, target_node)
+        response["message_id"] = envelope["message_id"]
+        response["trace_id"] = envelope["trace_id"]
+        response["context_id"] = envelope["conversation"]["context_id"]
+        return response
+
+    def build_interbot_reply_message(
+        self,
+        reply_text: str,
+        inbound_message: dict[str, Any],
+        *,
+        inbound_task_id: Optional[str] = None,
+        turn_type: Optional[str] = None,
+        intent_type: Optional[str] = None,
+        priority: Optional[str] = None,
+        human_note: Optional[str] = None,
+    ) -> dict[str, Any]:
+        source = inbound_message.get("source") if isinstance(inbound_message, dict) else None
+        if not isinstance(source, dict) or not isinstance(source.get("node_id"), str) or not source.get("node_id"):
+            raise ValueError("inbound inter-bot message is missing source.node_id")
+        inbound_intent = inbound_message.get("intent") if isinstance(inbound_message, dict) else None
+        inbound_priority = (
+            inbound_intent.get("priority")
+            if isinstance(inbound_intent, dict) and isinstance(inbound_intent.get("priority"), str)
+            else "normal"
+        )
+        conversation = inbound_message.get("conversation") if isinstance(inbound_message, dict) else None
+        inbound_turn_type = conversation.get("turn_type") if isinstance(conversation, dict) else None
+        reply_turn_type = turn_type or self._default_reply_turn_type(inbound_turn_type)
+        reply_intent = intent_type or self._default_reply_intent_type(
+            inbound_intent.get("type") if isinstance(inbound_intent, dict) else None
+        )
+        return self.build_interbot_message(
+            reply_text,
+            str(source["node_id"]),
+            target_alias=source.get("alias") if isinstance(source.get("alias"), str) else None,
+            intent_type=reply_intent,
+            priority=priority or inbound_priority,
+            context_id=conversation.get("context_id") if isinstance(conversation, dict) else None,
+            reply_to_task_id=inbound_task_id,
+            reply_to_message_id=inbound_message.get("message_id") if isinstance(inbound_message.get("message_id"), str) else None,
+            turn_type=reply_turn_type,
+            human_note=human_note,
+            trace_id=inbound_message.get("trace_id") if isinstance(inbound_message.get("trace_id"), str) else None,
+        )
+
+    async def submit_dm_reply(
+        self,
+        reply_text: str,
+        inbound_message: dict[str, Any],
+        *,
+        inbound_task_id: Optional[str] = None,
+        turn_type: Optional[str] = None,
+        intent_type: Optional[str] = None,
+        priority: Optional[str] = None,
+        human_note: Optional[str] = None,
+    ) -> dict:
+        envelope = self.build_interbot_reply_message(
+            reply_text,
+            inbound_message,
+            inbound_task_id=inbound_task_id,
+            turn_type=turn_type,
+            intent_type=intent_type,
+            priority=priority,
+            human_note=human_note,
+        )
+        target = envelope.get("target") if isinstance(envelope.get("target"), dict) else {}
+        target_node = target.get("node_id")
+        if not isinstance(target_node, str) or not target_node:
+            raise ValueError("reply envelope is missing target.node_id")
+        response = await self.submit_task(json.dumps(envelope), 0.0, None, target_node)
+        response["message_id"] = envelope["message_id"]
+        response["trace_id"] = envelope["trace_id"]
+        response["context_id"] = envelope["conversation"]["context_id"]
+        return response
+
+    def build_execution_request_message(
+        self,
+        instructions: str,
+        target_node: str,
+        *,
+        target_alias: Optional[str] = None,
+        context_id: Optional[str] = None,
+        reply_to_task_id: Optional[str] = None,
+        reply_to_message_id: Optional[str] = None,
+        turn_type: str = "operator_dm",
+        title: Optional[str] = None,
+        task_inputs: Optional[dict[str, Any]] = None,
+        required_capabilities: Optional[list[str]] = None,
+        must_include: Optional[list[str]] = None,
+        max_runtime_seconds: Optional[int] = None,
+        max_cost_seconds: Optional[float] = None,
+        human_note: Optional[str] = None,
+    ) -> dict[str, Any]:
+        constraints: dict[str, Any] = {}
+        capabilities = [
+            item.strip()
+            for item in (required_capabilities or ["code_edit"])
+            if isinstance(item, str) and item.strip()
+        ]
+        if capabilities:
+            constraints["required_capabilities"] = capabilities
+        if max_runtime_seconds is not None:
+            constraints["max_runtime_seconds"] = int(max_runtime_seconds)
+        if max_cost_seconds is not None:
+            constraints["max_cost_seconds"] = float(max_cost_seconds)
+        return self.build_interbot_message(
+            instructions,
+            target_node,
+            target_alias=target_alias,
+            intent_type="coordination.request",
+            priority="normal",
+            context_id=context_id,
+            reply_to_task_id=reply_to_task_id,
+            reply_to_message_id=reply_to_message_id,
+            turn_type=turn_type,
+            result_type=EXECUTION_RESULT_TYPE,
+            title=title,
+            task_inputs=task_inputs,
+            expected_output_must_include=must_include or list(DEFAULT_EXECUTION_MUST_INCLUDE),
+            constraints=constraints or None,
+            human_note=human_note,
+        )
+
+    async def submit_execution_dm(
+        self,
+        instructions: str,
+        target_node: str,
+        *,
+        target_alias: Optional[str] = None,
+        context_id: Optional[str] = None,
+        reply_to_task_id: Optional[str] = None,
+        reply_to_message_id: Optional[str] = None,
+        turn_type: str = "operator_dm",
+        title: Optional[str] = None,
+        task_inputs: Optional[dict[str, Any]] = None,
+        required_capabilities: Optional[list[str]] = None,
+        must_include: Optional[list[str]] = None,
+        max_runtime_seconds: Optional[int] = None,
+        max_cost_seconds: Optional[float] = None,
+        human_note: Optional[str] = None,
+    ) -> dict:
+        envelope = self.build_execution_request_message(
+            instructions,
+            target_node,
+            target_alias=target_alias,
+            context_id=context_id,
+            reply_to_task_id=reply_to_task_id,
+            reply_to_message_id=reply_to_message_id,
+            turn_type=turn_type,
+            title=title,
+            task_inputs=task_inputs,
+            required_capabilities=required_capabilities,
+            must_include=must_include,
+            max_runtime_seconds=max_runtime_seconds,
+            max_cost_seconds=max_cost_seconds,
+            human_note=human_note,
+        )
+        response = await self.submit_task(json.dumps(envelope), 0.0, None, target_node)
+        response["message_id"] = envelope["message_id"]
+        response["trace_id"] = envelope["trace_id"]
+        response["context_id"] = envelope["conversation"]["context_id"]
+        return response
 
     async def post_brainstorm_message(
         self,
@@ -283,6 +571,44 @@ class MEPClient:
             return await self._prepare_dm_payload_for_target(plaintext, peer_node_id)
         finally:
             self.privacy_mode = original_mode
+
+    @staticmethod
+    def parse_interbot_payload(payload_text: str) -> Optional[dict[str, Any]]:
+        if not isinstance(payload_text, str):
+            return None
+        try:
+            parsed = json.loads(payload_text)
+        except json.JSONDecodeError:
+            return None
+        if not isinstance(parsed, dict):
+            return None
+        if parsed.get("spec_version") != INTERBOT_SPEC_VERSION:
+            return None
+        return parsed
+
+    @classmethod
+    def extract_interbot_instructions(cls, payload_text: str) -> tuple[str, Optional[dict[str, Any]]]:
+        parsed = cls.parse_interbot_payload(payload_text)
+        if not parsed:
+            return payload_text, None
+        task = parsed.get("task")
+        if isinstance(task, dict):
+            instructions = task.get("instructions")
+            if isinstance(instructions, str) and instructions.strip():
+                return instructions.strip(), parsed
+        return payload_text, parsed
+
+    @staticmethod
+    def _default_reply_intent_type(inbound_intent_type: Optional[str]) -> str:
+        if inbound_intent_type == "review.request":
+            return "review.response"
+        return "chat.request"
+
+    @staticmethod
+    def _default_reply_turn_type(inbound_turn_type: Optional[str]) -> str:
+        if inbound_turn_type == "review_request":
+            return "review_response"
+        return "chat_turn"
 
     def _maybe_decrypt_dm_payload(self, payload_text: str) -> str:
         envelope = decode_dm_envelope(payload_text)

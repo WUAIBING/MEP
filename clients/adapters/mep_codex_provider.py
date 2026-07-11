@@ -8,6 +8,12 @@ import urllib.parse
 from typing import Any
 
 from clients.shared.dm_crypto import decode_dm_envelope
+from clients.shared.execution_bridge import (
+    build_execution_bridge_request,
+    execute_bridge_command,
+    is_execution_request,
+    render_execution_result,
+)
 from clients.shared.mep_client import MEPClient
 from clients.shared.manifest import load_manifest
 
@@ -46,6 +52,7 @@ class CodexProvider:
             or 30
         )
         runtime = self.manifest.runtime if self.manifest else {}
+        self.runtime_config = runtime
         self.openai_base_url = (
             os.getenv("OPENAI_BASE_URL")
             or runtime.get("openai_base_url")
@@ -180,6 +187,27 @@ class CodexProvider:
             f"Original message: {text}"
         )
 
+    async def _handle_execution_request(
+        self,
+        interbot_message: dict[str, Any] | None,
+        prompt: str,
+        consumer_id: str,
+        task_id: str,
+    ) -> str | None:
+        if not is_execution_request(interbot_message):
+            return None
+        request_payload = build_execution_bridge_request(
+            interbot_message or {},
+            consumer_id=consumer_id,
+            task_id=task_id,
+            prompt=prompt,
+        )
+        result = await execute_bridge_command(
+            request_payload,
+            runtime_config=self.runtime_config,
+        )
+        return render_execution_result(result)
+
     async def register(self) -> dict:
         response = await asyncio.to_thread(
             self.client.session.post,
@@ -236,7 +264,14 @@ class CodexProvider:
         payload_raw = (task.get("payload") or "").strip()
         encrypted_inbound = bool(decode_dm_envelope(payload_raw))
         payload = self.client._maybe_decrypt_dm_payload(payload_raw).strip()
-        reply = await self._generate_reply(payload, consumer_id, task_id)
+        prompt, interbot_message = self.client.extract_interbot_instructions(payload)
+        execution_reply = await self._handle_execution_request(
+            interbot_message,
+            prompt,
+            consumer_id,
+            task_id,
+        )
+        reply = execution_reply if execution_reply is not None else await self._generate_reply(prompt, consumer_id, task_id)
         bounty = float(task.get("bounty", 1.0) or 0.0)
         is_dm = bounty == 0.0 and bool(task.get("target_node"))
         result_payload = reply
