@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 from typing import Any, Optional
 
 from clients.shared.commands import parse_task_args
-from clients.shared.identity_paths import remember_identity, resolve_identity_key_path
+from clients.shared.identity_paths import default_key_dir, remember_identity, resolve_identity_key_path
 from clients.shared.mep_client import MEPClient
 
 DEFAULT_BOUNTY = float(os.getenv("MEP_DEFAULT_BOUNTY", "5.0"))
@@ -16,8 +16,11 @@ DEFAULT_BOUNTY = float(os.getenv("MEP_DEFAULT_BOUNTY", "5.0"))
 class StdioAdapter:
     def __init__(self, platform_name: str, default_model: str, key_file_name: str):
         alias = os.getenv("MEP_ALIAS", platform_name)
+        explicit_key_path = os.getenv("MEP_BOT_KEY_PATH")
+        if not explicit_key_path:
+            explicit_key_path = os.path.join(default_key_dir(), key_file_name)
         key_path = resolve_identity_key_path(
-            explicit_key_path=os.getenv("MEP_BOT_KEY_PATH"),
+            explicit_key_path=explicit_key_path,
             alias_hint=alias,
             create_if_missing=True,
         )
