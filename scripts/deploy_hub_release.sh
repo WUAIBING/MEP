@@ -86,7 +86,10 @@ prepare_release_checkout() {
     fi
   else
     rm -rf "$release_dir"
-    git clone "$SOURCE_REPO" "$release_dir" >/dev/null 2>&1
+    git clone "$SOURCE_REPO" "$release_dir" >/dev/null 2>&1 || {
+      echo "git clone failed: $SOURCE_REPO" >&2
+      exit 1
+    }
   fi
 
   git -C "$release_dir" fetch origin >/dev/null 2>&1
@@ -111,12 +114,13 @@ verify_version() {
   local version_json=""
 
   version_json="$(curl -fsS "$VERSION_URL")"
-  printf '%s' "$version_json" | python3 - "$expected_sha" <<'PY'
+  VERSION_JSON="$version_json" python3 - "$expected_sha" <<'PY'
 import json
+import os
 import sys
 
 expected_sha = sys.argv[1]
-payload = json.loads(sys.stdin.read())
+payload = json.loads(os.environ["VERSION_JSON"])
 
 if payload.get("build_sha") != expected_sha:
     raise SystemExit(
@@ -146,11 +150,16 @@ export MEP_BUILD_TIME="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 export MEP_DEPLOY_SOURCE="scripts/deploy_hub_release.sh"
 export MEP_HUB_LOGS_DIR="$SHARED_HUB_DATA_DIR"
 
+docker compose \
+  --project-name "$COMPOSE_PROJECT_NAME" \
+  -f "$RELEASE_DIR/docker-compose.yml" \
+  build mep-hub
+
 docker rm -f mep-hub >/dev/null 2>&1 || true
 docker compose \
   --project-name "$COMPOSE_PROJECT_NAME" \
   -f "$RELEASE_DIR/docker-compose.yml" \
-  up -d --build --no-deps mep-hub
+  up -d --no-build --no-deps mep-hub
 
 verify_version "$TARGET_SHA"
 ln -sfn "$RELEASE_DIR" "$CURRENT_LINK"

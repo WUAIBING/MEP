@@ -38,12 +38,13 @@ cd "$ROOT_DIR"
 docker compose --project-name "$COMPOSE_PROJECT_NAME" up -d --build mep-hub
 
 VERSION_JSON="$(curl -fsS http://127.0.0.1:8000/version)"
-printf '%s' "$VERSION_JSON" | python3 - "$TARGET_SHA" <<'PY'
+VERSION_JSON="$VERSION_JSON" python3 - "$TARGET_SHA" <<'PY'
 import json
+import os
 import sys
 
 expected_sha = sys.argv[1]
-payload = json.loads(sys.stdin.read())
+payload = json.loads(os.environ["VERSION_JSON"])
 
 if payload.get("build_sha") != expected_sha:
     raise SystemExit(f"deploy smoke check failed: expected {expected_sha}, got {payload.get('build_sha')}")
