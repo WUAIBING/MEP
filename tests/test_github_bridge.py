@@ -279,7 +279,7 @@ class TestGitHubToMEPBridge(unittest.TestCase):
         ):
             self.assertEqual(
                 self.service._extract_trigger(body),
-                ("review", "code.review.request"),
+                ("rereview", "code.review.request"),
             )
 
     def test_duplicate_delivery_is_deduplicated(self):
@@ -450,6 +450,7 @@ class TestGitHubToMEPBridge(unittest.TestCase):
         self.assertEqual(github_inputs["delivery_id"], "delivery-package")
         self.assertEqual(github_inputs["head_sha"], "1234567890abcdef")
         self.assertEqual(github_inputs["base_sha"], "fedcba0987654321")
+        self.assertEqual(github_inputs["review_mode"], "discovery_review")
         self.assertEqual(
             github_inputs["touched_paths"],
             ["hub/db.py", "tests/test_github_bridge.py"],
@@ -475,6 +476,25 @@ class TestGitHubToMEPBridge(unittest.TestCase):
         self.assertIn("Deterministic risk pack:", instructions)
         self.assertIn("Hunk-centered context pack:", instructions)
         self.assertIn("Changed identifiers: write_state, test_review_package", instructions)
+        self.assertIn("Review mode: discovery_review", instructions)
+
+    def test_rereview_trigger_sets_recheck_review_mode_in_github_inputs(self):
+        response = self._post_webhook(
+            _issue_comment_payload("@Hub-Sentinel rereview this PR"),
+            delivery_id="delivery-rereview-mode",
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+
+        self._flush_context(response.json()["context_id"])
+
+        envelope = self.submission.calls[0]["envelope"]
+        github_inputs = envelope["task"]["inputs"]["github"]
+        instructions = envelope["task"]["instructions"]
+
+        self.assertEqual(github_inputs["trigger_verb"], "rereview")
+        self.assertEqual(github_inputs["review_mode"], "recheck_review")
+        self.assertIn("Requested verb: rereview", instructions)
+        self.assertIn("Review mode: recheck_review", instructions)
 
     def test_pr_review_package_detects_singular_test_path_and_security_tag(self):
         self.github_session.get_responses = [

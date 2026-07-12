@@ -502,6 +502,14 @@ def _task_is_approval_review(task_data: dict[str, Any]) -> bool:
     return _review_intent_type(task_data) == "code.review.approve"
 
 
+def _review_mode_for_task(task_data: dict[str, Any]) -> str:
+    github_inputs = _review_github_inputs(task_data)
+    review_mode = _clean_review_label(github_inputs.get("review_mode"), max_chars=40).lower()
+    if review_mode == "recheck_review":
+        return "recheck_review"
+    return "discovery_review"
+
+
 def _review_lenses_for_task(task_data: dict[str, Any]) -> list[str]:
     github_inputs = _review_github_inputs(task_data)
     touched_paths = _clean_review_list(github_inputs.get("touched_paths"), max_items=8, max_chars=120)
@@ -696,6 +704,7 @@ def _system_prompt_for_task(
     if _task_requires_review_prompt(task_data):
         github_inputs = _review_github_inputs(task_data)
         approval_mode = _task_is_approval_review(task_data)
+        review_mode = _review_mode_for_task(task_data)
         workspace_path = str(github_inputs.get("local_workspace_path") or "").strip()
         workspace_hint = ""
         if workspace_path:
@@ -705,6 +714,18 @@ def _system_prompt_for_task(
                 "treat that material as the authoritative code context. Base findings on what the full files and "
                 "verification output actually show. Do not claim code is truncated, missing, or a placeholder because "
                 "of how the input is formatted or because a file body was shortened for length."
+            )
+        review_mode_hint = ""
+        if review_mode == "recheck_review":
+            review_mode_hint = (
+                " Review mode is `recheck_review`. Treat this as a follow-up verification pass on a PR that was already reviewed once. "
+                "Bias toward confirming whether the current diff still leaves a concrete blocker, disproving stale or weak earlier claims, "
+                "and checking whether the changed tests and enforcement paths now line up. Do not invent fresh low-signal concerns just to say something new."
+            )
+        else:
+            review_mode_hint = (
+                " Review mode is `discovery_review`. Treat this as the first serious review pass and spend your budget hunting for the single "
+                "highest-value correctness, regression, edge-case, or missing-validation issue before you summarize."
             )
         approval_hint = ""
         if approval_mode:
@@ -720,7 +741,7 @@ def _system_prompt_for_task(
             "Your primary job is to find the highest-value correctness, regression, edge-case, or missing-validation risk in the supplied PR context before you summarize anything. "
             "Review the provided GitHub PR context and return ONLY a JSON object with this schema: "
             '{"summary": string, "observation": string, "touched_paths": [string], "tests_reviewed": [string], '
-            '"risk_areas_checked": [string], "checks_performed": [string], "why_no_finding": string, '
+            '"risk_areas_checked": [string], "checks_performed": [string], '
             '"verified_identifiers": [string], '
             '"findings": [{"file": string, "issue": string, "rationale": string}], '
             '"approval_recommendation": "approve" | "comment" | "request_changes" | "abstain"}. '
@@ -728,18 +749,18 @@ def _system_prompt_for_task(
             "Use `observation` for one concrete non-blocking review note tied to the actual diff. "
             "Use `risk_areas_checked` for 1-4 concrete risk themes you examined in the changed code. "
             "Use `checks_performed` for 1-4 specific verification steps you actually performed against the diff, tests, or workspace excerpts. "
-            "When findings are empty, `why_no_finding` must explain why the changed behavior looks safe based on those checks; do not use it for generic praise. "
+            "When findings are empty, keep `summary` verdict-style and `observation` concrete; do not add filler sections or generic praise. "
             "Use `verified_identifiers` for exact function/variable/class names copied from changed lines in the supplied diff or workspace excerpts. "
             "Prefer real touched files and tests from the supplied GitHub inputs for `touched_paths` and `tests_reviewed`. "
             "For no-finding reviews, always anchor the output to the actual diff: include at least one touched path in `touched_paths`, "
             "include 1-3 exact changed-line identifiers in `verified_identifiers` when the review context provides them, "
-            "and make `summary`, `observation`, and `why_no_finding` explicitly about that changed behavior rather than generic quality praise. "
-            "If you mention code behavior in `observation` or `why_no_finding`, tie it to the same touched path or changed identifiers. "
+            "and make `summary` and `observation` explicitly about that changed behavior rather than generic quality praise. "
+            "If you mention code behavior in `summary` or `observation`, tie it to the same touched path or changed identifiers. "
             "Only include a finding when it is directly supported by the provided diff, file list, PR description, or patch excerpts. "
             "Do not speculate about unseen code, do not ask for more context, and do not include chain-of-thought or any text outside the JSON object. "
-            "If the change looks good, keep findings empty, use summary to state the overall conclusion, list the risk areas and checks you covered, explain why no finding is warranted, keep observation concrete, and set approval_recommendation to approve or comment. "
+            "If the change looks good, keep findings empty, use summary to state the overall conclusion, list the risk areas and checks you covered, keep observation concrete, and set approval_recommendation to approve or comment. "
             "Diff restatement without risk coverage is not a sufficient review. Keep the "
-            f"response within {review_max_chars} characters.{approval_hint}{workspace_hint}"
+            f"response within {review_max_chars} characters.{review_mode_hint}{approval_hint}{workspace_hint}"
         )
     return (
         "You are a helpful MEP (Miao Exchange Protocol) bot. "
@@ -751,6 +772,12 @@ def _system_prompt_for_task(
 def _candidate_system_prompt_for_task(task_data: dict[str, Any], *, review_max_chars: int) -> str:
     if not _task_requires_review_prompt(task_data):
         return _system_prompt_for_task(task_data, generic_max_chars=500, review_max_chars=review_max_chars)
+    review_mode = _review_mode_for_task(task_data)
+    mode_hint = (
+        "This is a recheck, so prefer verifying unresolved regression hypotheses, stale review claims, and test/enforcement alignment over opening a brand-new low-signal search space. "
+        if review_mode == "recheck_review"
+        else "This is a discovery pass, so optimize for finding the strongest previously-unreported bug or regression risk first. "
+    )
     return (
         "You are the candidate-generation pass for a MEP GitHub code review. "
         "Scan the supplied PR context, diff excerpts, risk pack, workspace context, and verification output. "
@@ -760,6 +787,7 @@ def _candidate_system_prompt_for_task(task_data: dict[str, Any], *, review_max_c
         "Prefer at most one candidate per lens, rank the highest-impact candidate first, and bias toward correctness, trust-boundary, state-transition, rollback, migration, and test-gap risks over style comments. "
         "Each candidate must be concrete, tied to a changed file, and phrased as a potential bug or regression worth verifying. "
         "Use `evidence` for 1-3 exact identifiers, tests, or changed behaviors from the supplied context that make the hypothesis worth verifying. "
+        f"{mode_hint}"
         "Do not summarize the PR. Do not give praise. Do not include chain-of-thought. "
         "If nothing looks risky enough to verify, return an empty `risk_candidates` list and use `coverage` to note what you inspected."
     )
@@ -769,6 +797,12 @@ def _verification_system_prompt_for_task(task_data: dict[str, Any], *, review_ma
     base = _system_prompt_for_task(task_data, generic_max_chars=500, review_max_chars=review_max_chars)
     if not _task_requires_review_prompt(task_data):
         return base
+    review_mode = _review_mode_for_task(task_data)
+    mode_hint = (
+        "Because this is `recheck_review`, explicitly look for evidence that earlier concerns were fixed, contradicted by the current diff, or demoted by the changed tests and enforcement path. "
+        if review_mode == "recheck_review"
+        else "Because this is `discovery_review`, prioritize confirming the strongest fresh candidate rather than spreading attention across many medium-signal ideas. "
+    )
     return (
         f"{base} This is the verification pass. The user message may include provisional candidate risks from an earlier pass. "
         "Treat those candidates as hypotheses only. Promote a candidate into `findings` only when the supplied diff, workspace context, tests, or verification output directly support it. "
@@ -776,9 +810,10 @@ def _verification_system_prompt_for_task(task_data: dict[str, Any], *, review_ma
         "Prefer the single highest-impact verified finding over multiple medium-signal findings. Publish a second finding only when it is independent, well-supported, and similarly important. "
         "Downgrade or discard candidates that are weakly evidenced, redundant with a stronger finding, or true but too low-value to be a meaningful review comment. "
         "Reject any candidate that relies only on nearby file context, naming similarity, or speculation. "
-        "If no candidate survives verification, keep `findings` empty, explain the checks you performed, and explicitly state why no finding is warranted. "
+        "If no candidate survives verification, keep `findings` empty, explain the checks you performed, and keep the summary grounded in the reviewed changed behavior. "
         "For that no-finding case, still return a grounded review: populate `touched_paths` from the real diff, populate `verified_identifiers` from changed lines when available, "
-        "and make `summary`, `observation`, and `why_no_finding` cite the reviewed changed behavior instead of generic praise. "
+        "and make `summary` and `observation` cite the reviewed changed behavior instead of generic praise. "
+        f"{mode_hint}"
         "In approval mode, any surviving finding must force `approval_recommendation` away from `approve`."
     )
 
@@ -872,7 +907,9 @@ def _approval_detail_supports_publishable_approval(
         return False
     if "## Review Findings" in text:
         return False
-    if "Touched paths reviewed:" not in text or "Why no finding:" not in text:
+    if "## Review Summary" not in text or "Touched paths reviewed:" not in text:
+        return False
+    if "Checks performed:" not in text or "Risk areas checked:" not in text:
         return False
     github_inputs = _review_github_inputs(task_data or {})
     touched_tests = _clean_review_list(github_inputs.get("touched_tests"), max_items=3, max_chars=120)
@@ -1304,11 +1341,6 @@ def _render_default_structured_review(
         verified_identifiers=verified_identifiers,
         task_data=task_data,
     )
-    why_no_finding = _default_no_finding_reason(
-        touched_paths=touched_paths,
-        verified_identifiers=verified_identifiers,
-        tests_reviewed=tests_reviewed,
-    )
     summary = _clean_review_text(summary_hint, max_chars=500)
     if _is_weak_review_text(summary):
         summary = ""
@@ -1317,7 +1349,14 @@ def _render_default_structured_review(
             touched_paths=touched_paths,
             verified_identifiers=verified_identifiers,
         )
+    observation = _default_review_observation(
+        touched_paths=touched_paths,
+        verified_identifiers=verified_identifiers,
+        tests_reviewed=tests_reviewed,
+    )
     sections = ["## Review Summary", summary]
+    if observation:
+        sections.append(f"Observation: {observation}")
     if touched_paths:
         sections.append("Touched paths reviewed: " + ", ".join(f"`{path}`" for path in touched_paths))
     if tests_reviewed:
@@ -1326,8 +1365,6 @@ def _render_default_structured_review(
         sections.append("Risk areas checked: " + ", ".join(risk_areas_checked))
     if checks_performed:
         sections.append("Checks performed: " + ", ".join(checks_performed))
-    if why_no_finding:
-        sections.append(f"Why no finding: {why_no_finding}")
     if verified_identifiers:
         sections.append("Changed identifiers verified: " + ", ".join(f"`{name}`" for name in verified_identifiers))
     return _finalize_model_reply("\n\n".join(sections), max_chars=max_chars)
@@ -1851,9 +1888,9 @@ def _render_structured_review_with_task_data(
     checks_performed = _clean_review_list(parsed.get("checks_performed"), max_items=4, max_chars=120)
     verified_identifiers = _clean_review_list(parsed.get("verified_identifiers"), max_items=4, max_chars=80)
     verified_identifiers = _filter_review_list_to_allowed(verified_identifiers, allowed_identifiers)
-    why_no_finding = _clean_review_text(parsed.get("why_no_finding"), max_chars=400)
-    if _is_weak_review_text(why_no_finding):
-        why_no_finding = ""
+    legacy_no_finding = _clean_review_text(parsed.get("why_no_finding"), max_chars=400)
+    if _is_weak_review_text(legacy_no_finding):
+        legacy_no_finding = ""
     findings_raw = parsed.get("findings")
     findings: list[str] = []
     allowed_path_keys = {item.lower(): item for item in allowed_paths}
@@ -1892,18 +1929,14 @@ def _render_structured_review_with_task_data(
                 verified_identifiers=verified_identifiers,
                 task_data=task_data,
             )
-        if not why_no_finding:
-            why_no_finding = _default_no_finding_reason(
-                touched_paths=touched_paths,
-                verified_identifiers=verified_identifiers,
-                tests_reviewed=tests_reviewed,
-            )
         if not summary:
             summary = _default_review_summary(
                 touched_paths=touched_paths,
                 verified_identifiers=verified_identifiers,
             )
-        if not observation and not summary and (touched_paths or verified_identifiers):
+        if not observation and legacy_no_finding:
+            observation = legacy_no_finding
+        if not observation and (touched_paths or verified_identifiers):
             observation = _default_review_observation(
                 touched_paths=touched_paths,
                 verified_identifiers=verified_identifiers,
@@ -1932,8 +1965,6 @@ def _render_structured_review_with_task_data(
             sections.append("Checks performed: " + ", ".join(checks_performed))
         if verified_identifiers:
             sections.append("Changed identifiers verified: " + ", ".join(f"`{name}`" for name in verified_identifiers))
-        if why_no_finding:
-            sections.append(f"Why no finding: {why_no_finding}")
         for index, finding in enumerate(findings, start=1):
             sections.append(f"{index}. {finding}")
     elif summary:
@@ -1951,8 +1982,6 @@ def _render_structured_review_with_task_data(
             sections.append("Checks performed: " + ", ".join(checks_performed))
         if verified_identifiers:
             sections.append("Changed identifiers verified: " + ", ".join(f"`{name}`" for name in verified_identifiers))
-        if why_no_finding:
-            sections.append(f"Why no finding: {why_no_finding}")
     else:
         sections.append("## Review Summary")
         sections.append(
@@ -1968,8 +1997,6 @@ def _render_structured_review_with_task_data(
             sections.append("Checks performed: " + ", ".join(checks_performed))
         if verified_identifiers:
             sections.append("Changed identifiers verified: " + ", ".join(f"`{name}`" for name in verified_identifiers))
-        if why_no_finding:
-            sections.append(f"Why no finding: {why_no_finding}")
     rendered = "\n\n".join(section for section in sections if section.strip())
     return _finalize_model_reply(rendered, max_chars=max_chars)
 

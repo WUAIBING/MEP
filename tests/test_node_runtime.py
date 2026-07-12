@@ -421,6 +421,7 @@ class TestRuntimeReviewPrompts(unittest.TestCase):
         changed_identifiers: Optional[list[str]] = None,
         touched_paths: Optional[list[str]] = None,
         touched_tests: Optional[list[str]] = None,
+        review_mode: str = "discovery_review",
     ) -> dict:
         identifiers = changed_identifiers or [
             "_record_pending_task_poll_failure",
@@ -453,6 +454,7 @@ class TestRuntimeReviewPrompts(unittest.TestCase):
                                 "repo_full_name": "WUAIBING/MEP",
                                 "entity_type": "pr",
                                 "number": 246,
+                                "review_mode": review_mode,
                                 "touched_paths": github_touched_paths,
                                 "touched_tests": github_touched_tests,
                                 "risk_pack": {
@@ -504,10 +506,11 @@ class TestRuntimeReviewPrompts(unittest.TestCase):
         self.assertIn('"tests_reviewed": [string]', prompt)
         self.assertIn('"risk_areas_checked": [string]', prompt)
         self.assertIn('"checks_performed": [string]', prompt)
-        self.assertIn('"why_no_finding": string', prompt)
+        self.assertNotIn('"why_no_finding": string', prompt)
         self.assertIn('"approval_recommendation"', prompt)
         self.assertIn("highest-value correctness, regression, edge-case", prompt)
         self.assertIn("always anchor the output to the actual diff", prompt)
+        self.assertIn("Review mode is `discovery_review`.", prompt)
 
     def test_approval_review_prompt_requires_verified_identifiers_and_test_awareness(self):
         task_data = self._bridge_review_task_data(intent_type="code.review.approve")
@@ -524,6 +527,18 @@ class TestRuntimeReviewPrompts(unittest.TestCase):
         self.assertIn("state the scope is low-risk", prompt)
         self.assertIn("checks are pending or failing", prompt)
         self.assertIn("Diff restatement without risk coverage is not a sufficient review", prompt)
+
+    def test_recheck_review_prompt_mentions_follow_up_verification_mode(self):
+        task_data = self._bridge_review_task_data(review_mode="recheck_review")
+        prompt = mep_runtime._system_prompt_for_task(  # noqa: SLF001
+            task_data,
+            generic_max_chars=300,
+            review_max_chars=1000,
+        )
+
+        self.assertIn("Review mode is `recheck_review`.", prompt)
+        self.assertIn("follow-up verification pass", prompt)
+        self.assertIn("Do not invent fresh low-signal concerns", prompt)
 
     def test_review_lenses_include_bridge_safety_focus(self):
         lenses = mep_runtime._review_lenses_for_task(self._bridge_review_task_data())  # noqa: SLF001
@@ -633,7 +648,8 @@ class TestRuntimeReviewPrompts(unittest.TestCase):
         self.assertIn("Tests reviewed: `tests/test_github_bridge.py`", reply)
         self.assertIn("Risk areas checked:", reply)
         self.assertIn("Checks performed:", reply)
-        self.assertIn("Why no finding:", reply)
+        self.assertIn("Observation:", reply)
+        self.assertNotIn("Why no finding:", reply)
 
     def test_structured_review_falls_back_to_github_inputs_for_paths_and_tests(self):
         rendered = mep_runtime._render_structured_review_with_task_data(  # noqa: SLF001
@@ -701,8 +717,7 @@ class TestRuntimeReviewPrompts(unittest.TestCase):
             "Tests reviewed: `tests/test_github_bridge.py`\n\n"
             "Risk areas checked: approval gating, changed-line anchoring\n\n"
             "Checks performed: traced approval suppression branches, compared changed identifiers against the diff\n\n"
-            "Changed identifiers verified: `_score_review_quality`, `_approval_quality_failure`\n\n"
-            "Why no finding: The changed-line evidence and test-aware approval gate stay aligned, so no concrete blocker remains."
+            "Changed identifiers verified: `_score_review_quality`, `_approval_quality_failure`"
         )
 
         action = mep_runtime.RuntimeNode._bridge_status_action(  # noqa: SLF001
@@ -732,7 +747,7 @@ class TestRuntimeReviewPrompts(unittest.TestCase):
 
         self.assertIn("Risk areas checked: trial persistence, endpoint decoding", rendered)
         self.assertIn("Checks performed: verified suppression and publish paths mention `review_result_json`, checked `/bridge/review-trials` returns stored review metadata", rendered)
-        self.assertIn("Why no finding: The new writes and reads stay consistent across both persistence paths, so the telemetry path looks low-risk.", rendered)
+        self.assertNotIn("Why no finding:", rendered)
 
     def test_structured_review_fills_no_finding_defaults_from_task_data(self):
         rendered = mep_runtime._render_structured_review_with_task_data(  # noqa: SLF001
@@ -753,7 +768,8 @@ class TestRuntimeReviewPrompts(unittest.TestCase):
         self.assertIn("Touched paths reviewed: `hub/auth.py`, `hub/db.py`, `hub/models.py`", rendered)
         self.assertIn("Risk areas checked:", rendered)
         self.assertIn("Checks performed:", rendered)
-        self.assertIn("Why no finding:", rendered)
+        self.assertIn("Observation:", rendered)
+        self.assertNotIn("Why no finding:", rendered)
         self.assertIn("Changed identifiers verified: `verify_signature`, `_evict_expired_nonces`, `NodeRegistration`", rendered)
 
     def test_structured_review_rewrites_generic_no_finding_text_to_grounded_anchors(self):
@@ -778,7 +794,7 @@ class TestRuntimeReviewPrompts(unittest.TestCase):
         self.assertIn("Changed identifiers verified: `verify_signature`, `_evict_expired_nonces`", rendered)
         self.assertIn("The patch looks good overall.", rendered)
         self.assertIn("Observation: The change is well-structured.", rendered)
-        self.assertIn("Why no finding: No issues found after review.", rendered)
+        self.assertNotIn("Why no finding:", rendered)
 
     def test_structured_review_synthesizes_grounded_summary_from_non_json_reply(self):
         rendered = mep_runtime._render_structured_review_with_task_data(  # noqa: SLF001
@@ -795,7 +811,8 @@ class TestRuntimeReviewPrompts(unittest.TestCase):
         self.assertIn("Touched paths reviewed: `hub/auth.py`, `hub/db.py`, `hub/models.py`, `hub/requirements.txt`", rendered)
         self.assertIn("Risk areas checked:", rendered)
         self.assertIn("Checks performed:", rendered)
-        self.assertIn("Why no finding:", rendered)
+        self.assertIn("Observation:", rendered)
+        self.assertNotIn("Why no finding:", rendered)
         self.assertIn("Changed identifiers verified: `verify_signature`, `_evict_expired_nonces`", rendered)
 
     def test_structured_review_drops_findings_without_allowed_changed_identifiers(self):
@@ -1050,8 +1067,7 @@ class TestRuntimeWebSocketLoop(unittest.TestCase):
             "Tests reviewed: `tests/test_github_bridge.py`\n\n"
             "Risk areas checked: approval gating, changed-line anchoring\n\n"
             "Checks performed: traced approval suppression branches, compared changed identifiers against the diff\n\n"
-            "Changed identifiers verified: `_score_review_quality`, `_approval_quality_failure`\n\n"
-            "Why no finding: The changed-line evidence and test-aware approval gate stay aligned, so no concrete blocker remains."
+            "Changed identifiers verified: `_score_review_quality`, `_approval_quality_failure`"
         )
         task_data = TestRuntimeReviewPrompts._bridge_review_task_data(  # noqa: SLF001
             intent_type="code.review.approve",
