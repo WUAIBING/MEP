@@ -30,6 +30,26 @@ class TestIdentityPaths(unittest.TestCase):
                 registry = json.load(handle)
             self.assertEqual(registry["aliases"]["alpha-bot"]["key_path"], key_path)
 
+    def test_resolve_identity_key_path_creates_new_alias_when_store_has_other_bot(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with patch.dict(os.environ, {"MEP_KEY_DIR": tmpdir}, clear=False):
+                alpha_key = identity_paths.resolve_identity_key_path(
+                    alias_hint="alpha-bot",
+                    create_if_missing=True,
+                )
+                beta_key = identity_paths.resolve_identity_key_path(
+                    alias_hint="beta-bot",
+                    create_if_missing=True,
+                )
+
+            self.assertNotEqual(os.path.abspath(alpha_key), os.path.abspath(beta_key))
+            self.assertEqual(identity_paths.read_alias_sidecar(alpha_key), "alpha-bot")
+            self.assertEqual(identity_paths.read_alias_sidecar(beta_key), "beta-bot")
+            with open(os.path.join(tmpdir, "bots.json"), "r", encoding="utf-8") as handle:
+                registry = json.load(handle)
+            self.assertEqual(registry["aliases"]["alpha-bot"]["key_path"], alpha_key)
+            self.assertEqual(registry["aliases"]["beta-bot"]["key_path"], beta_key)
+
     def test_resolve_identity_key_path_recovers_registered_alias_across_worktrees(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             repo_local = os.path.join(tmpdir, "repo_a", ".mep")

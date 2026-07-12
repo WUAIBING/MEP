@@ -315,6 +315,9 @@ def resolve_identity_key_path(
                 f"multiple local identities match alias={alias_hint!r}; pass --key-path explicitly"
             )
         return remember_identity(matches[0], alias_hint)
+    if create_if_missing and alias_hint:
+        created = create_new_local_identity(default_key_dir())
+        return remember_identity(created, alias_hint)
     if alias_hint and len(candidates) == 1:
         raise RuntimeKeyPathError(
             f"no local identity matches alias={alias_hint!r}; pass --key-path explicitly"
