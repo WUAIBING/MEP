@@ -36,6 +36,11 @@ try:
 except ImportError:  # pragma: no cover - direct file execution from node/ may not see repo root
     MEPClient = None  # type: ignore[assignment]
 
+try:
+    from clients.shared import identity_paths
+except ImportError:  # pragma: no cover - direct file execution from node/ may not see repo root
+    identity_paths = None  # type: ignore[assignment]
+
 
 DEFAULT_HUB_URL = os.getenv("HUB_URL", "http://localhost:8000")
 DEFAULT_WS_URL = os.getenv("WS_URL", "ws://localhost:8000")
@@ -98,6 +103,8 @@ def _env_positive_int(name: str, default: int) -> int:
 
 
 def _find_git_root(start_path: Optional[str] = None) -> Optional[str]:
+    if identity_paths is not None:
+        return identity_paths.find_git_root(start_path)
     current = os.path.abspath(start_path or os.getcwd())
     while True:
         git_marker = os.path.join(current, ".git")
@@ -110,16 +117,17 @@ def _find_git_root(start_path: Optional[str] = None) -> Optional[str]:
 
 
 def _default_key_dir() -> str:
+    if identity_paths is not None:
+        return identity_paths.default_key_dir()
     explicit = os.getenv("MEP_KEY_DIR")
     if explicit:
         return explicit
-    git_root = _find_git_root()
-    if git_root:
-        return os.path.join(git_root, ".mep")
     return os.path.join(os.path.expanduser("~"), ".mep")
 
 
 def _default_key_path() -> str:
+    if identity_paths is not None:
+        return identity_paths.default_key_path()
     explicit = os.getenv("MEP_PROVIDER_KEY_PATH")
     if explicit:
         return explicit
@@ -127,26 +135,39 @@ def _default_key_path() -> str:
 
 
 def _ensure_key_parent(path: str) -> None:
+    if identity_paths is not None:
+        identity_paths.ensure_key_parent(path)
+        return
     os.makedirs(os.path.dirname(path), exist_ok=True)
 
 
 def _same_path(left: str, right: str) -> bool:
+    if identity_paths is not None:
+        return identity_paths.same_path(left, right)
     return os.path.normcase(os.path.abspath(left)) == os.path.normcase(os.path.abspath(right))
 
 
 def _canonical_key_path(key_dir: str, node_id: str) -> str:
+    if identity_paths is not None:
+        return identity_paths.canonical_key_path(key_dir, node_id)
     return os.path.join(key_dir, f"{node_id}.pem")
 
 
 def _enc_key_path(key_path: str) -> str:
+    if identity_paths is not None:
+        return identity_paths.enc_key_path(key_path)
     return key_path.replace(".pem", "_enc.pem")
 
 
 def _pending_key_path(key_dir: str) -> str:
+    if identity_paths is not None:
+        return identity_paths.pending_key_path(key_dir)
     return os.path.join(key_dir, f".pending-runtime-{os.getpid()}-{int(time.time() * 1000)}.pem")
 
 
 def _is_identity_key_file(filename: str) -> bool:
+    if identity_paths is not None:
+        return identity_paths.is_identity_key_file(filename)
     return (
         filename.endswith(".pem")
         and not filename.endswith("_enc.pem")
@@ -155,6 +176,8 @@ def _is_identity_key_file(filename: str) -> bool:
 
 
 def _list_local_identity_key_paths(key_dir: str) -> list[str]:
+    if identity_paths is not None:
+        return identity_paths.list_local_identity_key_paths(key_dir)
     if not os.path.isdir(key_dir):
         return []
     return [
@@ -165,6 +188,9 @@ def _list_local_identity_key_paths(key_dir: str) -> list[str]:
 
 
 def _move_file_if_present(source: str, destination: str) -> None:
+    if identity_paths is not None:
+        identity_paths.move_file_if_present(source, destination)
+        return
     if _same_path(source, destination) or not os.path.exists(source):
         return
     _ensure_key_parent(destination)
@@ -172,15 +198,22 @@ def _move_file_if_present(source: str, destination: str) -> None:
 
 
 def _alias_sidecar_path(key_path: str) -> str:
+    if identity_paths is not None:
+        return identity_paths.alias_sidecar_path(key_path)
     return f"{key_path}.alias"
 
 
 def _write_alias_sidecar(key_path: str, alias: str) -> None:
+    if identity_paths is not None:
+        identity_paths.write_alias_sidecar(key_path, alias)
+        return
     with open(_alias_sidecar_path(key_path), "w", encoding="utf-8") as handle:
         handle.write(alias.strip() + "\n")
 
 
 def _read_alias_sidecar(key_path: str) -> Optional[str]:
+    if identity_paths is not None:
+        return identity_paths.read_alias_sidecar(key_path)
     path = _alias_sidecar_path(key_path)
     if not os.path.exists(path):
         return None
@@ -198,11 +231,16 @@ def _resolve_runtime_alias(key_path: str, cli_alias: Optional[str], *, node_id: 
     return node_id
 
 
-class RuntimeKeyPathError(ValueError):
-    """Raised when runtime identity selection is ambiguous or missing."""
+if identity_paths is not None:
+    RuntimeKeyPathError = identity_paths.RuntimeKeyPathError
+else:
+    class RuntimeKeyPathError(ValueError):
+        """Raised when runtime identity selection is ambiguous or missing."""
 
 
 def _canonicalize_local_identity(key_path: str, key_dir: str) -> str:
+    if identity_paths is not None:
+        return identity_paths.canonicalize_local_identity(key_path, key_dir)
     identity = MEPIdentity(key_path)
     canonical_path = _canonical_key_path(key_dir, identity.node_id)
     if _same_path(key_path, canonical_path):
@@ -220,6 +258,8 @@ def _canonicalize_local_identity(key_path: str, key_dir: str) -> str:
 
 
 def _choose_existing_local_identity(key_dir: str, cli_alias: Optional[str]) -> Optional[str]:
+    if identity_paths is not None:
+        return identity_paths.choose_existing_local_identity(key_dir, cli_alias)
     candidates = _list_local_identity_key_paths(key_dir)
     if not candidates:
         return None
@@ -246,12 +286,20 @@ def _choose_existing_local_identity(key_dir: str, cli_alias: Optional[str]) -> O
 
 
 def _create_new_local_identity(key_dir: str) -> str:
+    if identity_paths is not None:
+        return identity_paths.create_new_local_identity(key_dir)
     os.makedirs(key_dir, exist_ok=True)
     pending_path = _pending_key_path(key_dir)
     return _canonicalize_local_identity(pending_path, key_dir)
 
 
 def _resolve_default_runtime_key_path(command: str, cli_alias: Optional[str]) -> str:
+    if identity_paths is not None:
+        return identity_paths.resolve_identity_key_path(
+            explicit_key_path=os.getenv("MEP_PROVIDER_KEY_PATH"),
+            alias_hint=cli_alias,
+            create_if_missing=command in {"init", "up"},
+        )
     explicit = os.getenv("MEP_PROVIDER_KEY_PATH")
     if explicit:
         return explicit

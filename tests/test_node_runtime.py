@@ -1726,7 +1726,7 @@ class TestRuntimeKeyDirResolution(unittest.TestCase):
 
     def test_main_rejects_run_without_key_when_identity_selection_is_ambiguous(self):
         with tempfile.TemporaryDirectory() as tmpdir:
-            with patch.object(mep_runtime, "_default_key_dir", return_value=tmpdir):
+            with patch.dict(os.environ, {"MEP_KEY_DIR": tmpdir}, clear=False):
                 MEPIdentity(os.path.join(tmpdir, "alpha.pem"))
                 MEPIdentity(os.path.join(tmpdir, "beta.pem"))
 

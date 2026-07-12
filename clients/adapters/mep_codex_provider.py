@@ -2,7 +2,6 @@ import asyncio
 import json
 import os
 import re
-import tempfile
 import time
 import urllib.parse
 from typing import Any
@@ -14,6 +13,7 @@ from clients.shared.execution_bridge import (
     is_execution_request,
     render_execution_result,
 )
+from clients.shared.identity_paths import remember_identity, resolve_identity_key_path
 from clients.shared.mep_client import MEPClient
 from clients.shared.manifest import load_manifest
 
@@ -27,10 +27,12 @@ os.environ["NO_PROXY"] = "*"
 class CodexProvider:
     def __init__(self) -> None:
         self.manifest = load_manifest()
-        key_path = (
-            os.getenv("MEP_BOT_KEY_PATH")
-            or (self.manifest.key_path if self.manifest else None)
-            or os.path.join(tempfile.gettempdir(), "mep_codex_provider.pem")
+        stable_alias = os.getenv("MEP_ALIAS") or (self.manifest.alias if self.manifest else None)
+        key_path = resolve_identity_key_path(
+            explicit_key_path=os.getenv("MEP_BOT_KEY_PATH"),
+            manifest_key_path=self.manifest.key_path if self.manifest else None,
+            alias_hint=stable_alias,
+            create_if_missing=True,
         )
         hub_url = os.getenv("HUB_URL") or (self.manifest.hub_url if self.manifest else None)
         ws_url = os.getenv("WS_URL") or (self.manifest.ws_url if self.manifest else None)
@@ -46,6 +48,7 @@ class CodexProvider:
             self.alias = alias_prefix
         else:
             self.alias = f"{alias_prefix} {self.client.node_id}"
+        remember_identity(self.client.identity.key_path, stable_alias or self.alias)
         self.heartbeat_seconds = int(
             os.getenv("MEP_HEARTBEAT_SECONDS")
             or (self.manifest.heartbeat_seconds if self.manifest else 30)
