@@ -190,31 +190,43 @@ docker-compose ps
 
 ## Step 10: Update the Hub
 
-Use one clean deployment checkout for the live Hub. Do not build production from an old hand-maintained folder with local edits, or the live Hub can drift away from the merged repo code.
+Prefer the release deploy path below for production. It deploys from a fresh release checkout, keeps `.env` and `hub_data` outside the code tree, pins the Docker compose project name, and refuses to cut over if the old live checkout has unknown dirty source edits unless you explicitly allow it.
 
-When new versions are released:
+### Production-safe release deploy
+
+Start from one clean source checkout that can resolve `origin/main`, but do not point production at that checkout directly:
 
 ```bash
 cd ~/mep-hub/MEP
 git fetch origin
-export MEP_HUB_LOGS_DIR=~/mep-hub/MEP/hub_data
-./scripts/deploy_hub.sh origin/main
+
+export MEP_DEPLOY_COMPOSE_PROJECT_NAME=mep
+export MEP_DEPLOY_ALLOW_DIRTY_LIVE_TREE=1
+export MEP_DEPLOY_ENV_FILE=~/mep-hub/MEP/.env
+export MEP_DEPLOY_HUB_DATA_DIR=~/mep-hub/MEP/hub_data
+
+./scripts/deploy_hub_release.sh origin/main
 ```
 
-The deploy script does four things:
+The release deploy script does seven things:
 
-1. Refuses to deploy from a dirty working tree
-2. Resolves the exact target commit SHA and checks it out
-3. Rebuilds and restarts only `mep-hub`
-4. Calls `http://127.0.0.1:8000/version` and verifies the live Hub reports the same `build_sha`
+1. Resolves the exact target commit SHA from the clean source checkout
+2. Archives the current live checkout state if it has dirty tracked or untracked files
+3. Refuses the cutover unless `MEP_DEPLOY_ALLOW_DIRTY_LIVE_TREE=1` is set
+4. Creates or reuses a fresh release checkout under `~/mep-hub/releases/<sha>`
+5. Reuses the shared `.env` file and `hub_data` directory instead of copying production state into the repo tree
+6. Starts `mep-hub` with a fixed compose project name such as `mep` so the Hub reconnects to the production `postgres` network instead of creating a new isolated network
+7. Calls `http://127.0.0.1:8000/version` and verifies the live Hub reports the same `build_sha`
 
-Set `MEP_HUB_LOGS_DIR` when you deploy from a clean checkout but want to keep using the existing production log volume.
-
-You can also deploy an exact merged commit instead of `origin/main`:
+If you need to deploy an exact merged commit instead of `origin/main`:
 
 ```bash
-./scripts/deploy_hub.sh 0bac07cc65da3b878971abebbfb95a239cd757d3
+./scripts/deploy_hub_release.sh 0bac07cc65da3b878971abebbfb95a239cd757d3
 ```
+
+### Legacy in-place deploy
+
+`./scripts/deploy_hub.sh` still exists for a dedicated clean deployment checkout. It now also pins the compose project name via `MEP_DEPLOY_COMPOSE_PROJECT_NAME`, but it is not the preferred production path when live drift is possible.
 
 ---
 

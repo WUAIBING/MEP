@@ -3,6 +3,7 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 TARGET_REF="${1:-origin/main}"
+COMPOSE_PROJECT_NAME="${MEP_DEPLOY_COMPOSE_PROJECT_NAME:-mep}"
 
 require_clean_tree() {
   if [[ -n "$(git -C "$ROOT_DIR" status --porcelain --untracked-files=no)" ]]; then
@@ -34,7 +35,7 @@ export MEP_BUILD_TIME="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 export MEP_DEPLOY_SOURCE="scripts/deploy_hub.sh"
 
 cd "$ROOT_DIR"
-docker compose up -d --build mep-hub
+docker compose --project-name "$COMPOSE_PROJECT_NAME" up -d --build mep-hub
 
 VERSION_JSON="$(curl -fsS http://127.0.0.1:8000/version)"
 printf '%s' "$VERSION_JSON" | python3 - "$TARGET_SHA" <<'PY'
