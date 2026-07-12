@@ -8,31 +8,85 @@ from typing import Any, Awaitable, Callable, Optional
 
 import requests
 
+from clients.shared.dm_crypto import decode_dm_envelope, decrypt_dm_payload, encode_dm_envelope, encrypt_dm_payload
 from clients.shared.identity import MEPIdentity
+from clients.shared.manifest import load_manifest
 from node.task_envelope import build_task_envelope
 from node.ws_connect import ws_connect
 
-HUB_URL = os.getenv("HUB_URL", "https://mep-hub.silentcopilot.ai")
-WS_URL = os.getenv("WS_URL", "wss://mep-hub.silentcopilot.ai")
-WS_HEARTBEAT_INTERVAL_SECONDS = float(os.getenv("MEP_WS_HEARTBEAT_INTERVAL_SECONDS", "60"))
+PRIVACY_MODE_PLAINTEXT_ONLY = "plaintext_only"
+PRIVACY_MODE_PREFER_ENCRYPTED = "prefer_encrypted"
+PRIVACY_MODE_REQUIRE_ENCRYPTED = "require_encrypted"
+VALID_PRIVACY_MODES = {
+    PRIVACY_MODE_PLAINTEXT_ONLY,
+    PRIVACY_MODE_PREFER_ENCRYPTED,
+    PRIVACY_MODE_REQUIRE_ENCRYPTED,
+}
+INTERBOT_SPEC_VERSION = "mep.interbot.v1"
+EXECUTION_RESULT_TYPE = "code_edit_status"
+DEFAULT_EXECUTION_MUST_INCLUDE = [
+    "workspace_opened",
+    "file_edited",
+    "branch",
+    "commit_sha",
+    "pr",
+]
 REVIEW_VERDICTS = {"approve", "approve_with_conditions", "request_changes", "block"}
 HUMAN_APPROVAL_DECISION_TYPES = {"merge_decision", "deploy_decision", "policy_decision"}
 
 
 class MEPClient:
-    def __init__(self, key_path: str):
+    def __init__(self, key_path: str, hub_url: Optional[str] = None, ws_url: Optional[str] = None):
         self.identity = MEPIdentity(key_path)
         self.node_id = self.identity.node_id
         self.session = requests.Session()
+        self.session.trust_env = False
         self.task_channels: dict[str, str] = {}
         self._stop = asyncio.Event()
         self._active_ws = None
+        self._heartbeat_task: asyncio.Task | None = None
+        manifest = load_manifest()
+        self._manifest = manifest
+        self.hub_url = (
+            hub_url
+            or os.getenv("HUB_URL")
+            or (manifest.hub_url if manifest else None)
+            or "https://mep-hub.silentcopilot.ai"
+        )
+        self.ws_url = (
+            ws_url
+            or os.getenv("WS_URL")
+            or (manifest.ws_url if manifest else None)
+            or "wss://mep-hub.silentcopilot.ai"
+        )
+        self.heartbeat_seconds = int(
+            os.getenv("MEP_HEARTBEAT_SECONDS")
+            or (manifest.heartbeat_seconds if manifest else 30)
+            or 30
+        )
+        privacy_from_manifest = None
+        if manifest and isinstance(manifest.raw.get("privacy"), dict):
+            mode_raw = manifest.raw["privacy"].get("mode")
+            if isinstance(mode_raw, str) and mode_raw.strip():
+                privacy_from_manifest = mode_raw.strip().lower()
+        self.privacy_mode = (
+            os.getenv("MEP_PRIVACY_MODE", "").strip().lower()
+            or privacy_from_manifest
+            or PRIVACY_MODE_PREFER_ENCRYPTED
+        )
+        if self.privacy_mode not in VALID_PRIVACY_MODES:
+            self.privacy_mode = PRIVACY_MODE_PREFER_ENCRYPTED
 
     async def register(self) -> dict:
+        body = {
+            "pubkey": self.identity.pub_pem,
+            "x25519_public_key": self.identity.x25519_public_key,
+            "alias": self._manifest.alias if self._manifest else None,
+        }
         response = await asyncio.to_thread(
             self.session.post,
-            f"{HUB_URL}/register",
-            json={"pubkey": self.identity.pub_pem},
+            f"{self.hub_url}/register",
+            json=body,
             timeout=10,
         )
         response.raise_for_status()
@@ -42,6 +96,29 @@ class MEPClient:
         headers = self.identity.get_auth_headers(payload_str)
         headers["Content-Type"] = "application/json"
         return headers
+
+    async def heartbeat_loop(self, availability: str = "online") -> None:
+        while not self._stop.is_set():
+            body = {"availability": availability}
+            payload_str = json.dumps(body)
+            try:
+                response = await asyncio.to_thread(
+                    self.session.post,
+                    f"{self.hub_url}/registry/heartbeat",
+                    data=payload_str,
+                    headers=self._auth_headers(payload_str),
+                    timeout=15,
+                )
+                response.raise_for_status()
+            except Exception:
+                pass
+            await asyncio.sleep(max(1, self.heartbeat_seconds))
+
+    def start_heartbeat(self, availability: str = "online") -> asyncio.Task:
+        if self._heartbeat_task and not self._heartbeat_task.done():
+            return self._heartbeat_task
+        self._heartbeat_task = asyncio.create_task(self.heartbeat_loop(availability=availability))
+        return self._heartbeat_task
 
     async def submit_task(
         self,
@@ -58,9 +135,18 @@ class MEPClient:
         task_title: Optional[str] = None,
         task_inputs: Optional[dict[str, Any]] = None,
     ) -> dict:
+        payload_to_send = payload
+        if target_node and bounty == 0.0:
+            try:
+                payload_to_send = await self._prepare_dm_payload_for_target(payload, target_node)
+            except Exception as exc:
+                return {
+                    "status_code": 400,
+                    "json": {"status": "error", "detail": f"DM privacy policy blocked send: {exc}"},
+                }
         body = build_task_envelope(
             self.node_id,
-            payload,
+            payload_to_send,
             bounty,
             intent_type=intent_type,
             intent_priority=intent_priority,
@@ -76,7 +162,7 @@ class MEPClient:
         headers = self._auth_headers(payload_str)
         response = await asyncio.to_thread(
             self.session.post,
-            f"{HUB_URL}/tasks/submit",
+            f"{self.hub_url}/tasks/submit",
             data=payload_str,
             headers=headers,
             timeout=20,
@@ -175,7 +261,7 @@ class MEPClient:
         headers = self._auth_headers(payload_str)
         response = await asyncio.to_thread(
             self.session.post,
-            f"{HUB_URL}/tasks/cancel",
+            f"{self.hub_url}/tasks/cancel",
             data=payload_str,
             headers=headers,
             timeout=20,
@@ -187,18 +273,21 @@ class MEPClient:
         headers = self._auth_headers(payload_str)
         response = await asyncio.to_thread(
             self.session.get,
-            f"{HUB_URL}/tasks/result/{task_id}",
+            f"{self.hub_url}/tasks/result/{task_id}",
             headers=headers,
             timeout=20,
         )
-        return {"status_code": response.status_code, "json": response.json()}
+        data = response.json()
+        if response.status_code == 200 and isinstance(data, dict) and isinstance(data.get("result_payload"), str):
+            data["result_payload"] = self._maybe_decrypt_dm_payload(data["result_payload"])
+        return {"status_code": response.status_code, "json": data}
 
     async def get_balance(self) -> dict:
         payload_str = ""
         headers = self._auth_headers(payload_str)
         response = await asyncio.to_thread(
             self.session.get,
-            f"{HUB_URL}/balance/{self.node_id}",
+            f"{self.hub_url}/balance/{self.node_id}",
             headers=headers,
             timeout=20,
         )
@@ -221,7 +310,7 @@ class MEPClient:
         headers = self._auth_headers(payload_str)
         response = await asyncio.to_thread(
             self.session.post,
-            f"{HUB_URL}/brainstorm/sessions/create",
+            f"{self.hub_url}/brainstorm/sessions/create",
             data=payload_str,
             headers=headers,
             timeout=20,
@@ -241,54 +330,67 @@ class MEPClient:
         reply_to_message_id: Optional[str] = None,
         turn_type: str = "chat_turn",
         result_type: str = "text",
+        title: Optional[str] = None,
+        task_inputs: Optional[dict[str, Any]] = None,
+        expected_output_must_include: Optional[list[str]] = None,
+        constraints: Optional[dict[str, Any]] = None,
         human_note: Optional[str] = None,
+        message_id: Optional[str] = None,
         trace_id: Optional[str] = None,
         task_title: Optional[str] = None,
-        task_inputs: Optional[dict[str, Any]] = None,
         session_safety: Optional[dict[str, Any]] = None,
         turn_index: Optional[int] = None,
     ) -> dict[str, Any]:
-        message_id = str(uuid.uuid4())
+        message_uuid = message_id or str(uuid.uuid4())
         timestamp_ms = int(time.time() * 1000)
         if turn_index is not None and turn_index < 1:
             raise ValueError("turn_index must be at least 1")
-        task: dict[str, Any] = {
+        task_payload: dict[str, Any] = {
             "instructions": message,
             "expected_output": {"result_type": result_type},
         }
-        if task_title:
-            task["title"] = task_title
+        if title or task_title:
+            task_payload["title"] = title or task_title
         inputs: dict[str, Any] = dict(task_inputs or {})
         normalized_session_safety = self.build_session_safety_metadata(**session_safety) if session_safety else {}
         if normalized_session_safety and "started_at_ms" not in normalized_session_safety:
             normalized_session_safety["started_at_ms"] = timestamp_ms
         if normalized_session_safety:
             inputs["session_safety"] = normalized_session_safety
+        if expected_output_must_include:
+            task_payload["expected_output"]["must_include"] = list(expected_output_must_include)
         if inputs:
-            task["inputs"] = inputs
-        return {
-            "spec_version": "mep.interbot.v1",
-            "message_id": message_id,
-            "trace_id": trace_id or str(uuid.uuid4()),
+            task_payload["inputs"] = inputs
+        if constraints:
+            task_payload["constraints"] = dict(constraints)
+        envelope: dict[str, Any] = {
+            "spec_version": INTERBOT_SPEC_VERSION,
+            "message_id": message_uuid,
+            "trace_id": trace_id or message_uuid,
             "timestamp_ms": timestamp_ms,
-            "source": {"node_id": self.node_id},
+            "source": {
+                "node_id": self.node_id,
+                "alias": self._manifest.alias if self._manifest and self._manifest.alias else None,
+            },
             "target": {
                 "node_id": target_node,
-                **({"alias": target_alias} if target_alias else {}),
+                "alias": target_alias,
             },
             "conversation": {
-                "context_id": context_id or message_id,
+                "context_id": context_id or message_uuid,
                 "reply_to_task_id": reply_to_task_id,
                 "reply_to_message_id": reply_to_message_id,
                 "turn_type": turn_type,
                 **({"turn_index": turn_index} if turn_index is not None else {}),
             },
             "intent": {"type": intent_type, "priority": priority},
-            "task": task,
+            "task": task_payload,
             "economics": {"bounty_seconds": 0.0, "currency": "SECONDS"},
             "delivery": {"reply_mode": "new_dm", "settlement_mode": "task_result"},
-            **({"human_note": human_note} if human_note else {}),
         }
+        if human_note:
+            envelope["human_note"] = human_note
+        return envelope
 
     async def submit_dm(
         self,
@@ -302,7 +404,14 @@ class MEPClient:
         reply_to_task_id: Optional[str] = None,
         reply_to_message_id: Optional[str] = None,
         turn_type: str = "chat_turn",
+        result_type: str = "text",
+        title: Optional[str] = None,
+        task_inputs: Optional[dict[str, Any]] = None,
+        expected_output_must_include: Optional[list[str]] = None,
+        constraints: Optional[dict[str, Any]] = None,
         human_note: Optional[str] = None,
+        message_id: Optional[str] = None,
+        trace_id: Optional[str] = None,
         session_safety: Optional[dict[str, Any]] = None,
         turn_index: Optional[int] = None,
     ) -> dict:
@@ -316,7 +425,14 @@ class MEPClient:
             reply_to_task_id=reply_to_task_id,
             reply_to_message_id=reply_to_message_id,
             turn_type=turn_type,
+            result_type=result_type,
+            title=title,
+            task_inputs=task_inputs,
+            expected_output_must_include=expected_output_must_include,
+            constraints=constraints,
             human_note=human_note,
+            message_id=message_id,
+            trace_id=trace_id,
             session_safety=session_safety,
             turn_index=turn_index,
         )
@@ -337,21 +453,21 @@ class MEPClient:
         priority: Optional[str] = None,
         human_note: Optional[str] = None,
     ) -> dict[str, Any]:
-        source = inbound_message.get("source")
-        if not isinstance(source, dict) or not isinstance(source.get("node_id"), str):
+        source = inbound_message.get("source") if isinstance(inbound_message, dict) else None
+        if not isinstance(source, dict) or not isinstance(source.get("node_id"), str) or not source.get("node_id"):
             raise ValueError("inbound inter-bot message is missing source.node_id")
-        inbound_intent = inbound_message.get("intent")
+        inbound_intent = inbound_message.get("intent") if isinstance(inbound_message, dict) else None
         inbound_priority = (
             inbound_intent.get("priority")
             if isinstance(inbound_intent, dict) and isinstance(inbound_intent.get("priority"), str)
             else "normal"
         )
-        conversation = inbound_message.get("conversation")
+        conversation = inbound_message.get("conversation") if isinstance(inbound_message, dict) else None
         inbound_turn_type = conversation.get("turn_type") if isinstance(conversation, dict) else None
         next_turn_index = self._derive_reply_turn_index(inbound_message)
         return self.build_interbot_message(
             reply_text,
-            source["node_id"],
+            str(source["node_id"]),
             target_alias=source.get("alias") if isinstance(source.get("alias"), str) else None,
             intent_type=intent_type or self._default_reply_intent_type(
                 inbound_intent.get("type") if isinstance(inbound_intent, dict) else None
@@ -359,9 +475,7 @@ class MEPClient:
             priority=priority or inbound_priority,
             context_id=conversation.get("context_id") if isinstance(conversation, dict) else None,
             reply_to_task_id=inbound_task_id,
-            reply_to_message_id=inbound_message.get("message_id")
-            if isinstance(inbound_message.get("message_id"), str)
-            else None,
+            reply_to_message_id=inbound_message.get("message_id") if isinstance(inbound_message.get("message_id"), str) else None,
             turn_type=turn_type or self._default_reply_turn_type(inbound_turn_type),
             human_note=human_note,
             trace_id=inbound_message.get("trace_id") if isinstance(inbound_message.get("trace_id"), str) else None,
@@ -389,8 +503,107 @@ class MEPClient:
             priority=priority,
             human_note=human_note,
         )
-        target = envelope["target"]["node_id"]
-        response = await self.submit_task(json.dumps(envelope), 0.0, None, target)
+        target = envelope.get("target") if isinstance(envelope.get("target"), dict) else {}
+        target_node = target.get("node_id")
+        if not isinstance(target_node, str) or not target_node:
+            raise ValueError("reply envelope is missing target.node_id")
+        response = await self.submit_task(json.dumps(envelope), 0.0, None, target_node)
+        response["message_id"] = envelope["message_id"]
+        response["trace_id"] = envelope["trace_id"]
+        response["context_id"] = envelope["conversation"]["context_id"]
+        return response
+
+    def build_execution_request_message(
+        self,
+        instructions: str,
+        target_node: str,
+        *,
+        target_alias: Optional[str] = None,
+        context_id: Optional[str] = None,
+        reply_to_task_id: Optional[str] = None,
+        reply_to_message_id: Optional[str] = None,
+        turn_type: str = "operator_dm",
+        title: Optional[str] = None,
+        task_inputs: Optional[dict[str, Any]] = None,
+        required_capabilities: Optional[list[str]] = None,
+        must_include: Optional[list[str]] = None,
+        max_runtime_seconds: Optional[int] = None,
+        max_cost_seconds: Optional[float] = None,
+        human_note: Optional[str] = None,
+        session_safety: Optional[dict[str, Any]] = None,
+        turn_index: Optional[int] = None,
+    ) -> dict[str, Any]:
+        constraints: dict[str, Any] = {}
+        capabilities = [
+            item.strip()
+            for item in (required_capabilities or ["code_edit"])
+            if isinstance(item, str) and item.strip()
+        ]
+        if capabilities:
+            constraints["required_capabilities"] = capabilities
+        if max_runtime_seconds is not None:
+            constraints["max_runtime_seconds"] = int(max_runtime_seconds)
+        if max_cost_seconds is not None:
+            constraints["max_cost_seconds"] = float(max_cost_seconds)
+        return self.build_interbot_message(
+            instructions,
+            target_node,
+            target_alias=target_alias,
+            intent_type="coordination.request",
+            priority="normal",
+            context_id=context_id,
+            reply_to_task_id=reply_to_task_id,
+            reply_to_message_id=reply_to_message_id,
+            turn_type=turn_type,
+            result_type=EXECUTION_RESULT_TYPE,
+            title=title,
+            task_inputs=task_inputs,
+            expected_output_must_include=must_include or list(DEFAULT_EXECUTION_MUST_INCLUDE),
+            constraints=constraints or None,
+            human_note=human_note,
+            session_safety=session_safety,
+            turn_index=turn_index,
+        )
+
+    async def submit_execution_dm(
+        self,
+        instructions: str,
+        target_node: str,
+        *,
+        target_alias: Optional[str] = None,
+        context_id: Optional[str] = None,
+        reply_to_task_id: Optional[str] = None,
+        reply_to_message_id: Optional[str] = None,
+        turn_type: str = "operator_dm",
+        title: Optional[str] = None,
+        task_inputs: Optional[dict[str, Any]] = None,
+        required_capabilities: Optional[list[str]] = None,
+        must_include: Optional[list[str]] = None,
+        max_runtime_seconds: Optional[int] = None,
+        max_cost_seconds: Optional[float] = None,
+        human_note: Optional[str] = None,
+        session_safety: Optional[dict[str, Any]] = None,
+        turn_index: Optional[int] = None,
+    ) -> dict:
+        envelope = self.build_execution_request_message(
+            instructions,
+            target_node,
+            target_alias=target_alias,
+            context_id=context_id,
+            reply_to_task_id=reply_to_task_id,
+            reply_to_message_id=reply_to_message_id,
+            turn_type=turn_type,
+            title=title,
+            task_inputs=task_inputs,
+            required_capabilities=required_capabilities,
+            must_include=must_include,
+            max_runtime_seconds=max_runtime_seconds,
+            max_cost_seconds=max_cost_seconds,
+            human_note=human_note,
+            session_safety=session_safety,
+            turn_index=turn_index,
+        )
+        response = await self.submit_task(json.dumps(envelope), 0.0, None, target_node)
         response["message_id"] = envelope["message_id"]
         response["trace_id"] = envelope["trace_id"]
         response["context_id"] = envelope["conversation"]["context_id"]
@@ -754,7 +967,7 @@ class MEPClient:
         headers = self._auth_headers(payload_str)
         response = await asyncio.to_thread(
             self.session.post,
-            f"{HUB_URL}/brainstorm/sessions/post",
+            f"{self.hub_url}/brainstorm/sessions/post",
             data=payload_str,
             headers=headers,
             timeout=20,
@@ -766,7 +979,7 @@ class MEPClient:
         headers = self._auth_headers(payload_str)
         response = await asyncio.to_thread(
             self.session.get,
-            f"{HUB_URL}/brainstorm/sessions/{session_id}",
+            f"{self.hub_url}/brainstorm/sessions/{session_id}",
             params={"limit": limit},
             headers=headers,
             timeout=20,
@@ -1053,18 +1266,21 @@ class MEPClient:
         while not self._stop.is_set():
             ts = str(int(time.time()))
             sig = urllib.parse.quote(self.identity.sign(self.node_id, ts))
-            uri = f"{WS_URL}/ws/{self.node_id}?timestamp={ts}&signature={sig}"
+            uri = f"{self.ws_url}/ws/{self.node_id}?timestamp={ts}&signature={sig}"
             try:
                 async with ws_connect(uri) as ws:
                     self._active_ws = ws
                     heartbeat_task: Optional[asyncio.Task] = None
-                    if WS_HEARTBEAT_INTERVAL_SECONDS > 0:
+                    if self.heartbeat_seconds > 0:
                         heartbeat_task = asyncio.create_task(self._heartbeat_loop(ws))
                     try:
                         while not self._stop.is_set():
                             msg = await ws.recv()
                             data = json.loads(msg)
                             if data.get("event") == "task_result":
+                                task_data = data.get("data", {})
+                                if isinstance(task_data, dict) and isinstance(task_data.get("result_payload"), str):
+                                    task_data["result_payload"] = self._maybe_decrypt_dm_payload(task_data["result_payload"])
                                 await on_result(data["data"])
                             elif on_event is not None:
                                 await on_event(data)
@@ -1085,8 +1301,85 @@ class MEPClient:
 
     async def _heartbeat_loop(self, ws) -> None:
         while not self._stop.is_set():
-            await asyncio.sleep(WS_HEARTBEAT_INTERVAL_SECONDS)
+            await asyncio.sleep(self.heartbeat_seconds)
             await ws.send(json.dumps({"event": "heartbeat", "node_id": self.node_id, "ts": int(time.time())}))
 
     def stop(self) -> None:
         self._stop.set()
+        if self._heartbeat_task and not self._heartbeat_task.done():
+            self._heartbeat_task.cancel()
+
+    def get_privacy_registry_metadata(self) -> dict:
+        return {
+            "privacy_mode": self.privacy_mode,
+            "encryption_capabilities": {"dm": ["x25519-hkdf-sha256-aesgcm-v1"]},
+            "x25519_public_key_present": bool(self.identity.x25519_public_key),
+        }
+
+    async def get_registry_entry(self, node_id: str) -> Optional[dict]:
+        payload_str = ""
+        headers = self._auth_headers(payload_str)
+        response = await asyncio.to_thread(
+            self.session.get,
+            f"{self.hub_url}/registry/{node_id}",
+            headers=headers,
+            timeout=20,
+        )
+        if response.status_code != 200:
+            return None
+        data = response.json()
+        return data if isinstance(data, dict) else None
+
+    def _extract_registry_privacy_mode(self, entry: Optional[dict]) -> str:
+        if not isinstance(entry, dict):
+            return PRIVACY_MODE_PLAINTEXT_ONLY
+        metadata = entry.get("metadata")
+        if isinstance(metadata, dict):
+            mode = metadata.get("privacy_mode")
+            if isinstance(mode, str):
+                normalized = mode.strip().lower()
+                if normalized in VALID_PRIVACY_MODES:
+                    return normalized
+        return PRIVACY_MODE_PLAINTEXT_ONLY
+
+    def _supports_encryption(self, entry: Optional[dict]) -> bool:
+        if not isinstance(entry, dict):
+            return False
+        key = entry.get("x25519_public_key")
+        return isinstance(key, str) and bool(key.strip())
+
+    async def _prepare_dm_payload_for_target(self, plaintext: str, target_node: str) -> str:
+        target_entry = await self.get_registry_entry(target_node)
+        target_mode = self._extract_registry_privacy_mode(target_entry)
+        target_supports_encryption = self._supports_encryption(target_entry)
+        sender_prefers_encryption = self.privacy_mode in (
+            PRIVACY_MODE_PREFER_ENCRYPTED,
+            PRIVACY_MODE_REQUIRE_ENCRYPTED,
+        )
+        sender_requires_encryption = self.privacy_mode == PRIVACY_MODE_REQUIRE_ENCRYPTED
+        target_requires_encryption = target_mode == PRIVACY_MODE_REQUIRE_ENCRYPTED
+
+        if sender_prefers_encryption and target_supports_encryption:
+            envelope = encrypt_dm_payload(plaintext, str(target_entry["x25519_public_key"]))
+            return encode_dm_envelope(envelope)
+        if sender_requires_encryption or target_requires_encryption:
+            raise ValueError("Encrypted DM is required but peer negotiation failed")
+        return plaintext
+
+    async def prepare_dm_reply_payload(self, plaintext: str, peer_node_id: str, require_encrypted: bool = False) -> str:
+        original_mode = self.privacy_mode
+        try:
+            if require_encrypted:
+                self.privacy_mode = PRIVACY_MODE_REQUIRE_ENCRYPTED
+            return await self._prepare_dm_payload_for_target(plaintext, peer_node_id)
+        finally:
+            self.privacy_mode = original_mode
+
+    def _maybe_decrypt_dm_payload(self, payload_text: str) -> str:
+        envelope = decode_dm_envelope(payload_text)
+        if not envelope:
+            return payload_text
+        try:
+            return decrypt_dm_payload(envelope, self.identity.x25519_private_key)
+        except Exception:
+            return "[Encrypted DM received but decryption failed]"

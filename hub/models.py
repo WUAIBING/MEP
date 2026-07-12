@@ -4,11 +4,11 @@ from typing import Optional, List, Dict, Any
 class NodeRegistration(BaseModel):
     pubkey: str = Field(..., description="Node's public key or UUID")
     alias: Optional[str] = None
+    x25519_public_key: Optional[str] = None
     node_id: Optional[str] = None
     capabilities: Optional[List[str]] = None
     connectivity: Optional[Dict[str, Any]] = None
     auto_bid_policy: Optional[Dict[str, Any]] = None
-    x25519_public_key: Optional[str] = None
 
 class TaskCreate(BaseModel):
     consumer_id: Optional[str] = None

@@ -6,7 +6,9 @@ import warnings
 from dataclasses import dataclass
 
 from cryptography.hazmat.primitives import serialization
-from cryptography.hazmat.primitives.asymmetric import ed25519
+from cryptography.hazmat.primitives.asymmetric import ed25519, x25519
+
+from clients.shared.dm_crypto import serialize_x25519_public_key
 
 
 def _derive_node_id(pub_pem: str) -> str:
@@ -20,8 +22,10 @@ class MEPIdentity:
 
     def __post_init__(self) -> None:
         self._private_key = self._load_or_create_key(self.key_path)
+        self._x25519_private_key = self._load_or_create_x25519_key(self.key_path)
         self.pub_pem = self._public_pem(self._private_key)
         self.node_id = _derive_node_id(self.pub_pem)
+        self.x25519_public_key = serialize_x25519_public_key(self._x25519_private_key.public_key())
 
     def _load_or_create_key(self, key_path: str) -> ed25519.Ed25519PrivateKey:
         os.makedirs(os.path.dirname(os.path.abspath(key_path)), exist_ok=True)
@@ -53,6 +57,26 @@ class MEPIdentity:
             f.write(pem)
         return key
 
+    def _load_or_create_x25519_key(self, key_path: str) -> x25519.X25519PrivateKey:
+        x25519_path = f"{key_path}.x25519.pem"
+        os.makedirs(os.path.dirname(os.path.abspath(x25519_path)), exist_ok=True)
+        if os.path.exists(x25519_path):
+            with open(x25519_path, "rb") as f:
+                data = f.read()
+            key = serialization.load_pem_private_key(data, password=None)
+            if not isinstance(key, x25519.X25519PrivateKey):
+                raise ValueError("Unsupported X25519 private key type")
+            return key
+        key = x25519.X25519PrivateKey.generate()
+        pem = key.private_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PrivateFormat.PKCS8,
+            encryption_algorithm=serialization.NoEncryption(),
+        )
+        with open(x25519_path, "wb") as f:
+            f.write(pem)
+        return key
+
     def _public_pem(self, key: ed25519.Ed25519PrivateKey) -> str:
         public_key = key.public_key()
         public_pem = public_key.public_bytes(
@@ -74,3 +98,7 @@ class MEPIdentity:
             "X-MEP-Timestamp": timestamp,
             "X-MEP-Signature": signature,
         }
+
+    @property
+    def x25519_private_key(self) -> x25519.X25519PrivateKey:
+        return self._x25519_private_key

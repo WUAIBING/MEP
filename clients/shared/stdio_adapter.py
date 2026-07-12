@@ -19,6 +19,7 @@ class StdioAdapter:
         self.platform_name = platform_name
         self.default_model = default_model
         self.client = MEPClient(key_path)
+        self.alias = os.getenv("MEP_ALIAS", platform_name)
         self._recent_interbot_results: dict[str, dict[str, Any]] = {}
         self.live_call_enabled = os.getenv("MEP_LIVE_CALL_ENABLED", "0") not in ("0", "false", "False", "")
         self.call_auto_accept = os.getenv("MEP_CALL_AUTO_ACCEPT", "0") not in ("0", "false", "False", "")
@@ -29,6 +30,28 @@ class StdioAdapter:
             "",
         )
         self._call_seq_by_context: dict[str, int] = {}
+
+    async def _announce_registry(self) -> None:
+        body = {
+            "alias": self.alias,
+            "skills": ["dm", "chat", self.platform_name.lower()],
+            "models": [self.default_model],
+            "metadata": {
+                "platform": self.platform_name.lower(),
+                **self.client.get_privacy_registry_metadata(),
+            },
+            "availability": "online",
+        }
+        payload = json.dumps(body)
+        response = await asyncio.to_thread(
+            self.client.session.post,
+            f"{self.client.hub_url.rstrip('/')}/registry/update",
+            data=payload,
+            headers=self.client._auth_headers(payload),
+            timeout=15,
+        )
+        if response.status_code != 200:
+            raise RuntimeError(f"registry update failed: {response.text}")
 
     async def _handle_result(self, data: dict) -> None:
         task_id = data.get("task_id")
@@ -53,7 +76,6 @@ class StdioAdapter:
             print(f"[{self.platform_name}] {action} failed: live socket is not connected")
             return False
         return True
-
     async def _handle_call_event(self, data: dict[str, Any]) -> None:
         event = str(data.get("event") or "")
         context_id = data.get("context_id") if isinstance(data.get("context_id"), str) else None
@@ -1161,6 +1183,10 @@ class StdioAdapter:
 
     async def run(self) -> None:
         await self.client.register()
+        try:
+            await self._announce_registry()
+        except Exception as exc:
+            print(f"[{self.platform_name}] registry announce warning: {exc}")
         listener = asyncio.create_task(self.client.listen_results(self._handle_result, self._handle_event))
         print(f"[{self.platform_name}] connected as {self.client.node_id}")
         print(

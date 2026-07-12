@@ -230,6 +230,15 @@ ANTI_LOOP_WINDOW_SECONDS = float(os.getenv("MEP_ANTI_LOOP_WINDOW_SECONDS", "90")
 ANTI_LOOP_MAX_MESSAGES = int(os.getenv("MEP_ANTI_LOOP_MAX_MESSAGES", "6"))
 ANTI_LOOP_COOLDOWN_SECONDS = int(os.getenv("MEP_ANTI_LOOP_COOLDOWN_SECONDS", "60"))
 ANTI_LOOP_TERMINATION_TOKENS = ("[end]", "[no_relay]", "[ack_only]")
+PRIVACY_MODE_PLAINTEXT_ONLY = "plaintext_only"
+PRIVACY_MODE_PREFER_ENCRYPTED = "prefer_encrypted"
+PRIVACY_MODE_REQUIRE_ENCRYPTED = "require_encrypted"
+VALID_PRIVACY_MODES = {
+    PRIVACY_MODE_PLAINTEXT_ONLY,
+    PRIVACY_MODE_PREFER_ENCRYPTED,
+    PRIVACY_MODE_REQUIRE_ENCRYPTED,
+}
+DM_ENVELOPE_PREFIX = "mepdmenc:"
 
 if TASK_TIMEOUT_MIN_SECONDS > TASK_TIMEOUT_MAX_SECONDS:
     TASK_TIMEOUT_MIN_SECONDS, TASK_TIMEOUT_MAX_SECONDS = TASK_TIMEOUT_MAX_SECONDS, TASK_TIMEOUT_MIN_SECONDS
@@ -566,6 +575,30 @@ def _normalize_model_requirement(value: Optional[str]) -> Optional[str]:
     if not normalized:
         return None
     return normalized
+
+
+def _extract_privacy_mode_from_registry(entry: Optional[dict]) -> str:
+    if not entry:
+        return PRIVACY_MODE_PLAINTEXT_ONLY
+    metadata = entry.get("metadata")
+    if isinstance(metadata, dict):
+        mode = metadata.get("privacy_mode")
+        if isinstance(mode, str):
+            normalized = mode.strip().lower()
+            if normalized in VALID_PRIVACY_MODES:
+                return normalized
+    return PRIVACY_MODE_PLAINTEXT_ONLY
+
+
+def _registry_supports_encryption(entry: Optional[dict]) -> bool:
+    if not entry:
+        return False
+    key = entry.get("x25519_public_key")
+    return isinstance(key, str) and bool(key.strip())
+
+
+def _is_encrypted_dm_payload(payload: str) -> bool:
+    return isinstance(payload, str) and payload.startswith(DM_ENVELOPE_PREFIX)
 
 
 def _task_consumer_id(task: TaskCreate) -> str:
@@ -979,7 +1012,6 @@ def _validate_spec_task_if_enabled(task: TaskCreate) -> None:
     _task_consumer_id(task)
     _task_economics(task)
     _task_target_node(task)
-
 
 def _direct_dm_channel(a: str, b: str) -> str:
     left, right = sorted([a, b])
@@ -1786,9 +1818,12 @@ async def register_node(node: NodeRegistration, request: Request):
     validated_pubkey = _validate_registration_pubkey(node.pubkey)
     # Registration derives the Node ID from the validated Ed25519 public key PEM
     node_id = auth.derive_node_id(validated_pubkey)
+    x25519_public_key = node.x25519_public_key.strip() if node.x25519_public_key else None
+    if x25519_public_key and len(x25519_public_key) > 2048:
+        raise HTTPException(status_code=413, detail="x25519_public_key too large")
     result = db.register_node(node_id, validated_pubkey)
-    if node.alias or node.x25519_public_key:
-        db.upsert_registry(node_id, node.alias, [], [], {}, "offline", time.time(), node.x25519_public_key)
+    if node.alias or x25519_public_key:
+        db.upsert_registry(node_id, node.alias, [], [], {}, "offline", time.time(), x25519_public_key)
 
     status = result["status"]
     balance = result["balance"]
@@ -2300,8 +2335,28 @@ async def submit_task(
     else:
         _validate_interbot_payload_if_enabled(consumer_id, economics, target_node, payload)
     if target_node and bounty == 0.0:
+        consumer_registry = db.get_registry(consumer_id)
+        target_registry = db.get_registry(target_node)
+        consumer_mode = _extract_privacy_mode_from_registry(consumer_registry)
+        target_mode = _extract_privacy_mode_from_registry(target_registry)
+        encrypted_payload = _is_encrypted_dm_payload(payload)
+        target_supports_encryption = _registry_supports_encryption(target_registry)
+        if consumer_mode == PRIVACY_MODE_REQUIRE_ENCRYPTED and not encrypted_payload:
+            raise HTTPException(status_code=400, detail="Sender requires encrypted DM payload")
+        if target_mode == PRIVACY_MODE_REQUIRE_ENCRYPTED and not encrypted_payload:
+            raise HTTPException(status_code=400, detail="Target requires encrypted DM payload")
+        if encrypted_payload and not target_supports_encryption:
+            raise HTTPException(status_code=400, detail="Target does not advertise encryption support")
+        if (
+            encrypted_payload
+            and target_mode == PRIVACY_MODE_PLAINTEXT_ONLY
+            and consumer_mode == PRIVACY_MODE_REQUIRE_ENCRYPTED
+        ):
+            raise HTTPException(
+                status_code=400,
+                detail="Target plaintext_only cannot satisfy sender require_encrypted",
+            )
         await _anti_loop_check_and_record(consumer_id, target_node, payload)
-
     if x_mep_idempotency_key:
         existing = db.get_idempotency(authenticated_node, "/tasks/submit", x_mep_idempotency_key)
         if existing:
