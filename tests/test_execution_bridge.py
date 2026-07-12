@@ -1,5 +1,6 @@
 import asyncio
 import json
+import os
 import sys
 from pathlib import Path
 from unittest.mock import AsyncMock
@@ -104,6 +105,7 @@ def test_prepare_dm_reply_payload_requires_encryption(monkeypatch, tmp_path: Pat
 
 def test_codex_provider_routes_execution_dm_to_bridge(monkeypatch, tmp_path: Path) -> None:
     monkeypatch.setenv("MEP_PRIVACY_MODE", "plaintext_only")
+    monkeypatch.setenv("MEP_KEY_DIR", str(tmp_path / ".mep-home"))
     provider = CodexProvider()
     fake_session = _FakeSession()
     provider.client.session = fake_session
@@ -147,3 +149,19 @@ def test_codex_provider_routes_execution_dm_to_bridge(monkeypatch, tmp_path: Pat
     assert "FILE_EDITED yes." in result_payload
     assert "FILE scripts/github-actions/verify_checkout_provenance.sh." in result_payload
     assert "BRANCH feat/runtime-bridge." in result_payload
+
+
+def test_codex_provider_uses_persistent_identity_store(monkeypatch, tmp_path: Path) -> None:
+    store_dir = tmp_path / ".mep-home"
+    monkeypatch.setenv("MEP_KEY_DIR", str(store_dir))
+    monkeypatch.delenv("MEP_BOT_KEY_PATH", raising=False)
+    monkeypatch.delenv("MEP_MANIFEST_PATH", raising=False)
+    monkeypatch.setenv("MEP_ALIAS", "Persistent Codex")
+
+    provider = CodexProvider()
+
+    assert Path(provider.client.identity.key_path).parent == store_dir
+    assert provider.client.identity.key_path.endswith(".pem")
+    registry = json.loads((store_dir / "bots.json").read_text(encoding="utf-8"))
+    assert registry["aliases"]["Persistent Codex"]["key_path"] == provider.client.identity.key_path
+    assert os.path.exists(provider.client.identity.key_path)

@@ -1,18 +1,20 @@
 import os
 import shlex
-import tempfile
 
 import discord
 from discord.ext import commands
 
 from clients.shared.commands import parse_task_args
+from clients.shared.identity_paths import remember_identity, resolve_identity_key_path
 from clients.shared.mep_client import MEPClient
 
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 DEFAULT_BOUNTY = float(os.getenv("MEP_DEFAULT_BOUNTY", "5.0"))
-DISCORD_KEY_PATH = os.getenv(
-    "MEP_DISCORD_KEY_PATH",
-    os.path.join(tempfile.gettempdir(), "mep_discord_adapter.pem"),
+DISCORD_ALIAS = os.getenv("MEP_ALIAS", "discord-agent")
+DISCORD_KEY_PATH = resolve_identity_key_path(
+    explicit_key_path=os.getenv("MEP_DISCORD_KEY_PATH") or os.getenv("MEP_BOT_KEY_PATH"),
+    alias_hint=DISCORD_ALIAS,
+    create_if_missing=True,
 )
 MAX_OUTPUT_CHARS = int(os.getenv("MEP_DISCORD_MAX_OUTPUT_CHARS", "1800"))
 
@@ -27,6 +29,7 @@ intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 client = MEPClient(DISCORD_KEY_PATH)
+remember_identity(client.identity.key_path, DISCORD_ALIAS)
 
 
 @bot.event

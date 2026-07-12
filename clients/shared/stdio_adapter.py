@@ -2,12 +2,12 @@ import asyncio
 import json
 import os
 import shlex
-import tempfile
 import uuid
 from datetime import datetime, timezone
 from typing import Any, Optional
 
 from clients.shared.commands import parse_task_args
+from clients.shared.identity_paths import remember_identity, resolve_identity_key_path
 from clients.shared.mep_client import MEPClient
 
 DEFAULT_BOUNTY = float(os.getenv("MEP_DEFAULT_BOUNTY", "5.0"))
@@ -15,11 +15,17 @@ DEFAULT_BOUNTY = float(os.getenv("MEP_DEFAULT_BOUNTY", "5.0"))
 
 class StdioAdapter:
     def __init__(self, platform_name: str, default_model: str, key_file_name: str):
-        key_path = os.getenv("MEP_BOT_KEY_PATH", os.path.join(tempfile.gettempdir(), key_file_name))
+        alias = os.getenv("MEP_ALIAS", platform_name)
+        key_path = resolve_identity_key_path(
+            explicit_key_path=os.getenv("MEP_BOT_KEY_PATH"),
+            alias_hint=alias,
+            create_if_missing=True,
+        )
         self.platform_name = platform_name
         self.default_model = default_model
         self.client = MEPClient(key_path)
-        self.alias = os.getenv("MEP_ALIAS", platform_name)
+        self.alias = alias
+        remember_identity(self.client.identity.key_path, self.alias)
         self._recent_interbot_results: dict[str, dict[str, Any]] = {}
         self.live_call_enabled = os.getenv("MEP_LIVE_CALL_ENABLED", "0") not in ("0", "false", "False", "")
         self.call_auto_accept = os.getenv("MEP_CALL_AUTO_ACCEPT", "0") not in ("0", "false", "False", "")
