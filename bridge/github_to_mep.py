@@ -26,6 +26,7 @@ from node.task_envelope import build_task_envelope
 SUPPORTED_GITHUB_EVENTS = {"issue_comment", "pull_request", "pull_request_review_comment"}
 DEFAULT_TRIGGER_VERBS = {
     "review": "code.review.request",
+    "rereview": "code.review.request",
     "analyze": "analysis.request",
     "check": "code.review.request",
     "comment": "code.review.comment",
@@ -1185,6 +1186,7 @@ class GitHubToMEPBridgeService:
             "source_event": github_event,
             "source_action": action,
             "trigger_verb": first_verb,
+            "review_mode": self._review_mode_for_verb(first_verb),
         }
         review_context = ""
         if entity_type == "pr":
@@ -1206,6 +1208,7 @@ class GitHubToMEPBridgeService:
             actor_login=actor_login,
             action=action,
             imperative_verb=first_verb,
+            review_mode=self._review_mode_for_verb(first_verb),
             trigger_text=trigger_text,
             review_context=review_context,
         )
@@ -1250,9 +1253,14 @@ class GitHubToMEPBridgeService:
         if not command_match:
             return None
         verb = re.sub(r"[\s-]+", "", command_match.group("verb").strip().lower())
-        if verb == "rereview":
-            return "review"
         return verb
+
+    @staticmethod
+    def _review_mode_for_verb(verb: str) -> str:
+        normalized = str(verb or "").strip().lower()
+        if normalized == "rereview":
+            return "recheck_review"
+        return "discovery_review"
 
     def _extract_triggers(self, text: str) -> list[TriggerMatch]:
         """Extract ALL actionable @alias verb mentions from text."""
@@ -1878,6 +1886,7 @@ class GitHubToMEPBridgeService:
         actor_login: str,
         action: str,
         imperative_verb: str,
+        review_mode: str,
         trigger_text: str,
         review_context: str = "",
     ) -> str:
@@ -1894,6 +1903,7 @@ class GitHubToMEPBridgeService:
             f"Actor: @{actor_login}\n"
             f"Webhook action: {action}\n"
             f"Requested verb: {imperative_verb}\n"
+            f"Review mode: {review_mode}\n"
             "Instructions:\n"
             f"{clipped_trigger}"
         )
@@ -2033,7 +2043,7 @@ class GitHubToMEPBridgeService:
         imperative_verb = str(execution.get("imperative_verb") or "").strip().lower()
         if intent_type == "code.review.approve" or imperative_verb == "approve":
             return "approved"
-        if intent_type == "code.review.request" or imperative_verb in {"review", "check"}:
+        if intent_type == "code.review.request" or imperative_verb in {"review", "check", "rereview"}:
             return "reviewed"
         if intent_type == "code.review.comment" or imperative_verb == "comment":
             return "commented"
@@ -2422,9 +2432,6 @@ class GitHubToMEPBridgeService:
         if checks_performed:
             score += 1
             reasons.append("explicit_checks")
-        if why_no_finding and not has_findings:
-            score += 1
-            reasons.append("why_no_finding")
         if mentions_tests:
             score += 1
             reasons.append("test_awareness")
@@ -2625,7 +2632,7 @@ class GitHubToMEPBridgeService:
                 reviewability_bucket == "standard"
                 and anchored_paths
                 and not has_findings
-                and (checks_performed or risk_areas_checked or why_no_finding)
+                and (checks_performed or risk_areas_checked)
             ):
                 return sanitized, snapshot, score, reasons
             return None
@@ -2685,6 +2692,7 @@ class GitHubToMEPBridgeService:
         suppression_reason: Optional[str],
     ) -> dict[str, Any]:
         review_package = snapshot.get("review_package") or {}
+        github_inputs = self._execution_github_inputs(execution)
         ci_checks = snapshot.get("ci_checks") or {}
         anchored_paths = snapshot.get("anchored_paths") or set()
         changed_tokens = snapshot.get("changed_tokens") or set()
@@ -2715,6 +2723,7 @@ class GitHubToMEPBridgeService:
             "issue_number": int(execution.get("issue_number") or 0),
             "target_alias": str(execution.get("target_alias") or ""),
             "intent_type": str(execution.get("intent_type") or ""),
+            "review_mode": str(github_inputs.get("review_mode") or "discovery_review"),
             "head_sha": str(review_package.get("head_sha") or ""),
             "ci_state": str(ci_checks.get("state") or "none"),
             "ci_has_checks": bool(ci_checks.get("has_checks")),
