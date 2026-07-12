@@ -73,36 +73,38 @@ codex> mepdmreplysafe task_review_request 3 "I approve with conditions." --turn-
 - `target_node` usage is always `node_id`, never display nickname.
 
 ## Daily Git Hygiene (Server)
-- In repo path, run:
+- Keep one clean source checkout that only exists to resolve target SHAs for deploy.
+- Treat the old live checkout as evidence/debug state, not the place production builds should run from.
+- Before upgrade:
   - `git fetch origin --prune`
-  - compare `HEAD` vs `origin/main`
-- If behind:
-  - backup current state (status, HEAD, diff)
-  - preserve local edits (stash/backup branch)
-  - pull with `--ff-only`
-- Avoid upgrade if repo has unknown uncommitted changes until backed up.
+  - compare source-checkout `HEAD` vs `origin/main`
+  - inspect whether the old live checkout has unknown dirty source edits
+- Avoid upgrade if the live checkout is dirty until its state is archived.
 
 ## Safe Upgrade Procedure
 1. Backup:
-   - Save `git status`, `git rev-parse HEAD`, `git diff` into timestamped backup dir.
+   - Save old live checkout `git status`, `git rev-parse HEAD`, `git diff` into a timestamped backup dir.
 2. Preserve local edits:
-   - create stash or local backup branch.
+   - archive dirty live-tree diffs before cutover; do not rely on an untracked stash on the production box.
 3. Upgrade:
-   - `git pull --ff-only origin main`
+   - run `./scripts/deploy_hub_release.sh <target-ref-or-sha>` from the clean source checkout
+   - set `MEP_DEPLOY_COMPOSE_PROJECT_NAME=mep`
+   - set `MEP_DEPLOY_ENV_FILE` and `MEP_DEPLOY_HUB_DATA_DIR` to the shared production paths
 4. Restart:
-   - `docker compose up -d --build --no-deps mep-hub`
+   - let the release deploy script rebuild and restart only `mep-hub`
 5. Validate:
    - `GET /health` is healthy
+   - `GET /version` reports the expected `build_sha`
    - `mep-hub` container is `Up`
 6. Report:
    - new commit SHA
    - health summary
-   - remaining local modifications and stashes
+   - archived live-tree backup path if one was created
 
 ## Incident Response
 - If startup fails after upgrade:
   - capture logs first
-  - restore last known good commit or re-apply preserved stash
+  - redeploy the last known good SHA with `./scripts/deploy_hub_release.sh <sha>`
   - restore service availability before deeper debugging
 - If auth/signature failures spike:
   - verify node clocks (timestamp skew window)
