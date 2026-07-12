@@ -2,12 +2,13 @@ from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect, Requ
 from fastapi.responses import HTMLResponse, PlainTextResponse, JSONResponse
 from fastapi.exceptions import RequestValidationError
 from pydantic import BaseModel
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 import asyncio
 import uuid
 import time
 import json
 import ipaddress
+import hmac
 from datetime import datetime
 import os
 import ctypes
@@ -17,6 +18,7 @@ from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import ed25519
 import db
 import auth
+from call_relay import CallRelay
 from logger import log_event, log_audit
 
 from models import (
@@ -25,6 +27,8 @@ from models import (
     TaskResult,
     TaskBid,
     TaskCancel,
+    TaskReject,
+    TaskVerificationAccept,
     RegistryUpdate,
     AvailabilityUpdate,
     RegistryHeartbeat,
@@ -37,7 +41,21 @@ from models import (
     BrainstormSessionPost,
 )
 
-app = FastAPI(title="MEP Hub", description="The Time Exchange Clearinghouse", version="0.1.2")
+from v2_models import (
+    V2BalanceResponse,
+    V2RegistrationResponse,
+    V2TaskSubmitRequest,
+    V2TaskResponse,
+    V2EscrowResponse,
+    V2EscrowListResponse,
+    V2LedgerEntryResponse,
+    V2LedgerListResponse,
+)
+
+from nanoseconds import ns_to_legacy_seconds
+import money
+
+app = FastAPI(title="MEP Hub", description="The Time Exchange Clearinghouse", version="0.1.2", docs_url="/docs", redoc_url="/redoc")
 
 # In-memory storage for active tasks
 active_tasks: Dict[str, dict] = {}
@@ -47,11 +65,61 @@ rate_limits: Dict[str, List[float]] = {}
 task_lock = asyncio.Lock()
 node_lock = asyncio.Lock()
 mesh_lock = asyncio.Lock()
+
+CALL_RELAY_ENABLED = os.getenv("MEP_CALL_RELAY_ENABLED", "1") not in ("0", "false", "False")
+
+
+def _hub_build_info() -> dict[str, str]:
+    build_sha = str(os.getenv("MEP_BUILD_SHA", "")).strip() or "unknown"
+    build_time = str(os.getenv("MEP_BUILD_TIME", "")).strip() or "unknown"
+    deploy_source = str(os.getenv("MEP_DEPLOY_SOURCE", "")).strip() or "unknown"
+    return {
+        "app_version": app.version,
+        "build_sha": build_sha,
+        "build_time": build_time,
+        "deploy_source": deploy_source,
+    }
+
+
+async def _call_relay_send(node_id: str, message: dict) -> bool:
+    """Deliver a call.* event to a node's current live socket (used by CallRelay)."""
+    ws = connected_nodes.get(node_id)
+    if ws is None:
+        return False
+    try:
+        await ws.send_json(message)
+        return True
+    except Exception:
+        async with node_lock:
+            if connected_nodes.get(node_id) is ws:
+                del connected_nodes[node_id]
+        return False
+
+
+call_relay = CallRelay(
+    _call_relay_send,
+    is_online=lambda nid: nid in connected_nodes,
+)
+
+
+def _parse_call_event(raw: str) -> Optional[dict]:
+    """Return a parsed call.* event dict, or None if the frame isn't a call event."""
+    try:
+        msg = json.loads(raw)
+    except (ValueError, TypeError):
+        return None
+    if isinstance(msg, dict) and str(msg.get("event", "")).startswith("call."):
+        return msg
+    return None
+
+
 anti_loop_lock = asyncio.Lock()
 brainstorm_lock = asyncio.Lock()
 mesh_assemblies: Dict[str, dict] = {}
 anti_loop_channels: Dict[str, dict] = {}
 brainstorm_sessions: Dict[str, dict] = {}
+onboard_diagnosis_counts: Dict[str, int] = {}
+onboard_diagnosis_total = 0
 MAX_BODY_BYTES = 200_000
 MAX_PAYLOAD_CHARS = 20_000
 RATE_LIMIT_WINDOW = 10.0
@@ -122,13 +190,38 @@ ASSIGNMENT_TIMEOUT_SECONDS = int(os.getenv("MEP_ASSIGNMENT_TIMEOUT_SECONDS", "36
 TASK_TIMEOUT_DEFAULT_SECONDS = int(os.getenv("MEP_TASK_TIMEOUT_DEFAULT_SECONDS", str(ASSIGNMENT_TIMEOUT_SECONDS)))
 TASK_TIMEOUT_MIN_SECONDS = int(os.getenv("MEP_TASK_TIMEOUT_MIN_SECONDS", "60"))
 TASK_TIMEOUT_MAX_SECONDS = int(os.getenv("MEP_TASK_TIMEOUT_MAX_SECONDS", "86400"))
+SUBMITTED_RESULT_TIMEOUT_SECONDS = int(os.getenv("MEP_SUBMITTED_RESULT_TIMEOUT_SECONDS", "86400"))
+MAX_REBROADCAST_COUNT = int(os.getenv("MEP_MAX_REBROADCAST_COUNT", "3"))
 ASSIGNMENT_SWEEP_INTERVAL_SECONDS = int(os.getenv("MEP_ASSIGNMENT_SWEEP_INTERVAL_SECONDS", "60"))
 MAINTENANCE_SWEEP_INTERVAL_SECONDS = int(os.getenv("MEP_MAINTENANCE_SWEEP_INTERVAL_SECONDS", "60"))
+REGISTRY_RECONCILE_LIMIT = int(os.getenv("MEP_REGISTRY_RECONCILE_LIMIT", "1000"))
+REGISTRY_RECONCILE_STALE_SECONDS = float(os.getenv("MEP_REGISTRY_RECONCILE_STALE_SECONDS", "180"))
+DM_QUEUE_ENABLED = os.getenv("MEP_DM_QUEUE_ENABLED", "true").lower() in ("1", "true", "yes", "on")
+MAX_QUEUED_DMS_PER_NODE = int(os.getenv("MEP_MAX_QUEUED_DMS_PER_NODE", "50"))
+QUEUED_DM_STATUS = "queued_dm"
 COMPLETED_TASK_CACHE_TTL_SECONDS = int(os.getenv("MEP_COMPLETED_TASK_CACHE_TTL_SECONDS", "3600"))
 COMPLETED_TASK_CACHE_MAX_ITEMS = int(os.getenv("MEP_COMPLETED_TASK_CACHE_MAX_ITEMS", "1000"))
 IDEMPOTENCY_TTL_SECONDS = int(os.getenv("MEP_IDEMPOTENCY_TTL_SECONDS", "86400"))
 TIMEOUT_POLICY = os.getenv("MEP_TIMEOUT_POLICY", "refund").lower()
 VALID_AVAILABILITY = {"online", "idle", "busy", "offline", "degraded", "unknown"}
+LIVE_AVAILABILITY = {"online", "idle", "busy"}
+INTERBOT_SPEC_VERSION = "mep.interbot.v1"
+INTERBOT_ALLOWED_INTENTS = {
+    "chat.request",
+    "coordination.request",
+    "deployment.request",
+    "analysis.request",
+    "code.review.request",
+    "incident.response",
+    "test.request",
+    "human.approval.request",
+    "human.input.request",
+    "data.feed.offer",
+    "data.dataset.offer",
+}
+INTERBOT_SPEC_VALIDATE_ENABLED = os.getenv("MEP_INTERBOT_SPEC_VALIDATE", "false").lower() in ("1", "true", "yes")
+INTERBOT_CLOCK_SKEW_MS = int(os.getenv("MEP_INTERBOT_CLOCK_SKEW_MS", "600000"))
+INTERBOT_LEGACY_POLICY = os.getenv("MEP_INTERBOT_LEGACY_POLICY", "dm_only").strip().lower() or "dm_only"
 MESH_ALLOWED_TRIGGERS = {"brainstorm", "code_review", "incident", "planning"}
 MESH_DEFAULT_TIMEOUT_SECONDS = 300
 MESH_MAX_TIMEOUT_SECONDS = 3600
@@ -150,12 +243,26 @@ DM_ENVELOPE_PREFIX = "mepdmenc:"
 if TASK_TIMEOUT_MIN_SECONDS > TASK_TIMEOUT_MAX_SECONDS:
     TASK_TIMEOUT_MIN_SECONDS, TASK_TIMEOUT_MAX_SECONDS = TASK_TIMEOUT_MAX_SECONDS, TASK_TIMEOUT_MIN_SECONDS
 TASK_TIMEOUT_DEFAULT_SECONDS = max(TASK_TIMEOUT_MIN_SECONDS, min(TASK_TIMEOUT_DEFAULT_SECONDS, TASK_TIMEOUT_MAX_SECONDS))
+SUBMITTED_RESULT_TIMEOUT_SECONDS = max(TASK_TIMEOUT_MIN_SECONDS, min(SUBMITTED_RESULT_TIMEOUT_SECONDS, TASK_TIMEOUT_MAX_SECONDS))
+MAX_REBROADCAST_COUNT = max(0, MAX_REBROADCAST_COUNT)
 
 # ---------------------------------------------------------------------------
 # Node Activity Tracking (for passive degraded detection)
 # ---------------------------------------------------------------------------
 node_activity_lock = asyncio.Lock()
 node_last_activity: Dict[str, float] = {}
+registry_reconcile_lock = asyncio.Lock()
+registry_reconcile_metrics: Dict[str, Any] = {
+    "runs": 0,
+    "candidates_scanned": 0,
+    "reconciled_total": 0,
+    "skipped_recent_total": 0,
+    "last_run_at": None,
+    "last_run_candidates": 0,
+    "last_run_reconciled": 0,
+    "last_run_skipped_recent": 0,
+    "last_reconciled_at": None,
+}
 
 DEGRADED_THRESHOLD_SECONDS = float(os.getenv("MEP_DEGRADED_THRESHOLD_SECONDS", "600"))
 
@@ -176,6 +283,81 @@ async def _sweep_node_activity():
                 if existing and existing.get("availability") not in ("offline", "degraded"):
                     db.update_registry_availability(node_id, "degraded", now)
                     log_event("node_degraded", f"Node {node_id} marked degraded due to inactivity", node_id=node_id)
+
+
+async def _reconcile_live_registry_presence():
+    stale_candidates: list[tuple[str, str]] = []
+    for availability in LIVE_AVAILABILITY:
+        rows = db.search_registry(
+            alias=None,
+            skill=None,
+            model=None,
+            availability=availability,
+            min_score=None,
+            min_reviews=None,
+            min_updated_at=None,
+            limit=max(1, REGISTRY_RECONCILE_LIMIT),
+        )
+        for row in rows:
+            node_id = str(row.get("node_id") or "").strip()
+            if not node_id:
+                continue
+            stale_candidates.append((node_id, availability))
+
+    if not stale_candidates:
+        now = time.time()
+        async with registry_reconcile_lock:
+            registry_reconcile_metrics["runs"] += 1
+            registry_reconcile_metrics["last_run_at"] = now
+            registry_reconcile_metrics["last_run_candidates"] = 0
+            registry_reconcile_metrics["last_run_reconciled"] = 0
+            registry_reconcile_metrics["last_run_skipped_recent"] = 0
+        return
+
+    now = time.time()
+    reconciled = 0
+    skipped_recent = 0
+    for node_id, seen_availability in stale_candidates:
+        async with node_lock:
+            if node_id in connected_nodes:
+                continue
+        existing = db.get_registry(node_id)
+        if not existing:
+            continue
+        current_availability = str(existing.get("availability") or "unknown").strip().lower()
+        if current_availability not in LIVE_AVAILABILITY:
+            continue
+        last_updated = existing.get("updated_at")
+        if last_updated is not None:
+            try:
+                age_seconds = now - float(last_updated)
+                if age_seconds < REGISTRY_RECONCILE_STALE_SECONDS:
+                    skipped_recent += 1
+                    continue
+            except (TypeError, ValueError):
+                pass
+        db.update_registry_availability(node_id, "offline", now)
+        reconciled += 1
+        log_event(
+            "registry_reconciled_offline",
+            f"Node {node_id} forced offline (registry={seen_availability}, ws=disconnected)",
+            node_id=node_id,
+            previous_availability=seen_availability,
+            reconciled_availability="offline",
+        )
+    async with registry_reconcile_lock:
+        registry_reconcile_metrics["runs"] += 1
+        registry_reconcile_metrics["candidates_scanned"] += len(stale_candidates)
+        registry_reconcile_metrics["reconciled_total"] += reconciled
+        registry_reconcile_metrics["skipped_recent_total"] += skipped_recent
+        registry_reconcile_metrics["last_run_at"] = now
+        registry_reconcile_metrics["last_run_candidates"] = len(stale_candidates)
+        registry_reconcile_metrics["last_run_reconciled"] = reconciled
+        registry_reconcile_metrics["last_run_skipped_recent"] = skipped_recent
+        if reconciled:
+            registry_reconcile_metrics["last_reconciled_at"] = now
+    if reconciled:
+        log_event("registry_reconcile_summary", f"Reconciled {reconciled} stale live registry entries", reconciled=reconciled)
 DEFAULT_REGISTRY_MAX_AGE_MINUTES = float(os.getenv("MEP_REGISTRY_MAX_AGE_MINUTES", "0") or "0")
 ASSIGNMENT_REPUTATION_WEIGHT = float(os.getenv("MEP_ASSIGNMENT_REPUTATION_WEIGHT", "0.55"))
 ASSIGNMENT_AVAILABILITY_WEIGHT = float(os.getenv("MEP_ASSIGNMENT_AVAILABILITY_WEIGHT", "0.25"))
@@ -338,6 +520,7 @@ async def _load_active_tasks_from_db():
             "status": task["status"],
             "target_node": task["target_node"],
             "model_requirement": task["model_requirement"],
+            "verifier_type": task.get("verifier_type"),
             "expires_in_seconds": task.get("expires_in_seconds"),
             "provider_id": task["provider_id"],
             "payload_uri": task.get("payload_uri"),
@@ -374,7 +557,7 @@ def _apply_rate_limit(key: str):
     rate_limits[key] = timestamps
 
 def _require_admin(x_mep_admin_key: Optional[str]):
-    if not ADMIN_KEY or not x_mep_admin_key or x_mep_admin_key != ADMIN_KEY:
+    if not ADMIN_KEY or not x_mep_admin_key or not hmac.compare_digest(x_mep_admin_key, ADMIN_KEY):
         raise HTTPException(status_code=403, detail="Admin key required")
 
 def _normalize_availability(value: Optional[str]) -> Optional[str]:
@@ -417,6 +600,418 @@ def _registry_supports_encryption(entry: Optional[dict]) -> bool:
 def _is_encrypted_dm_payload(payload: str) -> bool:
     return isinstance(payload, str) and payload.startswith(DM_ENVELOPE_PREFIX)
 
+
+def _task_consumer_id(task: TaskCreate) -> str:
+    source = task.source if isinstance(task.source, dict) else {}
+    source_node_id = source.get("node_id") if isinstance(source, dict) else None
+    if task.consumer_id and isinstance(source_node_id, str) and source_node_id.strip() and source_node_id.strip() != task.consumer_id:
+        raise HTTPException(status_code=400, detail="Task source.node_id mismatch with consumer_id")
+    if task.consumer_id:
+        return task.consumer_id
+    if isinstance(source_node_id, str) and source_node_id.strip():
+        return source_node_id.strip()
+    raise HTTPException(status_code=400, detail="Task requires consumer_id or source.node_id")
+
+
+def _task_instructions(task: TaskCreate) -> str:
+    if isinstance(task.task, dict):
+        instructions = task.task.get("instructions")
+        if isinstance(instructions, str) and instructions.strip():
+            return instructions.strip()
+    if isinstance(task.payload, str) and task.payload.strip():
+        return task.payload.strip()
+    raise HTTPException(status_code=400, detail="Task requires payload or task.instructions")
+
+
+def _task_expected_output(task: TaskCreate) -> dict:
+    if isinstance(task.task, dict):
+        expected_output = task.task.get("expected_output")
+        if isinstance(expected_output, dict):
+            return expected_output
+    return {}
+
+
+def _task_source(task: TaskCreate, consumer_id: str) -> dict:
+    if isinstance(task.source, dict):
+        source = dict(task.source)
+        source_node_id = source.get("node_id")
+        if not isinstance(source_node_id, str) or not source_node_id.strip():
+            source["node_id"] = consumer_id
+        else:
+            source["node_id"] = source_node_id.strip()
+        return source
+    return {"node_id": consumer_id}
+
+
+def _task_intent(task: TaskCreate) -> dict:
+    if isinstance(task.intent, dict) and task.intent:
+        return dict(task.intent)
+    return {"type": "analysis.request"}
+
+
+def _task_structured_body(task: TaskCreate, payload: str) -> dict:
+    task_body = dict(task.task) if isinstance(task.task, dict) else {}
+    task_body["instructions"] = payload
+    task_body["expected_output"] = _task_expected_output(task)
+    return task_body
+
+
+def _task_requires_envelope_persistence(task: TaskCreate) -> bool:
+    source = task.source if isinstance(task.source, dict) else {}
+    if any(str(key) != "node_id" for key in source.keys()):
+        return True
+
+    intent = task.intent if isinstance(task.intent, dict) else {}
+    if intent:
+        if str(intent.get("type") or "").strip() != "analysis.request":
+            return True
+        if any(str(key) != "type" for key in intent.keys()):
+            return True
+
+    task_body = task.task if isinstance(task.task, dict) else {}
+    if task_body:
+        if any(str(key) not in {"instructions", "expected_output"} for key in task_body.keys()):
+            return True
+        expected_output = task_body.get("expected_output")
+        if isinstance(expected_output, dict) and expected_output:
+            return True
+
+    if isinstance(task.economics, dict) and task.economics:
+        return True
+
+    return False
+
+
+def _task_data_from_row(task_row: dict, *, status: Optional[str] = None, provider_id: Optional[str] = None) -> dict:
+    payload = str(task_row.get("payload") or "")
+    consumer_id = str(task_row.get("consumer_id") or "")
+    hydrated: dict[str, Any] = {}
+    envelope_raw = task_row.get("envelope_json")
+    if isinstance(envelope_raw, str) and envelope_raw.strip():
+        try:
+            parsed = json.loads(envelope_raw)
+        except (ValueError, TypeError):
+            parsed = None
+        if isinstance(parsed, dict):
+            hydrated = dict(parsed)
+
+    hydrated["id"] = task_row["task_id"]
+    hydrated["consumer_id"] = consumer_id
+    hydrated["payload"] = payload
+    hydrated["bounty"] = task_row.get("bounty")
+    hydrated["status"] = status or task_row.get("status") or "bidding"
+    hydrated["target_node"] = task_row.get("target_node")
+    hydrated["model_requirement"] = task_row.get("model_requirement")
+    hydrated["verifier_type"] = task_row.get("verifier_type")
+    hydrated["expires_in_seconds"] = task_row.get("expires_in_seconds")
+    hydrated["payload_uri"] = task_row.get("payload_uri")
+    hydrated["secret_data"] = task_row.get("result_payload")
+    effective_provider_id = provider_id if provider_id is not None else task_row.get("provider_id")
+    if effective_provider_id:
+        hydrated["provider_id"] = effective_provider_id
+    else:
+        hydrated.pop("provider_id", None)
+
+    source = hydrated.get("source")
+    if not isinstance(source, dict):
+        hydrated["source"] = {"node_id": consumer_id}
+    else:
+        source_node_id = source.get("node_id")
+        if not isinstance(source_node_id, str) or not source_node_id.strip():
+            source["node_id"] = consumer_id
+
+    intent = hydrated.get("intent")
+    if not isinstance(intent, dict) or not intent:
+        hydrated["intent"] = {"type": "analysis.request"}
+
+    task_body = hydrated.get("task")
+    if not isinstance(task_body, dict):
+        task_body = {}
+    task_body["instructions"] = payload
+    expected_output = task_body.get("expected_output")
+    if not isinstance(expected_output, dict):
+        task_body["expected_output"] = {}
+    hydrated["task"] = task_body
+    return hydrated
+
+
+def _task_economics(task: TaskCreate) -> dict:
+    if isinstance(task.economics, dict):
+        economics = dict(task.economics)
+        currency_raw = economics.get("currency")
+        currency = str(currency_raw or "").strip().upper() if currency_raw is not None else None
+        market = str(economics.get("market") or "").strip().lower() or None
+        payment_direction = str(economics.get("payment_direction") or "").strip().lower() or None
+
+        if "bounty_quanta" in economics or currency == "MEP_QUANTA":
+            raise HTTPException(status_code=400, detail="Task economics must use bounty_ns with currency MEP_NS")
+        bounty_ns_value = economics.get("bounty_ns")
+        if bounty_ns_value is not None:
+            if currency is None:
+                currency = "MEP_NS"
+            if currency != "MEP_NS":
+                raise HTTPException(status_code=400, detail="Task economics currency must be MEP_NS")
+            if isinstance(bounty_ns_value, bool):
+                raise HTTPException(status_code=400, detail="Task economics bounty_ns must be an integer")
+            if isinstance(bounty_ns_value, int):
+                bounty_ns = bounty_ns_value
+            elif isinstance(bounty_ns_value, str) and bounty_ns_value.strip().isdigit():
+                bounty_ns = int(bounty_ns_value.strip())
+            else:
+                raise HTTPException(status_code=400, detail="Task economics bounty_ns must be an integer or decimal string")
+            if bounty_ns < 0:
+                raise HTTPException(status_code=400, detail="Task economics bounty_ns must be non-negative")
+            bounty_seconds_unsigned = float(bounty_ns) / 1_000_000_000.0
+
+            if market is None:
+                market = "chat" if bounty_ns == 0 else "compute"
+            if payment_direction is None:
+                payment_direction = "none" if market == "chat" else ("receiver_to_sender" if market == "data" else "sender_to_receiver")
+
+            if market == "chat":
+                if bounty_ns != 0 or payment_direction != "none":
+                    raise HTTPException(status_code=400, detail="Task economics chat market requires bounty_ns=0 and payment_direction=none")
+                bounty_seconds = 0.0
+            elif market == "compute":
+                if bounty_ns <= 0 or payment_direction != "sender_to_receiver":
+                    raise HTTPException(status_code=400, detail="Task economics compute market requires bounty_ns>0 and payment_direction=sender_to_receiver")
+                bounty_seconds = bounty_seconds_unsigned
+            elif market == "data":
+                if bounty_ns <= 0 or payment_direction != "receiver_to_sender":
+                    raise HTTPException(status_code=400, detail="Task economics data market requires bounty_ns>0 and payment_direction=receiver_to_sender")
+                bounty_seconds = -bounty_seconds_unsigned
+            else:
+                raise HTTPException(status_code=400, detail="Task economics market must be compute, chat, or data")
+
+            return {
+                "bounty_ns": bounty_ns,
+                "bounty_seconds": bounty_seconds,
+                "market": market,
+                "payment_direction": payment_direction,
+                "currency": "SECONDS",
+                "wire_currency": "MEP_NS",
+            }
+
+        bounty_value = economics.get("bounty_seconds")
+        if bounty_value is None:
+            bounty_value = economics.get("bounty")
+        if bounty_value is None:
+            bounty_value = task.bounty if task.bounty is not None else task.bounty_ns
+        if bounty_value is None:
+            bounty_value = 0.0
+        try:
+            bounty_seconds = float(bounty_value)
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=400, detail="Task economics bounty must be a number")
+        if market is None:
+            market = "data" if bounty_seconds < 0 else ("chat" if bounty_seconds == 0 else "compute")
+            payment_direction = payment_direction or ("receiver_to_sender" if market == "data" else ("none" if market == "chat" else "sender_to_receiver"))
+        if payment_direction is None:
+            payment_direction = "sender_to_receiver"
+        return {
+            "bounty_seconds": bounty_seconds,
+            "bounty_ns": int(abs(bounty_seconds) * 1_000_000_000),
+            "market": market,
+            "payment_direction": payment_direction,
+            "currency": "SECONDS",
+            "wire_currency": (currency or "SECONDS"),
+        }
+    bounty_value = task.bounty if task.bounty is not None else task.bounty_ns
+    if bounty_value is None:
+        bounty_value = 0.0
+    try:
+        bounty_seconds = float(bounty_value)
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="Task bounty must be a number")
+    market = "data" if bounty_seconds < 0 else ("chat" if bounty_seconds == 0 else "compute")
+    payment_direction = "receiver_to_sender" if bounty_seconds < 0 else ("none" if bounty_seconds == 0 else "sender_to_receiver")
+    return {
+        "bounty_seconds": bounty_seconds,
+        "bounty_ns": int(abs(bounty_seconds) * 1_000_000_000),
+        "market": market,
+        "payment_direction": payment_direction,
+        "currency": "SECONDS",
+        "wire_currency": "SECONDS",
+    }
+
+
+def _task_target_node(task: TaskCreate) -> Optional[str]:
+    if isinstance(task.routing, dict):
+        target_node_id = task.routing.get("target_node_id")
+        if isinstance(target_node_id, str) and target_node_id.strip():
+            return target_node_id.strip()
+        legacy_target = task.routing.get("target_node")
+        if isinstance(legacy_target, str) and legacy_target.strip():
+            return legacy_target.strip()
+    if isinstance(task.target_node, str) and task.target_node.strip():
+        return task.target_node.strip()
+    return None
+
+
+def _task_target_capability(task: TaskCreate) -> Optional[str]:
+    if isinstance(task.routing, dict):
+        capability = task.routing.get("target_capability")
+        if isinstance(capability, str) and capability.strip():
+            return capability.strip()
+    if isinstance(task.model_requirement, str) and task.model_requirement.strip():
+        return task.model_requirement.strip()
+    return None
+
+
+def _task_verifier_type(task: TaskCreate) -> Optional[str]:
+    verifier_type = task.verifier_type
+    if verifier_type is None and isinstance(task.verifier, dict):
+        verifier_type = task.verifier.get("type")
+    if verifier_type is None and isinstance(task.task, dict) and isinstance(task.task.get("verifier"), dict):
+        verifier_type = task.task["verifier"].get("type")
+    if verifier_type is None:
+        return None
+    normalized = str(verifier_type).strip().lower()
+    if not normalized:
+        return None
+    if normalized not in {"manual_acceptance", "automated"}:
+        raise HTTPException(status_code=400, detail="Unsupported verifier_type")
+    return normalized
+
+
+async def _coerce_live_availability(node_id: str, availability: Optional[str]) -> Optional[str]:
+    if availability is None or availability not in LIVE_AVAILABILITY:
+        return availability
+    async with node_lock:
+        has_live_websocket = node_id in connected_nodes
+    if has_live_websocket:
+        return availability
+    return "offline"
+
+
+def _interbot_require_object(data: Any, field_name: str) -> dict:
+    if not isinstance(data, dict):
+        raise HTTPException(status_code=400, detail=f"Inter-bot payload missing object: {field_name}")
+    return data
+
+
+def _interbot_require_string(data: dict, field_name: str) -> str:
+    value = data.get(field_name)
+    if not isinstance(value, str) or not value.strip():
+        raise HTTPException(status_code=400, detail=f"Inter-bot payload missing field: {field_name}")
+    return value.strip()
+
+
+def _validate_interbot_payload_if_enabled(consumer_id: str, task_economics: dict, target_node: Optional[str], payload: str) -> None:
+    if not INTERBOT_SPEC_VALIDATE_ENABLED or not payload:
+        return
+    payload_text = payload.strip()
+    if not payload_text:
+        return
+
+    try:
+        message = json.loads(payload_text)
+    except json.JSONDecodeError:
+        bounty_seconds = float(task_economics.get("bounty_seconds") or 0.0)
+        if INTERBOT_LEGACY_POLICY == "dm_only" and not (target_node and bounty_seconds == 0.0):
+            raise HTTPException(
+                status_code=400,
+                detail="Legacy plaintext payload allowed only for direct DM tasks when MEP_INTERBOT_SPEC_VALIDATE=true",
+            )
+        return
+
+    message_obj = _interbot_require_object(message, "root")
+    if message_obj.get("spec_version") != INTERBOT_SPEC_VERSION:
+        raise HTTPException(status_code=400, detail="Inter-bot payload spec_version must be mep.interbot.v1")
+    _interbot_require_string(message_obj, "message_id")
+    timestamp_ms = message_obj.get("timestamp_ms")
+    if not isinstance(timestamp_ms, (int, float)):
+        raise HTTPException(status_code=400, detail="Inter-bot payload missing field: timestamp_ms")
+    now_ms = int(time.time() * 1000)
+    if abs(now_ms - int(timestamp_ms)) > INTERBOT_CLOCK_SKEW_MS:
+        raise HTTPException(status_code=400, detail="Inter-bot payload timestamp_ms out of allowed window")
+
+    source_obj = _interbot_require_object(message_obj.get("source"), "source")
+    source_node_id = _interbot_require_string(source_obj, "node_id")
+    if source_node_id != consumer_id:
+        raise HTTPException(status_code=400, detail="Inter-bot payload source.node_id mismatch with consumer_id")
+
+    intent_obj = _interbot_require_object(message_obj.get("intent"), "intent")
+    intent_type = _interbot_require_string(intent_obj, "type")
+    if intent_type not in INTERBOT_ALLOWED_INTENTS and "." not in intent_type:
+        raise HTTPException(status_code=400, detail="Inter-bot payload intent.type must use known type or namespaced custom value")
+
+    task_obj = _interbot_require_object(message_obj.get("task"), "task")
+    instructions = _interbot_require_string(task_obj, "instructions")
+    if len(instructions) > 4000:
+        raise HTTPException(status_code=400, detail="Inter-bot payload task.instructions too long (max 4000)")
+    expected_output_obj = _interbot_require_object(task_obj.get("expected_output"), "task.expected_output")
+    _interbot_require_string(expected_output_obj, "result_type")
+
+    economics_obj = _interbot_require_object(message_obj.get("economics"), "economics")
+    currency = economics_obj.get("currency")
+    bounty_ns_value = economics_obj.get("bounty_ns")
+    if bounty_ns_value is None and "bounty_seconds" in economics_obj:
+        if currency not in {None, "SECONDS"}:
+            raise HTTPException(status_code=400, detail="Inter-bot payload economics.currency must be MEP_NS")
+        bounty_ns_value = int(abs(float(economics_obj.get("bounty_seconds") or 0.0)) * 1_000_000_000)
+    elif currency != "MEP_NS":
+        raise HTTPException(status_code=400, detail="Inter-bot payload economics.currency must be MEP_NS")
+    if bounty_ns_value is None:
+        raise HTTPException(status_code=400, detail="Inter-bot payload missing field: economics.bounty_ns")
+    if isinstance(bounty_ns_value, bool):
+        raise HTTPException(status_code=400, detail="Inter-bot payload economics.bounty_ns must be an integer")
+    if isinstance(bounty_ns_value, int):
+        bounty_ns = bounty_ns_value
+    elif isinstance(bounty_ns_value, str) and bounty_ns_value.strip().isdigit():
+        bounty_ns = int(bounty_ns_value.strip())
+    else:
+        raise HTTPException(status_code=400, detail="Inter-bot payload economics.bounty_ns must be an integer or decimal string")
+    if bounty_ns < 0:
+        raise HTTPException(status_code=400, detail="Inter-bot payload economics.bounty_ns must be non-negative")
+
+    market = economics_obj.get("market") or task_economics.get("market")
+    payment_direction = economics_obj.get("payment_direction") or task_economics.get("payment_direction")
+    if market not in ("compute", "chat", "data"):
+        raise HTTPException(status_code=400, detail="Inter-bot payload economics.market must be compute, chat, or data")
+    if payment_direction not in ("sender_to_receiver", "receiver_to_sender", "none"):
+        raise HTTPException(status_code=400, detail="Inter-bot payload economics.payment_direction invalid")
+    if market == "chat" and (bounty_ns != 0 or payment_direction != "none"):
+        raise HTTPException(status_code=400, detail="Inter-bot payload economics chat market requires bounty_ns=0 and payment_direction=none")
+    if market == "compute" and (bounty_ns <= 0 or payment_direction != "sender_to_receiver"):
+        raise HTTPException(status_code=400, detail="Inter-bot payload economics compute market requires bounty_ns>0 and payment_direction=sender_to_receiver")
+    if market == "data" and (bounty_ns <= 0 or payment_direction != "receiver_to_sender"):
+        raise HTTPException(status_code=400, detail="Inter-bot payload economics data market requires bounty_ns>0 and payment_direction=receiver_to_sender")
+
+    expected_bounty_ns = task_economics.get("bounty_ns")
+    if isinstance(expected_bounty_ns, int):
+        if bounty_ns != expected_bounty_ns:
+            raise HTTPException(status_code=400, detail="Inter-bot payload economics.bounty_ns must match task economics")
+    else:
+        bounty_seconds = float(task_economics.get("bounty_seconds") or 0.0)
+        message_seconds_unsigned = float(bounty_ns) / 1_000_000_000.0
+        message_seconds = 0.0 if market == "chat" else (-message_seconds_unsigned if market == "data" else message_seconds_unsigned)
+        if abs(float(message_seconds) - float(bounty_seconds)) > 1e-9:
+            raise HTTPException(status_code=400, detail="Inter-bot payload economics must match task bounty")
+
+    routing_obj = message_obj.get("routing")
+    if isinstance(routing_obj, dict) and target_node:
+        target_node_id = routing_obj.get("target_node_id")
+        if isinstance(target_node_id, str) and target_node_id.strip() and target_node_id.strip() != target_node:
+            raise HTTPException(status_code=400, detail="Inter-bot payload routing.target_node_id must match target_node")
+    target_obj = message_obj.get("target")
+    if isinstance(target_obj, dict) and target_node:
+        target_node_id = target_obj.get("node_id")
+        if isinstance(target_node_id, str) and target_node_id.strip() and target_node_id.strip() != target_node:
+            raise HTTPException(status_code=400, detail="Inter-bot payload target.node_id must match target_node")
+
+
+def _validate_spec_task_if_enabled(task: TaskCreate) -> None:
+    if not INTERBOT_SPEC_VALIDATE_ENABLED:
+        return
+    if not (task.task or task.economics or task.source or task.routing):
+        return
+    instructions = _task_instructions(task)
+    if len(instructions) > 4000:
+        raise HTTPException(status_code=400, detail="Inter-bot payload task.instructions too long (max 4000)")
+    _task_consumer_id(task)
+    _task_economics(task)
+    _task_target_node(task)
 
 def _direct_dm_channel(a: str, b: str) -> str:
     left, right = sorted([a, b])
@@ -979,43 +1574,50 @@ async def _sweep_assigned_timeouts():
         return
     for task in expired_tasks:
         if TIMEOUT_POLICY == "rebroadcast" and not task["target_node"]:
-            if not db.requeue_task_if_assigned(task["task_id"], now):
+            rebroadcast_count = int(task.get("rebroadcast_count") or 0)
+            if MAX_REBROADCAST_COUNT > 0 and rebroadcast_count >= MAX_REBROADCAST_COUNT:
+                log_event(
+                    "task_rebroadcast_limit",
+                    f"Task {task['task_id'][:8]} reached rebroadcast limit",
+                    task_id=task["task_id"],
+                    consumer_id=task["consumer_id"],
+                    bounty=task["bounty"],
+                    rebroadcast_count=rebroadcast_count,
+                    max_rebroadcast_count=MAX_REBROADCAST_COUNT,
+                )
+            else:
+                if task["bounty"] < 0:
+                    refunded = db.refund_escrow(task["task_id"], now)
+                    if refunded is not None:
+                        buyer_id = task.get("provider_id") or ""
+                        new_balance = db.get_balance(buyer_id) or 0.0
+                        log_audit("DATA_TIMEOUT_REFUND", buyer_id, refunded, new_balance, task["task_id"])
+                if not db.requeue_task_if_assigned(task["task_id"], now):
+                    continue
+                task_data = _task_data_from_row(task, status="bidding", provider_id=None)
+                async with task_lock:
+                    active_tasks[task["task_id"]] = task_data
+                model_requirement = _normalize_model_requirement(task["model_requirement"])
+                rfc_data = {
+                    "id": task["task_id"],
+                    "consumer_id": task["consumer_id"],
+                    "bounty": task["bounty"],
+                    "model_requirement": model_requirement,
+                    "payload_uri": task.get("payload_uri")
+                }
+                async with node_lock:
+                    broadcast_nodes = list(connected_nodes.items())
+                candidate_nodes = _select_rfc_recipients(task["consumer_id"], model_requirement, broadcast_nodes)
+                for node_id, ws in candidate_nodes:
+                    try:
+                        await ws.send_json({"event": "rfc", "data": rfc_data})
+                    except Exception as exc:
+                        log_event("broadcast_error", f"Failed to send RFC to {node_id}: {exc}", node_id=node_id, task_id=task["task_id"])
+                        async with node_lock:
+                            if connected_nodes.get(node_id) is ws:
+                                del connected_nodes[node_id]
+                log_event("task_requeued_timeout", f"Task {task['task_id'][:8]} requeued after timeout", task_id=task["task_id"], consumer_id=task["consumer_id"], bounty=task["bounty"], rebroadcast_count=rebroadcast_count + 1)
                 continue
-            task_data = {
-                "id": task["task_id"],
-                "consumer_id": task["consumer_id"],
-                "payload": task["payload"],
-                "bounty": task["bounty"],
-                "status": "bidding",
-                "target_node": task["target_node"],
-                "model_requirement": task["model_requirement"],
-                "expires_in_seconds": task.get("expires_in_seconds"),
-                "payload_uri": task.get("payload_uri"),
-                "secret_data": task.get("result_payload")
-            }
-            async with task_lock:
-                active_tasks[task["task_id"]] = task_data
-            model_requirement = _normalize_model_requirement(task["model_requirement"])
-            rfc_data = {
-                "id": task["task_id"],
-                "consumer_id": task["consumer_id"],
-                "bounty": task["bounty"],
-                "model_requirement": model_requirement,
-                "payload_uri": task.get("payload_uri")
-            }
-            async with node_lock:
-                broadcast_nodes = list(connected_nodes.items())
-            candidate_nodes = _select_rfc_recipients(task["consumer_id"], model_requirement, broadcast_nodes)
-            for node_id, ws in candidate_nodes:
-                try:
-                    await ws.send_json({"event": "rfc", "data": rfc_data})
-                except Exception as exc:
-                    log_event("broadcast_error", f"Failed to send RFC to {node_id}: {exc}", node_id=node_id, task_id=task["task_id"])
-                    async with node_lock:
-                        if connected_nodes.get(node_id) is ws:
-                            del connected_nodes[node_id]
-            log_event("task_requeued_timeout", f"Task {task['task_id'][:8]} requeued after timeout", task_id=task["task_id"], consumer_id=task["consumer_id"], bounty=task["bounty"])
-            continue
         if not db.expire_task_if_assigned(task["task_id"], now):
             continue
         if task["bounty"] > 0:
@@ -1024,6 +1626,12 @@ async def _sweep_assigned_timeouts():
                 db.add_balance(task["consumer_id"], task["bounty"])
             new_balance = db.get_balance(task["consumer_id"])
             log_audit("TIMEOUT_REFUND", task["consumer_id"], task["bounty"], new_balance, task["task_id"])
+        elif task["bounty"] < 0:
+            refunded = db.refund_escrow(task["task_id"], now)
+            if refunded is not None:
+                buyer_id = task.get("provider_id") or ""
+                new_balance = db.get_balance(buyer_id) or 0.0
+                log_audit("DATA_TIMEOUT_REFUND", buyer_id, refunded, new_balance, task["task_id"])
         async with task_lock:
             if task["task_id"] in active_tasks:
                 del active_tasks[task["task_id"]]
@@ -1056,11 +1664,48 @@ async def _sweep_bidding_timeouts():
                 del active_tasks[task["task_id"]]
         log_event("task_expired_bidding", f"Task {task['task_id'][:8]} expired", task_id=task["task_id"], consumer_id=task["consumer_id"])
 
+async def _sweep_submitted_result_timeouts():
+    """Expire verifier-gated results that were never accepted and refund held escrow."""
+    if SUBMITTED_RESULT_TIMEOUT_SECONDS <= 0:
+        return
+    now = time.time()
+    expired_submissions = db.get_submitted_result_tasks_for_timeout(now, SUBMITTED_RESULT_TIMEOUT_SECONDS)
+    if not expired_submissions:
+        return
+    for task in expired_submissions:
+        if not db.expire_task_if_submitted_result(task["task_id"], now):
+            continue
+        bounty = float(task.get("bounty", 0.0))
+        if bounty > 0:
+            refunded = db.refund_escrow(task["task_id"], now)
+            if refunded is None:
+                db.add_balance(task["consumer_id"], bounty)
+            new_balance = db.get_balance(task["consumer_id"])
+            log_audit("VERIFICATION_TIMEOUT_REFUND", task["consumer_id"], bounty, new_balance, task["task_id"])
+        elif bounty < 0:
+            refunded = db.refund_escrow(task["task_id"], now)
+            if refunded is not None:
+                buyer_id = task.get("provider_id") or ""
+                new_balance = db.get_balance(buyer_id) or 0.0
+                log_audit("DATA_VERIFICATION_TIMEOUT_REFUND", buyer_id, refunded, new_balance, task["task_id"])
+        async with task_lock:
+            if task["task_id"] in active_tasks:
+                del active_tasks[task["task_id"]]
+        log_event(
+            "submitted_result_expired",
+            f"Task {task['task_id'][:8]} expired while awaiting verifier acceptance",
+            task_id=task["task_id"],
+            consumer_id=task["consumer_id"],
+            provider_id=task.get("provider_id"),
+            bounty=bounty,
+        )
+
 async def _assignment_timeout_worker():
     while True:
         try:
             await _sweep_assigned_timeouts()
             await _sweep_bidding_timeouts()
+            await _sweep_submitted_result_timeouts()
         except Exception as exc:
             log_event("timeout_sweep_failed", f"Timeout sweep failed: {exc}")
         await asyncio.sleep(ASSIGNMENT_SWEEP_INTERVAL_SECONDS)
@@ -1071,6 +1716,7 @@ async def _maintenance_worker():
             await _evict_completed_tasks_cache()
             _sweep_idempotency_records()
             await _sweep_node_activity()
+            await _reconcile_live_registry_presence()
         except Exception as exc:
             log_event("maintenance_sweep_failed", f"Maintenance sweep failed: {exc}")
         await asyncio.sleep(max(1, MAINTENANCE_SWEEP_INTERVAL_SECONDS))
@@ -1078,8 +1724,18 @@ async def _maintenance_worker():
 @app.on_event("startup")
 async def start_timeout_worker():
     await _load_active_tasks_from_db()
+    await _reconcile_live_registry_presence()
     asyncio.create_task(_assignment_timeout_worker())
     asyncio.create_task(_maintenance_worker())
+    build_info = _hub_build_info()
+    log_event(
+        "hub_build_info",
+        f"Hub build {build_info['build_sha']} ({build_info['deploy_source']})",
+        app_version=build_info["app_version"],
+        build_sha=build_info["build_sha"],
+        build_time=build_info["build_time"],
+        deploy_source=build_info["deploy_source"],
+    )
     if REQUIRE_TLS:
         log_event("transport_policy", "TLS enforcement enabled", require_tls=True, trust_proxy_proto=TRUST_PROXY_PROTO)
     else:
@@ -1162,19 +1818,75 @@ async def register_node(node: NodeRegistration, request: Request):
     validated_pubkey = _validate_registration_pubkey(node.pubkey)
     # Registration derives the Node ID from the validated Ed25519 public key PEM
     node_id = auth.derive_node_id(validated_pubkey)
-    balance = db.register_node(node_id, validated_pubkey)
     x25519_public_key = node.x25519_public_key.strip() if node.x25519_public_key else None
     if x25519_public_key and len(x25519_public_key) > 2048:
         raise HTTPException(status_code=413, detail="x25519_public_key too large")
+    result = db.register_node(node_id, validated_pubkey)
     if node.alias or x25519_public_key:
         db.upsert_registry(node_id, node.alias, [], [], {}, "offline", time.time(), x25519_public_key)
 
-    log_event("node_registered", f"Node {node_id} registered with starting balance {balance}", node_id=node_id, starting_balance=balance)
-    log_audit("REGISTER", node_id, balance, balance, "START_BONUS")
+    status = result["status"]
+    balance = result["balance"]
+    if status == "registered":
+        log_event("node_registered", f"Node {node_id} already registered with balance {balance}", node_id=node_id, balance=balance)
+    else:
+        log_event("node_pending", f"Node {node_id} registration pending approval", node_id=node_id)
 
     hub_url, ws_url = get_hub_urls(request)
 
-    return {"status": "success", "node_id": node_id, "balance": balance, "hub_url": hub_url, "ws_url": ws_url}
+    return {"status": status, "node_id": node_id, "balance": balance, "hub_url": hub_url, "ws_url": ws_url}
+
+@app.post("/v2/register")
+async def register_node_v2(node: NodeRegistration, request: Request):
+    client_host = _request_client_ip(request)
+    if not _is_allowed_ip(client_host):
+        raise HTTPException(status_code=403, detail="Client IP not allowed")
+    _apply_rate_limit(f"{client_host or 'unknown'}:/register")
+    validated_pubkey = _validate_registration_pubkey(node.pubkey)
+    # Registration derives the Node ID from the validated Ed25519 public key PEM
+    node_id = auth.derive_node_id(validated_pubkey)
+    result = db.register_node(node_id, validated_pubkey)
+    if node.alias or node.x25519_public_key:
+        db.upsert_registry(node_id, node.alias, [], [], {}, "offline", time.time(), node.x25519_public_key)
+
+    status = result["status"]
+    balance = result["balance"]
+    if status == "registered":
+        log_event("node_registered", f"Node {node_id} already registered with balance {balance}", node_id=node_id, balance=balance)
+    else:
+        log_event("node_pending", f"Node {node_id} registration pending approval", node_id=node_id)
+
+    hub_url, ws_url = get_hub_urls(request)
+    balance_row = db.get_balance_row(node_id)
+    balance_ns_value = balance_row[1] if balance_row else None
+    balance_ns_str = money.to_v2_ns_string(balance, balance_ns_value, "balance", allow_negative=False)
+
+    return V2RegistrationResponse(
+        status=status,
+        node_id=node_id,
+        balance_ns=balance_ns_str,
+        hub_url=hub_url,
+        ws_url=ws_url
+    )
+
+@app.post("/admin/approve-registration")
+async def approve_registration(payload: dict, x_mep_admin_key: Optional[str] = Header(default=None)):
+    _require_admin(x_mep_admin_key)
+    node_id = payload.get("node_id")
+    if not node_id:
+        raise HTTPException(status_code=400, detail="node_id required")
+    approved = db.approve_registration(node_id, "admin")
+    if not approved:
+        raise HTTPException(status_code=404, detail="Pending registration not found")
+    balance = db.get_balance(node_id) or 0.0
+    log_audit("REGISTRATION_APPROVED", node_id, balance, balance, "ADMIN_APPROVAL")
+    return {"status": "approved", "node_id": node_id, "balance": balance}
+
+@app.get("/admin/pending-registrations")
+async def list_pending_registrations(x_mep_admin_key: Optional[str] = Header(default=None)):
+    _require_admin(x_mep_admin_key)
+    pending = db.get_pending_registrations()
+    return {"pending": pending}
 
 @app.post("/registry/update")
 async def update_registry(payload: RegistryUpdate, authenticated_node: str = Depends(verify_request)):
@@ -1185,12 +1897,23 @@ async def update_registry(payload: RegistryUpdate, authenticated_node: str = Dep
     if availability is None:
         existing = db.get_registry(authenticated_node)
         availability = existing.get("availability") if existing else "unknown"
-    db.upsert_registry(authenticated_node, payload.alias, skills, models, metadata, availability, time.time())
+    availability = await _coerce_live_availability(authenticated_node, availability)
+    db.upsert_registry(
+        authenticated_node,
+        payload.alias,
+        skills,
+        models,
+        metadata,
+        availability,
+        time.time(),
+        payload.x25519_public_key,
+    )
     return {"status": "success", "node_id": authenticated_node}
 
 @app.post("/registry/availability")
 async def update_availability(payload: AvailabilityUpdate, authenticated_node: str = Depends(verify_request)):
     availability = _normalize_availability(payload.availability)
+    availability = await _coerce_live_availability(authenticated_node, availability)
     db.update_registry_availability(authenticated_node, availability, time.time())
     await _track_node_activity(authenticated_node)
     return {"status": "success", "node_id": authenticated_node, "availability": availability}
@@ -1201,6 +1924,7 @@ async def registry_heartbeat(payload: RegistryHeartbeat, request: Request, authe
     if availability is None:
         existing = db.get_registry(authenticated_node)
         availability = existing.get("availability") if existing else "unknown"
+    availability = await _coerce_live_availability(authenticated_node, availability)
     db.update_registry_availability(authenticated_node, availability, time.time())
     await _track_node_activity(authenticated_node)
     hub_url, ws_url = get_hub_urls(request)
@@ -1569,10 +2293,21 @@ async def get_reputation(node_id: str):
 
 @app.get("/balance/{node_id}")
 async def get_balance(node_id: str):
-    balance = db.get_balance(node_id)
-    if balance is None:
+    row = db.get_balance_row(node_id)
+    if row is None:
         raise HTTPException(status_code=404, detail="Node not found")
-    return {"node_id": node_id, "balance_seconds": balance}
+    balance, balance_ns = row
+    balance_seconds = money.to_legacy_seconds(balance, balance_ns, "balance", allow_negative=False)
+    return {"node_id": node_id, "balance_seconds": balance_seconds}
+
+@app.get("/v2/balance/{node_id}")
+async def get_balance_v2(node_id: str):
+    row = db.get_balance_row(node_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="Node not found")
+    balance, balance_ns = row
+    balance_ns_str = money.to_v2_ns_string(balance, balance_ns, "balance", allow_negative=False)
+    return V2BalanceResponse(node_id=node_id, balance_ns=balance_ns_str)
 
 @app.post("/tasks/submit")
 async def submit_task(
@@ -1580,20 +2315,28 @@ async def submit_task(
     authenticated_node: str = Depends(verify_request),
     x_mep_idempotency_key: Optional[str] = Header(default=None)
 ):
-    # Verify the signer is actually the consumer claiming to submit the task
-    if authenticated_node != task.consumer_id:
+    consumer_id = _task_consumer_id(task)
+    if authenticated_node != consumer_id:
         raise HTTPException(status_code=403, detail="Cannot submit tasks on behalf of another node")
 
     normalized_payload_uri = _normalize_artifact_uri(task.payload_uri, "payload_uri")
-    payload = task.payload or ""
+    payload = _task_instructions(task)
     if not payload and not normalized_payload_uri:
         raise HTTPException(status_code=400, detail="Task requires payload or payload_uri")
     if len(payload) > MAX_PAYLOAD_CHARS:
         raise HTTPException(status_code=413, detail="Task payload too large")
-
-    if task.target_node and float(task.bounty) == 0.0:
-        consumer_registry = db.get_registry(task.consumer_id)
-        target_registry = db.get_registry(task.target_node)
+    target_node = _task_target_node(task)
+    target_capability = _task_target_capability(task)
+    verifier_type = _task_verifier_type(task)
+    economics = _task_economics(task)
+    bounty = float(economics["bounty_seconds"])
+    if task.task or task.economics or task.source or task.routing:
+        _validate_spec_task_if_enabled(task)
+    else:
+        _validate_interbot_payload_if_enabled(consumer_id, economics, target_node, payload)
+    if target_node and bounty == 0.0:
+        consumer_registry = db.get_registry(consumer_id)
+        target_registry = db.get_registry(target_node)
         consumer_mode = _extract_privacy_mode_from_registry(consumer_registry)
         target_mode = _extract_privacy_mode_from_registry(target_registry)
         encrypted_payload = _is_encrypted_dm_payload(payload)
@@ -1613,21 +2356,20 @@ async def submit_task(
                 status_code=400,
                 detail="Target plaintext_only cannot satisfy sender require_encrypted",
             )
-        await _anti_loop_check_and_record(task.consumer_id, task.target_node, payload)
-    
+        await _anti_loop_check_and_record(consumer_id, target_node, payload)
     if x_mep_idempotency_key:
         existing = db.get_idempotency(authenticated_node, "/tasks/submit", x_mep_idempotency_key)
         if existing:
             return existing["response"]
 
-    consumer_balance = db.get_balance(task.consumer_id)
+    consumer_balance = db.get_balance(consumer_id)
     if consumer_balance is None:
         raise HTTPException(status_code=404, detail="Consumer node not found")
 
     # If bounty is positive, consumer is PAYING. Check consumer balance.
-    if task.bounty > 0 and consumer_balance < task.bounty:
+    if bounty > 0 and consumer_balance < bounty:
         raise HTTPException(status_code=400, detail="Insufficient SECONDS balance to pay for task")
-    if task.bounty < 0 and not task.secret_data:
+    if bounty < 0 and not task.secret_data:
         raise HTTPException(status_code=400, detail="Data market tasks (bounty < 0) require secret_data")
     if task.expires_in_seconds is not None:
         task.expires_in_seconds = max(
@@ -1640,85 +2382,139 @@ async def submit_task(
 
     # Note: If bounty is negative, consumer is SELLING data. We don't deduct here.
     # We will deduct from the provider when they complete the task.
-    if task.bounty > 0:
-        success = db.deduct_balance(task.consumer_id, task.bounty)
+    if bounty > 0:
+        success = db.deduct_balance(consumer_id, bounty)
         if not success:
-            log_event("task_rejected", f"Node {task.consumer_id} lacks SECONDS to submit task", consumer_id=task.consumer_id, bounty=task.bounty)
+            log_event("task_rejected", f"Node {consumer_id} lacks SECONDS to submit task", consumer_id=consumer_id, bounty=bounty)
             raise HTTPException(status_code=400, detail="Insufficient SECONDS balance")
-            
-        db.create_escrow(task_id, task.consumer_id, task.bounty, now)
-        new_balance = db.get_balance(task.consumer_id)
-        log_audit("ESCROW", task.consumer_id, -task.bounty, new_balance, task_id)
-        
-    log_event("task_submitted", f"Task {task_id[:8]} broadcasted by {task.consumer_id} for {task.bounty}", consumer_id=task.consumer_id, task_id=task_id, bounty=task.bounty)
+        db.create_escrow(task_id, consumer_id, bounty, now)
+        new_balance = db.get_balance(consumer_id)
+        log_audit("ESCROW", consumer_id, -bounty, new_balance, task_id)
+
+    log_event("task_submitted", f"Task {task_id[:8]} broadcasted by {consumer_id} for {bounty}", consumer_id=consumer_id, task_id=task_id, bounty=bounty)
 
     task_data = {
         "id": task_id,
-        "consumer_id": task.consumer_id,
+        "consumer_id": consumer_id,
         "payload": payload,
-        "bounty": task.bounty,
+        "bounty": bounty,
         "status": "bidding",
-        "target_node": task.target_node,
-        "model_requirement": task.model_requirement,
+        "source": _task_source(task, consumer_id),
+        "intent": _task_intent(task),
+        "task": _task_structured_body(task, payload),
+        "economics": economics,
+        "target_node": target_node,
+        "model_requirement": target_capability,
+        "verifier_type": verifier_type,
         "expires_in_seconds": task.expires_in_seconds,
         "payload_uri": normalized_payload_uri,
         "secret_data": task.secret_data
     }
     db.create_task(
         task_id,
-        task.consumer_id,
+        consumer_id,
         payload,
-        task.bounty,
+        bounty,
         "bidding",
-        task.target_node,
-        task.model_requirement,
+        target_node,
+        target_capability,
         now,
         result_payload=task.secret_data,
         payload_uri=normalized_payload_uri,
         expires_in_seconds=task.expires_in_seconds,
+        verifier_type=verifier_type,
     )
+    require_envelope_persistence = _task_requires_envelope_persistence(task)
+    try:
+        db.set_task_envelope(task_id, json.dumps(task_data))
+    except Exception as exc:
+        if require_envelope_persistence:
+            cancel_time = time.time()
+            cancelled = db.cancel_task_if_open(task_id, cancel_time)
+            refunded = None
+            if bounty > 0:
+                refunded = db.refund_escrow(task_id, cancel_time)
+                if refunded:
+                    refund_balance = db.get_balance(consumer_id)
+                    log_audit("ESCROW_REFUND", consumer_id, refunded, refund_balance, task_id)
+            log_event(
+                "task_envelope_error",
+                f"Failed to persist structured task envelope {task_id[:8]}: {exc}",
+                task_id=task_id,
+                fail_closed=True,
+                cancelled=cancelled,
+                refunded=refunded,
+            )
+            raise HTTPException(status_code=500, detail="Failed to persist structured task envelope")
+        log_event("task_envelope_error", f"Failed to persist task envelope {task_id[:8]}: {exc}", task_id=task_id)
     async with task_lock:
         active_tasks[task_id] = task_data
 
     # Target specific node if requested (Direct Message skips bidding)
-    if task.target_node:
+    if target_node:
         async with node_lock:
-            target_ws = connected_nodes.get(task.target_node)
+            target_ws = connected_nodes.get(target_node)
         if target_ws:
             try:
                 async with task_lock:
                     task_data["status"] = "assigned"
-                    task_data["provider_id"] = task.target_node
-                db.update_task_assignment(task_id, task.target_node, "assigned", time.time())
+                    task_data["provider_id"] = target_node
+                db.update_task_assignment(task_id, target_node, "assigned", time.time())
                 await target_ws.send_json({"event": "new_task", "data": task_data})
-                response_payload = {"status": "success", "task_id": task_id, "routed_to": task.target_node}
+                response_payload = {"status": "success", "task_id": task_id, "routed_to": target_node}
                 if x_mep_idempotency_key:
                     db.set_idempotency(authenticated_node, "/tasks/submit", x_mep_idempotency_key, response_payload, 200, time.time())
                 return response_payload
             except Exception as exc:
-                log_event("direct_message_failed", f"Failed to route {task_id[:8]} to {task.target_node}: {exc}", task_id=task_id, provider_id=task.target_node)
+                log_event("direct_message_failed", f"Failed to route {task_id[:8]} to {target_node}: {exc}", task_id=task_id, provider_id=target_node)
                 async with task_lock:
                     task_data["status"] = "bidding"
                     if "provider_id" in task_data:
                         del task_data["provider_id"]
                 db.update_task_status(task_id, "bidding", time.time())
                 async with node_lock:
-                    if connected_nodes.get(task.target_node) is target_ws:
-                        del connected_nodes[task.target_node]
+                    if connected_nodes.get(target_node) is target_ws:
+                        del connected_nodes[target_node]
                 return {"status": "error", "detail": "Target node disconnected"}
+        # Target offline. For zero-bounty direct messages, store-and-forward the DM
+        # so it is delivered when the target reconnects (voicemail, not a dropped
+        # call). Escrow-backed targeted tasks (bounty != 0) keep the fail-fast path.
+        if DM_QUEUE_ENABLED and bounty == 0.0:
+            if db.count_queued_dms_for_node(target_node) >= MAX_QUEUED_DMS_PER_NODE:
+                return {"status": "error", "detail": "Target node DM queue is full"}
+            async with task_lock:
+                task_data["status"] = QUEUED_DM_STATUS
+                task_data["provider_id"] = target_node
+            db.update_task_assignment(task_id, target_node, QUEUED_DM_STATUS, time.time())
+            # Persist the full new_task envelope so the queued DM is flushed on
+            # reconnect with the exact same shape as live delivery (no thinner
+            # event contract for offline recipients).
+            try:
+                db.set_task_envelope(task_id, json.dumps(task_data))
+            except Exception as exc:
+                log_event("dm_queue_envelope_error", f"Failed to persist DM envelope {task_id[:8]}: {exc}", task_id=task_id)
+            log_event(
+                "direct_message_queued",
+                f"Queued DM {task_id[:8]} for offline {target_node}",
+                task_id=task_id,
+                provider_id=target_node,
+            )
+            response_payload = {"status": "queued", "task_id": task_id, "queued_for": target_node}
+            if x_mep_idempotency_key:
+                db.set_idempotency(authenticated_node, "/tasks/submit", x_mep_idempotency_key, response_payload, 200, time.time())
+            return response_payload
         return {"status": "error", "detail": "Target node not currently connected to Hub"}
 
-    model_requirement = _normalize_model_requirement(task.model_requirement)
     rfc_data = {
         "id": task_id,
-        "consumer_id": task.consumer_id,
-        "bounty": task.bounty,
-        "model_requirement": model_requirement,
+        "consumer_id": consumer_id,
+        "bounty": bounty,
+        "model_requirement": target_capability,
         "payload_uri": normalized_payload_uri
     }
     async with node_lock:
         broadcast_nodes = list(connected_nodes.items())
-    candidate_nodes = _select_rfc_recipients(task.consumer_id, model_requirement, broadcast_nodes)
+    candidate_nodes = _select_rfc_recipients(consumer_id, target_capability, broadcast_nodes)
     for node_id, ws in candidate_nodes:
         try:
             await ws.send_json({"event": "rfc", "data": rfc_data})
@@ -1733,7 +2529,7 @@ async def submit_task(
         discovery_query = _build_registry_query(
             alias=None,
             skill=None,
-            model=model_requirement,
+            model=target_capability,
             availability="online",
             min_score=None,
             min_reviews=None,
@@ -1747,6 +2543,35 @@ async def submit_task(
     if x_mep_idempotency_key:
         db.set_idempotency(authenticated_node, "/tasks/submit", x_mep_idempotency_key, response_payload, 200, time.time())
     return response_payload
+
+@app.post("/v2/tasks/submit")
+async def submit_task_v2(
+    task: V2TaskSubmitRequest,
+    authenticated_node: str = Depends(verify_request),
+    x_mep_idempotency_key: Optional[str] = Header(default=None)
+):
+    # Convert v2 economics to legacy format for internal processing
+    bounty_ns = int(task.economics.bounty_ns)
+    bounty = ns_to_legacy_seconds(bounty_ns)
+    
+    # Build legacy TaskCreate from v2 request
+    legacy_task = TaskCreate(
+        consumer_id=task.consumer_id,
+        source=task.source,
+        intent=task.intent,
+        task=task.task,
+        economics={"bounty_seconds": bounty},
+        payload=task.payload,
+        target_node=task.target_node,
+        routing=task.routing,
+        verifier=task.verifier,
+        expires_in_seconds=task.expires_in_seconds,
+        secret_data=task.secret_data,
+        payload_uri=task.payload_uri
+    )
+    
+    # Call the internal task submission logic
+    return await submit_task(legacy_task, authenticated_node, x_mep_idempotency_key)
 
 @app.post("/tasks/cancel")
 async def cancel_task(
@@ -1820,7 +2645,18 @@ async def place_bid(bid: TaskBid, authenticated_node: str = Depends(verify_reque
         if assignment_profile["risk_reasons"]:
             risk_reasons = ", ".join(assignment_profile["risk_reasons"])
             return {"status": "rejected", "detail": f"Provider rejected by risk control: {risk_reasons}"}
-        if not db.assign_task_if_open(bid.task_id, bid.provider_id, time.time()):
+        bounty = task["bounty"]
+        now = time.time()
+        if bounty < 0:
+            cost = abs(float(bounty))
+            assignment = db.assign_data_task_with_escrow_if_open(bid.task_id, bid.provider_id, cost, now)
+            if assignment["status"] == "insufficient_balance":
+                return {"status": "rejected", "detail": "Provider lacks SECONDS to buy this data"}
+            if assignment["status"] != "accepted":
+                return {"status": "rejected", "detail": "Task already assigned to another node"}
+            new_balance = db.get_balance(bid.provider_id) or 0.0
+            log_audit("BUY_DATA_ESCROW", bid.provider_id, -cost, new_balance, bid.task_id)
+        elif not db.assign_task_if_open(bid.task_id, bid.provider_id, now):
             return {"status": "rejected", "detail": "Task already assigned to another node"}
         task["status"] = "assigned"
         task["provider_id"] = bid.provider_id
@@ -1828,7 +2664,10 @@ async def place_bid(bid: TaskBid, authenticated_node: str = Depends(verify_reque
         consumer_id = task["consumer_id"]
         model_requirement = task.get("model_requirement")
         payload_uri = task.get("payload_uri")
-        bounty = task["bounty"]
+        task_body = dict(task["task"]) if isinstance(task.get("task"), dict) else {"instructions": payload, "expected_output": {}}
+        source = dict(task["source"]) if isinstance(task.get("source"), dict) else {"node_id": consumer_id}
+        intent = dict(task["intent"]) if isinstance(task.get("intent"), dict) else {"type": "analysis.request"}
+        economics = dict(task["economics"]) if isinstance(task.get("economics"), dict) else {}
 
     log_event("bid_accepted", f"Task {bid.task_id[:8]} assigned to {bid.provider_id}", task_id=bid.task_id, provider_id=bid.provider_id, bounty=bounty)
 
@@ -1839,8 +2678,69 @@ async def place_bid(bid: TaskBid, authenticated_node: str = Depends(verify_reque
         "model_requirement": model_requirement,
         "payload_uri": payload_uri,
         "secret_data": task.get("secret_data", task.get("result_payload")),
+        "source": source,
+        "intent": intent,
+        "task": task_body,
+        "economics": economics,
         "assignment_score": assignment_profile["assignment_score"]
     }
+
+
+async def _finalize_settled_task(settled: dict, task_id: str, provider_id: str, result_payload: str, result_uri: Optional[str]):
+    task = settled["task"]
+    bounty = task["bounty"]
+    for event in settled.get("ledger_events", []):
+        node_id = event["node_id"]
+        amount = event["amount"]
+        new_balance = db.get_balance(node_id) or 0.0
+        log_audit(event["kind"], node_id, amount, new_balance, task_id)
+
+    log_event("task_completed", f"Task {task_id[:8]} completed by {provider_id}", task_id=task_id, provider_id=provider_id, bounty=bounty)
+
+    async with task_lock:
+        completed_entry = {
+            "id": task["task_id"],
+            "consumer_id": task["consumer_id"],
+            "payload": task["payload"],
+            "bounty": bounty,
+            "status": "completed",
+            "target_node": task.get("target_node"),
+            "model_requirement": task.get("model_requirement"),
+            "verifier_type": task.get("verifier_type"),
+            "provider_id": provider_id,
+            "payload_uri": task.get("payload_uri"),
+            "result": result_payload,
+            "result_uri": result_uri,
+            "completed_at": task["updated_at"],
+        }
+        completed_tasks[task_id] = completed_entry
+        if task_id in active_tasks:
+            del active_tasks[task_id]
+    await _evict_completed_tasks_cache()
+
+    consumer_id = task["consumer_id"]
+    async with node_lock:
+        consumer_ws = connected_nodes.get(consumer_id)
+    if consumer_ws:
+        try:
+            await consumer_ws.send_json({
+                "event": "task_result",
+                "data": {
+                    "task_id": task_id,
+                    "provider_id": provider_id,
+                    "result_payload": result_payload,
+                    "result_uri": result_uri,
+                    "bounty_spent": bounty
+                }
+            })
+        except Exception as exc:
+            log_event("deliver_result_failed", f"Failed to deliver result {task_id[:8]} to {consumer_id}: {exc}", task_id=task_id, consumer_id=consumer_id)
+            async with node_lock:
+                if connected_nodes.get(consumer_id) is consumer_ws:
+                    del connected_nodes[consumer_id]
+
+    return settled["response"]
+
 
 @app.post("/tasks/complete")
 async def complete_task(
@@ -1858,103 +2758,220 @@ async def complete_task(
     if len(result_payload) > MAX_PAYLOAD_CHARS:
         raise HTTPException(status_code=413, detail="Result payload too large")
     
-    if x_mep_idempotency_key:
-        existing = db.get_idempotency(authenticated_node, "/tasks/complete", x_mep_idempotency_key)
-        if existing:
-            return existing["response"]
-
-    async with task_lock:
-        task = active_tasks.get(result.task_id)
-    if not task:
-        db_task = db.get_task(result.task_id)
-        if not db_task or db_task["status"] not in ("bidding", "assigned"):
+    task = db.get_task(result.task_id)
+    if task and task.get("verifier_type") in ("manual_acceptance", "automated"):
+        submitted = db.submit_task_result_for_verification(
+            result.task_id,
+            result.provider_id,
+            result_payload,
+            time.time(),
+            result_uri=normalized_result_uri,
+            idem_node_id=authenticated_node if x_mep_idempotency_key else None,
+            idem_endpoint="/tasks/complete" if x_mep_idempotency_key else None,
+            idem_key=x_mep_idempotency_key,
+        )
+        if submitted["status"] == "idempotent":
+            return submitted["response"]
+        if submitted["status"] in ("not_found", "not_active"):
             raise HTTPException(status_code=404, detail="Task not found or already claimed")
-        task = {
-            "id": db_task["task_id"],
-            "consumer_id": db_task["consumer_id"],
-            "payload": db_task["payload"],
-            "bounty": db_task["bounty"],
-            "status": db_task["status"],
-            "target_node": db_task["target_node"],
-            "model_requirement": db_task["model_requirement"],
-            "provider_id": db_task["provider_id"],
-            "payload_uri": db_task.get("payload_uri"),
-            "secret_data": db_task.get("result_payload")
-        }
+        if submitted["status"] == "assigned_to_other":
+            raise HTTPException(status_code=409, detail="Task assigned to another provider")
+        if submitted["status"] != "pending_verification":
+            raise HTTPException(status_code=409, detail="Task result could not be submitted for verification")
+
         async with task_lock:
-            active_tasks[result.task_id] = task
+            if result.task_id in active_tasks:
+                active_tasks[result.task_id]["status"] = "submitted_result"
+                active_tasks[result.task_id]["result"] = result_payload
+                active_tasks[result.task_id]["result_uri"] = normalized_result_uri
+        log_event("task_result_submitted", f"Task {result.task_id[:8]} submitted for verification", task_id=result.task_id, provider_id=result.provider_id)
+        return submitted["response"]
 
-    assigned_provider = task.get("provider_id")
-    if assigned_provider and assigned_provider != result.provider_id:
+    settled = db.complete_task_atomic(
+        result.task_id,
+        result.provider_id,
+        result_payload,
+        time.time(),
+        result_uri=normalized_result_uri,
+        idem_node_id=authenticated_node if x_mep_idempotency_key else None,
+        idem_endpoint="/tasks/complete" if x_mep_idempotency_key else None,
+        idem_key=x_mep_idempotency_key,
+    )
+    if settled["status"] == "idempotent":
+        return settled["response"]
+    if settled["status"] in ("not_found", "not_active"):
+        raise HTTPException(status_code=404, detail="Task not found or already claimed")
+    if settled["status"] == "assigned_to_other":
         raise HTTPException(status_code=409, detail="Task assigned to another provider")
+    if settled["status"] == "insufficient_balance":
+        log_event("data_purchase_failed", f"Provider {result.provider_id} lacks SECONDS to buy {result.task_id}", task_id=result.task_id, provider_id=result.provider_id)
+        raise HTTPException(status_code=400, detail="Provider lacks SECONDS to buy this data")
+    if settled["status"] == "escrow_not_held":
+        raise HTTPException(status_code=409, detail="Escrow is not held for this task")
+    if settled["status"] != "success":
+        raise HTTPException(status_code=409, detail="Task could not be settled")
+    return await _finalize_settled_task(settled, result.task_id, result.provider_id, result_payload, normalized_result_uri)
 
-    provider_balance = db.get_balance(result.provider_id)
-    if provider_balance is None:
-        db.set_balance(result.provider_id, 0.0)
 
-    # Transfer SECONDS based on positive or negative bounty
-    bounty = task["bounty"]
-    if bounty >= 0:
-        released = db.release_escrow(result.task_id, result.provider_id, time.time())
-        if released is None:
-            db.add_balance(result.provider_id, bounty)
-        new_balance = db.get_balance(result.provider_id)
-        log_audit("ESCROW_RELEASE", result.provider_id, bounty, new_balance, result.task_id)
-    else:
-        # Data Market: Provider PAYS to receive this payload/task
-        cost = abs(bounty)
-        success = db.deduct_balance(result.provider_id, cost)
-        if not success:
-            log_event("data_purchase_failed", f"Provider {result.provider_id} lacks SECONDS to buy {result.task_id}", task_id=result.task_id, provider_id=result.provider_id, cost=cost)
-            raise HTTPException(status_code=400, detail="Provider lacks SECONDS to buy this data")
+@app.get("/tasks/pending/{node_id}")
+async def get_pending_tasks(node_id: str, authenticated_node: str = Depends(verify_request)):
+    if authenticated_node != node_id:
+        raise HTTPException(status_code=403, detail="Cannot view pending tasks for another node")
+    tasks = []
+    for row in db.get_pending_tasks_for_provider(node_id):
+        task_data = _task_data_from_row(row)
+        task_data["task_id"] = task_data["id"]
+        tasks.append(task_data)
+    return {"node_id": node_id, "tasks": tasks, "count": len(tasks)}
 
-        p_balance = db.get_balance(result.provider_id) or 0.0
-        log_audit("BUY_DATA", result.provider_id, -cost, p_balance, result.task_id)
 
-        db.add_balance(task["consumer_id"], cost) # The sender earns SECONDS
-        c_balance = db.get_balance(task["consumer_id"]) or 0.0
-        log_audit("SELL_DATA", task["consumer_id"], cost, c_balance, result.task_id)
+@app.post("/tasks/reject")
+async def reject_task(
+    rejection: TaskReject,
+    authenticated_node: str = Depends(verify_request),
+):
+    if authenticated_node != rejection.provider_id:
+        raise HTTPException(status_code=403, detail="Cannot reject tasks on behalf of another node")
 
-    log_event("task_completed", f"Task {result.task_id[:8]} completed by {result.provider_id}", task_id=result.task_id, provider_id=result.provider_id, bounty=bounty)
+    rejected = db.reject_task_if_assigned(rejection.task_id, rejection.provider_id, time.time())
+    if rejected["status"] in ("success", "already_rejected"):
+        for event in rejected.get("ledger_events", []):
+            node_id = event["node_id"]
+            amount = event["amount"]
+            new_balance = db.get_balance(node_id) or 0.0
+            log_audit(event["kind"], node_id, amount, new_balance, rejection.task_id)
+        async with task_lock:
+            if rejection.task_id in active_tasks:
+                active_tasks[rejection.task_id]["status"] = "rejected"
+        reason = (rejection.reason or "provider_rejected")[:200]
+        log_event(
+            "task_rejected_by_provider",
+            f"Task {rejection.task_id[:8]} rejected by {rejection.provider_id}: {reason}",
+            task_id=rejection.task_id,
+            provider_id=rejection.provider_id,
+            reason=reason,
+        )
+        return {"status": "success", "task_id": rejection.task_id, "reason": reason}
+    if rejected["status"] == "not_found":
+        raise HTTPException(status_code=404, detail="Task not found")
+    if rejected["status"] == "assigned_to_other":
+        raise HTTPException(status_code=409, detail="Task assigned to another provider")
+    if rejected["status"] == "escrow_not_held":
+        raise HTTPException(status_code=409, detail="Escrow is not held for this task")
+    raise HTTPException(status_code=409, detail="Task is not assigned")
 
-    # Move task to completed
-    async with task_lock:
-        task["status"] = "completed"
-        task["provider_id"] = result.provider_id
-        task["result"] = result_payload
-        task["completed_at"] = time.time()
-        completed_tasks[result.task_id] = task
-        if result.task_id in active_tasks:
-            del active_tasks[result.task_id]
-    db.update_task_result(result.task_id, result.provider_id, result_payload, "completed", time.time(), result_uri=normalized_result_uri)
-    await _evict_completed_tasks_cache()
+def _verify_simple_automated(task, result_payload):
+    """Simple automated verifier: checks result is non-empty and valid JSON."""
+    if not result_payload or not result_payload.strip():
+        return False, "Result payload is empty"
+    try:
+        result = json.loads(result_payload)
+    except json.JSONDecodeError:
+        return False, "Result payload is not valid JSON"
+    if not isinstance(result, dict):
+        return False, "Result must be a JSON object"
+    if "result" not in result and "error" not in result:
+        return False, "Result must contain 'result' or 'error' field"
+    return True, "OK"
 
-    # ROUTE RESULT BACK TO CONSUMER VIA WEBSOCKET
-    consumer_id = task["consumer_id"]
-    async with node_lock:
-        consumer_ws = connected_nodes.get(consumer_id)
-    if consumer_ws:
-        try:
-            await consumer_ws.send_json({
-                "event": "task_result",
-                "data": {
-                    "task_id": result.task_id,
-                    "provider_id": result.provider_id,
-                    "result_payload": result_payload,
-                    "result_uri": normalized_result_uri,
-                    "bounty_spent": task["bounty"]
-                }
-            })
-        except Exception as exc:
-            log_event("deliver_result_failed", f"Failed to deliver result {result.task_id[:8]} to {consumer_id}: {exc}", task_id=result.task_id, consumer_id=consumer_id)
-            async with node_lock:
-                if connected_nodes.get(consumer_id) is consumer_ws:
-                    del connected_nodes[consumer_id]
+@app.post("/tasks/verify/accept")
+async def accept_verified_task(
+    verification: TaskVerificationAccept,
+    authenticated_node: str = Depends(verify_request),
+    x_mep_idempotency_key: Optional[str] = Header(default=None)
+):
+    task = db.get_task(verification.task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+    if authenticated_node != task["consumer_id"]:
+        raise HTTPException(status_code=403, detail="Only the consumer can accept a submitted result")
+    if task.get("verifier_type") != "manual_acceptance":
+        raise HTTPException(status_code=400, detail="Task is not verifier-gated")
+    if task["status"] != "submitted_result" and not x_mep_idempotency_key:
+        raise HTTPException(status_code=400, detail="Task is not pending verification")
 
-    response_payload = {"status": "success", "earned": task["bounty"], "new_balance": db.get_balance(result.provider_id)}
-    if x_mep_idempotency_key:
-        db.set_idempotency(authenticated_node, "/tasks/complete", x_mep_idempotency_key, response_payload, 200, time.time())
-    return response_payload
+    provider_id = task.get("provider_id")
+    if not provider_id:
+        raise HTTPException(status_code=409, detail="Task has no assigned provider")
+    result_payload = task.get("result_payload") or ""
+    result_uri = task.get("result_uri")
+    if not result_payload and not result_uri:
+        raise HTTPException(status_code=409, detail="Task has no submitted result")
+
+    settled = db.complete_task_atomic(
+        verification.task_id,
+        provider_id,
+        result_payload,
+        time.time(),
+        result_uri=result_uri,
+        idem_node_id=authenticated_node if x_mep_idempotency_key else None,
+        idem_endpoint="/tasks/verify/accept" if x_mep_idempotency_key else None,
+        idem_key=x_mep_idempotency_key,
+        expected_status="submitted_result",
+    )
+    if settled["status"] == "idempotent":
+        return settled["response"]
+    if settled["status"] in ("not_found", "not_active"):
+        raise HTTPException(status_code=404, detail="Task not found or not pending verification")
+    if settled["status"] == "assigned_to_other":
+        raise HTTPException(status_code=409, detail="Task assigned to another provider")
+    if settled["status"] == "escrow_not_held":
+        raise HTTPException(status_code=409, detail="Escrow is not held for this task")
+    if settled["status"] != "success":
+        raise HTTPException(status_code=409, detail="Task could not be settled")
+    return await _finalize_settled_task(settled, verification.task_id, provider_id, result_payload, result_uri)
+
+
+@app.post("/tasks/verify/automated")
+async def verify_task_automated(
+    verification: TaskVerificationAccept,
+    x_mep_admin_key: Optional[str] = Header(default=None),
+    x_mep_idempotency_key: Optional[str] = Header(default=None)
+):
+    _require_admin(x_mep_admin_key)
+    task = db.get_task(verification.task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+    if task.get("verifier_type") != "automated":
+        raise HTTPException(status_code=400, detail="Task is not configured for automated verification")
+    if task["status"] != "submitted_result":
+        raise HTTPException(status_code=400, detail="Task is not pending verification")
+
+    result_payload = task.get("result_payload") or ""
+    passed, reason = _verify_simple_automated(task, result_payload)
+    if not passed:
+        log_event("automated_verification_failed", f"Task {verification.task_id[:8]} failed automated verification: {reason}", task_id=verification.task_id, reason=reason)
+        raise HTTPException(status_code=400, detail=f"Automated verification failed: {reason}")
+
+    provider_id = task.get("provider_id")
+    if not provider_id:
+        raise HTTPException(status_code=409, detail="Task has no assigned provider")
+    result_uri = task.get("result_uri")
+
+    settled = db.complete_task_atomic(
+        verification.task_id,
+        provider_id,
+        result_payload,
+        time.time(),
+        result_uri=result_uri,
+        idem_node_id="automated_verifier" if x_mep_idempotency_key else None,
+        idem_endpoint="/tasks/verify/automated" if x_mep_idempotency_key else None,
+        idem_key=x_mep_idempotency_key,
+        expected_status="submitted_result",
+    )
+    if settled["status"] == "idempotent":
+        return settled["response"]
+    if settled["status"] in ("not_found", "not_active"):
+        raise HTTPException(status_code=404, detail="Task not found or not pending verification")
+    if settled["status"] == "assigned_to_other":
+        raise HTTPException(status_code=409, detail="Task assigned to another provider")
+    if settled["status"] == "already_completed":
+        raise HTTPException(status_code=409, detail="Task already completed")
+    if settled["status"] == "escrow_not_held":
+        raise HTTPException(status_code=409, detail="Escrow is not held for this task")
+    log_event("automated_verification_passed", f"Task {verification.task_id[:8]} passed automated verification", task_id=verification.task_id)
+    return {"status": "verified", "task_id": verification.task_id, "reason": reason}
+
 
 @app.get("/tasks/result/{task_id}")
 async def get_task_result(task_id: str, authenticated_node: str = Depends(verify_request)):
@@ -1963,14 +2980,38 @@ async def get_task_result(task_id: str, authenticated_node: str = Depends(verify
         raise HTTPException(status_code=404, detail="Task not found or not completed")
     if authenticated_node not in (task["consumer_id"], task["provider_id"]):
         raise HTTPException(status_code=403, detail="Not authorized to view this result")
+    bounty_seconds = money.to_legacy_seconds(
+        task["bounty"], task.get("bounty_ns"), "bounty", allow_negative=True
+    )
     return {
         "task_id": task["task_id"],
         "consumer_id": task["consumer_id"],
         "provider_id": task["provider_id"],
-        "bounty": task["bounty"],
+        "bounty": bounty_seconds,
         "result_payload": task["result_payload"],
         "result_uri": task.get("result_uri")
     }
+
+@app.get("/v2/tasks/{task_id}/result")
+async def get_task_result_v2(task_id: str, authenticated_node: str = Depends(verify_request)):
+    task = db.get_task(task_id)
+    if not task or task["status"] != "completed":
+        raise HTTPException(status_code=404, detail="Task not found or not completed")
+    if authenticated_node not in (task["consumer_id"], task["provider_id"]):
+        raise HTTPException(status_code=403, detail="Not authorized to view this result")
+    
+    bounty_ns_str = money.to_v2_ns_string(
+        task["bounty"], task.get("bounty_ns"), "bounty", allow_negative=True
+    )
+    
+    return V2TaskResponse(
+        task_id=task["task_id"],
+        consumer_id=task["consumer_id"],
+        provider_id=task["provider_id"],
+        status=task["status"],
+        bounty_ns=bounty_ns_str,
+        result_uri=task.get("result_uri")
+    )
 
 @app.post("/disputes/open")
 async def open_dispute(payload: DisputeOpen, authenticated_node: str = Depends(verify_request)):
@@ -2059,6 +3100,8 @@ async def health_check():
     db_health = db.check_database_health()
     async with node_lock:
         online_count = len(connected_nodes)
+    async with registry_reconcile_lock:
+        reconcile_snapshot = dict(registry_reconcile_metrics)
     async with task_lock:
         active_count = len(active_tasks)
         completed_count = len(completed_tasks)
@@ -2068,13 +3111,26 @@ async def health_check():
         "metrics": {
             "connected_nodes": online_count,
             "active_tasks": active_count,
-            "completed_task_cache": completed_count
+            "completed_task_cache": completed_count,
+            "registry_reconcile": reconcile_snapshot,
         }
     }
 
 
+@app.get("/version")
+async def hub_version():
+    build_info = _hub_build_info()
+    return {
+        "status": "ok",
+        "app_version": build_info["app_version"],
+        "build_sha": build_info["build_sha"],
+        "build_time": build_info["build_time"],
+        "deploy_source": build_info["deploy_source"],
+    }
+
+
 # ---------------------------------------------------------------------------
-# Diagnostic Endpoint 鈥?tiered approach (per Hermes DM discussion)
+# Diagnostic Endpoint — tiered approach (per Hermes DM discussion)
 # ---------------------------------------------------------------------------
 class DiagnosticResponse(BaseModel):
     node_id: Optional[str] = None
@@ -2088,6 +3144,147 @@ class DiagnosticResponse(BaseModel):
     error: Optional[str] = None
 
 
+class OnboardDiagnoseRequest(BaseModel):
+    node_id: Optional[str] = None
+    registered: Optional[bool] = None
+    ws_connected: Optional[bool] = None
+    heartbeat_seconds_ago: Optional[float] = None
+    auth_status: Optional[str] = None
+    dm_status: Optional[str] = None
+    listener_contract_ok: Optional[bool] = None
+    ai_configured: Optional[bool] = None
+    clock_skew_seconds: Optional[float] = None
+
+
+def _onboard_diagnosis_result(
+    root_cause: str,
+    severity: str,
+    fix_steps: list[str],
+    copy_paste_commands: list[str],
+) -> dict:
+    return {
+        "root_cause": root_cause,
+        "severity": severity,
+        "fix_steps": fix_steps,
+        "copy_paste_commands": copy_paste_commands,
+    }
+
+
+def _diagnose_onboarding(payload: OnboardDiagnoseRequest) -> dict:
+    auth_status = (payload.auth_status or "").strip().lower()
+    dm_status = (payload.dm_status or "").strip().lower()
+
+    if auth_status in {"401", "invalid_signature", "signature_invalid", "timestamp_invalid"}:
+        return _onboard_diagnosis_result(
+            "auth_401_signature_or_timestamp",
+            "high",
+            [
+                "Regenerate signature using payload + current Unix timestamp.",
+                "Verify local clock drift is under 5 minutes.",
+                "Confirm Node ID and private key pair match registration public key.",
+            ],
+            [
+                "python -m node.test_crypto",
+                "curl -s http://localhost:8000/diagnostic?node_id=<your_node_id>",
+            ],
+        )
+
+    if auth_status in {"403", "unregistered"} or payload.registered is False:
+        return _onboard_diagnosis_result(
+            "auth_403_unregistered_or_policy",
+            "high",
+            [
+                "Register node before any signed endpoint usage.",
+                "Confirm allowlist and trusted host policy settings.",
+                "Retry after registration with fresh signature headers.",
+            ],
+            [
+                "curl -X POST http://localhost:8000/register -H \"Content-Type: application/json\" -d \"{\\\"pubkey\\\":\\\"<PEM>\\\"}\"",
+            ],
+        )
+
+    if payload.ws_connected is False and payload.heartbeat_seconds_ago is not None and payload.heartbeat_seconds_ago <= 120:
+        return _onboard_diagnosis_result(
+            "ghost_online_no_ws_presence",
+            "high",
+            [
+                "Restart listener and ensure websocket connection stays active.",
+                "Treat websocket connectivity as source of truth for live status.",
+                "Keep heartbeat interval steady and shorter than disconnect detection window.",
+            ],
+            [
+                "python -m node.mep_status",
+                "curl -s \"http://localhost:8000/diagnostic?node_id=<your_node_id>\"",
+            ],
+        )
+
+    if dm_status in {"pending", "target_offline", "route_error", "delivery_failed"}:
+        return _onboard_diagnosis_result(
+            "dm_pending_target_offline_or_route_issue",
+            "medium",
+            [
+                "Verify target node websocket is online before DM.",
+                "Check DM target node_id spelling and connectivity.",
+                "Retry DM after confirming both nodes are connected.",
+            ],
+            [
+                "python -m node.test_dm",
+            ],
+        )
+
+    if payload.listener_contract_ok is False:
+        return _onboard_diagnosis_result(
+            "listener_payload_contract_mismatch",
+            "medium",
+            [
+                "Use authoritative fields expected by Hub APIs (task_id/provider_id/result_payload).",
+                "Avoid stub payload responses for completed tasks.",
+                "Validate listener request/response schema with integration tests.",
+            ],
+            [
+                "python -m pytest tests/test_hub_api.py -q",
+            ],
+        )
+
+    if payload.clock_skew_seconds is not None and abs(payload.clock_skew_seconds) > MAX_SKEW_SECONDS:
+        return _onboard_diagnosis_result(
+            "heartbeat_interval_or_clock_drift",
+            "medium",
+            [
+                "Synchronize host clock with NTP before signing requests.",
+                "Keep heartbeat interval stable (for example 30-60s).",
+                "Re-run diagnostic checks after clock sync.",
+            ],
+            [
+                "python -m node.mep_status",
+            ],
+        )
+
+    if payload.ai_configured is False:
+        return _onboard_diagnosis_result(
+            "ai_provider_config_invalid",
+            "low",
+            [
+                "Configure provider credentials/model in runtime config.",
+                "Start with mock adapter to validate runtime before real AI adapter.",
+                "Switch to Ollama or OpenAI-compatible adapter after runtime passes doctor checks.",
+            ],
+            [
+                "python -m node.mep_ai_provider",
+            ],
+        )
+
+    return _onboard_diagnosis_result(
+        "healthy_or_insufficient_signal",
+        "info",
+        [
+            "No critical onboarding fault detected from provided snapshot.",
+            "If issues persist, include auth_status, dm_status, and websocket state in the next diagnosis call.",
+        ],
+        [],
+    )
+
+
 @app.get("/diagnostic")
 async def diagnostic(
     node_id: Optional[str] = None,
@@ -2098,11 +3295,11 @@ async def diagnostic(
     """
     Tiered diagnostic endpoint.
 
-    Tier 1 (public, no auth) 鈥?specify node_id as query param:
+    Tier 1 (public, no auth) — specify node_id as query param:
         GET /diagnostic?node_id=node_xxx
         Returns: {node_id, registered, availability, last_heartbeat}
 
-    Tier 2 (authenticated) 鈥?no query param, uses auth headers:
+    Tier 2 (authenticated) — no query param, uses auth headers:
         GET /diagnostic (with X-MEP-NodeID, X-MEP-Timestamp, X-MEP-Signature)
         Returns: full health report including ws_connected, last_ws_activity, auth_ok
 
@@ -2161,6 +3358,27 @@ async def diagnostic(
     return DiagnosticResponse(error="usage", node_id=None, registered=False, ws_connected=False)
 
 
+@app.post("/onboard/diagnose")
+async def onboard_diagnose(payload: OnboardDiagnoseRequest):
+    global onboard_diagnosis_total
+    result = _diagnose_onboarding(payload)
+    root_cause = result["root_cause"]
+    onboard_diagnosis_total += 1
+    onboard_diagnosis_counts[root_cause] = int(onboard_diagnosis_counts.get(root_cause, 0)) + 1
+    result["telemetry"] = {
+        "total_requests": onboard_diagnosis_total,
+        "root_cause_count": onboard_diagnosis_counts[root_cause],
+    }
+    log_event(
+        "onboard_diagnose",
+        f"Onboarding diagnosis generated: {root_cause}",
+        node_id=payload.node_id,
+        root_cause=root_cause,
+        severity=result["severity"],
+    )
+    return result
+
+
 @app.get("/logs/ledger_audit.log", response_class=PlainTextResponse)
 async def ledger_audit_log():
     path = _resolve_log_path("ledger_audit.log")
@@ -2174,6 +3392,98 @@ async def ledger_entries(limit: int = 50, authenticated_node: str = Depends(veri
     safe_limit = max(1, min(limit, 200))
     entries = _read_audit_entries_for_node(authenticated_node, safe_limit)
     return {"node_id": authenticated_node, "entries": entries, "count": len(entries)}
+
+@app.get("/v2/ledger/{node_id}")
+async def ledger_entries_v2(node_id: str, limit: int = 50, authenticated_node: str = Depends(verify_request)):
+    if authenticated_node != node_id:
+        raise HTTPException(status_code=403, detail="Not authorized to view this ledger")
+    
+    safe_limit = max(1, min(limit, 200))
+    entries = _read_audit_entries_for_node(node_id, safe_limit)
+    
+    # Parse audit entries and convert to structured v2 format
+    v2_entries = []
+    for entry in entries:
+        # Parse audit log format: "TIMESTAMP | Node: node_id | Action: action | Amount: amount | Balance: balance"
+        try:
+            parts = [part.strip() for part in entry.split("|")]
+            entry_dict = {}
+            for part in parts:
+                if ":" in part:
+                    key, value = part.split(":", 1)
+                    entry_dict[key.strip().lower()] = value.strip()
+            
+            # Ledger entries come from the audit log (legacy text, no ns column),
+            # so this is pure boundary adaptation routed through the money layer.
+            amount_ns = None
+            balance_ns = None
+            if "amount" in entry_dict:
+                try:
+                    amount = float(entry_dict["amount"])
+                    amount_ns = money.to_v2_ns_string(amount, None, "amount", allow_negative=True)
+                except (ValueError, KeyError):
+                    pass
+            if "balance" in entry_dict:
+                try:
+                    balance = float(entry_dict["balance"])
+                    balance_ns = money.to_v2_ns_string(balance, None, "balance", allow_negative=False)
+                except (ValueError, KeyError):
+                    pass
+            
+            v2_entries.append(V2LedgerEntryResponse(
+                node_id=node_id,
+                amount_ns=amount_ns,
+                balance_ns=balance_ns,
+                kind=entry_dict.get("action", "unknown"),
+                reference_id=entry_dict.get("reference")
+            ))
+        except Exception:
+            # Skip malformed entries
+            continue
+    
+    return V2LedgerListResponse(
+        node_id=node_id,
+        entries=v2_entries[:safe_limit]
+    )
+
+@app.get("/v2/escrows/{task_id}")
+async def get_escrow_v2(task_id: str, authenticated_node: str = Depends(verify_request)):
+    escrow = db.get_escrow(task_id)
+    if not escrow:
+        raise HTTPException(status_code=404, detail="Escrow not found")
+    if authenticated_node not in (escrow["consumer_id"], escrow.get("provider_id")):
+        raise HTTPException(status_code=403, detail="Not authorized to view this escrow")
+    
+    amount_ns_str = money.to_v2_ns_string(
+        escrow["amount"], escrow.get("amount_ns"), "amount", allow_negative=False
+    )
+    
+    return V2EscrowResponse(
+        task_id=task_id,
+        consumer_id=escrow["consumer_id"],
+        provider_id=escrow.get("provider_id"),
+        amount_ns=amount_ns_str,
+        status=escrow["status"]
+    )
+
+@app.get("/v2/escrows")
+async def list_escrows_v2(authenticated_node: str = Depends(verify_request)):
+    escrows = db.get_escrows_by_node(authenticated_node)
+    
+    v2_escrows = []
+    for escrow in escrows:
+        amount_ns_str = money.to_v2_ns_string(
+            escrow["amount"], escrow.get("amount_ns"), "amount", allow_negative=False
+        )
+        v2_escrows.append(V2EscrowResponse(
+            task_id=escrow["task_id"],
+            consumer_id=escrow["consumer_id"],
+            provider_id=escrow.get("provider_id"),
+            amount_ns=amount_ns_str,
+            status=escrow["status"]
+        ))
+    
+    return V2EscrowListResponse(escrows=v2_escrows)
 
 @app.get("/events/recent")
 async def recent_events(limit: int = 50, x_mep_admin_key: Optional[str] = Header(default=None)):
@@ -2243,6 +3553,7 @@ async def anti_loop_reset(channel: Optional[str] = None, x_mep_admin_key: Option
 
 @app.get("/", response_class=HTMLResponse)
 async def hub_landing(request: Request):
+    build_info = _hub_build_info()
     async with node_lock:
         online_count = len(connected_nodes)
     async with task_lock:
@@ -2286,7 +3597,7 @@ async def hub_landing(request: Request):
 <body>
   <div class="card">
     <div class="label">Welcome to MEP Hub 0</div>
-    <div>Version {app.version} 鈥?Uptime {uptime} 鈥?Status {status}</div>
+    <div>Version {build_info["app_version"]} Uptime {uptime} Status {status}</div>
     <div class="row">
       <div>
         <div class="kpi">{online_count}</div>
@@ -2304,6 +3615,10 @@ async def hub_landing(request: Request):
     <div class="section">
       <div class="label">Docs</div>
       <div><a href="https://github.com/WUAIBING/MEP/blob/main/README.md">GitHub README</a></div>
+    </div>
+    <div class="section">
+      <div class="label">Build</div>
+      <div class="mono">SHA={build_info["build_sha"]}<br>Time={build_info["build_time"]}<br>Source={build_info["deploy_source"]}<br>Version URL={base_url}/version</div>
     </div>
     <div class="section">
       <div class="label">How to connect</div>
@@ -2345,6 +3660,42 @@ async def hub_landing(request: Request):
 </body>
 </html>"""
     return HTMLResponse(html)
+
+def _build_queued_dm_event(row: dict, node_id: str, payload: str) -> dict:
+    """Build the new_task `data` for a queued DM so it matches the live targeted
+    delivery shape. Prefers the persisted full envelope (byte-identical to live);
+    falls back to reconstruction for legacy rows queued before envelope capture.
+    """
+    hydrated_row = dict(row)
+    hydrated_row["payload"] = payload
+    return _task_data_from_row(hydrated_row, status="assigned", provider_id=node_id)
+
+async def _flush_queued_dms(node_id: str, websocket: WebSocket) -> None:
+    """Deliver store-and-forward DMs queued while node_id was offline.
+
+    Each queued DM is pushed as a new_task event (same shape as live delivery)
+    then marked assigned. A delivery failure leaves the DM queued for the next
+    reconnect, so nothing is lost.
+    """
+    if not DM_QUEUE_ENABLED:
+        return
+    try:
+        queued = db.get_queued_dms_for_node(node_id)
+    except Exception as exc:
+        log_event("dm_flush_error", f"Failed to load queued DMs for {node_id}: {exc}", node_id=node_id)
+        return
+    for row in queued:
+        task_id = row["task_id"]
+        payload = row.get("payload") or ""
+        event_data = _build_queued_dm_event(row, node_id, payload)
+        try:
+            await websocket.send_json({"event": "new_task", "data": event_data})
+        except Exception as exc:
+            log_event("dm_flush_error", f"Failed to deliver queued DM {task_id[:8]} to {node_id}: {exc}", task_id=task_id, node_id=node_id)
+            break
+        db.update_task_assignment(task_id, node_id, "assigned", time.time())
+        log_event("direct_message_delivered", f"Delivered queued DM {task_id[:8]} to {node_id}", task_id=task_id, provider_id=node_id)
+
 
 @app.websocket("/ws/{node_id}")
 async def websocket_endpoint(
@@ -2396,12 +3747,19 @@ async def websocket_endpoint(
     async with node_lock:
         connected_nodes[node_id] = websocket
     db.update_registry_availability(node_id, "online", time.time())
+    await _flush_queued_dms(node_id, websocket)
     try:
         while True:
-            await websocket.receive_text()
+            raw = await websocket.receive_text()
             await _track_node_activity(node_id)
+            if CALL_RELAY_ENABLED and raw:
+                event = _parse_call_event(raw)
+                if event is not None:
+                    await call_relay.handle(node_id, event)
     except WebSocketDisconnect:
         async with node_lock:
             if connected_nodes.get(node_id) is websocket:
                 del connected_nodes[node_id]
         db.update_registry_availability(node_id, "offline", time.time())
+        if CALL_RELAY_ENABLED:
+            await call_relay.on_node_disconnect(node_id)

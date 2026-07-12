@@ -1,6 +1,7 @@
 *.db
 *.sqlite3
 *.pem
+*.pem.alias
 *.pyc
 __pycache__/
 .mypy_cache/

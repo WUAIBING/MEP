@@ -10,13 +10,28 @@ import sys
 import json
 import subprocess
 import tempfile
-import websockets
-import requests
 import time
 import urllib.parse
-import boto3
-from botocore.config import Config
-from dotenv import load_dotenv
+import requests
+
+try:
+    import websockets
+except ImportError:  # pragma: no cover - optional dependency
+    websockets = None
+
+try:
+    import boto3
+    from botocore.config import Config
+except ImportError:  # pragma: no cover - optional dependency
+    boto3 = None
+    Config = None
+
+try:
+    from dotenv import load_dotenv
+except ImportError:  # pragma: no cover - optional dependency
+    def load_dotenv(*_args, **_kwargs):
+        return False
+
 from identity import MEPIdentity
 
 # Load env for R2 keys
@@ -32,7 +47,7 @@ class R2Storage:
         self.secret_key = os.getenv("R2_SECRET_ACCESS_KEY")
         self.bucket = os.getenv("R2_BUCKET_NAME", "mep-data")
         
-        if self.endpoint and self.access_key:
+        if self.endpoint and self.access_key and boto3 is not None and Config is not None:
             self.client = boto3.client(
                 's3',
                 endpoint_url=self.endpoint,
@@ -74,6 +89,10 @@ class MEPAIProvider:
     async def connect(self):
         """Connect to MEP Hub and start mining."""
         print(f"[AI Provider {self.node_id}] Starting...")
+        if websockets is None:
+            print("[AI Provider] missing optional dependency: websockets")
+            print("[AI Provider] install with: pip install websockets")
+            return
         
         # Register with hub (Send Encryption Key)
         try:

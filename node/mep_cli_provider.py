@@ -44,6 +44,7 @@ class MEPCLIProvider:
         os.makedirs(self.workspace_dir, exist_ok=True)
         self.upload_code = os.getenv("MEP_CLI_UPLOAD_CODE", "false").lower() in ("1", "true", "yes")
         self.max_code_chars = int(os.getenv("MEP_CLI_MAX_CODE_CHARS", "12000"))
+        self.allow_execution = os.getenv("MEP_CLI_ALLOW_EXECUTION", "false").lower() in ("1", "true", "yes")
         # Safety: maximum SECONDS a node will spend to buy data (negative bounty)
         self.max_purchase_price = float(os.getenv("MEP_MAX_PURCHASE_PRICE", "0.0"))
 
@@ -110,6 +111,11 @@ class MEPCLIProvider:
         model = rfc_data.get("model_requirement")
         
         if model not in self.capabilities and model is not None:
+            return
+
+        if bounty != 0 and not self.allow_execution:
+            print(f"[CLI Provider] Execution disabled; refusing executable task {task_id[:8]}. "
+                  "Set MEP_CLI_ALLOW_EXECUTION=true only in a sandboxed environment.")
             return
         
         # 🛡️ CRITICAL SAFETY CHECK: DO NOT BUY DATA UNLESS EXPLICITLY ENABLED
@@ -257,6 +263,33 @@ class MEPCLIProvider:
         
         print(f"  ✅ Result saved to {results_file}")
 
+    @staticmethod
+    def _build_agent_argv(agent_cmd: str, payload: str) -> list[str]:
+        """Build an argv list for a local agent without invoking a shell."""
+        argv = shlex.split(agent_cmd, posix=os.name != "nt")
+        if not argv:
+            raise ValueError("MEP_CLI_AGENT_CMD is empty")
+        if any("{payload}" in arg for arg in argv):
+            return [arg.replace("{payload}", payload) for arg in argv]
+        return [*argv, payload]
+
+    async def _reject_task(self, task_id: str, reason: str):
+        payload_str = json.dumps({
+            "task_id": task_id,
+            "provider_id": self.node_id,
+            "reason": reason,
+        })
+        headers = self.identity.get_auth_headers(payload_str)
+        headers["Content-Type"] = "application/json"
+        resp = await self._post_with_retry(f"{HUB_URL}/tasks/reject", payload_str=payload_str, headers=headers)
+        if resp is None:
+            print(f"[CLI Provider] Failed to reject task {task_id[:8]}")
+            return
+        if resp.status_code != 200:
+            print(f"[CLI Provider] Task reject failed for {task_id[:8]}: HTTP {resp.status_code} {resp.text}")
+            return
+        print(f"[CLI Provider] Rejected task {task_id[:8]}: {reason}")
+
     async def process_task(self, task_data: dict, secret_data: Optional[str] = None):
         """Execute the task using a local CLI agent."""
         task_id = task_data["id"]
@@ -268,6 +301,13 @@ class MEPCLIProvider:
             await self._handle_dm(task_data)
             return
         # ===== END DM DETECTION =====
+
+        if not self.allow_execution:
+            print(f"[CLI Provider] Execution disabled; skipping task {task_id[:8]}. "
+                  "Set MEP_CLI_ALLOW_EXECUTION=true only in a sandboxed environment.")
+            if bounty != 0:
+                await self._reject_task(task_id, "execution_disabled")
+            return
         
         # If this is a Data Market purchase, save the secret data!
         if secret_data:
@@ -307,53 +347,29 @@ class MEPCLIProvider:
                     print(f"[CLI Provider] ❌ Download error: {e}")
 
             print(f"[CLI Provider] Upload code enabled: {self.upload_code}")
-            
-            if os.name == "nt":
-                safe_payload = payload.replace('"', '""')
-                cmd = (
-                    "echo Booting Autonomous CLI Agent... & "
-                    "timeout /t 1 > nul & "
-                    f'echo Analyzing: \"{safe_payload}\" & '
-                    "timeout /t 1 > nul & "
-                    "echo Code generated and saved to workspace."
-                )
-            else:
-                safe_payload = shlex.quote(payload)
-                cmd = (
-                    "echo 'Booting Autonomous CLI Agent...' && "
-                    "sleep 1 && "
-                    f"echo 'Analyzing: {safe_payload}' && "
-                    "sleep 1 && "
-                    "echo 'Code generated and saved to workspace.'"
-                )
             agent_cmd = os.getenv("MEP_CLI_AGENT_CMD")
             if agent_cmd:
-                if "{payload}" in agent_cmd:
-                    # Substitute placeholder with quoted payload
-                    cmd = agent_cmd.replace("{payload}", safe_payload)
-                else:
-                    # Append quoted payload to agent command
-                    cmd = f"{agent_cmd} {safe_payload}"
-                # Note: Full fix requires subprocess_exec + arg array instead of shell=True
-                # to prevent injection via agent_cmd path itself.
-            
-            print(f"\n[CLI Agent] Executing in {task_dir}:")
-            print(f"$ {cmd[:100]}...\n")
-            
-            process = await asyncio.create_subprocess_shell(
-                cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                cwd=task_dir
-            )
-            
-            stdout, stderr = await process.communicate()
-            
-            output = stdout.decode(errors="replace").strip()
-            if stderr:
-                output += "\n[Errors/Warnings]:\n" + stderr.decode(errors="replace").strip()
-                
-            print(f"[CLI Agent] Finished with exit code {process.returncode}")
+                argv = self._build_agent_argv(agent_cmd, payload)
+                print(f"\n[CLI Agent] Executing in {task_dir}:")
+                print(f"$ {' '.join(shlex.quote(part) for part in argv)[:100]}...\n")
+                process = await asyncio.create_subprocess_exec(
+                    *argv,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                    cwd=task_dir
+                )
+                stdout, stderr = await process.communicate()
+                output = stdout.decode(errors="replace").strip()
+                if stderr:
+                    output += "\n[Errors/Warnings]:\n" + stderr.decode(errors="replace").strip()
+                print(f"[CLI Agent] Finished with exit code {process.returncode}")
+            else:
+                output = (
+                    "Booting Autonomous CLI Agent...\n"
+                    f"Analyzing: {payload}\n"
+                    "No MEP_CLI_AGENT_CMD configured; simulated execution only."
+                )
+                print("[CLI Agent] No MEP_CLI_AGENT_CMD configured; simulated execution only.")
             code_block = ""
             if self.upload_code:
                 py_candidates = [
@@ -399,7 +415,7 @@ class MEPCLIProvider:
 if __name__ == "__main__":
     print("=" * 60)
     print("MEP Autonomous CLI Provider")
-    print("WARNING: This node executes shell commands. Use sandboxing!")
+    print("Execution is disabled by default. Set MEP_CLI_ALLOW_EXECUTION=true only with sandboxing.")
     print("=" * 60)
     
     key_dir = os.getenv("MEP_KEY_DIR", os.path.join(os.path.expanduser("~"), ".mep"))

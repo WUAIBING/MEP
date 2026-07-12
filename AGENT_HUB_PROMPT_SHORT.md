@@ -24,5 +24,12 @@ Required behavior:
 8) Validate API success by JSON status/task_id, not HTTP status alone.
 9) Use node_id (not nickname) for target_node.
 10) Recovery mode if ws disconnected >60s or heartbeat stale >90s; reconnect with backoff+jitter.
+
+Threaded review workflow:
+- For structured review DMs, keep the original `context_id` and reply references.
+- Inspect cached structured DMs with `mepdmlist` before replying.
+- Send machine-readable bot verdicts with `mepdmverdict`.
+- Escalate final human decisions with `mepdmhumanapproval`.
+- Use `mepdmreplysafe` when the thread should continue under declared session safety limits.
 ```
 

@@ -1,0 +1,762 @@
+import asyncio
+import json
+import unittest
+from unittest.mock import patch
+
+from clients.shared.mep_client import MEPClient
+
+
+class _FakeIdentity:
+    node_id = "node_consumer"
+    pub_pem = "pub"
+
+    def get_auth_headers(self, payload: str) -> dict:
+        return {"X-MEP-NodeID": self.node_id, "X-MEP-Signature": "sig"}
+
+
+class _FakeResponse:
+    def __init__(self, status_code=200, json_data=None):
+        self.status_code = status_code
+        self._json_data = json_data or {"status": "success", "task_id": "task_123456"}
+
+    def json(self) -> dict:
+        return self._json_data
+
+
+class _FakeWebSocket:
+    def __init__(self):
+        self.sent = []
+
+    async def send(self, payload: str) -> None:
+        self.sent.append(payload)
+
+
+class TestSharedMEPClient(unittest.TestCase):
+    def test_submit_task_uses_spec_shaped_envelope(self):
+        with (
+            patch("clients.shared.mep_client.MEPIdentity", return_value=_FakeIdentity()),
+            patch("clients.shared.mep_client.requests.Session") as session_cls,
+        ):
+            session = session_cls.return_value
+            session.post.return_value = _FakeResponse()
+            client = MEPClient("unused.pem")
+
+            response = asyncio.run(
+                client.submit_task(
+                    "summarize this",
+                    1.5,
+                    model_requirement="text",
+                    target_node="node_provider",
+                )
+            )
+
+        self.assertEqual(response["json"]["task_id"], "task_123456")
+        body = json.loads(session.post.call_args.kwargs["data"])
+        self.assertEqual(body["source"], {"node_id": "node_consumer"})
+        self.assertEqual(body["task"]["instructions"], "summarize this")
+        self.assertEqual(body["task"]["expected_output"], {"result_type": "text"})
+        self.assertEqual(
+            body["economics"],
+            {
+                "bounty_ns": 1_500_000_000,
+                "currency": "MEP_NS",
+                "market": "compute",
+                "payment_direction": "sender_to_receiver",
+            },
+        )
+        self.assertEqual(body["routing"], {"target_node_id": "node_provider", "target_capability": "text"})
+
+    def test_send_ws_event_uses_active_socket_when_present(self):
+        with patch("clients.shared.mep_client.MEPIdentity", return_value=_FakeIdentity()):
+            client = MEPClient("unused.pem")
+            ws = _FakeWebSocket()
+            client._active_ws = ws
+
+            sent = asyncio.run(client.send_ws_event({"event": "call.accept", "context_id": "ctx-1"}))
+
+        self.assertTrue(sent)
+        self.assertEqual(json.loads(ws.sent[0]), {"event": "call.accept", "context_id": "ctx-1"})
+
+    def test_send_ws_event_returns_false_without_active_socket(self):
+        with patch("clients.shared.mep_client.MEPIdentity", return_value=_FakeIdentity()):
+            client = MEPClient("unused.pem")
+
+            sent = asyncio.run(client.send_ws_event({"event": "call.accept", "context_id": "ctx-1"}))
+
+        self.assertFalse(sent)
+
+    def test_submit_task_can_send_secret_data_offer(self):
+        with (
+            patch("clients.shared.mep_client.MEPIdentity", return_value=_FakeIdentity()),
+            patch("clients.shared.mep_client.requests.Session") as session_cls,
+        ):
+            session = session_cls.return_value
+            session.post.return_value = _FakeResponse()
+            client = MEPClient("unused.pem")
+
+            asyncio.run(client.submit_task("Data offer available", -0.25, secret_data="encrypted-data"))
+
+        body = json.loads(session.post.call_args.kwargs["data"])
+        self.assertEqual(
+            body["economics"],
+            {
+                "bounty_ns": 250_000_000,
+                "currency": "MEP_NS",
+                "market": "data",
+                "payment_direction": "receiver_to_sender",
+            },
+        )
+        self.assertEqual(body["secret_data"], "encrypted-data")
+
+    def test_submit_repo_audit_builds_structured_repo_audit_request(self):
+        with (
+            patch("clients.shared.mep_client.MEPIdentity", return_value=_FakeIdentity()),
+            patch("clients.shared.mep_client.requests.Session") as session_cls,
+        ):
+            session = session_cls.return_value
+            session.post.return_value = _FakeResponse()
+            client = MEPClient("unused.pem")
+
+            response = asyncio.run(
+                client.submit_repo_audit(
+                    "github.com/WUAIBING/MEP",
+                    audit_type="architecture_audit",
+                    ref="main",
+                    max_findings=7,
+                    inline_summary_max_chars=7000,
+                    artifact_preference="artifact_preferred",
+                    target_node="node_repo_bot",
+                )
+            )
+
+        self.assertEqual(response["json"]["task_id"], "task_123456")
+        body = json.loads(session.post.call_args.kwargs["data"])
+        self.assertEqual(body["intent"], {"type": "repo_audit.request", "priority": "high"})
+        self.assertEqual(body["routing"], {"target_node_id": "node_repo_bot", "target_capability": "repo_audit"})
+        self.assertEqual(body["task"]["title"], "Repo audit: github.com/WUAIBING/MEP")
+        self.assertEqual(
+            body["task"]["inputs"],
+            {
+                "repo_audit": {
+                    "repo_url": "github.com/WUAIBING/MEP",
+                    "audit_type": "architecture_audit",
+                    "max_findings": 7,
+                    "artifact_preference": "artifact_preferred",
+                    "inline_summary_max_chars": 7000,
+                    "ref": "main",
+                }
+            },
+        )
+        self.assertEqual(
+            body["task"]["expected_output"],
+            {
+                "result_type": "repo_audit_result",
+                "format": "json",
+                "artifact_allowed": True,
+                "inline_summary_max_chars": 7000,
+            },
+        )
+        self.assertIn("architecture_audit repo audit", body["task"]["instructions"])
+        self.assertIn("ref main", body["task"]["instructions"])
+        self.assertIn("include its URI", body["task"]["instructions"])
+
+    def test_submit_task_preserves_200_error_body(self):
+        response_body = {"status": "error", "detail": "Target node not currently connected to Hub"}
+        with (
+            patch("clients.shared.mep_client.MEPIdentity", return_value=_FakeIdentity()),
+            patch("clients.shared.mep_client.requests.Session") as session_cls,
+        ):
+            session = session_cls.return_value
+            session.post.return_value = _FakeResponse(200, response_body)
+            client = MEPClient("unused.pem")
+
+            response = asyncio.run(client.submit_task("hello", 0.0, target_node="node_offline"))
+
+        self.assertEqual(response["status_code"], 200)
+        self.assertEqual(response["json"], response_body)
+
+    def test_submit_dm_builds_threaded_interbot_envelope(self):
+        with (
+            patch("clients.shared.mep_client.MEPIdentity", return_value=_FakeIdentity()),
+            patch("clients.shared.mep_client.requests.Session") as session_cls,
+        ):
+            session = session_cls.return_value
+            session.post.return_value = _FakeResponse()
+            client = MEPClient("unused.pem")
+
+            response = asyncio.run(
+                client.submit_dm(
+                    "Please review PR 154",
+                    "node_reviewer",
+                    intent_type="review.request",
+                    context_id="pr154-review",
+                    reply_to_task_id="task_parent",
+                    reply_to_message_id="message_parent",
+                    turn_type="review_request",
+                    turn_index=1,
+                )
+            )
+
+        submit_body = json.loads(session.post.call_args.kwargs["data"])
+        self.assertEqual(submit_body["routing"], {"target_node_id": "node_reviewer"})
+        body = json.loads(submit_body["task"]["instructions"])
+        self.assertEqual(body["spec_version"], "mep.interbot.v1")
+        self.assertEqual(body["target"]["node_id"], "node_reviewer")
+        self.assertEqual(body["conversation"]["context_id"], "pr154-review")
+        self.assertEqual(body["conversation"]["reply_to_task_id"], "task_parent")
+        self.assertEqual(body["conversation"]["reply_to_message_id"], "message_parent")
+        self.assertEqual(body["conversation"]["turn_type"], "review_request")
+        self.assertEqual(body["conversation"]["turn_index"], 1)
+        self.assertEqual(body["intent"], {"type": "review.request", "priority": "normal"})
+        self.assertEqual(body["task"]["instructions"], "Please review PR 154")
+        self.assertEqual(body["delivery"], {"reply_mode": "new_dm", "settlement_mode": "task_result"})
+        self.assertEqual(response["context_id"], "pr154-review")
+        self.assertTrue(response["message_id"])
+        self.assertTrue(response["trace_id"])
+
+    def test_submit_dm_can_attach_session_safety_metadata(self):
+        with (
+            patch("clients.shared.mep_client.MEPIdentity", return_value=_FakeIdentity()),
+            patch("clients.shared.mep_client.requests.Session") as session_cls,
+        ):
+            session = session_cls.return_value
+            session.post.return_value = _FakeResponse()
+            client = MEPClient("unused.pem")
+
+            asyncio.run(
+                client.submit_dm(
+                    "Stay inside the review lane.",
+                    "node_reviewer",
+                    context_id="pr154-review",
+                    turn_type="review_request",
+                    session_safety={"max_turns": 6, "max_duration_seconds": 900, "checkpoint_interval": 3},
+                )
+            )
+
+        submit_body = json.loads(session.post.call_args.kwargs["data"])
+        body = json.loads(submit_body["task"]["instructions"])
+        session_safety = body["task"]["inputs"]["session_safety"]
+        self.assertEqual(session_safety["max_turns"], 6)
+        self.assertEqual(session_safety["max_duration_seconds"], 900)
+        self.assertEqual(session_safety["checkpoint_interval"], 3)
+        self.assertEqual(session_safety["started_at_ms"], body["timestamp_ms"])
+
+    def test_extract_interbot_instructions_prefers_structured_task_text(self):
+        payload = json.dumps(
+            {
+                "spec_version": "mep.interbot.v1",
+                "task": {
+                    "instructions": "Structured instructions",
+                    "expected_output": {"result_type": "text"},
+                },
+            }
+        )
+
+        instructions, parsed = MEPClient.extract_interbot_instructions(payload)
+
+        self.assertEqual(instructions, "Structured instructions")
+        self.assertIsNotNone(parsed)
+        self.assertEqual(parsed["spec_version"], "mep.interbot.v1")
+
+    def test_submit_review_verdict_dm_builds_structured_verdict_payload(self):
+        with (
+            patch("clients.shared.mep_client.MEPIdentity", return_value=_FakeIdentity()),
+            patch("clients.shared.mep_client.requests.Session") as session_cls,
+        ):
+            session = session_cls.return_value
+            session.post.return_value = _FakeResponse()
+            client = MEPClient("unused.pem")
+
+            response = asyncio.run(
+                client.submit_review_verdict_dm(
+                    "approve_with_conditions",
+                    "Threading model is sound, but docs should mention ack expectations.",
+                    "node_governor",
+                    context_id="pr154-review",
+                    reply_to_task_id="task_review_request",
+                    reply_to_message_id="message_review_request",
+                    conditions=["Document expected ack behavior", "Keep reply_mode=new_dm"],
+                    human_recommendation="Merge after the follow-up docs note lands.",
+                    turn_index=2,
+                )
+            )
+
+        submit_body = json.loads(session.post.call_args.kwargs["data"])
+        body = json.loads(submit_body["task"]["instructions"])
+        self.assertEqual(body["intent"], {"type": "review.response", "priority": "normal"})
+        self.assertEqual(body["conversation"]["turn_type"], "approval")
+        self.assertEqual(body["conversation"]["turn_index"], 2)
+        self.assertEqual(body["conversation"]["context_id"], "pr154-review")
+        self.assertEqual(body["conversation"]["reply_to_task_id"], "task_review_request")
+        self.assertEqual(body["conversation"]["reply_to_message_id"], "message_review_request")
+        self.assertEqual(body["task"]["title"], "Review verdict")
+        self.assertEqual(
+            body["task"]["inputs"]["review_verdict"],
+            {
+                "decision": "approve_with_conditions",
+                "rationale": "Threading model is sound, but docs should mention ack expectations.",
+                "conditions": ["Document expected ack behavior", "Keep reply_mode=new_dm"],
+                "human_recommendation": "Merge after the follow-up docs note lands.",
+            },
+        )
+        self.assertEqual(response["context_id"], "pr154-review")
+
+    def test_extract_review_verdict_reads_structured_verdict_payload(self):
+        payload = json.dumps(
+            {
+                "spec_version": "mep.interbot.v1",
+                "task": {
+                    "instructions": "Review verdict: approve",
+                    "inputs": {
+                        "review_verdict": {
+                            "decision": "approve",
+                            "rationale": "Looks good.",
+                            "conditions": ["Ship a short follow-up doc note", ""],
+                            "human_recommendation": "Safe to merge.",
+                        }
+                    },
+                    "expected_output": {"result_type": "text"},
+                },
+            }
+        )
+
+        verdict = MEPClient.extract_review_verdict(payload)
+
+        self.assertEqual(
+            verdict,
+            {
+                "decision": "approve",
+                "rationale": "Looks good.",
+                "conditions": ["Ship a short follow-up doc note"],
+                "human_recommendation": "Safe to merge.",
+            },
+        )
+
+    def test_submit_human_approval_request_dm_builds_structured_payload(self):
+        with (
+            patch("clients.shared.mep_client.MEPIdentity", return_value=_FakeIdentity()),
+            patch("clients.shared.mep_client.requests.Session") as session_cls,
+        ):
+            session = session_cls.return_value
+            session.post.return_value = _FakeResponse()
+            client = MEPClient("unused.pem")
+
+            response = asyncio.run(
+                client.submit_human_approval_request_dm(
+                    "Two bots approve with conditions; no remaining blocker in code.",
+                    "node_master_wu",
+                    context_id="pr155-review",
+                    reply_to_task_id="task_review_verdict",
+                    reply_to_message_id="message_review_verdict",
+                    review_decision="approve_with_conditions",
+                    blockers=["Need explicit merge confirmation from the human governor"],
+                    recommended_next_action="Merge after human approval.",
+                    turn_index=3,
+                )
+            )
+
+        submit_body = json.loads(session.post.call_args.kwargs["data"])
+        body = json.loads(submit_body["task"]["instructions"])
+        self.assertEqual(body["intent"], {"type": "human.approval.request", "priority": "high"})
+        self.assertEqual(body["conversation"]["turn_type"], "session_close")
+        self.assertEqual(body["conversation"]["turn_index"], 3)
+        self.assertEqual(body["conversation"]["context_id"], "pr155-review")
+        self.assertEqual(body["task"]["title"], "Human approval request")
+        self.assertEqual(
+            body["task"]["inputs"]["human_approval_request"],
+            {
+                "decision_type": "merge_decision",
+                "summary": "Two bots approve with conditions; no remaining blocker in code.",
+                "review_decision": "approve_with_conditions",
+                "blockers": ["Need explicit merge confirmation from the human governor"],
+                "recommended_next_action": "Merge after human approval.",
+            },
+        )
+        self.assertEqual(response["context_id"], "pr155-review")
+
+    def test_extract_human_approval_request_reads_structured_payload(self):
+        payload = json.dumps(
+            {
+                "spec_version": "mep.interbot.v1",
+                "task": {
+                    "instructions": "Human approval request: merge_decision",
+                    "inputs": {
+                        "human_approval_request": {
+                            "decision_type": "merge_decision",
+                            "summary": "Need final merge confirmation.",
+                            "review_decision": "approve",
+                            "blockers": ["Confirm release window", ""],
+                            "recommended_next_action": "Merge after approval.",
+                        }
+                    },
+                    "expected_output": {"result_type": "text"},
+                },
+            }
+        )
+
+        request = MEPClient.extract_human_approval_request(payload)
+
+        self.assertEqual(
+            request,
+            {
+                "decision_type": "merge_decision",
+                "summary": "Need final merge confirmation.",
+                "review_decision": "approve",
+                "blockers": ["Confirm release window"],
+                "recommended_next_action": "Merge after approval.",
+            },
+        )
+
+    def test_submit_dm_reply_preserves_session_safety_from_inbound_message(self):
+        with (
+            patch("clients.shared.mep_client.MEPIdentity", return_value=_FakeIdentity()),
+            patch("clients.shared.mep_client.requests.Session") as session_cls,
+        ):
+            session = session_cls.return_value
+            session.post.return_value = _FakeResponse()
+            client = MEPClient("unused.pem")
+
+            inbound_message = {
+                "message_id": "message_review_request",
+                "trace_id": "trace-123",
+                "timestamp_ms": 1_777_000_000_000,
+                "source": {"node_id": "node_reviewer"},
+                "intent": {"type": "review.request", "priority": "high"},
+                "conversation": {"context_id": "pr154-review", "turn_type": "review_request", "turn_index": 1},
+                "task": {
+                    "instructions": "Please review this PR.",
+                    "inputs": {
+                        "session_safety": {
+                            "max_turns": 6,
+                            "checkpoint_interval": 3,
+                            "started_at_ms": 1_777_000_000_000,
+                        }
+                    },
+                },
+            }
+
+            asyncio.run(
+                client.submit_dm_reply(
+                    "I approve with conditions.",
+                    inbound_message,
+                    inbound_task_id="task_review_request",
+                )
+            )
+
+        submit_body = json.loads(session.post.call_args.kwargs["data"])
+        body = json.loads(submit_body["task"]["instructions"])
+        self.assertEqual(
+            body["task"]["inputs"]["session_safety"],
+            {"max_turns": 6, "checkpoint_interval": 3, "started_at_ms": 1_777_000_000_000},
+        )
+        self.assertEqual(body["conversation"]["reply_to_task_id"], "task_review_request")
+        self.assertEqual(body["conversation"]["reply_to_message_id"], "message_review_request")
+        self.assertEqual(body["conversation"]["turn_index"], 2)
+
+    def test_extract_session_safety_reads_structured_payload(self):
+        payload = json.dumps(
+            {
+                "spec_version": "mep.interbot.v1",
+                "timestamp_ms": 1_777_000_000_000,
+                "task": {
+                    "instructions": "Stay in the review thread.",
+                    "inputs": {
+                        "session_safety": {
+                            "max_turns": 5,
+                            "max_duration_seconds": 600,
+                            "started_at_ms": 1_777_000_000_000,
+                        }
+                    },
+                    "expected_output": {"result_type": "text"},
+                },
+            }
+        )
+
+        session_safety = MEPClient.extract_session_safety(payload)
+
+        self.assertEqual(
+            session_safety,
+            {"max_turns": 5, "max_duration_seconds": 600, "started_at_ms": 1_777_000_000_000},
+        )
+
+    def test_evaluate_interbot_session_safety_requests_checkpoint_at_interval(self):
+        payload = json.dumps(
+            {
+                "spec_version": "mep.interbot.v1",
+                "timestamp_ms": 1_777_000_000_000,
+                "task": {
+                    "instructions": "Stay in the review thread.",
+                    "inputs": {"session_safety": {"max_turns": 6, "checkpoint_interval": 3}},
+                    "expected_output": {"result_type": "text"},
+                },
+            }
+        )
+
+        evaluation = MEPClient.evaluate_interbot_session_safety(
+            payload,
+            next_turn_index=3,
+            now_ms=1_777_000_100_000,
+        )
+
+        self.assertEqual(evaluation["session_safety"], {"max_turns": 6, "checkpoint_interval": 3})
+        self.assertTrue(evaluation["should_checkpoint"])
+        self.assertFalse(evaluation["should_stop"])
+        self.assertEqual(evaluation["violations"], [])
+
+    def test_evaluate_interbot_session_safety_stops_when_limits_are_exceeded(self):
+        payload = json.dumps(
+            {
+                "spec_version": "mep.interbot.v1",
+                "timestamp_ms": 1_777_000_000_000,
+                "task": {
+                    "instructions": "Stay in the review thread.",
+                    "inputs": {
+                        "session_safety": {"max_turns": 4, "max_duration_seconds": 60, "checkpoint_interval": 2}
+                    },
+                    "expected_output": {"result_type": "text"},
+                },
+            }
+        )
+
+        evaluation = MEPClient.evaluate_interbot_session_safety(
+            payload,
+            next_turn_index=5,
+            now_ms=1_777_000_070_000,
+        )
+
+        self.assertFalse(evaluation["should_checkpoint"])
+        self.assertTrue(evaluation["should_stop"])
+        self.assertEqual(
+            evaluation["violations"],
+            ["max_turns_exceeded", "max_duration_exceeded"],
+        )
+
+    def test_evaluate_interbot_session_safety_uses_original_session_start_time(self):
+        payload = json.dumps(
+            {
+                "spec_version": "mep.interbot.v1",
+                "timestamp_ms": 1_777_000_060_000,
+                "task": {
+                    "instructions": "Stay in the review thread.",
+                    "inputs": {
+                        "session_safety": {
+                            "max_duration_seconds": 60,
+                            "started_at_ms": 1_777_000_000_000,
+                        }
+                    },
+                    "expected_output": {"result_type": "text"},
+                },
+            }
+        )
+
+        evaluation = MEPClient.evaluate_interbot_session_safety(
+            payload,
+            next_turn_index=2,
+            now_ms=1_777_000_070_000,
+        )
+
+        self.assertTrue(evaluation["should_stop"])
+        self.assertEqual(evaluation["violations"], ["max_duration_exceeded"])
+
+    def test_submit_safe_dm_reply_replies_when_session_is_within_limits(self):
+        with (
+            patch("clients.shared.mep_client.MEPIdentity", return_value=_FakeIdentity()),
+            patch("clients.shared.mep_client.requests.Session") as session_cls,
+        ):
+            session = session_cls.return_value
+            session.post.return_value = _FakeResponse()
+            client = MEPClient("unused.pem")
+            inbound_message = {
+                "message_id": "message_review_request",
+                "trace_id": "trace-123",
+                "timestamp_ms": 1_777_000_000_000,
+                "source": {"node_id": "node_reviewer"},
+                "intent": {"type": "review.request", "priority": "high"},
+                "conversation": {"context_id": "pr154-review", "turn_type": "review_request", "turn_index": 1},
+                "task": {
+                    "instructions": "Please review this PR.",
+                    "inputs": {"session_safety": {"max_turns": 6, "checkpoint_interval": 3}},
+                },
+            }
+
+            response = asyncio.run(
+                client.submit_safe_dm_reply(
+                    "I approve with conditions.",
+                    inbound_message,
+                    inbound_task_id="task_review_request",
+                    next_turn_index=2,
+                    now_ms=1_777_000_010_000,
+                )
+            )
+
+        submit_body = json.loads(session.post.call_args.kwargs["data"])
+        body = json.loads(submit_body["task"]["instructions"])
+        self.assertEqual(response["reply_action"], "reply")
+        self.assertEqual(response["status"], "replied")
+        self.assertFalse(response["safety"]["should_stop"])
+        self.assertEqual(body["task"]["instructions"], "I approve with conditions.")
+        self.assertEqual(body["conversation"]["turn_index"], 2)
+
+    def test_submit_safe_dm_reply_sends_checkpoint_when_interval_is_reached(self):
+        with (
+            patch("clients.shared.mep_client.MEPIdentity", return_value=_FakeIdentity()),
+            patch("clients.shared.mep_client.requests.Session") as session_cls,
+        ):
+            session = session_cls.return_value
+            session.post.return_value = _FakeResponse()
+            client = MEPClient("unused.pem")
+            inbound_message = {
+                "message_id": "message_review_request",
+                "trace_id": "trace-123",
+                "timestamp_ms": 1_777_000_000_000,
+                "source": {"node_id": "node_reviewer", "alias": "Reviewer"},
+                "intent": {"type": "review.request", "priority": "high"},
+                "conversation": {"context_id": "pr154-review", "turn_type": "review_request", "turn_index": 2},
+                "task": {
+                    "instructions": "Please review this PR.",
+                    "inputs": {"session_safety": {"max_turns": 6, "checkpoint_interval": 3}},
+                },
+            }
+
+            response = asyncio.run(
+                client.submit_safe_dm_reply(
+                    "I approve with conditions.",
+                    inbound_message,
+                    inbound_task_id="task_review_request",
+                    next_turn_index=3,
+                    checkpoint_summary="Checkpoint: 3 turns reached.",
+                    now_ms=1_777_000_020_000,
+                )
+            )
+
+        submit_body = json.loads(session.post.call_args.kwargs["data"])
+        body = json.loads(submit_body["task"]["instructions"])
+        self.assertEqual(response["reply_action"], "checkpoint")
+        self.assertEqual(response["status"], "checkpointed")
+        self.assertTrue(response["safety"]["should_checkpoint"])
+        self.assertEqual(body["conversation"]["turn_type"], "checkpoint")
+        self.assertEqual(body["conversation"]["turn_index"], 3)
+        self.assertEqual(body["task"]["instructions"], "Checkpoint: 3 turns reached.")
+
+    def test_submit_safe_dm_reply_progresses_from_reply_to_checkpoint_to_stop(self):
+        with (
+            patch("clients.shared.mep_client.MEPIdentity", return_value=_FakeIdentity()),
+            patch("clients.shared.mep_client.requests.Session") as session_cls,
+        ):
+            session = session_cls.return_value
+            session.post.side_effect = [
+                _FakeResponse(json_data={"status": "success", "task_id": "task_reply"}),
+                _FakeResponse(json_data={"status": "success", "task_id": "task_checkpoint"}),
+            ]
+            client = MEPClient("unused.pem")
+            started_at_ms = 1_777_000_000_000
+            inbound_message = {
+                "message_id": "message_review_request",
+                "trace_id": "trace-123",
+                "timestamp_ms": started_at_ms,
+                "source": {"node_id": "node_reviewer", "alias": "Reviewer"},
+                "intent": {"type": "review.request", "priority": "high"},
+                "conversation": {"context_id": "pr154-review", "turn_type": "review_request", "turn_index": 1},
+                "task": {
+                    "instructions": "Please review this PR.",
+                    "inputs": {
+                        "session_safety": {
+                            "max_turns": 4,
+                            "checkpoint_interval": 3,
+                            "max_duration_seconds": 60,
+                            "started_at_ms": started_at_ms,
+                        }
+                    },
+                },
+            }
+
+            reply_response = asyncio.run(
+                client.submit_safe_dm_reply(
+                    "I approve with conditions.",
+                    inbound_message,
+                    inbound_task_id="task_review_request",
+                    next_turn_index=2,
+                    now_ms=1_777_000_010_000,
+                )
+            )
+            reply_submit_body = json.loads(session.post.call_args_list[0].kwargs["data"])
+            reply_message = json.loads(reply_submit_body["task"]["instructions"])
+
+            checkpoint_response = asyncio.run(
+                client.submit_safe_dm_reply(
+                    "I approve with conditions.",
+                    reply_message,
+                    inbound_task_id="task_reply",
+                    next_turn_index=3,
+                    checkpoint_summary="Checkpoint: two review turns completed.",
+                    now_ms=1_777_000_020_000,
+                )
+            )
+            checkpoint_submit_body = json.loads(session.post.call_args_list[1].kwargs["data"])
+            checkpoint_message = json.loads(checkpoint_submit_body["task"]["instructions"])
+
+            stop_response = asyncio.run(
+                client.submit_safe_dm_reply(
+                    "I approve with conditions.",
+                    checkpoint_message,
+                    inbound_task_id="task_checkpoint",
+                    next_turn_index=5,
+                    now_ms=1_777_000_070_000,
+                )
+            )
+
+        self.assertEqual(session.post.call_count, 2)
+        self.assertEqual(reply_response["reply_action"], "reply")
+        self.assertEqual(reply_response["status"], "replied")
+        self.assertEqual(
+            reply_message["task"]["inputs"]["session_safety"]["started_at_ms"],
+            started_at_ms,
+        )
+        self.assertEqual(reply_message["conversation"]["turn_index"], 2)
+        self.assertEqual(checkpoint_response["reply_action"], "checkpoint")
+        self.assertEqual(checkpoint_response["status"], "checkpointed")
+        self.assertEqual(checkpoint_message["conversation"]["turn_type"], "checkpoint")
+        self.assertEqual(checkpoint_message["conversation"]["turn_index"], 3)
+        self.assertEqual(
+            checkpoint_message["task"]["inputs"]["session_safety"]["started_at_ms"],
+            started_at_ms,
+        )
+        self.assertEqual(stop_response["reply_action"], "stop")
+        self.assertEqual(stop_response["status"], "stopped")
+        self.assertEqual(stop_response["safety"]["violations"], ["max_turns_exceeded", "max_duration_exceeded"])
+        self.assertEqual(stop_response["session_safety"]["started_at_ms"], started_at_ms)
+
+    def test_submit_safe_dm_reply_stops_when_session_limits_are_exceeded(self):
+        with patch("clients.shared.mep_client.MEPIdentity", return_value=_FakeIdentity()):
+            client = MEPClient("unused.pem")
+            inbound_message = {
+                "message_id": "message_review_request",
+                "trace_id": "trace-123",
+                "timestamp_ms": 1_777_000_000_000,
+                "source": {"node_id": "node_reviewer"},
+                "intent": {"type": "review.request", "priority": "high"},
+                "conversation": {"context_id": "pr154-review", "turn_type": "review_request"},
+                "task": {
+                    "instructions": "Please review this PR.",
+                    "inputs": {"session_safety": {"max_turns": 4, "max_duration_seconds": 60}},
+                },
+            }
+
+            response = asyncio.run(
+                client.submit_safe_dm_reply(
+                    "I approve with conditions.",
+                    inbound_message,
+                    inbound_task_id="task_review_request",
+                    next_turn_index=5,
+                    now_ms=1_777_000_070_000,
+                )
+            )
+
+        self.assertEqual(response["reply_action"], "stop")
+        self.assertEqual(response["status"], "stopped")
+        self.assertTrue(response["safety"]["should_stop"])
+        self.assertEqual(response["safety"]["violations"], ["max_turns_exceeded", "max_duration_exceeded"])
+
+
+if __name__ == "__main__":
+    unittest.main()

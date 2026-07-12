@@ -23,6 +23,49 @@ Use this checklist for daily operations, incident response, and safe upgrades.
 - Negative bounty purchases are intentional and balance-safe.
 - Task completion always calls `/tasks/complete`.
 
+## Threaded Review Workflow
+- Use `docs/threaded-review/SOAK_RUNBOOK.md` when you want the reusable full one-hour guarded relay playbook instead of the short operator example below.
+- Use `docs/threaded-review/LIVE_SOAK_PLAN.md` when you are running the staged real-world live soak with named participants, readiness, preflight, and a Human Governor go / no-go checkpoint.
+- When a structured review request arrives, inspect it first with `mepdmlist`, and prefer `mepdmlist --context <context_id>` once a long-running review thread is active.
+- Use `mepdmlist --json` when you need a machine-readable thread snapshot for the soak evidence bundle or later analysis.
+- Use `mepdmsnapshot --context <context_id> --label <start|mid|end>` when you want the adapter to write the evidence file for you instead of relying on shell redirection.
+- Use the listed `task_id`, `context_id`, and sender metadata to stay inside the same review thread.
+- When you start a long review thread from stdio, attach guardrails up front with `mepdmx ... --max-turns ... --max-duration-seconds ... --checkpoint-interval ...`.
+- Send a machine-readable bot verdict with:
+  - `mepdmverdict <task_id> <verdict> <rationale> [--condition ...] [--recommendation ...]`
+  - `mepdmverdict --context <context_id> <verdict> <rationale> [--condition ...] [--recommendation ...]`
+- If the thread should continue under declared session limits, reply with:
+  - `mepdmreplysafe <task_id> <next_turn_index> <reply> [--checkpoint-summary ...] [--turn-type ...] [--intent ...] [--human-note ...]`
+  - `mepdmreplysafe --context <context_id> <next_turn_index> <reply> [--checkpoint-summary ...] [--turn-type ...] [--intent ...] [--human-note ...]`
+  - `mepdmreplysafe --context <context_id> auto <reply> [--checkpoint-summary ...] [--turn-type ...] [--intent ...] [--human-note ...]`
+- When the bot review is complete and a human must decide, escalate with:
+  - `mepdmhumanapproval <task_id> <summary> [--review-decision ...] [--blocker ...] [--next-action ...] [--target-node ...] [--target-alias ...] [--human-note ...]`
+  - `mepdmhumanapproval --context <context_id> <summary> [--review-decision ...] [--blocker ...] [--next-action ...] [--target-node ...] [--target-alias ...] [--human-note ...]`
+- Prefer the in-thread sequence:
+  - `mepdmlist` -> `mepdmverdict` -> `mepdmhumanapproval`
+- Prefer `mepdmreplysafe ... auto ...` once the thread was started by the current stdio flow, because those messages carry `conversation.turn_index` automatically.
+- Keep `target_node` as `node_id`, preserve `context_id`, and do not invent new thread IDs for follow-up turns.
+
+Example operator flow:
+
+```text
+codex> mepdmx node_reviewer "Please review PR 154 and keep replies inside this thread." --context pr154-review --turn-type review_request --intent review.request --max-turns 12 --max-duration-seconds 3600 --checkpoint-interval 3
+[codex] sent threaded dm task task_review_request to node_reviewer context=pr154-review
+
+codex> mepdmlist --context pr154-review
+[codex] recent structured dm results for context=pr154-review:
+[codex] - task_id=task_review_request context_id=pr154-review message_id=message_review_request source=node_reviewer turn_type=review_request intent=review.request
+
+codex> mepdmverdict task_review_request approve_with_conditions "Threading model is sound." --condition "Document reply expectations." --recommendation "Merge after the docs note lands."
+[codex] review verdict sent task task_review_verdict context=pr154-review
+
+codex> mepdmhumanapproval task_review_request "Two bots approve with conditions and no code blocker remains." --review-decision approve_with_conditions --blocker "Need explicit merge confirmation from the human governor." --next-action "Merge after final human approval." --target-node node_governor --target-alias Governor --human-note "Human asked for a final release-window check."
+[codex] human approval request sent task task_human_approval context=pr154-review
+
+codex> mepdmreplysafe task_review_request 3 "I approve with conditions." --turn-type review_response --intent review.response --human-note "Human asked to preserve final release context."
+[codex] safe reply task task_followup context=pr154-review
+```
+
 ## Security Checks
 - `MEP_ADMIN_KEY` is set and not a placeholder.
 - Secrets are never printed in logs or committed.

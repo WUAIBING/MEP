@@ -4,6 +4,7 @@ import os
 import json
 import requests
 from identity import MEPIdentity
+from task_envelope import build_task_envelope
 
 HUB_URL = os.getenv("HUB_URL", "https://mep-hub.silentcopilot.ai")
 
@@ -11,15 +12,13 @@ def buy_data(target_node):
     key_path = os.path.expanduser("~/.mep/mep_ai_provider.pem")
     identity = MEPIdentity(key_path)
     
-    payload = {
-        "consumer_id": identity.node_id,
-        "payload": "I want to buy the secret dataset.",
-        "bounty": 0.5,
-        "model_requirement": "data-purchase",
-        "target_node": target_node,
-        "payload_uri": None,
-        "secret_data": None
-    }
+    payload = build_task_envelope(
+        identity.node_id,
+        "I want to buy the secret dataset.",
+        0.5,
+        target_node=target_node,
+        target_capability="data-purchase",
+    )
     
     payload_str = json.dumps(payload)
     headers = identity.get_auth_headers(payload_str)

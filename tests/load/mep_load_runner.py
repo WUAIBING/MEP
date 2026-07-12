@@ -10,7 +10,6 @@ from dataclasses import dataclass
 from typing import Any, Optional
 
 import requests
-import websockets
 
 from clients.shared.identity import MEPIdentity
 
@@ -71,6 +70,32 @@ def _percentile_ms(values: list[float], p: float) -> Optional[float]:
     return round(values[idx] * 1000.0, 2)
 
 
+def build_task_request(node_id: str, payload: str, bounty: float) -> dict:
+    if bounty < 0:
+        market = "data"
+        payment_direction = "receiver_to_sender"
+    elif bounty == 0:
+        market = "chat"
+        payment_direction = "none"
+    else:
+        market = "compute"
+        payment_direction = "sender_to_receiver"
+    return {
+        "source": {"node_id": node_id},
+        "intent": {"type": "load.test.request"},
+        "task": {
+            "instructions": payload,
+            "expected_output": {"result_type": "text"},
+        },
+        "economics": {
+            "bounty_ns": int(abs(float(bounty)) * 1_000_000_000),
+            "currency": "MEP_NS",
+            "market": market,
+            "payment_direction": payment_direction,
+        },
+    }
+
+
 class VirtualNode:
     def __init__(
         self,
@@ -127,7 +152,7 @@ class VirtualNode:
         return response.status_code, data
 
     async def submit_task(self, payload: str, bounty: float) -> Optional[str]:
-        body = {"consumer_id": self.node_id, "payload": payload, "bounty": bounty}
+        body = build_task_request(self.node_id, payload, bounty)
         code, data = await self._post_json("/tasks/submit", body)
         if code == 200 and data.get("status") == "success":
             await self.metrics.inc("submits_ok")
@@ -172,12 +197,14 @@ class VirtualNode:
         await self._complete(task_id, result)
 
     async def connect_and_listen(self) -> None:
+        from node.ws_connect import ws_connect
+
         while not self.stop_event.is_set():
             ts = str(int(time.time()))
             sig = urllib.parse.quote(self.identity.sign(self.node_id, ts))
             uri = f"{self.ws_url}/ws/{self.node_id}?timestamp={ts}&signature={sig}"
             try:
-                self.ws = await websockets.connect(uri, ping_interval=20, ping_timeout=20)
+                self.ws = await ws_connect(uri, ping_interval=20, ping_timeout=20)
                 while not self.stop_event.is_set():
                     raw = await self.ws.recv()
                     data = json.loads(raw)

@@ -1,6 +1,5 @@
 import asyncio
 import json
-import websockets
 import requests
 import uuid
 import time
@@ -77,11 +76,13 @@ class ChronosNode:
 
     async def listen(self):
         """Persistent WebSocket connection."""
+        from ws_connect import ws_connect
+
         ts = str(int(time.time()))
         sig = self.identity.sign(self.node_id, ts)
         sig_safe = urllib.parse.quote(sig)
         uri = f"{self.ws_url}/ws/{self.node_id}?timestamp={ts}&signature={sig_safe}"
-        async with websockets.connect(uri) as ws:
+        async with ws_connect(uri) as ws:
             print(f"[Node {self.node_id}] Connected to Hub via WebSocket.")
             heartbeat_task = asyncio.create_task(self._heartbeat_loop(ws))
             try:
@@ -102,21 +103,54 @@ class ChronosNode:
             await asyncio.sleep(WS_HEARTBEAT_INTERVAL_SECONDS)
             await ws.send(json.dumps({"event": "heartbeat", "node_id": self.node_id, "ts": int(time.time())}))
 
-    async def submit_task(self, payload: str, bounty: float):
+    async def submit_task(self, payload: str, bounty: float, target_node: str | None = None, target_capability: str | None = None):
         """As a Consumer, create a task and lock SECONDS."""
-        payload_str = json.dumps({
-            "consumer_id": self.node_id,
-            "payload": payload,
-            "bounty": bounty
-        })
+        bounty_ns = int(abs(float(bounty)) * 1_000_000_000)
+        if bounty < 0:
+            market = "data"
+            payment_direction = "receiver_to_sender"
+        elif bounty == 0:
+            market = "chat"
+            payment_direction = "none"
+        else:
+            market = "compute"
+            payment_direction = "sender_to_receiver"
+
+        task_request = {
+            "source": {"node_id": self.node_id},
+            "intent": {"type": "analysis.request"},
+            "task": {
+                "instructions": payload,
+                "expected_output": {"result_type": "text"},
+            },
+            "economics": {
+                "bounty_ns": bounty_ns,
+                "currency": "MEP_NS",
+                "market": market,
+                "payment_direction": payment_direction,
+            },
+        }
+        if target_node or target_capability:
+            task_request["routing"] = {}
+            if target_node:
+                task_request["routing"]["target_node_id"] = target_node
+            if target_capability:
+                task_request["routing"]["target_capability"] = target_capability
+
+        payload_str = json.dumps(task_request)
         headers = self.identity.get_auth_headers(payload_str)
         headers["Content-Type"] = "application/json"
         resp = requests.post(f"{self.hub_url}/tasks/submit", data=payload_str, headers=headers)
-        if resp.status_code == 200:
-            task_id = resp.json()["task_id"]
+        try:
+            response_body = resp.json()
+        except ValueError:
+            response_body = {}
+        task_id = response_body.get("task_id")
+        if resp.status_code == 200 and response_body.get("status") == "success" and task_id:
             print(f"[Node {self.node_id} (Consumer)] Submitted Task {task_id[:6]} for {bounty}s")
         else:
-            print(f"Failed to submit task: {resp.text}")
+            detail = response_body.get("detail") or resp.text
+            print(f"Failed to submit task: {detail}")
 
 async def run_demo():
     # Setup two nodes
