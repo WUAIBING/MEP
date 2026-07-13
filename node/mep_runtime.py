@@ -805,6 +805,8 @@ def _system_prompt_for_task(
             "and make `summary` and `observation` explicitly about that changed behavior rather than generic quality praise. "
             "If you mention code behavior in `summary` or `observation`, tie it to the same touched path or changed identifiers. "
             "Do not claim a helper is missing validation, checks, or guards unless the changed lines themselves show that absence rather than a nearby allowlist, raise, or verification branch. "
+            "Do not publish a runtime-exception finding unless the changed lines expose the exact operator, method call, or data-shape transition that would fail under Python semantics. "
+            "Do not infer `TypeError`, `unhashable`, or similar hashability failures from ordinary `in`/`not in` membership checks that are only validating an optional value against an allowlist or classification set. "
             "Only include a finding when it is directly supported by the provided diff, file list, PR description, or patch excerpts. "
             "Do not speculate about unseen code, do not ask for more context, and do not include chain-of-thought or any text outside the JSON object. "
             "If the change looks good, keep findings empty, use summary to state the overall conclusion, list the risk areas and checks you covered, keep observation concrete, and set approval_recommendation to approve or comment. "
@@ -863,6 +865,8 @@ def _verification_system_prompt_for_task(task_data: dict[str, Any], *, review_ma
         "For that no-finding case, still return a grounded review: populate `touched_paths` from the real diff, populate `verified_identifiers` from changed lines when available, "
         "and make `summary` and `observation` cite the reviewed changed behavior instead of generic praise. "
         "If `summary` or `observation` says a helper lacks validation, guard logic, or checks, that claim must survive nearby contradiction from the changed lines themselves. "
+        "If a candidate predicts a Python runtime exception, verify the exact failing operator or method call from the changed lines before promoting it. "
+        "Do not promote `TypeError` or `unhashable` claims that are based only on ordinary allowlist membership checks for optional values. "
         f"{mode_hint}"
         "In approval mode, any surviving finding must force `approval_recommendation` away from `approve`."
     )

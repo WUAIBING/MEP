@@ -2251,6 +2251,21 @@ class GitHubToMEPBridgeService:
         return any(re.search(pattern, lowered) for pattern in validation_patterns)
 
     @staticmethod
+    def _is_hashability_membership_claim(text: str) -> bool:
+        lowered = str(text or "").lower()
+        if not lowered:
+            return False
+        has_hashability_language = any(
+            token in lowered
+            for token in ("typeerror", "unhashable", "not hashable", "hashability")
+        )
+        has_membership_language = any(
+            token in lowered
+            for token in (" membership ", " allowlist ", " not in ", " in `", " in ")
+        )
+        return has_hashability_language and has_membership_language
+
+    @staticmethod
     def _finding_conflicts_with_patch(finding_text: str, patch_text: str) -> bool:
         if not finding_text or not patch_text:
             return False
@@ -2292,6 +2307,18 @@ class GitHubToMEPBridgeService:
                 "unsupported ",
             )
             return any(token in lowered_patch for token in validation_evidence_tokens)
+        if GitHubToMEPBridgeService._is_hashability_membership_claim(lowered_finding):
+            allowlist_membership_tokens = (
+                " not in ",
+                " in interbot_governance_classifications",
+                " in allowed_",
+                " in valid_",
+                "classification",
+                "allowlist",
+                "unsupported ",
+            )
+            if any(token in lowered_patch for token in allowlist_membership_tokens):
+                return True
         return False
 
     @staticmethod
