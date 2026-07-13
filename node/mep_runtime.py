@@ -804,6 +804,7 @@ def _system_prompt_for_task(
             "include 1-3 exact changed-line identifiers in `verified_identifiers` when the review context provides them, "
             "and make `summary` and `observation` explicitly about that changed behavior rather than generic quality praise. "
             "If you mention code behavior in `summary` or `observation`, tie it to the same touched path or changed identifiers. "
+            "Do not claim a helper is missing validation, checks, or guards unless the changed lines themselves show that absence rather than a nearby allowlist, raise, or verification branch. "
             "Only include a finding when it is directly supported by the provided diff, file list, PR description, or patch excerpts. "
             "Do not speculate about unseen code, do not ask for more context, and do not include chain-of-thought or any text outside the JSON object. "
             "If the change looks good, keep findings empty, use summary to state the overall conclusion, list the risk areas and checks you covered, keep observation concrete, and set approval_recommendation to approve or comment. "
@@ -861,6 +862,7 @@ def _verification_system_prompt_for_task(task_data: dict[str, Any], *, review_ma
         "If no candidate survives verification, keep `findings` empty, explain the checks you performed, and keep the summary grounded in the reviewed changed behavior. "
         "For that no-finding case, still return a grounded review: populate `touched_paths` from the real diff, populate `verified_identifiers` from changed lines when available, "
         "and make `summary` and `observation` cite the reviewed changed behavior instead of generic praise. "
+        "If `summary` or `observation` says a helper lacks validation, guard logic, or checks, that claim must survive nearby contradiction from the changed lines themselves. "
         f"{mode_hint}"
         "In approval mode, any surviving finding must force `approval_recommendation` away from `approve`."
     )

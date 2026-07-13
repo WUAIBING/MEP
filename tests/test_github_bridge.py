@@ -2621,6 +2621,59 @@ class TestGitHubToMEPBridge(unittest.TestCase):
         self.assertEqual(len(self.github_session.posts), 0)
         self.assertEqual(self.service.github_writeback_metrics["last_suppressed_reason"], "observation_in_context_only")
 
+    def test_status_callback_suppresses_summary_conflicting_with_changed_validation_logic(self):
+        self._set_pr_review_package(
+            [
+                {
+                    "filename": "clients/shared/mep_client.py",
+                    "status": "modified",
+                    "patch": (
+                        "@@ -1177,0 +1177,12 @@\n"
+                        "+def build_governance_metadata(classification: str, approval_status: Optional[str] = None) -> dict[str, Any]:\n"
+                        "+    normalized_classification = classification.strip().lower() if isinstance(classification, str) else \"\"\n"
+                        "+    if normalized_classification not in GOVERNANCE_CLASSIFICATIONS:\n"
+                        "+        raise ValueError(f\"unsupported governance classification: {classification}\")\n"
+                        "+    if approval_status is not None:\n"
+                        "+        normalized_status = approval_status.strip().lower() if isinstance(approval_status, str) else \"\"\n"
+                        "+        if normalized_status not in GOVERNANCE_APPROVAL_STATUSES:\n"
+                        "+            raise ValueError(f\"unsupported governance approval status: {approval_status}\")\n"
+                    ),
+                },
+            ],
+            pr_body="Adds governance metadata validation for classification and approval status.",
+        )
+        response = self._post_webhook(
+            _issue_comment_payload("@Hub-Sentinel review this PR"),
+            delivery_id="delivery-summary-conflicts-with-validation-guard",
+        )
+        bridge_id = response.json()["bridge_id"]
+        self._flush_context(response.json()["context_id"])
+
+        token = self.service._generate_status_token(bridge_id, "node_target")
+        status_response = self.client.post(
+            "/bridge/status",
+            json={
+                "bridge_id": bridge_id,
+                "status": "completed",
+                "target_node_id": "node_target",
+                "task_id": "task-summary-conflicts-with-validation-guard",
+                "detail": (
+                    "## Review Summary\n\n"
+                    "`build_governance_metadata` does not validate `classification` or `approval_status`, so unsupported values can still flow through.\n\n"
+                    "Observation: The helper still passes raw values through to the governance payload.\n\n"
+                    "Touched paths reviewed: `clients/shared/mep_client.py`\n\n"
+                    "Risk areas checked: governance metadata validation\n\n"
+                    "Checks performed: compared `build_governance_metadata` against the changed validation branch\n\n"
+                    "Changed identifiers verified: `build_governance_metadata`, `classification`, `approval_status`"
+                ),
+            },
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        self.assertEqual(status_response.status_code, 200)
+        self.assertEqual(len(self.github_session.posts), 0)
+        self.assertIn("action: retrying", self.notifier.calls[-1]["text"])
+        self.assertEqual(self.service.github_writeback_metrics["last_suppressed_reason"], "summary_conflicts_with_patch")
+
     def test_status_callback_allows_finding_grounded_to_changed_lines(self):
         self._set_pr_review_package(
             [

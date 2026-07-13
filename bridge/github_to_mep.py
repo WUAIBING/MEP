@@ -2162,6 +2162,24 @@ class GitHubToMEPBridgeService:
         return str(match.group(1) or "").strip()
 
     @staticmethod
+    def _extract_summary_text(detail: str) -> str:
+        if not detail:
+            return ""
+        match = re.search(
+            r"##\s*Review Summary\s*(.+?)(?:\n\s*Observation:|\n\s*Touched paths reviewed:|\n\s*Tests reviewed:|\n\s*Risk areas checked:|\n\s*Checks performed:|\n\s*Changed identifiers verified:|$)",
+            detail,
+            re.IGNORECASE | re.DOTALL,
+        )
+        if not match:
+            return ""
+        summary = re.sub(r"\s+", " ", str(match.group(1) or "").strip()).strip()
+        if not summary:
+            return ""
+        if summary.lower().startswith("observation:"):
+            return ""
+        return summary
+
+    @staticmethod
     def _extract_review_section_text(detail: str, label: str) -> str:
         if not detail:
             return ""
@@ -2212,6 +2230,27 @@ class GitHubToMEPBridgeService:
         return any(token in lowered for token in (" has no ", " no ", " without ", " missing "))
 
     @staticmethod
+    def _is_validation_absence_claim(text: str) -> bool:
+        lowered = str(text or "").lower()
+        if not lowered:
+            return False
+        validation_patterns = (
+            r"\bdoes not validate\b",
+            r"\bdoesn't validate\b",
+            r"\bmissing validation\b",
+            r"\blacks validation\b",
+            r"\bwithout validating\b",
+            r"\bno validation\b",
+            r"\bdoes not check\b",
+            r"\bdoesn't check\b",
+            r"\bmissing guard\b",
+            r"\blacks guard\b",
+            r"\bmissing allowlist\b",
+            r"\blacks allowlist\b",
+        )
+        return any(re.search(pattern, lowered) for pattern in validation_patterns)
+
+    @staticmethod
     def _finding_conflicts_with_patch(finding_text: str, patch_text: str) -> bool:
         if not finding_text or not patch_text:
             return False
@@ -2242,6 +2281,17 @@ class GitHubToMEPBridgeService:
             return any(token in lowered_patch for token in auth_evidence_tokens)
         if GitHubToMEPBridgeService._is_auth_absence_claim(lowered_finding):
             return any(token in lowered_patch for token in auth_evidence_tokens)
+        if GitHubToMEPBridgeService._is_validation_absence_claim(lowered_finding):
+            validation_evidence_tokens = (
+                "raise valueerror",
+                "raise runtimekeypatherror",
+                "allowed_",
+                "valid_",
+                "validator",
+                " not in ",
+                "unsupported ",
+            )
+            return any(token in lowered_patch for token in validation_evidence_tokens)
         return False
 
     @staticmethod
@@ -2348,9 +2398,11 @@ class GitHubToMEPBridgeService:
             "changes": "\n".join(patches_by_path.get(path, {}).get("changes", "") for path in anchored_paths),
         }
         has_findings = "## review findings" in lowered or bool(self._extract_review_finding_entries(detail or ""))
+        summary_text = self._extract_summary_text(detail or "")
         observation_text = self._extract_observation_text(detail or "")
         risk_areas_checked = self._extract_review_section_list(detail or "", "Risk areas checked")
         checks_performed = self._extract_review_section_list(detail or "", "Checks performed")
+        verified_identifiers = self._extract_review_section_list(detail or "", "Changed identifiers verified")
         why_no_finding = self._extract_review_section_text(detail or "", "Why no finding")
         has_structured_sections = any(
             snippet in lowered
@@ -2383,9 +2435,11 @@ class GitHubToMEPBridgeService:
             "patches_by_path": patches_by_path,
             "anchored_patch_info": anchored_patch_info,
             "has_findings": has_findings,
+            "summary_text": summary_text,
             "observation_text": observation_text,
             "risk_areas_checked": risk_areas_checked,
             "checks_performed": checks_performed,
+            "verified_identifiers": verified_identifiers,
             "why_no_finding": why_no_finding,
             "has_structured_sections": has_structured_sections,
             "grounded_tokens": grounded_tokens,
@@ -2400,9 +2454,11 @@ class GitHubToMEPBridgeService:
         changed_tokens = snapshot.get("changed_tokens") or set()
         grounded_tokens = snapshot.get("grounded_tokens") or set()
         has_findings = bool(snapshot.get("has_findings"))
+        summary_text = str(snapshot.get("summary_text") or "").strip()
         observation_text = str(snapshot.get("observation_text") or "").strip()
         risk_areas_checked = snapshot.get("risk_areas_checked") or []
         checks_performed = snapshot.get("checks_performed") or []
+        verified_identifiers = snapshot.get("verified_identifiers") or []
         why_no_finding = str(snapshot.get("why_no_finding") or "").strip()
         expected_tests = snapshot.get("expected_tests") or []
         mentions_tests = bool(snapshot.get("mentions_tests"))
@@ -2420,12 +2476,15 @@ class GitHubToMEPBridgeService:
         if len(changed_tokens) >= 2:
             score += 1
             reasons.append("multiple_changed_identifiers")
+        elif verified_identifiers:
+            score += 1
+            reasons.append("verified_changed_identifiers")
         if has_findings:
             score += 2
             reasons.append("concrete_findings")
-        elif observation_text and grounded_tokens:
+        elif (summary_text or observation_text) and (changed_tokens or grounded_tokens or verified_identifiers):
             score += 1
-            reasons.append("grounded_observation")
+            reasons.append("grounded_summary_or_observation")
         if risk_areas_checked:
             score += 1
             reasons.append("risk_coverage")
@@ -2532,8 +2591,10 @@ class GitHubToMEPBridgeService:
         anchored_patch_info = snapshot.get("anchored_patch_info") or {"full": "", "changes": ""}
         has_findings = bool(snapshot.get("has_findings"))
         observation_text = str(snapshot.get("observation_text") or "")
+        summary_text = str(snapshot.get("summary_text") or "")
         risk_areas_checked = snapshot.get("risk_areas_checked") or []
         checks_performed = snapshot.get("checks_performed") or []
+        verified_identifiers = snapshot.get("verified_identifiers") or []
         has_structured_sections = bool(snapshot.get("has_structured_sections"))
         why_no_finding = str(snapshot.get("why_no_finding") or "").strip()
         grounded_tokens = snapshot.get("grounded_tokens") or set()
@@ -2554,8 +2615,14 @@ class GitHubToMEPBridgeService:
         if reviewability_bucket == "low_signal" and not has_findings and action != "approved":
             return True, "low_signal_no_finding"
         if has_structured_sections and not has_findings:
+            if summary_text and anchored_paths and review_package:
+                if self._finding_conflicts_with_patch(summary_text, anchored_patch_info["full"]) or self._finding_conflicts_with_patch(detail or "", anchored_patch_info["full"]):
+                    return True, "summary_conflicts_with_patch"
             if not observation_text and not grounded_tokens and not checks_performed and not risk_areas_checked:
                 return True, "summary_without_code_evidence"
+            summary_tokens = self._extract_identifier_tokens(summary_text)
+            if summary_tokens and not changed_tokens and not verified_identifiers:
+                return True, "summary_in_context_only"
             observation_tokens = self._extract_identifier_tokens(observation_text)
             
             # Phase 3A: Summary-only reviews must anchor to at least one changed token if they mention code
@@ -2595,6 +2662,13 @@ class GitHubToMEPBridgeService:
         elif reason in {"ungrounded_finding", "finding_in_context_only", "speculative_finding"}:
             sanitized = re.sub(r"(?im)^\s*\d+\.\s+\*\*.+(?:\n|$)", "", sanitized)
             sanitized = re.sub(r"(?im)^##\s*Review Findings\b", "## Review Summary", sanitized, count=1)
+        elif reason in {"summary_conflicts_with_patch", "summary_in_context_only"}:
+            sanitized = re.sub(
+                r"(?ims)^##\s*Review Summary\s*.*?(?=\n\s*Observation:|\n\s*Touched paths reviewed:|\n\s*Tests reviewed:|\n\s*Risk areas checked:|\n\s*Checks performed:|\n\s*Changed identifiers verified:|$)",
+                "## Review Summary\n\n",
+                sanitized,
+                count=1,
+            )
         elif reason == "summary_without_changed_behavior_evidence":
             sanitized = re.sub(r"(?im)^\s*Why no finding:\s*.+(?:\n|$)", "", sanitized)
         return cls._cleanup_review_detail(sanitized)
@@ -2608,6 +2682,8 @@ class GitHubToMEPBridgeService:
         suppression_reason: Optional[str],
     ) -> Optional[tuple[str, dict[str, Any], int, list[str]]]:
         if action == "approved":
+            return None
+        if suppression_reason in {"summary_conflicts_with_patch"}:
             return None
         sanitized = self._sanitize_review_detail_for_reason(detail, suppression_reason)
         if not sanitized or sanitized == str(detail or "").strip():

@@ -540,6 +540,16 @@ class TestRuntimeReviewPrompts(unittest.TestCase):
         self.assertIn("follow-up verification pass", prompt)
         self.assertIn("Do not invent fresh low-signal concerns", prompt)
 
+    def test_review_prompt_blocks_summary_claims_that_ignore_nearby_validation_guards(self):
+        prompt = mep_runtime._system_prompt_for_task(  # noqa: SLF001
+            self._bridge_review_task_data(),
+            generic_max_chars=300,
+            review_max_chars=1000,
+        )
+
+        self.assertIn("Do not claim a helper is missing validation, checks, or guards", prompt)
+        self.assertIn("nearby allowlist, raise, or verification branch", prompt)
+
     def test_review_lenses_include_bridge_safety_focus(self):
         lenses = mep_runtime._review_lenses_for_task(self._bridge_review_task_data())  # noqa: SLF001
 
