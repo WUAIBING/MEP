@@ -241,6 +241,49 @@ class TestSharedMEPClient(unittest.TestCase):
         self.assertEqual(session_safety["checkpoint_interval"], 3)
         self.assertEqual(session_safety["started_at_ms"], body["timestamp_ms"])
 
+    def test_submit_dm_can_attach_governance_metadata(self):
+        with (
+            patch("clients.shared.mep_client.MEPIdentity", return_value=_FakeIdentity()),
+            patch("clients.shared.mep_client.requests.Session") as session_cls,
+        ):
+            session = session_cls.return_value
+            session.post.return_value = _FakeResponse()
+            client = MEPClient("unused.pem")
+
+            asyncio.run(
+                client.submit_dm(
+                    "Need a redacted workspace summary.",
+                    "node_reviewer",
+                    context_id="gov-ctx",
+                    governance=client.build_governance_metadata(
+                        classification="approval_required",
+                        reason="share redacted workspace facts only",
+                        disclosure_scope=["workspace_summary"],
+                        redaction_applied=True,
+                        approval_status="approved",
+                        approval_context_id="approval-ctx",
+                        approved_by="node_human",
+                    ),
+                )
+            )
+
+        submit_body = json.loads(session.post.call_args.kwargs["data"])
+        body = json.loads(submit_body["task"]["instructions"])
+        self.assertEqual(
+            body["task"]["inputs"]["governance"],
+            {
+                "classification": "approval_required",
+                "reason": "share redacted workspace facts only",
+                "disclosure_scope": ["workspace_summary"],
+                "redaction_applied": True,
+                "approval": {
+                    "status": "approved",
+                    "context_id": "approval-ctx",
+                    "approved_by": "node_human",
+                },
+            },
+        )
+
     def test_extract_interbot_instructions_prefers_structured_task_text(self):
         payload = json.dumps(
             {
@@ -372,6 +415,16 @@ class TestSharedMEPClient(unittest.TestCase):
                 "recommended_next_action": "Merge after human approval.",
             },
         )
+        self.assertEqual(
+            body["task"]["inputs"]["governance"],
+            {
+                "classification": "approval_required",
+                "reason": "human approval required for merge_decision",
+                "disclosure_scope": ["merge_decision"],
+                "redaction_applied": False,
+                "approval": {"status": "pending"},
+            },
+        )
         self.assertEqual(response["context_id"], "pr155-review")
 
     def test_extract_human_approval_request_reads_structured_payload(self):
@@ -404,6 +457,47 @@ class TestSharedMEPClient(unittest.TestCase):
                 "review_decision": "approve",
                 "blockers": ["Confirm release window"],
                 "recommended_next_action": "Merge after approval.",
+            },
+        )
+
+    def test_extract_governance_metadata_reads_structured_payload(self):
+        payload = json.dumps(
+            {
+                "spec_version": "mep.interbot.v1",
+                "task": {
+                    "instructions": "Share a redacted runtime fact summary.",
+                    "inputs": {
+                        "governance": {
+                            "classification": "approval_required",
+                            "reason": "share runtime facts after approval",
+                            "disclosure_scope": ["runtime_facts"],
+                            "redaction_applied": True,
+                            "approval": {
+                                "status": "approved",
+                                "context_id": "approval-123",
+                                "approved_by": "node_human",
+                            },
+                        }
+                    },
+                    "expected_output": {"result_type": "text"},
+                },
+            }
+        )
+
+        governance = MEPClient.extract_governance_metadata(payload)
+
+        self.assertEqual(
+            governance,
+            {
+                "classification": "approval_required",
+                "reason": "share runtime facts after approval",
+                "disclosure_scope": ["runtime_facts"],
+                "redaction_applied": True,
+                "approval": {
+                    "status": "approved",
+                    "context_id": "approval-123",
+                    "approved_by": "node_human",
+                },
             },
         )
 

@@ -33,6 +33,8 @@ DEFAULT_EXECUTION_MUST_INCLUDE = [
 ]
 REVIEW_VERDICTS = {"approve", "approve_with_conditions", "request_changes", "block"}
 HUMAN_APPROVAL_DECISION_TYPES = {"merge_decision", "deploy_decision", "policy_decision"}
+GOVERNANCE_CLASSIFICATIONS = {"safe", "approval_required", "forbidden"}
+GOVERNANCE_APPROVAL_STATUSES = {"pending", "approved", "denied"}
 
 
 class MEPClient:
@@ -339,6 +341,7 @@ class MEPClient:
         trace_id: Optional[str] = None,
         task_title: Optional[str] = None,
         session_safety: Optional[dict[str, Any]] = None,
+        governance: Optional[dict[str, Any]] = None,
         turn_index: Optional[int] = None,
     ) -> dict[str, Any]:
         message_uuid = message_id or str(uuid.uuid4())
@@ -357,6 +360,9 @@ class MEPClient:
             normalized_session_safety["started_at_ms"] = timestamp_ms
         if normalized_session_safety:
             inputs["session_safety"] = normalized_session_safety
+        normalized_governance = self._normalize_governance_input(governance) if governance else None
+        if normalized_governance:
+            inputs["governance"] = normalized_governance
         if expected_output_must_include:
             task_payload["expected_output"]["must_include"] = list(expected_output_must_include)
         if inputs:
@@ -413,6 +419,7 @@ class MEPClient:
         message_id: Optional[str] = None,
         trace_id: Optional[str] = None,
         session_safety: Optional[dict[str, Any]] = None,
+        governance: Optional[dict[str, Any]] = None,
         turn_index: Optional[int] = None,
     ) -> dict:
         envelope = self.build_interbot_message(
@@ -434,6 +441,7 @@ class MEPClient:
             message_id=message_id,
             trace_id=trace_id,
             session_safety=session_safety,
+            governance=governance,
             turn_index=turn_index,
         )
         response = await self.submit_task(json.dumps(envelope), 0.0, None, target_node)
@@ -531,6 +539,7 @@ class MEPClient:
         max_cost_seconds: Optional[float] = None,
         human_note: Optional[str] = None,
         session_safety: Optional[dict[str, Any]] = None,
+        governance: Optional[dict[str, Any]] = None,
         turn_index: Optional[int] = None,
     ) -> dict[str, Any]:
         constraints: dict[str, Any] = {}
@@ -562,6 +571,7 @@ class MEPClient:
             constraints=constraints or None,
             human_note=human_note,
             session_safety=session_safety,
+            governance=governance,
             turn_index=turn_index,
         )
 
@@ -583,6 +593,7 @@ class MEPClient:
         max_cost_seconds: Optional[float] = None,
         human_note: Optional[str] = None,
         session_safety: Optional[dict[str, Any]] = None,
+        governance: Optional[dict[str, Any]] = None,
         turn_index: Optional[int] = None,
     ) -> dict:
         envelope = self.build_execution_request_message(
@@ -601,6 +612,7 @@ class MEPClient:
             max_cost_seconds=max_cost_seconds,
             human_note=human_note,
             session_safety=session_safety,
+            governance=governance,
             turn_index=turn_index,
         )
         response = await self.submit_task(json.dumps(envelope), 0.0, None, target_node)
@@ -896,6 +908,13 @@ class MEPClient:
         if normalized_next_action:
             message_lines.append(f"Recommended next action: {normalized_next_action}")
 
+        governance_payload = self.build_governance_metadata(
+            classification="approval_required",
+            reason=f"human approval required for {normalized_decision_type}",
+            disclosure_scope=[normalized_decision_type],
+            approval_status="pending",
+        )
+
         return self.build_interbot_message(
             "\n".join(message_lines),
             target_node,
@@ -910,6 +929,7 @@ class MEPClient:
             human_note=human_note,
             task_title="Human approval request",
             task_inputs={"human_approval_request": approval_payload},
+            governance=governance_payload,
             turn_index=turn_index,
         )
 
@@ -1154,6 +1174,57 @@ class MEPClient:
         return normalized
 
     @classmethod
+    def build_governance_metadata(
+        cls,
+        *,
+        classification: str,
+        reason: str,
+        disclosure_scope: Optional[list[str]] = None,
+        redaction_applied: bool = False,
+        approval_status: Optional[str] = None,
+        approval_context_id: Optional[str] = None,
+        approved_by: Optional[str] = None,
+    ) -> dict[str, Any]:
+        normalized_classification = classification.strip().lower() if isinstance(classification, str) else ""
+        if normalized_classification not in GOVERNANCE_CLASSIFICATIONS:
+            raise ValueError(f"unsupported governance classification: {classification}")
+        normalized_reason = reason.strip() if isinstance(reason, str) else ""
+        if not normalized_reason:
+            raise ValueError("governance reason must be non-empty")
+        normalized: dict[str, Any] = {
+            "classification": normalized_classification,
+            "reason": normalized_reason,
+            "redaction_applied": bool(redaction_applied),
+        }
+        normalized_scope = cls._normalize_string_list(disclosure_scope)
+        if normalized_scope:
+            normalized["disclosure_scope"] = normalized_scope
+        if approval_status is not None:
+            normalized_status = approval_status.strip().lower() if isinstance(approval_status, str) else ""
+            if normalized_status not in GOVERNANCE_APPROVAL_STATUSES:
+                raise ValueError(f"unsupported governance approval status: {approval_status}")
+            approval_payload: dict[str, Any] = {"status": normalized_status}
+            if isinstance(approval_context_id, str) and approval_context_id.strip():
+                approval_payload["context_id"] = approval_context_id.strip()
+            if isinstance(approved_by, str) and approved_by.strip():
+                approval_payload["approved_by"] = approved_by.strip()
+            normalized["approval"] = approval_payload
+        return normalized
+
+    @classmethod
+    def _normalize_governance_input(cls, governance: dict[str, Any]) -> dict[str, Any]:
+        approval = governance.get("approval") if isinstance(governance.get("approval"), dict) else {}
+        return cls.build_governance_metadata(
+            classification=governance.get("classification"),
+            reason=governance.get("reason"),
+            disclosure_scope=governance.get("disclosure_scope"),
+            redaction_applied=bool(governance.get("redaction_applied", False)),
+            approval_status=approval.get("status"),
+            approval_context_id=approval.get("context_id"),
+            approved_by=approval.get("approved_by"),
+        )
+
+    @classmethod
     def extract_human_approval_request(cls, payload_text: str) -> Optional[dict[str, Any]]:
         parsed = cls.parse_interbot_payload(payload_text)
         if not parsed:
@@ -1185,6 +1256,25 @@ class MEPClient:
         if isinstance(recommended_next_action, str) and recommended_next_action.strip():
             extracted["recommended_next_action"] = recommended_next_action.strip()
         return extracted
+
+    @classmethod
+    def extract_governance_metadata(cls, payload_text: str) -> Optional[dict[str, Any]]:
+        parsed = cls.parse_interbot_payload(payload_text)
+        if not parsed:
+            return None
+        task = parsed.get("task")
+        if not isinstance(task, dict):
+            return None
+        inputs = task.get("inputs")
+        if not isinstance(inputs, dict):
+            return None
+        governance = inputs.get("governance")
+        if not isinstance(governance, dict):
+            return None
+        try:
+            return cls._normalize_governance_input(governance)
+        except ValueError:
+            return None
 
     @staticmethod
     def _default_reply_intent_type(inbound_intent_type: Optional[str]) -> str:
