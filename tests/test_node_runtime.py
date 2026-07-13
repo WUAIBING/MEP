@@ -738,6 +738,54 @@ class TestRuntimeReviewPrompts(unittest.TestCase):
 
         self.assertEqual(action, "approved")
 
+    def test_recheck_review_request_bridge_action_upgrades_to_approved_for_grounded_no_finding_review(self):
+        task_data = self._bridge_review_task_data(
+            intent_type="code.review.request",
+            review_mode="recheck_review",
+            changed_identifiers=["_score_review_quality", "_approval_quality_failure"],
+        )
+        detail = (
+            "## Review Summary\n\n"
+            "Verified the follow-up patch stays low-risk and the earlier concern is resolved.\n\n"
+            "Touched paths reviewed: `bridge/github_to_mep.py`\n\n"
+            "Tests reviewed: `tests/test_github_bridge.py`\n\n"
+            "Risk areas checked: approval gating, changed-line anchoring\n\n"
+            "Checks performed: traced approval suppression branches, compared changed identifiers against the diff\n\n"
+            "Changed identifiers verified: `_score_review_quality`, `_approval_quality_failure`"
+        )
+
+        action = mep_runtime.RuntimeNode._bridge_status_action(  # noqa: SLF001
+            mep_runtime._interbot_message_from_task_data(task_data),  # noqa: SLF001
+            detail=detail,
+            task_data=task_data,
+        )
+
+        self.assertEqual(action, "approved")
+
+    def test_discovery_review_request_bridge_action_stays_reviewed_even_for_grounded_no_finding_review(self):
+        task_data = self._bridge_review_task_data(
+            intent_type="code.review.request",
+            review_mode="discovery_review",
+            changed_identifiers=["_score_review_quality", "_approval_quality_failure"],
+        )
+        detail = (
+            "## Review Summary\n\n"
+            "Checked the initial review pass and found no blocker.\n\n"
+            "Touched paths reviewed: `bridge/github_to_mep.py`\n\n"
+            "Tests reviewed: `tests/test_github_bridge.py`\n\n"
+            "Risk areas checked: approval gating, changed-line anchoring\n\n"
+            "Checks performed: traced approval suppression branches, compared changed identifiers against the diff\n\n"
+            "Changed identifiers verified: `_score_review_quality`, `_approval_quality_failure`"
+        )
+
+        action = mep_runtime.RuntimeNode._bridge_status_action(  # noqa: SLF001
+            mep_runtime._interbot_message_from_task_data(task_data),  # noqa: SLF001
+            detail=detail,
+            task_data=task_data,
+        )
+
+        self.assertEqual(action, "reviewed")
+
     def test_structured_review_renders_risk_coverage_for_no_finding_reviews(self):
         rendered = mep_runtime._render_structured_review_with_task_data(  # noqa: SLF001
             (
