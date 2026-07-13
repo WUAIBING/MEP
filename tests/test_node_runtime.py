@@ -762,7 +762,7 @@ class TestRuntimeReviewPrompts(unittest.TestCase):
 
         self.assertEqual(action, "approved")
 
-    def test_discovery_review_request_bridge_action_stays_reviewed_even_for_grounded_no_finding_review(self):
+    def test_discovery_review_request_bridge_action_upgrades_to_approved_for_grounded_no_finding_review(self):
         task_data = self._bridge_review_task_data(
             intent_type="code.review.request",
             review_mode="discovery_review",
@@ -784,7 +784,7 @@ class TestRuntimeReviewPrompts(unittest.TestCase):
             task_data=task_data,
         )
 
-        self.assertEqual(action, "reviewed")
+        self.assertEqual(action, "approved")
 
     def test_structured_review_renders_risk_coverage_for_no_finding_reviews(self):
         rendered = mep_runtime._render_structured_review_with_task_data(  # noqa: SLF001

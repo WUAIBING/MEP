@@ -2917,10 +2917,7 @@ class RuntimeNode:
                 return "reviewed"
             return "approved"
         if intent_type == "code.review.request":
-            if (
-                _review_mode_for_task(task_data or {}) == "recheck_review"
-                and _approval_detail_supports_publishable_approval(detail, task_data=task_data)
-            ):
+            if _approval_detail_supports_publishable_approval(detail, task_data=task_data):
                 return "approved"
             return "reviewed"
         if intent_type == "code.review.comment":
