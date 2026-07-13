@@ -2776,6 +2776,51 @@ class TestGitHubToMEPBridge(unittest.TestCase):
         self.assertEqual(len(self.github_session.posts), 0)
         self.assertEqual(self.service.github_writeback_metrics["last_suppressed_reason"], "speculative_finding")
 
+    def test_status_callback_suppresses_hashability_claim_from_allowlist_membership(self):
+        self._set_pr_review_package(
+            [
+                {
+                    "filename": "hub/main.py",
+                    "status": "modified",
+                    "patch": (
+                        "@@ -1048,0 +1048,6 @@\n"
+                        '+classification = governance.get("classification")\n'
+                        "+if classification not in INTERBOT_GOVERNANCE_CLASSIFICATIONS:\n"
+                        '+    raise HTTPException(status_code=400, detail="Inter-bot governance classification invalid")\n'
+                    ),
+                },
+            ],
+            pr_body="Adds governance validation for inter-bot payload classification.",
+        )
+        response = self._post_webhook(
+            _issue_comment_payload("@Hub-Sentinel review this PR", delivery_number=124),
+            delivery_id="delivery-hashability-finding",
+        )
+        self.assertEqual(response.status_code, 200)
+        bridge_id = response.json()["bridge_id"]
+        self._flush_context(response.json()["context_id"])
+
+        token = self.service._generate_status_token(bridge_id, "node_target")
+        status_response = self.client.post(
+            "/bridge/status",
+            json={
+                "bridge_id": bridge_id,
+                "status": "completed",
+                "target_node_id": "node_target",
+                "task_id": "task-hashability-finding",
+                "detail": (
+                    "## Review Findings\n\n"
+                    "1. **`classification` can raise a `TypeError` during allowlist membership checks.** (`hub/main.py`): "
+                    "If `governance.get(\"classification\")` returns `None`, the `classification not in "
+                    "INTERBOT_GOVERNANCE_CLASSIFICATIONS` guard will treat it as unhashable and fail before the intended HTTPException."
+                ),
+            },
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        self.assertEqual(status_response.status_code, 200, status_response.text)
+        self.assertEqual(len(self.github_session.posts), 0)
+        self.assertEqual(self.service.github_writeback_metrics["last_suppressed_reason"], "ungrounded_finding")
+
     def test_status_callback_posts_issue_comment_for_analysis_completion(self):
         response = self._post_webhook(
             _issue_comment_payload("@Hub-Sentinel analyze this PR", delivery_number=227),
