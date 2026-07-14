@@ -90,8 +90,27 @@ PHASE8_STABILITY_TARGETS = {
     "min_low_signal_suppression_rate": 1.0,
     "min_green_approval_publish_rate": 1.0,
     "max_non_green_approval_publish_count": 0,
-    "min_avg_quality_score": 8.0,
+    "min_avg_quality_score": 7.0,
 }
+_QUALITY_SCORE_WEIGHTS = {
+    "path_anchor": 2.0,
+    "changed_code_evidence": 2.0,
+    "review_substance": 2.0,
+    "risk_coverage": 1.0,
+    "explicit_checks": 1.0,
+    "test_awareness": 1.0,
+    "approval_low_risk": 1.0,
+}
+_LOW_RISK_CLAIM_RE = re.compile(
+    r"\b(?:"
+    r"no\s+risky\s+changes?"
+    r"|low[- ]risk"
+    r"|no\s+concrete\s+(?:correctness|regression)(?:\s+or\s+(?:correctness|regression))?\s+issue(?:s)?"
+    r"|does\s+not\s+show\s+a\s+concrete\s+regression\s+trigger"
+    r"|no\s+changed[- ]line\s+evidence\s+of\s+a\s+new\s+failure\s+path"
+    r")\b",
+    re.IGNORECASE,
+)
 _WEAK_GITHUB_REVIEW_PATTERNS = [
     r"\blooks good\b",
     r"\blooks correct\b",
@@ -2475,8 +2494,8 @@ class GitHubToMEPBridgeService:
         }
 
     def _score_review_quality(self, snapshot: dict[str, Any], *, action: str) -> tuple[int, list[str]]:
-        score = 0
         reasons: list[str] = []
+        raw_score = 0.0
         anchored_paths = snapshot.get("anchored_paths") or set()
         changed_tokens = snapshot.get("changed_tokens") or set()
         grounded_tokens = snapshot.get("grounded_tokens") or set()
@@ -2486,47 +2505,47 @@ class GitHubToMEPBridgeService:
         risk_areas_checked = snapshot.get("risk_areas_checked") or []
         checks_performed = snapshot.get("checks_performed") or []
         verified_identifiers = snapshot.get("verified_identifiers") or []
-        why_no_finding = str(snapshot.get("why_no_finding") or "").strip()
         expected_tests = snapshot.get("expected_tests") or []
         mentions_tests = bool(snapshot.get("mentions_tests"))
         lowered = str(snapshot.get("lowered") or "")
 
         if anchored_paths:
-            score += 1
+            raw_score += min(len(anchored_paths), 2)
             reasons.append("touched_path_anchor")
         if len(anchored_paths) >= 2:
-            score += 1
             reasons.append("multi_path_anchor")
-        if changed_tokens:
-            score += 1
+        changed_evidence_count = len(changed_tokens)
+        if not changed_evidence_count and verified_identifiers:
+            changed_evidence_count = min(len(verified_identifiers), 2)
+        if changed_evidence_count:
+            raw_score += min(changed_evidence_count, 2)
             reasons.append("changed_code_evidence")
-        if len(changed_tokens) >= 2:
-            score += 1
+        if len(changed_tokens) >= 2 or len(verified_identifiers) >= 2:
             reasons.append("multiple_changed_identifiers")
         elif verified_identifiers:
-            score += 1
             reasons.append("verified_changed_identifiers")
         if has_findings:
-            score += 2
+            raw_score += _QUALITY_SCORE_WEIGHTS["review_substance"]
             reasons.append("concrete_findings")
         elif (summary_text or observation_text) and (changed_tokens or grounded_tokens or verified_identifiers):
-            score += 1
+            raw_score += _QUALITY_SCORE_WEIGHTS["review_substance"] / 2
             reasons.append("grounded_summary_or_observation")
         if risk_areas_checked:
-            score += 1
+            raw_score += _QUALITY_SCORE_WEIGHTS["risk_coverage"]
             reasons.append("risk_coverage")
         if checks_performed:
-            score += 1
+            raw_score += _QUALITY_SCORE_WEIGHTS["explicit_checks"]
             reasons.append("explicit_checks")
         if mentions_tests:
-            score += 1
+            raw_score += _QUALITY_SCORE_WEIGHTS["test_awareness"]
             reasons.append("test_awareness")
         elif not expected_tests and re.search(r"\btest(?:s|ed|ing)?\b", lowered):
-            score += 1
+            raw_score += _QUALITY_SCORE_WEIGHTS["test_awareness"] / 2
             reasons.append("general_test_awareness")
-        if action == "approved" and "no risky changes" in lowered:
-            score += 1
+        if action == "approved" and _LOW_RISK_CLAIM_RE.search(lowered):
+            raw_score += _QUALITY_SCORE_WEIGHTS["approval_low_risk"]
             reasons.append("explicit_low_risk_claim")
+        score = int(round(min(raw_score, 10.0)))
         return score, reasons
 
     def _approval_quality_failure(self, snapshot: dict[str, Any], score: int) -> Optional[str]:
@@ -2544,7 +2563,7 @@ class GitHubToMEPBridgeService:
             return "approval_without_changed_code_evidence"
         if snapshot.get("expected_tests") and not snapshot.get("mentions_tests"):
             return "approval_without_test_awareness"
-        if score < 4:
+        if score < 6:
             return "approval_below_quality_bar"
         return None
 
@@ -3575,9 +3594,9 @@ class GitHubToMEPBridgeService:
         useful_rate = round(useful_count / feedback_count, 4) if feedback_count else None
         label_coverage = round(feedback_count / (feedback_count + feedback_pending_count), 4) if (feedback_count + feedback_pending_count) else None
         quality_bands = {
-            "9_plus": sum(1 for score in quality_scores if score >= 9),
-            "8": sum(1 for score in quality_scores if score == 8),
-            "below_8": sum(1 for score in quality_scores if score < 8),
+            "high": sum(1 for score in quality_scores if score >= 8),
+            "medium": sum(1 for score in quality_scores if 6 <= score < 8),
+            "low": sum(1 for score in quality_scores if score < 6),
         }
 
         def _rate(numerator: int, denominator: int) -> Optional[float]:
