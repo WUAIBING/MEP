@@ -998,6 +998,50 @@ class TestGitHubToMEPBridge(unittest.TestCase):
         self.assertGreaterEqual(score, 6)
         self.assertIn("explicit_low_risk_claim", reasons)
 
+    def test_score_review_quality_clamps_max_score_to_ten(self):
+        score, reasons = self.service._score_review_quality(  # noqa: SLF001
+            {
+                "anchored_paths": {
+                    "bridge/github_to_mep.py",
+                    "tests/test_github_bridge.py",
+                    "node/mep_runtime.py",
+                },
+                "changed_tokens": {
+                    "_score_review_quality",
+                    "PHASE8_STABILITY_TARGETS",
+                    "_approval_quality_failure",
+                },
+                "grounded_tokens": {
+                    "_score_review_quality",
+                    "PHASE8_STABILITY_TARGETS",
+                    "_approval_quality_failure",
+                },
+                "has_findings": True,
+                "summary_text": "Verified the scoring path and found a concrete regression risk.",
+                "observation_text": "Changed-line evidence supports the same finding.",
+                "risk_areas_checked": ["approval gate", "phase8 stability"],
+                "checks_performed": ["reviewed changed diff", "checked related tests"],
+                "verified_identifiers": [
+                    "_score_review_quality",
+                    "PHASE8_STABILITY_TARGETS",
+                    "_approval_quality_failure",
+                ],
+                "expected_tests": ["tests/test_github_bridge.py"],
+                "mentions_tests": True,
+                "lowered": "verified the scoring path. low risk. tests reviewed.",
+            },
+            action="approved",
+        )
+
+        self.assertEqual(score, 10)
+        self.assertIn("explicit_low_risk_claim", reasons)
+
+    def test_score_review_quality_empty_snapshot_returns_zero(self):
+        score, reasons = self.service._score_review_quality({}, action="reviewed")  # noqa: SLF001
+
+        self.assertEqual(score, 0)
+        self.assertEqual(reasons, [])
+
     def test_review_trials_endpoint_returns_latest_trial_results(self):
         self._set_pr_review_package(
             [

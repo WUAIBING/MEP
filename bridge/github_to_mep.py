@@ -2510,7 +2510,8 @@ class GitHubToMEPBridgeService:
         lowered = str(snapshot.get("lowered") or "")
 
         if anchored_paths:
-            raw_score += min(len(anchored_paths), 2)
+            path_anchor_units = min(len(anchored_paths), 2) / 2
+            raw_score += path_anchor_units * _QUALITY_SCORE_WEIGHTS["path_anchor"]
             reasons.append("touched_path_anchor")
         if len(anchored_paths) >= 2:
             reasons.append("multi_path_anchor")
@@ -2518,7 +2519,8 @@ class GitHubToMEPBridgeService:
         if not changed_evidence_count and verified_identifiers:
             changed_evidence_count = min(len(verified_identifiers), 2)
         if changed_evidence_count:
-            raw_score += min(changed_evidence_count, 2)
+            changed_code_units = min(changed_evidence_count, 2) / 2
+            raw_score += changed_code_units * _QUALITY_SCORE_WEIGHTS["changed_code_evidence"]
             reasons.append("changed_code_evidence")
         if len(changed_tokens) >= 2 or len(verified_identifiers) >= 2:
             reasons.append("multiple_changed_identifiers")
