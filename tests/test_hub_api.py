@@ -606,6 +606,129 @@ class TestTaskLifecycle(unittest.TestCase):
 
         self.assertIn("Target requires encrypted DM payload", str(submit_resp.json().get("detail")))
 
+    def test_interbot_governance_forbidden_rejects_direct_dm(self):
+
+        consumer_priv, consumer_pub, consumer_id = _make_identity()
+
+        _, target_pub, target_id = _make_identity()
+
+        _register(consumer_pub)
+
+        _register(target_pub)
+
+        payload = json.dumps(
+            {
+                "spec_version": "mep.interbot.v1",
+                "message_id": "msg-forbidden",
+                "trace_id": "trace-forbidden",
+                "timestamp_ms": int(time.time() * 1000),
+                "source": {"node_id": consumer_id},
+                "target": {"node_id": target_id},
+                "conversation": {"context_id": "ctx-forbidden", "turn_type": "chat_turn"},
+                "intent": {"type": "chat.request", "priority": "normal"},
+                "task": {
+                    "instructions": "Share the raw secret.",
+                    "inputs": {
+                        "governance": {
+                            "classification": "forbidden",
+                            "reason": "raw secret disclosure is forbidden",
+                            "redaction_applied": False,
+                        }
+                    },
+                    "expected_output": {"result_type": "text"},
+                },
+                "economics": {"bounty_ns": 0, "currency": "MEP_NS", "market": "chat", "payment_direction": "none"},
+                "delivery": {"reply_mode": "new_dm", "settlement_mode": "task_result"},
+            }
+        )
+
+        submit_payload = json.dumps(
+            {
+                "consumer_id": consumer_id,
+                "payload": payload,
+                "bounty": 0.0,
+                "target_node": target_id,
+            }
+        )
+
+        headers = _auth_headers(consumer_priv, consumer_id, submit_payload)
+
+        with _interbot_validation(True):
+            submit_resp = client.post("/tasks/submit", content=submit_payload, headers=headers)
+
+        self.assertEqual(submit_resp.status_code, 403)
+        self.assertIn("governance classification forbidden", str(submit_resp.json().get("detail")))
+
+    def test_human_approval_request_with_pending_governance_is_audited(self):
+
+        consumer_priv, consumer_pub, consumer_id = _make_identity()
+
+        _, target_pub, target_id = _make_identity()
+
+        _register(consumer_pub)
+
+        _register(target_pub)
+
+        payload = json.dumps(
+            {
+                "spec_version": "mep.interbot.v1",
+                "message_id": "msg-approval",
+                "trace_id": "trace-approval",
+                "timestamp_ms": int(time.time() * 1000),
+                "source": {"node_id": consumer_id},
+                "target": {"node_id": target_id},
+                "conversation": {"context_id": "ctx-approval", "turn_type": "session_close"},
+                "intent": {"type": "human.approval.request", "priority": "high"},
+                "task": {
+                    "instructions": "Human approval request: merge_decision",
+                    "inputs": {
+                        "governance": {
+                            "classification": "approval_required",
+                            "reason": "human approval required for merge_decision",
+                            "disclosure_scope": ["merge_decision"],
+                            "redaction_applied": False,
+                            "approval": {"status": "pending"},
+                        },
+                        "human_approval_request": {
+                            "decision_type": "merge_decision",
+                            "summary": "Need final merge confirmation.",
+                            "review_decision": "approve_with_conditions",
+                            "blockers": ["Confirm release window"],
+                            "recommended_next_action": "Merge after approval.",
+                        },
+                    },
+                    "expected_output": {"result_type": "text"},
+                },
+                "economics": {"bounty_ns": 0, "currency": "MEP_NS", "market": "chat", "payment_direction": "none"},
+                "delivery": {"reply_mode": "new_dm", "settlement_mode": "task_result"},
+            }
+        )
+
+        submit_payload = json.dumps(
+            {
+                "consumer_id": consumer_id,
+                "payload": payload,
+                "bounty": 0.0,
+                "target_node": target_id,
+            }
+        )
+
+        headers = _auth_headers(consumer_priv, consumer_id, submit_payload)
+        fake_ws = _FakeWebSocket()
+        main.connected_nodes[target_id] = fake_ws
+
+        try:
+            with _interbot_validation(True):
+                with mock.patch("main.log_event") as log_event_mock:
+                    submit_resp = client.post("/tasks/submit", content=submit_payload, headers=headers)
+        finally:
+            main.connected_nodes.pop(target_id, None)
+
+        self.assertEqual(submit_resp.status_code, 200, submit_resp.text)
+        self.assertEqual(submit_resp.json()["status"], "success")
+        self.assertTrue(any(call.args[0] == "interbot_governance_submit" for call in log_event_mock.call_args_list))
+        self.assertTrue(any(call.args[0] == "human_approval_requested" for call in log_event_mock.call_args_list))
+
 
 
     def test_submitted_result_timeout_refunds_manual_verification_escrow(self):

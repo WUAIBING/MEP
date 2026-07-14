@@ -124,6 +124,10 @@ MAX_BODY_BYTES = 200_000
 MAX_PAYLOAD_CHARS = 20_000
 RATE_LIMIT_WINDOW = 10.0
 RATE_LIMIT_MAX = 50
+INTERBOT_GOVERNANCE_CLASSIFICATIONS = {"safe", "approval_required", "forbidden"}
+INTERBOT_GOVERNANCE_APPROVAL_STATUSES = {"pending", "approved", "denied"}
+INTERBOT_REVIEW_VERDICTS = {"approve", "approve_with_conditions", "request_changes", "block"}
+INTERBOT_HUMAN_APPROVAL_INTENTS = {"human.approval.request"}
 
 def get_hub_urls(request: Request) -> tuple:
     """Get correct Hub and WebSocket URLs for clients."""
@@ -897,6 +901,224 @@ def _interbot_require_string(data: dict, field_name: str) -> str:
     return value.strip()
 
 
+def _parse_interbot_message(payload_text: str) -> Optional[dict]:
+    try:
+        parsed = json.loads(payload_text)
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(parsed, dict):
+        return None
+    if parsed.get("spec_version") != INTERBOT_SPEC_VERSION:
+        return None
+    return parsed
+
+
+def _normalize_interbot_string_list(values: Any) -> list[str]:
+    if not isinstance(values, list):
+        return []
+    normalized: list[str] = []
+    for value in values:
+        if isinstance(value, str) and value.strip():
+            normalized.append(value.strip())
+    return normalized
+
+
+def _extract_interbot_governance(message_obj: dict) -> Optional[dict]:
+    task_obj = message_obj.get("task")
+    if not isinstance(task_obj, dict):
+        return None
+    inputs_obj = task_obj.get("inputs")
+    if not isinstance(inputs_obj, dict):
+        return None
+    governance_obj = inputs_obj.get("governance")
+    if governance_obj is None:
+        return None
+    if not isinstance(governance_obj, dict):
+        raise HTTPException(status_code=400, detail="Inter-bot payload task.inputs.governance must be an object")
+    classification = governance_obj.get("classification")
+    if not isinstance(classification, str) or classification.strip().lower() not in INTERBOT_GOVERNANCE_CLASSIFICATIONS:
+        raise HTTPException(status_code=400, detail="Inter-bot payload governance.classification invalid")
+    reason = governance_obj.get("reason")
+    if not isinstance(reason, str) or not reason.strip():
+        raise HTTPException(status_code=400, detail="Inter-bot payload governance.reason must be non-empty")
+    normalized: dict[str, Any] = {
+        "classification": classification.strip().lower(),
+        "reason": reason.strip(),
+        "redaction_applied": bool(governance_obj.get("redaction_applied", False)),
+    }
+    disclosure_scope = _normalize_interbot_string_list(governance_obj.get("disclosure_scope"))
+    if disclosure_scope:
+        normalized["disclosure_scope"] = disclosure_scope
+    approval_obj = governance_obj.get("approval")
+    if approval_obj is not None:
+        if not isinstance(approval_obj, dict):
+            raise HTTPException(status_code=400, detail="Inter-bot payload governance.approval must be an object")
+        status = approval_obj.get("status")
+        if not isinstance(status, str) or status.strip().lower() not in INTERBOT_GOVERNANCE_APPROVAL_STATUSES:
+            raise HTTPException(status_code=400, detail="Inter-bot payload governance.approval.status invalid")
+        normalized_approval: dict[str, Any] = {"status": status.strip().lower()}
+        context_id = approval_obj.get("context_id")
+        if isinstance(context_id, str) and context_id.strip():
+            normalized_approval["context_id"] = context_id.strip()
+        approved_by = approval_obj.get("approved_by")
+        if isinstance(approved_by, str) and approved_by.strip():
+            normalized_approval["approved_by"] = approved_by.strip()
+        normalized["approval"] = normalized_approval
+    return normalized
+
+
+def _extract_human_approval_request(message_obj: dict) -> Optional[dict]:
+    task_obj = message_obj.get("task")
+    if not isinstance(task_obj, dict):
+        return None
+    inputs_obj = task_obj.get("inputs")
+    if not isinstance(inputs_obj, dict):
+        return None
+    approval_obj = inputs_obj.get("human_approval_request")
+    if not isinstance(approval_obj, dict):
+        return None
+    decision_type = approval_obj.get("decision_type")
+    summary = approval_obj.get("summary")
+    if not isinstance(decision_type, str) or not decision_type.strip():
+        return None
+    if not isinstance(summary, str) or not summary.strip():
+        return None
+    extracted: dict[str, Any] = {
+        "decision_type": decision_type.strip().lower(),
+        "summary": summary.strip(),
+        "blockers": _normalize_interbot_string_list(approval_obj.get("blockers")),
+    }
+    review_decision = approval_obj.get("review_decision")
+    if isinstance(review_decision, str) and review_decision.strip().lower() in INTERBOT_REVIEW_VERDICTS:
+        extracted["review_decision"] = review_decision.strip().lower()
+    next_action = approval_obj.get("recommended_next_action")
+    if isinstance(next_action, str) and next_action.strip():
+        extracted["recommended_next_action"] = next_action.strip()
+    return extracted
+
+
+def _extract_review_verdict(message_obj: dict) -> Optional[dict]:
+    task_obj = message_obj.get("task")
+    if not isinstance(task_obj, dict):
+        return None
+    inputs_obj = task_obj.get("inputs")
+    if not isinstance(inputs_obj, dict):
+        return None
+    verdict_obj = inputs_obj.get("review_verdict")
+    if not isinstance(verdict_obj, dict):
+        return None
+    decision = verdict_obj.get("decision")
+    rationale = verdict_obj.get("rationale")
+    if not isinstance(decision, str) or decision.strip().lower() not in INTERBOT_REVIEW_VERDICTS:
+        return None
+    if not isinstance(rationale, str) or not rationale.strip():
+        return None
+    extracted: dict[str, Any] = {
+        "decision": decision.strip().lower(),
+        "rationale": rationale.strip(),
+        "conditions": _normalize_interbot_string_list(verdict_obj.get("conditions")),
+    }
+    recommendation = verdict_obj.get("human_recommendation")
+    if isinstance(recommendation, str) and recommendation.strip():
+        extracted["human_recommendation"] = recommendation.strip()
+    return extracted
+
+
+def _log_interbot_governance_submit(task_id: str, consumer_id: str, target_node: Optional[str], payload: str) -> None:
+    message_obj = _parse_interbot_message(payload)
+    if not message_obj:
+        return
+    context_id = None
+    turn_type = None
+    conversation_obj = message_obj.get("conversation")
+    if isinstance(conversation_obj, dict):
+        context_id = conversation_obj.get("context_id")
+        turn_type = conversation_obj.get("turn_type")
+    intent_obj = message_obj.get("intent")
+    intent_type = intent_obj.get("type") if isinstance(intent_obj, dict) else None
+    governance = _extract_interbot_governance(message_obj)
+    if governance:
+        approval = governance.get("approval") if isinstance(governance.get("approval"), dict) else {}
+        log_event(
+            "interbot_governance_submit",
+            f"Inter-bot governance recorded for task {task_id[:8]}",
+            task_id=task_id,
+            consumer_id=consumer_id,
+            provider_id=target_node,
+            message_id=message_obj.get("message_id"),
+            trace_id=message_obj.get("trace_id"),
+            context_id=context_id,
+            turn_type=turn_type,
+            intent_type=intent_type,
+            governance_classification=governance.get("classification"),
+            governance_reason=governance.get("reason"),
+            governance_redaction_applied=governance.get("redaction_applied"),
+            governance_disclosure_scope=governance.get("disclosure_scope", []),
+            governance_approval_status=approval.get("status"),
+            governance_approval_context_id=approval.get("context_id"),
+            governance_approved_by=approval.get("approved_by"),
+        )
+    approval_request = _extract_human_approval_request(message_obj)
+    if approval_request:
+        log_event(
+            "human_approval_requested",
+            f"Human approval requested for task {task_id[:8]}",
+            task_id=task_id,
+            consumer_id=consumer_id,
+            provider_id=target_node,
+            message_id=message_obj.get("message_id"),
+            trace_id=message_obj.get("trace_id"),
+            context_id=context_id,
+            decision_type=approval_request.get("decision_type"),
+            review_decision=approval_request.get("review_decision"),
+            blockers=approval_request.get("blockers", []),
+        )
+
+
+def _log_interbot_governance_result(task_id: str, provider_id: str, payload_text: str) -> None:
+    message_obj = _parse_interbot_message(payload_text)
+    if not message_obj:
+        return
+    context_id = None
+    turn_type = None
+    conversation_obj = message_obj.get("conversation")
+    if isinstance(conversation_obj, dict):
+        context_id = conversation_obj.get("context_id")
+        turn_type = conversation_obj.get("turn_type")
+    intent_obj = message_obj.get("intent")
+    intent_type = intent_obj.get("type") if isinstance(intent_obj, dict) else None
+    governance = _extract_interbot_governance(message_obj)
+    if governance:
+        approval = governance.get("approval") if isinstance(governance.get("approval"), dict) else {}
+        log_event(
+            "interbot_governance_result",
+            f"Inter-bot governance result recorded for task {task_id[:8]}",
+            task_id=task_id,
+            provider_id=provider_id,
+            message_id=message_obj.get("message_id"),
+            trace_id=message_obj.get("trace_id"),
+            context_id=context_id,
+            turn_type=turn_type,
+            intent_type=intent_type,
+            governance_classification=governance.get("classification"),
+            governance_reason=governance.get("reason"),
+            governance_redaction_applied=governance.get("redaction_applied"),
+            governance_disclosure_scope=governance.get("disclosure_scope", []),
+            governance_approval_status=approval.get("status"),
+        )
+    review_verdict = _extract_review_verdict(message_obj)
+    if review_verdict:
+        log_event(
+            "review_verdict_recorded",
+            f"Review verdict recorded for task {task_id[:8]}",
+            task_id=task_id,
+            provider_id=provider_id,
+            context_id=context_id,
+            decision=review_verdict.get("decision"),
+            conditions=review_verdict.get("conditions", []),
+        )
+
+
 def _validate_interbot_payload_if_enabled(consumer_id: str, task_economics: dict, target_node: Optional[str], payload: str) -> None:
     if not INTERBOT_SPEC_VALIDATE_ENABLED or not payload:
         return
@@ -942,6 +1164,25 @@ def _validate_interbot_payload_if_enabled(consumer_id: str, task_economics: dict
         raise HTTPException(status_code=400, detail="Inter-bot payload task.instructions too long (max 4000)")
     expected_output_obj = _interbot_require_object(task_obj.get("expected_output"), "task.expected_output")
     _interbot_require_string(expected_output_obj, "result_type")
+    governance = _extract_interbot_governance(message_obj)
+    if governance:
+        classification = governance["classification"]
+        if classification == "forbidden":
+            raise HTTPException(status_code=403, detail="Inter-bot payload governance classification forbidden is not allowed")
+        approval = governance.get("approval") if isinstance(governance.get("approval"), dict) else {}
+        approval_status = approval.get("status")
+        if classification == "approval_required":
+            if intent_type in INTERBOT_HUMAN_APPROVAL_INTENTS:
+                if approval_status not in (None, "pending"):
+                    raise HTTPException(
+                        status_code=400,
+                        detail="Inter-bot human approval requests must use governance approval status pending",
+                    )
+            elif approval_status != "approved":
+                raise HTTPException(
+                    status_code=403,
+                    detail="Inter-bot payload governance approval_required requires approved governance.approval.status",
+                )
 
     economics_obj = _interbot_require_object(message_obj.get("economics"), "economics")
     currency = economics_obj.get("currency")
@@ -2392,6 +2633,12 @@ async def submit_task(
         log_audit("ESCROW", consumer_id, -bounty, new_balance, task_id)
 
     log_event("task_submitted", f"Task {task_id[:8]} broadcasted by {consumer_id} for {bounty}", consumer_id=consumer_id, task_id=task_id, bounty=bounty)
+    try:
+        _log_interbot_governance_submit(task_id, consumer_id, target_node, payload)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        log_event("interbot_governance_audit_error", f"Failed to audit governance for task {task_id[:8]}: {exc}", task_id=task_id)
 
     task_data = {
         "id": task_id,
@@ -2757,6 +3004,17 @@ async def complete_task(
         raise HTTPException(status_code=400, detail="Task result requires result_payload or result_uri")
     if len(result_payload) > MAX_PAYLOAD_CHARS:
         raise HTTPException(status_code=413, detail="Result payload too large")
+    if result_payload:
+        try:
+            _log_interbot_governance_result(result.task_id, result.provider_id, result_payload)
+        except HTTPException:
+            raise
+        except Exception as exc:
+            log_event(
+                "interbot_governance_audit_error",
+                f"Failed to audit governance result for task {result.task_id[:8]}: {exc}",
+                task_id=result.task_id,
+            )
     
     task = db.get_task(result.task_id)
     if task and task.get("verifier_type") in ("manual_acceptance", "automated"):
