@@ -971,6 +971,33 @@ class TestGitHubToMEPBridge(unittest.TestCase):
         self.assertEqual(self.service.github_writeback_metrics["suppressed_approvals"], 0)
         self.assertGreaterEqual(self.service.github_writeback_metrics["last_quality_score"], 4)
 
+    def test_score_review_quality_accepts_professional_low_risk_approval_phrasing(self):
+        score, reasons = self.service._score_review_quality(  # noqa: SLF001
+            {
+                "anchored_paths": {"bridge/github_to_mep.py", "tests/test_github_bridge.py"},
+                "changed_tokens": {"_score_review_quality", "PHASE8_STABILITY_TARGETS"},
+                "grounded_tokens": {"_score_review_quality", "PHASE8_STABILITY_TARGETS"},
+                "has_findings": False,
+                "summary_text": (
+                    "Verified `_score_review_quality`; no concrete correctness or regression issue is supported."
+                ),
+                "observation_text": "The reviewed diff does not show a concrete regression trigger.",
+                "risk_areas_checked": ["approval gate calibration"],
+                "checks_performed": ["reviewed changed diff"],
+                "verified_identifiers": ["_score_review_quality", "PHASE8_STABILITY_TARGETS"],
+                "expected_tests": ["tests/test_github_bridge.py"],
+                "mentions_tests": True,
+                "lowered": (
+                    "verified _score_review_quality; no concrete correctness or regression issue is supported. "
+                    "the reviewed diff does not show a concrete regression trigger. tests reviewed."
+                ),
+            },
+            action="approved",
+        )
+
+        self.assertGreaterEqual(score, 6)
+        self.assertIn("explicit_low_risk_claim", reasons)
+
     def test_review_trials_endpoint_returns_latest_trial_results(self):
         self._set_pr_review_package(
             [
@@ -1258,7 +1285,7 @@ class TestGitHubToMEPBridge(unittest.TestCase):
         self.assertEqual(stability["low_signal_review_suppression_rate"], 1.0)
         self.assertEqual(stability["green_approval_publish_rate"], 1.0)
         self.assertEqual(stability["non_green_approval_suppression_rate"], 1.0)
-        self.assertEqual(stability["quality_score_bands"], {"9_plus": 2, "8": 2, "below_8": 0})
+        self.assertEqual(stability["quality_score_bands"], {"high": 4, "medium": 0, "low": 0})
         self.assertEqual(stability["stability_alerts"], [])
         self.assertTrue(stability["meets_phase8_guardrails"])
 
@@ -1272,7 +1299,7 @@ class TestGitHubToMEPBridge(unittest.TestCase):
                         "resolved_action": "suppressed",
                         "published": False,
                         "suppressed": True,
-                        "quality_score": 7,
+                        "quality_score": 4,
                         "reviewability_bucket": "standard",
                         "ci_state": "green",
                         "intent_type": "code.review.request",
