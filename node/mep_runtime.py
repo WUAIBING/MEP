@@ -37,6 +37,21 @@ except ImportError:  # pragma: no cover - direct file execution from node/ may n
     MEPClient = None  # type: ignore[assignment]
 
 try:
+    from clients.shared.execution_bridge import (
+        build_execution_bridge_request,
+        build_execution_unavailable_result,
+        execute_bridge_command,
+        is_execution_request,
+        render_execution_result,
+    )
+except ImportError:  # pragma: no cover - supports direct file execution
+    build_execution_bridge_request = None  # type: ignore[assignment]
+    build_execution_unavailable_result = None  # type: ignore[assignment]
+    execute_bridge_command = None  # type: ignore[assignment]
+    is_execution_request = None  # type: ignore[assignment]
+    render_execution_result = None  # type: ignore[assignment]
+
+try:
     from clients.shared import identity_paths
 except ImportError:  # pragma: no cover - direct file execution from node/ may not see repo root
     identity_paths = None  # type: ignore[assignment]
@@ -3691,6 +3706,33 @@ class RuntimeNode:
                 print(f"[mep repo_audit] refusing normalized task={task_id[:8]} reason={detail}")
                 self.complete(task_id, detail)
                 return
+
+        # ── Execution bridge gate: route code-editing tasks to the real bridge,
+        # not the LLM adapter. LLMs hallucinate shell output; bridges execute.
+        # Falls through to adapter when bridge functions aren't importable (None).
+        if (
+            interbot_message is not None
+            and is_execution_request is not None
+            and is_execution_request(interbot_message)
+        ):
+            bridge_request = build_execution_bridge_request(
+                interbot_message,
+                consumer_id=str(task_data.get("consumer_id") or ""),
+                task_id=task_id,
+                prompt=instructions,
+            )
+            try:
+                bridge_result = asyncio.run(
+                    execute_bridge_command(bridge_request, timeout_seconds=600)
+                )
+            except Exception as exc:  # noqa: BLE001
+                bridge_result = build_execution_unavailable_result(
+                    f"bridge_raised: {exc}"
+                )
+            rendered = render_execution_result(bridge_result)
+            self.complete(task_id, rendered)
+            print(f"[mep run] execution bridge task={task_id[:8]} result={rendered}")
+            return
 
         result = self.adapter.generate_reply(instructions, adapter_task_data)
 
