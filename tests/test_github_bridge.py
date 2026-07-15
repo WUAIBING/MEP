@@ -15,6 +15,7 @@ from fastapi.testclient import TestClient
 ROOT = os.path.dirname(os.path.dirname(__file__))
 sys.path.insert(0, ROOT)
 
+import bridge.github_to_mep as github_to_mep  # noqa: E402
 from bridge.github_to_mep import (  # noqa: E402
     BridgeConfig,
     BridgeRegistrationPendingApprovalError,
@@ -24,6 +25,7 @@ from bridge.github_to_mep import (  # noqa: E402
     NormalizedGitHubEvent,
     create_app,
 )
+from clients.shared import review_patterns  # noqa: E402
 
 
 class _FakeSubmissionClient:
@@ -2257,6 +2259,93 @@ class TestGitHubToMEPBridge(unittest.TestCase):
         self.assertEqual(review_payload["event"], "COMMENT")
         self.assertIn("## Review Summary", review_payload["body"])
         self.assertEqual(self.service.github_writeback_metrics["last_suppressed_reason"], None)
+
+    def test_status_callback_salvages_partial_diff_caveat_observation(self):
+        self._set_pr_review_package(
+            [
+                {
+                    "filename": "bridge/github_to_mep.py",
+                    "status": "modified",
+                    "additions": 12,
+                    "deletions": 2,
+                    "changes": 14,
+                    "patch": (
+                        "@@ -2577,2 +2577,4 @@\n"
+                        "+def _suppression_reason_allows_retry(reason: Optional[str]) -> bool:\n"
+                        "+    return reason not in {\"low_signal_no_finding\"}\n"
+                    ),
+                },
+                {
+                    "filename": "tests/test_github_bridge.py",
+                    "status": "modified",
+                    "additions": 18,
+                    "deletions": 0,
+                    "changes": 18,
+                    "patch": (
+                        "@@ -735,0 +735,18 @@\n"
+                        "+def test_status_callback_queues_retry_when_approve_checks_are_pending(self):\n"
+                        "+    self.assertTrue(trial[\"retry_queued\"])\n"
+                    ),
+                },
+            ],
+            pr_body="Hardens retry handling for suppressed approval review writebacks.",
+        )
+        response = self._post_webhook(
+            _issue_comment_payload("@Hub-Sentinel review this PR", delivery_number=309),
+            delivery_id="delivery-partial-diff-caveat",
+        )
+        self.assertEqual(response.status_code, 200)
+        bridge_id = response.json()["bridge_id"]
+        self._flush_context(response.json()["context_id"])
+
+        token = self.service._generate_status_token(bridge_id, "node_target")
+        status_response = self.client.post(
+            "/bridge/status",
+            json={
+                "bridge_id": bridge_id,
+                "status": "completed",
+                "target_node_id": "node_target",
+                "task_id": "task-partial-diff-caveat",
+                "detail": (
+                    "## Review Summary\n\n"
+                    "The retry handling changes stay focused on approval suppression paths.\n\n"
+                    "Observation: The test bodies are not fully shown in the diff.\n\n"
+                    "Touched paths reviewed: `bridge/github_to_mep.py`, `tests/test_github_bridge.py`\n\n"
+                    "Tests reviewed: `tests/test_github_bridge.py`\n\n"
+                    "Risk areas checked: retry queuing, stale metadata refresh\n\n"
+                    "Checks performed: reviewed `_suppression_reason_allows_retry`, checked the new retry queue coverage for pending approvals\n\n"
+                    "Changed identifiers verified: `_suppression_reason_allows_retry`, `_issue_retry_task`"
+                ),
+            },
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        self.assertEqual(status_response.status_code, 200, status_response.text)
+        self.assertEqual(len(self.github_session.posts), 1)
+        review_payload = self.github_session.posts[0]["json"]
+        self.assertEqual(review_payload["event"], "COMMENT")
+        self.assertIn("## Review Summary", review_payload["body"])
+        self.assertNotIn("not fully shown in the diff", review_payload["body"])
+        self.assertNotIn("verification is limited", review_payload["body"])
+        self.assertEqual(self.service.github_writeback_metrics["last_suppressed_reason"], None)
+
+    def test_has_partial_diff_caveat_matches_trailing_colon(self):
+        self.assertIs(
+            review_patterns.PARTIAL_DIFF_CAVEAT_PATTERNS,
+            github_to_mep._PARTIAL_DIFF_CAVEAT_PATTERNS,
+        )
+        self.assertTrue(
+            self.service._has_partial_diff_caveat(  # noqa: SLF001
+                "Observation: Partial diff: verification is limited."
+            )
+        )
+
+    def test_has_partial_diff_caveat_falls_back_when_shared_import_is_unavailable(self):
+        with patch.object(github_to_mep, "_shared_review_patterns", None):
+            self.assertTrue(
+                self.service._has_partial_diff_caveat(  # noqa: SLF001
+                    "The test bodies are not fully shown in the diff."
+                )
+            )
 
     def test_status_callback_suppresses_finding_conflicting_with_patch_evidence(self):
         self._set_pr_review_package(
