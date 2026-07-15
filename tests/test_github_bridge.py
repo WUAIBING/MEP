@@ -2307,7 +2307,7 @@ class TestGitHubToMEPBridge(unittest.TestCase):
                 "detail": (
                     "## Review Summary\n\n"
                     "The retry handling changes stay focused on approval suppression paths.\n\n"
-                    "Observation: The test bodies are not fully shown in the diff, so verification is limited.\n\n"
+                    "Observation: The test bodies are not fully shown in the diff: verification is limited.\n\n"
                     "Touched paths reviewed: `bridge/github_to_mep.py`, `tests/test_github_bridge.py`\n\n"
                     "Tests reviewed: `tests/test_github_bridge.py`\n\n"
                     "Risk areas checked: retry queuing, stale metadata refresh\n\n"

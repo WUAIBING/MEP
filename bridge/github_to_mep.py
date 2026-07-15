@@ -126,12 +126,10 @@ _WEAK_GITHUB_REVIEW_PATTERNS = [
     r"\bfocused runtime tests\b",
 ]
 _PARTIAL_DIFF_CAVEAT_PATTERNS = [
-    r"\bnot fully shown\b",
-    r"\bnot fully shown in the diff\b",
-    r"\bpartial diff\b",
-    r"\bpartially shown\b",
-    r"\bwithout the full diff\b",
-    r"\bwithout the full patch\b",
+    r"\bnot fully shown(?:\s+in\s+the\s+diff)?\b(?:[.:;,])?",
+    r"\bpartial diff\b(?:[.:;,])?",
+    r"\bpartially shown\b(?:[.:;,])?",
+    r"\bwithout the full (?:diff|patch)\b(?:[.:;,])?",
 ]
 _SPECULATIVE_FINDING_PATTERNS = [
     r"\bif intended\b",

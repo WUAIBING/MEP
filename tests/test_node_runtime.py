@@ -871,7 +871,7 @@ class TestRuntimeReviewPrompts(unittest.TestCase):
         rendered = mep_runtime._render_structured_review_with_task_data(  # noqa: SLF001
             (
                 '{"summary":"The retry update stays narrowly scoped.",'
-                '"observation":"The test bodies are not fully shown in the diff, so verification is limited.",'
+                '"observation":"The test bodies are not fully shown in the diff: verification is limited.",'
                 '"findings":[],"approval_recommendation":"comment"}'
             ),
             max_chars=1000,
