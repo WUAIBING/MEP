@@ -41,6 +41,23 @@ try:
 except ImportError:  # pragma: no cover - direct file execution from node/ may not see repo root
     identity_paths = None  # type: ignore[assignment]
 
+try:
+    from clients.shared.review_patterns import has_partial_diff_caveat
+except ImportError:  # pragma: no cover - direct file execution from node/ may not see repo root
+    def has_partial_diff_caveat(text: str) -> bool:
+        lowered = str(text or "").strip().lower()
+        if not lowered:
+            return False
+        return any(
+            re.search(pattern, lowered)
+            for pattern in (
+                r"\bnot fully shown(?:\s+in\s+the\s+diff)?\b(?:[.:;,])?",
+                r"\bpartial diff\b(?:[.:;,])?",
+                r"\bpartially shown\b(?:[.:;,])?",
+                r"\bwithout the full (?:diff|patch)\b(?:[.:;,])?",
+            )
+        )
+
 
 DEFAULT_HUB_URL = os.getenv("HUB_URL", "http://localhost:8000")
 DEFAULT_WS_URL = os.getenv("WS_URL", "ws://localhost:8000")
@@ -1267,9 +1284,6 @@ _WEAK_REVIEW_PATTERNS = [
     r"\bimpossible to verify\b",
     r"\bwithout seeing\b",
     r"\bwithout the full\b",
-    r"\bnot fully shown(?:\s+in\s+the\s+diff)?\b(?:[.:;,])?",
-    r"\bpartial diff\b(?:[.:;,])?",
-    r"\bpartially shown\b(?:[.:;,])?",
     r"\bdoes not show\b",
     r"\bdoesn't show\b",
     r"\bnot enough context\b",
@@ -1282,7 +1296,7 @@ def _is_weak_review_text(text: str) -> bool:
     lowered = text.strip().lower()
     if not lowered:
         return True
-    return any(re.search(pattern, lowered) for pattern in _WEAK_REVIEW_PATTERNS)
+    return has_partial_diff_caveat(lowered) or any(re.search(pattern, lowered) for pattern in _WEAK_REVIEW_PATTERNS)
 
 
 def _default_review_risk_areas(task_data: Optional[dict[str, Any]]) -> list[str]:

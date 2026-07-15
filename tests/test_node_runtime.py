@@ -7,6 +7,7 @@ import unittest
 from typing import Any, Optional
 from unittest.mock import AsyncMock, patch
 
+from clients.shared import review_patterns
 from node.identity import MEPIdentity
 from node import mep_runtime
 
@@ -891,6 +892,9 @@ class TestRuntimeReviewPrompts(unittest.TestCase):
         self.assertIn("_issue_retry_task", rendered)
 
     def test_is_weak_review_text_matches_partial_diff_caveat_with_trailing_colon(self):
+        self.assertTrue(
+            review_patterns.has_partial_diff_caveat("Observation: Partial diff: verification is limited.")
+        )
         self.assertTrue(
             mep_runtime._is_weak_review_text(  # noqa: SLF001
                 "Observation: Partial diff: verification is limited."

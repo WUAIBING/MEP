@@ -15,6 +15,7 @@ from fastapi.testclient import TestClient
 ROOT = os.path.dirname(os.path.dirname(__file__))
 sys.path.insert(0, ROOT)
 
+import bridge.github_to_mep as github_to_mep  # noqa: E402
 from bridge.github_to_mep import (  # noqa: E402
     BridgeConfig,
     BridgeRegistrationPendingApprovalError,
@@ -24,6 +25,7 @@ from bridge.github_to_mep import (  # noqa: E402
     NormalizedGitHubEvent,
     create_app,
 )
+from clients.shared import review_patterns  # noqa: E402
 
 
 class _FakeSubmissionClient:
@@ -2327,6 +2329,10 @@ class TestGitHubToMEPBridge(unittest.TestCase):
         self.assertEqual(self.service.github_writeback_metrics["last_suppressed_reason"], None)
 
     def test_has_partial_diff_caveat_matches_trailing_colon(self):
+        self.assertIs(
+            review_patterns.PARTIAL_DIFF_CAVEAT_PATTERNS,
+            github_to_mep._PARTIAL_DIFF_CAVEAT_PATTERNS,
+        )
         self.assertTrue(
             self.service._has_partial_diff_caveat(  # noqa: SLF001
                 "Observation: Partial diff: verification is limited."

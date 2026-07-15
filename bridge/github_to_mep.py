@@ -19,6 +19,7 @@ import requests
 from fastapi import FastAPI, Header, HTTPException, Request
 from pydantic import BaseModel, Field
 
+from clients.shared import review_patterns
 from clients.shared.identity import MEPIdentity
 from node.task_envelope import build_task_envelope
 
@@ -125,12 +126,7 @@ _WEAK_GITHUB_REVIEW_PATTERNS = [
     r"\bno blocking issues\b",
     r"\bfocused runtime tests\b",
 ]
-_PARTIAL_DIFF_CAVEAT_PATTERNS = [
-    r"\bnot fully shown(?:\s+in\s+the\s+diff)?\b(?:[.:;,])?",
-    r"\bpartial diff\b(?:[.:;,])?",
-    r"\bpartially shown\b(?:[.:;,])?",
-    r"\bwithout the full (?:diff|patch)\b(?:[.:;,])?",
-]
+_PARTIAL_DIFF_CAVEAT_PATTERNS = review_patterns.PARTIAL_DIFF_CAVEAT_PATTERNS
 _SPECULATIVE_FINDING_PATTERNS = [
     r"\bif intended\b",
     r"\bif .*? intended for\b",
@@ -2249,10 +2245,7 @@ class GitHubToMEPBridgeService:
 
     @staticmethod
     def _has_partial_diff_caveat(text: str) -> bool:
-        lowered = str(text or "").strip().lower()
-        if not lowered:
-            return False
-        return any(re.search(pattern, lowered) for pattern in _PARTIAL_DIFF_CAVEAT_PATTERNS)
+        return review_patterns.has_partial_diff_caveat(text)
 
     @staticmethod
     def _is_auth_absence_claim(text: str) -> bool:
