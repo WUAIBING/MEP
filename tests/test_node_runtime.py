@@ -910,6 +910,31 @@ class TestRuntimeReviewPrompts(unittest.TestCase):
         self.assertNotIn("LGTM", rendered)
         self.assertNotIn("looks good", rendered)
 
+    def test_structured_review_rewrites_hyphenated_generic_no_finding_text(self):
+        rendered = mep_runtime._render_structured_review_with_task_data(  # noqa: SLF001
+            (
+                '{"summary":"Looks-Good overall.",'
+                '"observation":"The change is well-structured.",'
+                '"findings":[],"approval_recommendation":"comment"}'
+            ),
+            max_chars=1400,
+            task_data=self._bridge_review_task_data(
+                changed_identifiers=["verify_signature", "_evict_expired_nonces"],
+                touched_paths=["hub/auth.py", "hub/db.py"],
+                touched_tests=["tests/test_hub_api.py"],
+            ),
+        )
+
+        self.assertIn(
+            "Reviewed the changed behavior around `verify_signature`, `_evict_expired_nonces` and did not find a concrete issue supported by the diff.",
+            rendered,
+        )
+        self.assertIn(
+            "Observation: `verify_signature`, `_evict_expired_nonces` stay scoped to `hub/auth.py`, and the changed test context in `tests/test_hub_api.py` supports the reviewed low-risk path.",
+            rendered,
+        )
+        self.assertNotIn("Looks-Good overall.", rendered)
+
     def test_structured_review_synthesizes_grounded_summary_from_non_json_reply(self):
         rendered = mep_runtime._render_structured_review_with_task_data(  # noqa: SLF001
             "The replay-protection and dependency-pin changes look low-risk after review.",

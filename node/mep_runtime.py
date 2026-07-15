@@ -1267,8 +1267,8 @@ _WEAK_REVIEW_PATTERNS = [
 
 
 _GENERIC_NO_FINDING_PATTERNS = [
-    r"\blooks good\b",
-    r"\blooks correct\b",
+    r"\blooks[- ]good\b",
+    r"\blooks[- ]correct\b",
     r"\bwell-structured\b",
     r"\bwell structured\b",
     r"\bwell-scoped\b",
