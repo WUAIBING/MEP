@@ -2339,6 +2339,14 @@ class TestGitHubToMEPBridge(unittest.TestCase):
             )
         )
 
+    def test_has_partial_diff_caveat_falls_back_when_shared_import_is_unavailable(self):
+        with patch.object(github_to_mep, "_shared_review_patterns", None):
+            self.assertTrue(
+                self.service._has_partial_diff_caveat(  # noqa: SLF001
+                    "The test bodies are not fully shown in the diff."
+                )
+            )
+
     def test_status_callback_suppresses_finding_conflicting_with_patch_evidence(self):
         self._set_pr_review_package(
             [
