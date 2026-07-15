@@ -22,6 +22,7 @@ from bridge.github_to_mep import (  # noqa: E402
     DefaultMEPSubmissionClient,
     GitHubToMEPBridgeService,
     NormalizedGitHubEvent,
+    PHASE8_STABILITY_TARGETS,
     create_app,
 )
 
@@ -1017,6 +1018,7 @@ class TestGitHubToMEPBridge(unittest.TestCase):
                     "_approval_quality_failure",
                 },
                 "has_findings": True,
+                "finding_correctness": "verified",
                 "summary_text": "Verified the scoring path and found a concrete regression risk.",
                 "observation_text": "Changed-line evidence supports the same finding.",
                 "risk_areas_checked": ["approval gate", "phase8 stability"],
@@ -1035,12 +1037,111 @@ class TestGitHubToMEPBridge(unittest.TestCase):
 
         self.assertEqual(score, 10)
         self.assertIn("explicit_low_risk_claim", reasons)
+        self.assertIn("finding_verified_against_patch", reasons)
 
     def test_score_review_quality_empty_snapshot_returns_zero(self):
         score, reasons = self.service._score_review_quality({}, action="reviewed")  # noqa: SLF001
 
         self.assertEqual(score, 0)
         self.assertEqual(reasons, [])
+
+    def test_score_review_quality_discounts_contradicted_finding(self):
+        score, reasons = self.service._score_review_quality(  # noqa: SLF001
+            {
+                "anchored_paths": {"bridge/github_to_mep.py"},
+                "changed_tokens": {"_score_review_quality"},
+                "grounded_tokens": {"_score_review_quality"},
+                "has_findings": True,
+                "finding_correctness": "contradicted",
+                "summary_text": "The review cites a concrete defect.",
+                "observation_text": "The claim is tied to the touched path and changed code.",
+                "risk_areas_checked": ["quality rubric"],
+                "checks_performed": ["reviewed changed diff"],
+                "verified_identifiers": ["_score_review_quality"],
+                "expected_tests": [],
+                "mentions_tests": True,
+                "lowered": "reviewed the changed diff and tests.",
+            },
+            action="reviewed",
+        )
+
+        self.assertLess(score, PHASE8_STABILITY_TARGETS["min_avg_quality_score"])
+        self.assertIn("finding_contradicted_by_patch", reasons)
+
+    def test_score_review_quality_clamps_contradicted_only_review_to_zero(self):
+        score, reasons = self.service._score_review_quality(  # noqa: SLF001
+            {
+                "has_findings": True,
+                "finding_correctness": "contradicted",
+            },
+            action="reviewed",
+        )
+
+        self.assertEqual(score, 0)
+        self.assertIn("finding_contradicted_by_patch", reasons)
+
+    def test_build_review_snapshot_marks_contradicted_findings(self):
+        self._set_pr_review_package(
+            [
+                {
+                    "filename": "node/mep_runtime.py",
+                    "status": "modified",
+                    "patch": (
+                        "@@ -1290,0 +1294,4 @@\n"
+                        "+def _is_generic_no_finding_text(text: str) -> bool:\n"
+                        '+    normalized = _clean_review_text(text).lower()\n'
+                        '+    return any(re.search(pattern, normalized) for pattern in _GENERIC_NO_FINDING_PATTERNS)\n'
+                    ),
+                }
+            ],
+            pr_body="Normalize generic no-finding matching before regex evaluation.",
+        )
+
+        snapshot = self.service._build_review_snapshot(  # noqa: SLF001
+            {
+                "entity_type": "pr",
+                "repo_full_name": "WUAIBING/MEP",
+                "issue_number": 304,
+            },
+            (
+                "## Review Findings\n\n"
+                "1. **Regex pattern is case-sensitive and misses `Looks Good`.** (`node/mep_runtime.py`): "
+                "The matcher does not normalize case before testing `looks good` variants."
+            ),
+        )
+
+        self.assertEqual(snapshot["finding_correctness"], "contradicted")
+
+    def test_build_review_snapshot_marks_context_only_findings_unsupported(self):
+        self._set_pr_review_package(
+            [
+                {
+                    "filename": "hub/auth.py",
+                    "status": "modified",
+                    "patch": (
+                        "@@ -88,0 +88,4 @@\n"
+                        "+def verify_signature(payload: str, signature: str) -> bool:\n"
+                        "+    nonce = _evict_expired_nonces()\n"
+                    ),
+                }
+            ],
+            pr_body="Touches the signature verification path.",
+        )
+
+        snapshot = self.service._build_review_snapshot(  # noqa: SLF001
+            {
+                "entity_type": "pr",
+                "repo_full_name": "WUAIBING/MEP",
+                "issue_number": 304,
+            },
+            (
+                "## Review Findings\n\n"
+                "1. **`load_cached_public_keys` skips tenant validation.** (`hub/auth.py`): "
+                "The change leaves `load_cached_public_keys` without a changed-line validation guard."
+            ),
+        )
+
+        self.assertEqual(snapshot["finding_correctness"], "unsupported")
 
     def test_review_trials_endpoint_returns_latest_trial_results(self):
         self._set_pr_review_package(
