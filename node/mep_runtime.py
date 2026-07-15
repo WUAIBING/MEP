@@ -41,6 +41,32 @@ try:
 except ImportError:  # pragma: no cover - direct file execution from node/ may not see repo root
     identity_paths = None  # type: ignore[assignment]
 
+try:
+    from clients.shared.review_patterns import has_partial_diff_caveat as _shared_has_partial_diff_caveat
+except ImportError:  # pragma: no cover - direct file execution from node/ may not see repo root
+    _shared_has_partial_diff_caveat = None
+
+
+def _fallback_has_partial_diff_caveat(text: str) -> bool:
+    lowered = str(text or "").strip().lower()
+    if not lowered:
+        return False
+    return any(
+        re.search(pattern, lowered)
+        for pattern in (
+            r"\bnot fully shown(?:\s+in\s+the\s+diff)?\b(?:[.:;,])?",
+            r"\bpartial diff\b(?:[.:;,])?",
+            r"\bpartially shown\b(?:[.:;,])?",
+            r"\bwithout the full (?:diff|patch)\b(?:[.:;,])?",
+        )
+    )
+
+
+def has_partial_diff_caveat(text: str) -> bool:
+    if _shared_has_partial_diff_caveat is not None:
+        return _shared_has_partial_diff_caveat(text)
+    return _fallback_has_partial_diff_caveat(text)
+
 
 DEFAULT_HUB_URL = os.getenv("HUB_URL", "http://localhost:8000")
 DEFAULT_WS_URL = os.getenv("WS_URL", "ws://localhost:8000")
@@ -1373,7 +1399,7 @@ def _is_weak_review_text(text: str) -> bool:
     lowered = text.strip().lower()
     if not lowered:
         return True
-    return any(re.search(pattern, lowered) for pattern in _WEAK_REVIEW_PATTERNS)
+    return has_partial_diff_caveat(lowered) or any(re.search(pattern, lowered) for pattern in _WEAK_REVIEW_PATTERNS)
 
 
 def _default_review_risk_areas(task_data: Optional[dict[str, Any]]) -> list[str]:
@@ -1542,19 +1568,31 @@ def _finalize_model_reply(text: str, *, max_chars: int) -> str:
             clipped.rfind(". "),
             clipped.rfind("! "),
             clipped.rfind("? "),
+            clipped.rfind("; "),
+            clipped.rfind(": "),
         ]
         best_break = max(breakpoints)
         if best_break >= max(120, max_chars // 2):
-            if clipped[best_break : best_break + 2] in {". ", "! ", "? "}:
+            if clipped[best_break : best_break + 2] in {". ", "! ", "? ", "; ", ": "}:
                 clipped = clipped[: best_break + 1].rstrip()
             else:
                 clipped = clipped[:best_break].rstrip()
         cleaned = clipped
     if cleaned and cleaned[-1] not in ".!?":
+        trailing_word_break = cleaned.rfind(" ")
+        trailing_fragment = cleaned[trailing_word_break + 1 :] if trailing_word_break >= 0 else cleaned
+        if (
+            trailing_word_break >= max(80, len(cleaned) - 40)
+            and trailing_fragment
+            and re.fullmatch(r"[A-Za-z]{1,12}", trailing_fragment)
+        ):
+            cleaned = cleaned[:trailing_word_break].rstrip()
         last_sentence = max(cleaned.rfind(". "), cleaned.rfind("! "), cleaned.rfind("? "))
         if last_sentence >= max(80, len(cleaned) // 2):
             cleaned = cleaned[: last_sentence + 1].rstrip()
-        if cleaned and cleaned[-1] not in ".!?":
+        if cleaned.endswith((",", ";", ":")):
+            cleaned = cleaned[:-1].rstrip() + "."
+        elif cleaned and cleaned[-1] not in ".!?":
             cleaned += "."
     return cleaned
 
