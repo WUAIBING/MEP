@@ -422,6 +422,7 @@ class TestRuntimeReviewPrompts(unittest.TestCase):
         changed_identifiers: Optional[list[str]] = None,
         touched_paths: Optional[list[str]] = None,
         touched_tests: Optional[list[str]] = None,
+        changed_files: Optional[list[dict[str, Any]]] = None,
         review_mode: str = "discovery_review",
         ci_checks: Optional[dict[str, Any]] = None,
     ) -> dict:
@@ -459,6 +460,7 @@ class TestRuntimeReviewPrompts(unittest.TestCase):
                                 "review_mode": review_mode,
                                 "touched_paths": github_touched_paths,
                                 "touched_tests": github_touched_tests,
+                                "changed_files": changed_files or [],
                                 "ci_checks": ci_checks or {"has_checks": False, "state": "none", "all_green": False},
                                 "risk_pack": {
                                     "changed_identifiers": identifiers
@@ -1142,6 +1144,90 @@ class TestRuntimeReviewPrompts(unittest.TestCase):
 
         self.assertIn("Changed identifiers verified: `last_poll_status`", rendered)
         self.assertNotIn("[A-Za-z_][A-Za-z0-9_]*_[A-Za-z0-9_]+", rendered)
+
+    def test_structured_review_drops_overlong_verified_identifiers_instead_of_clipping(self):
+        rendered = mep_runtime._render_structured_review_with_task_data(  # noqa: SLF001
+            (
+                '{"summary":"Checked the runtime diff.","observation":"The changed path stays narrow.",'
+                '"touched_paths":["node/mep_runtime.py"],'
+                '"tests_reviewed":["tests/test_node_runtime.py"],'
+                '"verified_identifiers":["test_structured_approval_review_replaces_behavior_overstatement_with_grounded_summary",'
+                '"_trim_dangling_review_tail"],'
+                '"findings":[],"approval_recommendation":"comment"}'
+            ),
+            max_chars=1200,
+            task_data=self._bridge_review_task_data(
+                changed_identifiers=[
+                    "test_structured_approval_review_replaces_behavior_overstatement_with_grounded_summary",
+                    "_trim_dangling_review_tail",
+                ],
+                touched_paths=["node/mep_runtime.py", "tests/test_node_runtime.py"],
+                touched_tests=["tests/test_node_runtime.py"],
+            ),
+        )
+
+        self.assertIn("Changed identifiers verified: `_trim_dangling_review_tail`", rendered)
+        self.assertNotIn(
+            "test_structured_approval_review_replaces_behavior_overstatement_with_grounded_summary",
+            rendered,
+        )
+        self.assertNotIn("test_structured_approval_review_replaces_behavior_overstatement_with_gr", rendered)
+
+    def test_default_structured_review_drops_overlong_changed_identifiers(self):
+        rendered = mep_runtime._render_default_structured_review(  # noqa: SLF001
+            task_data=self._bridge_review_task_data(
+                changed_identifiers=[
+                    "test_structured_approval_review_replaces_behavior_overstatement_with_grounded_summary",
+                    "_trim_dangling_review_tail",
+                ],
+                touched_paths=["node/mep_runtime.py", "tests/test_node_runtime.py"],
+                touched_tests=["tests/test_node_runtime.py"],
+            ),
+            max_chars=1200,
+        )
+
+        self.assertIn("_trim_dangling_review_tail", rendered)
+        self.assertNotIn(
+            "test_structured_approval_review_replaces_behavior_overstatement_with_grounded_summary",
+            rendered,
+        )
+        self.assertNotIn("test_structured_approval_review_replaces_behavior_overstatement_with_gr", rendered)
+
+    def test_structured_review_drops_changed_identifiers_not_visible_in_patch_excerpt(self):
+        rendered = mep_runtime._render_structured_review_with_task_data(  # noqa: SLF001
+            (
+                '{"summary":"Checked the runtime diff.","observation":"The changed path stays narrow.",'
+                '"touched_paths":["bridge/github_to_mep.py","node/mep_runtime.py","tests/test_github_bridge.py"],'
+                '"tests_reviewed":["tests/test_github_bridge.py","tests/test_node_runtime.py"],'
+                '"verified_identifiers":["_trim_dangling_review_tail","test_status_callback_publishes_reviewed_blocker_when_approve_checks_are_pending"],'
+                '"findings":[],"approval_recommendation":"comment"}'
+            ),
+            max_chars=1400,
+            task_data=self._bridge_review_task_data(
+                changed_identifiers=[
+                    "_trim_dangling_review_tail",
+                    "test_status_callback_publishes_reviewed_blocker_when_approve_checks_are_pending",
+                ],
+                touched_paths=["bridge/github_to_mep.py", "node/mep_runtime.py", "tests/test_github_bridge.py"],
+                touched_tests=["tests/test_github_bridge.py", "tests/test_node_runtime.py"],
+                changed_files=[
+                    {
+                        "filename": "node/mep_runtime.py",
+                        "patch_excerpt": "@@ -697,0 +698,14 @@\n+def _trim_dangling_review_tail(text: str, *, clipped_from_longer: bool) -> str:\n+    return cleaned\n",
+                    },
+                    {
+                        "filename": "tests/test_github_bridge.py",
+                        "patch_excerpt": "@@ -3200,0 +3210,10 @@\n+def test_other_changed_case(self):\n+    assert sanitized\n",
+                    },
+                ],
+            ),
+        )
+
+        self.assertIn("Changed identifiers verified: `_trim_dangling_review_tail`", rendered)
+        self.assertNotIn(
+            "test_status_callback_publishes_reviewed_blocker_when_approve_checks_are_pending",
+            rendered,
+        )
 
     def test_structured_review_drops_findings_for_untouched_files(self):
         rendered = mep_runtime._render_structured_review_with_task_data(  # noqa: SLF001

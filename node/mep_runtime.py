@@ -564,6 +564,38 @@ def _review_github_inputs(task_data: dict[str, Any]) -> dict[str, Any]:
     return github_inputs if isinstance(github_inputs, dict) else {}
 
 
+def _review_patch_visible_identifier_tokens(task_data: Optional[dict[str, Any]]) -> set[str]:
+    github_inputs = _review_github_inputs(task_data or {})
+    visible_tokens: set[str] = set()
+    changed_files = github_inputs.get("changed_files")
+    if isinstance(changed_files, list):
+        for item in changed_files:
+            if not isinstance(item, dict):
+                continue
+            visible_tokens.update(_extract_review_identifier_tokens(item.get("patch_excerpt")))
+    hunk_contexts = github_inputs.get("hunk_contexts")
+    if isinstance(hunk_contexts, list):
+        for item in hunk_contexts:
+            if not isinstance(item, dict):
+                continue
+            visible_tokens.update(_extract_review_identifier_tokens(item.get("changed_lines")))
+            visible_tokens.update(_extract_review_identifier_tokens(item.get("hunk_header")))
+    return visible_tokens
+
+
+def _filter_review_identifiers_to_patch_visibility(
+    values: list[str],
+    *,
+    task_data: Optional[dict[str, Any]],
+) -> list[str]:
+    if not values:
+        return []
+    visible_tokens = _review_patch_visible_identifier_tokens(task_data)
+    if not visible_tokens:
+        return values
+    return [item for item in values if item.lower() in visible_tokens]
+
+
 def _review_intent_type(task_data: dict[str, Any]) -> str:
     interbot_message = _interbot_message_from_task_data(task_data)
     intent: Any = task_data.get("intent")
@@ -683,6 +715,28 @@ def _clean_review_list(values: Any, *, max_items: int, max_chars: int) -> list[s
     for item in values:
         entry = _clean_review_label(item, max_chars=max_chars)
         if not entry:
+            continue
+        key = entry.lower()
+        if key in seen:
+            continue
+        cleaned.append(entry)
+        seen.add(key)
+        if len(cleaned) >= max_items:
+            break
+    return cleaned
+
+
+def _clean_review_identifier_list(values: Any, *, max_items: int, max_chars: int) -> list[str]:
+    if not isinstance(values, list):
+        return []
+    cleaned: list[str] = []
+    seen: set[str] = set()
+    for item in values:
+        entry = str(item or "").strip()
+        if not entry:
+            continue
+        entry = re.sub(r"\s+", " ", entry).strip()
+        if len(entry) > max_chars or not _is_renderable_review_identifier(entry):
             continue
         key = entry.lower()
         if key in seen:
@@ -1146,9 +1200,13 @@ def _approval_detail_supports_publishable_approval(
     touched_tests = _clean_review_list(github_inputs.get("touched_tests"), max_items=3, max_chars=120)
     risk_pack = github_inputs.get("risk_pack")
     changed_identifiers = (
-        _clean_review_list(risk_pack.get("changed_identifiers"), max_items=8, max_chars=80)
+        _clean_review_identifier_list(risk_pack.get("changed_identifiers"), max_items=8, max_chars=80)
         if isinstance(risk_pack, dict)
         else []
+    )
+    changed_identifiers = _filter_review_identifiers_to_patch_visibility(
+        changed_identifiers,
+        task_data=task_data,
     )
     touched_paths = _clean_review_list(github_inputs.get("touched_paths"), max_items=4, max_chars=120)
     if touched_tests and "Tests reviewed:" not in text:
@@ -1561,9 +1619,13 @@ def _render_default_structured_review(
     tests_reviewed = _clean_review_list(github_inputs.get("touched_tests"), max_items=3, max_chars=120)
     risk_pack = github_inputs.get("risk_pack")
     verified_identifiers = (
-        _clean_review_list(risk_pack.get("changed_identifiers"), max_items=3, max_chars=80)
+        _clean_review_identifier_list(risk_pack.get("changed_identifiers"), max_items=3, max_chars=80)
         if isinstance(risk_pack, dict)
         else []
+    )
+    verified_identifiers = _filter_review_identifiers_to_patch_visibility(
+        verified_identifiers,
+        task_data=task_data,
     )
     risk_areas_checked = _default_review_risk_areas(task_data)
     checks_performed = _default_review_checks(
@@ -2105,7 +2167,7 @@ def _render_structured_review_with_task_data(
     allowed_tests = _clean_review_list(github_inputs.get("touched_tests"), max_items=3, max_chars=120)
     risk_pack = github_inputs.get("risk_pack")
     allowed_identifiers = (
-        _clean_review_list(
+        _clean_review_identifier_list(
             risk_pack.get("changed_identifiers"),
             max_items=8,
             max_chars=80,
@@ -2113,7 +2175,10 @@ def _render_structured_review_with_task_data(
         if isinstance(risk_pack, dict)
         else []
     )
-    allowed_identifiers = _filter_renderable_review_identifiers(allowed_identifiers)
+    allowed_identifiers = _filter_review_identifiers_to_patch_visibility(
+        allowed_identifiers,
+        task_data=task_data,
+    )
     summary = _clean_review_text(parsed.get("summary"), max_chars=500)
     if _is_weak_review_text(summary):
         summary = ""
@@ -2130,8 +2195,7 @@ def _render_structured_review_with_task_data(
         tests_reviewed = allowed_tests
     risk_areas_checked = _clean_review_list(parsed.get("risk_areas_checked"), max_items=4, max_chars=100)
     checks_performed = _clean_review_list(parsed.get("checks_performed"), max_items=4, max_chars=120)
-    verified_identifiers = _clean_review_list(parsed.get("verified_identifiers"), max_items=4, max_chars=80)
-    verified_identifiers = _filter_renderable_review_identifiers(verified_identifiers)
+    verified_identifiers = _clean_review_identifier_list(parsed.get("verified_identifiers"), max_items=4, max_chars=80)
     verified_identifiers = _filter_review_list_to_allowed(verified_identifiers, allowed_identifiers)
     if summary and (
         not _review_text_uses_only_allowed_identifiers(summary, allowed_identifiers)
@@ -3215,6 +3279,9 @@ class RuntimeNode:
             payload["action"] = action
         if detail:
             payload["detail"] = detail[:60000]
+        # #region debug-point B:bridge-status-request
+        import json, urllib.request; _p='.dbg/approve-callback-loss.env'; _u,_s='http://127.0.0.1:7777/event','approve-callback-loss'; exec("try:\n with open(_p, encoding='utf-8') as f: c=f.read(); _u=next((l.split('=',1)[1] for l in c.split('\\n') if l.startswith('DEBUG_SERVER_URL=')), _u); _s=next((l.split('=',1)[1] for l in c.split('\\n') if l.startswith('DEBUG_SESSION_ID=')), _s)\nexcept: pass"); exec("try:\n urllib.request.urlopen(urllib.request.Request(_u, data=json.dumps({'sessionId': _s, 'runId': 'pre', 'hypothesisId': 'B', 'location': 'node/mep_runtime.py:3218', 'msg': '[DEBUG] posting bridge status callback', 'data': {'task_id': task_id, 'bridge_id': bridge_metadata.get('bridge_id'), 'intent_type': _review_intent_type(task_data), 'status': status, 'action': action, 'status_endpoint': bridge_metadata.get('status_endpoint')}, 'ts': int(time.time() * 1000)}).encode(), headers={'Content-Type': 'application/json'}), timeout=2).read()\nexcept: pass")
+        # #endregion
         code, _body, raw = _safe_request(
             "POST",
             bridge_metadata["status_endpoint"],
@@ -3222,6 +3289,9 @@ class RuntimeNode:
             headers={"Authorization": f"Bearer {bridge_metadata['status_token']}"},
             timeout=20.0,
         )
+        # #region debug-point C:bridge-status-response
+        import json, urllib.request; _p='.dbg/approve-callback-loss.env'; _u,_s='http://127.0.0.1:7777/event','approve-callback-loss'; exec("try:\n with open(_p, encoding='utf-8') as f: c=f.read(); _u=next((l.split('=',1)[1] for l in c.split('\\n') if l.startswith('DEBUG_SERVER_URL=')), _u); _s=next((l.split('=',1)[1] for l in c.split('\\n') if l.startswith('DEBUG_SESSION_ID=')), _s)\nexcept: pass"); exec("try:\n urllib.request.urlopen(urllib.request.Request(_u, data=json.dumps({'sessionId': _s, 'runId': 'pre', 'hypothesisId': 'C', 'location': 'node/mep_runtime.py:3225', 'msg': '[DEBUG] bridge status callback returned', 'data': {'task_id': task_id, 'bridge_id': bridge_metadata.get('bridge_id'), 'status_code': code, 'raw_prefix': str(raw or '')[:240]}, 'ts': int(time.time() * 1000)}).encode(), headers={'Content-Type': 'application/json'}), timeout=2).read()\nexcept: pass")
+        # #endregion
         if code == 200:
             print(f"[mep run] bridge status reported task={task_id[:8]} bridge_id={bridge_metadata['bridge_id']}")
         else:
@@ -3897,6 +3967,9 @@ class RuntimeNode:
                 return
 
         result = self.adapter.generate_reply(instructions, adapter_task_data)
+        # #region debug-point A:review-result
+        import json, urllib.request; _p='.dbg/approve-callback-loss.env'; _u,_s='http://127.0.0.1:7777/event','approve-callback-loss'; exec("try:\n with open(_p, encoding='utf-8') as f: c=f.read(); _u=next((l.split('=',1)[1] for l in c.split('\\n') if l.startswith('DEBUG_SERVER_URL=')), _u); _s=next((l.split('=',1)[1] for l in c.split('\\n') if l.startswith('DEBUG_SESSION_ID=')), _s)\nexcept: pass"); exec("try:\n urllib.request.urlopen(urllib.request.Request(_u, data=json.dumps({'sessionId': _s, 'runId': 'pre', 'hypothesisId': 'A', 'location': 'node/mep_runtime.py:3899', 'msg': '[DEBUG] generated review result for bridge-eligible task', 'data': {'task_id': task_id, 'intent_type': _review_intent_type(task_data), 'bridge_eligible': self._bridge_eligible_interbot_message(task_data, interbot_message), 'bridge_action': self._bridge_status_action(interbot_message, detail=result, task_data=task_data), 'result_prefix': str(result or '')[:180]}, 'ts': int(time.time() * 1000)}).encode(), headers={'Content-Type': 'application/json'}), timeout=2).read()\nexcept: pass")
+        # #endregion
 
         # Fail-safe: a reviewer runtime must never let an adapter error (missing or
         # expired API key, HTTP error, timeout, empty completion) be written back as

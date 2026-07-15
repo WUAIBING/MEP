@@ -3289,6 +3289,43 @@ class TestGitHubToMEPBridge(unittest.TestCase):
         )
         self.assertNotIn("Changed identifiers verified:", sanitized)
 
+    def test_classify_review_detail_allows_verified_identifiers_with_backticks_and_trailing_punctuation(self):
+        self._set_pr_review_package(
+            [
+                {
+                    "filename": "tests/test_github_bridge.py",
+                    "status": "modified",
+                    "patch": (
+                        "+def test_status_callback_publishes_reviewed_blocker_when_approve_checks_are_pending(self):\n"
+                        "+    assert review_payload\n"
+                    ),
+                },
+            ],
+        )
+        response = self._post_webhook(
+            _issue_comment_payload("@Hub-Sentinel review this PR"),
+            delivery_id="delivery-verified-identifiers-punctuation",
+        )
+        self._flush_context(response.json()["context_id"])
+        execution = self.store.get_execution(response.json()["bridge_id"])
+        self.assertIsNotNone(execution)
+
+        suppress, reason = self.service._classify_review_writeback_detail(
+            execution or {},
+            (
+                "## Review Summary\n\n"
+                "Checked the blocker path against the supplied diff.\n\n"
+                "Touched paths reviewed: `tests/test_github_bridge.py`\n\n"
+                "Risk areas checked: approval blocker publication\n\n"
+                "Checks performed: compared `test_status_callback_publishes_reviewed_blocker_when_approve_checks_are_pending` against the changed test path\n\n"
+                "Changed identifiers verified: `test_status_callback_publishes_reviewed_blocker_when_approve_checks_are_pending`."
+            ),
+            action="reviewed",
+        )
+
+        self.assertFalse(suppress)
+        self.assertNotEqual(reason, "verified_identifiers_in_context_only")
+
     def test_classify_review_detail_suppresses_finding_with_mixed_changed_and_context_only_identifiers(self):
         self._set_pr_review_package(
             [

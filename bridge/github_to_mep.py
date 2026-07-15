@@ -2667,12 +2667,16 @@ class GitHubToMEPBridgeService:
         grounded_tokens = self._grounded_code_tokens(detail or "", anchored_patch_info)
         changed_tokens = self._changed_code_tokens(detail or "", anchored_patch_info)
         changed_text = anchored_patch_info["changes"]
-        changed_verified_identifiers = [
-            token for token in verified_identifiers if token and token.lower() in changed_text
-        ]
-        unsupported_verified_identifiers = [
-            token for token in verified_identifiers if token and token.lower() not in changed_text
-        ]
+        changed_verified_identifiers: list[str] = []
+        unsupported_verified_identifiers: list[str] = []
+        for item in verified_identifiers:
+            identifier_tokens = self._extract_identifier_tokens(item)
+            if not item or not identifier_tokens:
+                continue
+            if all(token in changed_text for token in identifier_tokens):
+                changed_verified_identifiers.append(item)
+            else:
+                unsupported_verified_identifiers.append(item)
         summary_tokens = self._extract_identifier_tokens(summary_text)
         summary_changed_tokens = self._changed_code_tokens(summary_text, anchored_patch_info)
         observation_tokens = self._extract_identifier_tokens(observation_text)
@@ -3547,6 +3551,9 @@ class GitHubToMEPBridgeService:
         expected_target = claims.get("target_node_id")
         if expected_target and update.target_node_id and expected_target != update.target_node_id:
             raise HTTPException(status_code=403, detail="target_node_id mismatch")
+        # #region debug-point D:bridge-status-entry
+        import json, urllib.request; _p='.dbg/approve-callback-loss.env'; _u,_s='http://127.0.0.1:7777/event','approve-callback-loss'; exec("try:\n with open(_p, encoding='utf-8') as f: c=f.read(); _u=next((l.split('=',1)[1] for l in c.split('\\n') if l.startswith('DEBUG_SERVER_URL=')), _u); _s=next((l.split('=',1)[1] for l in c.split('\\n') if l.startswith('DEBUG_SESSION_ID=')), _s)\nexcept: pass"); exec("try:\n urllib.request.urlopen(urllib.request.Request(_u, data=json.dumps({'sessionId': _s, 'runId': 'pre', 'hypothesisId': 'D', 'location': 'bridge/github_to_mep.py:3550', 'msg': '[DEBUG] bridge received status callback', 'data': {'bridge_id': update.bridge_id, 'raw_status': update.status, 'task_id': update.task_id, 'incoming_action': update.action, 'target_node_id': update.target_node_id, 'expected_target': expected_target}, 'ts': int(time.time() * 1000)}).encode(), headers={'Content-Type': 'application/json'}), timeout=2).read()\nexcept: pass")
+        # #endregion
         normalized_status = self._normalize_callback_status(update.status)
         resolved_action = update.action
         refreshed = execution
@@ -3588,6 +3595,9 @@ class GitHubToMEPBridgeService:
                 action=update.action,
             )
             refreshed = self.store.get_execution(update.bridge_id) or execution
+        # #region debug-point E:bridge-status-persisted
+        import json, urllib.request; _p='.dbg/approve-callback-loss.env'; _u,_s='http://127.0.0.1:7777/event','approve-callback-loss'; exec("try:\n with open(_p, encoding='utf-8') as f: c=f.read(); _u=next((l.split('=',1)[1] for l in c.split('\\n') if l.startswith('DEBUG_SERVER_URL=')), _u); _s=next((l.split('=',1)[1] for l in c.split('\\n') if l.startswith('DEBUG_SESSION_ID=')), _s)\nexcept: pass"); exec("try:\n urllib.request.urlopen(urllib.request.Request(_u, data=json.dumps({'sessionId': _s, 'runId': 'pre', 'hypothesisId': 'E', 'location': 'bridge/github_to_mep.py:3590', 'msg': '[DEBUG] bridge persisted callback state', 'data': {'bridge_id': update.bridge_id, 'normalized_status': normalized_status, 'resolved_action': resolved_action, 'stored_status': refreshed.get('status') if isinstance(refreshed, dict) else None, 'stored_action': refreshed.get('action') if isinstance(refreshed, dict) else None}, 'ts': int(time.time() * 1000)}).encode(), headers={'Content-Type': 'application/json'}), timeout=2).read()\nexcept: pass")
+        # #endregion
         event = NormalizedGitHubEvent(
             delivery_id="",
             source_event="",
