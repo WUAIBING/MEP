@@ -2815,6 +2815,126 @@ class TestGitHubToMEPBridge(unittest.TestCase):
         self.assertEqual(len(self.github_session.posts), 0)
         self.assertEqual(self.service.github_writeback_metrics["last_suppressed_reason"], "observation_in_context_only")
 
+    def test_classify_review_detail_suppresses_summary_with_mixed_changed_and_context_only_identifiers(self):
+        self._set_pr_review_package(
+            [
+                {
+                    "filename": "bridge/github_to_mep.py",
+                    "status": "modified",
+                    "patch": (
+                        "+def preserve_coalesced_targets():\n"
+                        "+    return True\n"
+                    ),
+                },
+            ],
+        )
+        response = self._post_webhook(
+            _issue_comment_payload("@Hub-Sentinel review this PR"),
+            delivery_id="delivery-summary-mixed-identifiers",
+        )
+        self._flush_context(response.json()["context_id"])
+        execution = self.store.get_execution(response.json()["bridge_id"])
+        self.assertIsNotNone(execution)
+
+        suppress, reason = self.service._classify_review_writeback_detail(
+            execution or {},
+            (
+                "## Review Summary\n\n"
+                "`preserve_coalesced_targets` still looks safe, but `imagined_guard` now controls the retry path.\n\n"
+                "Touched paths reviewed: `bridge/github_to_mep.py`\n\n"
+                "Risk areas checked: review writeback grounding\n\n"
+                "Checks performed: compared `preserve_coalesced_targets` against the changed retry path\n\n"
+                "Changed identifiers verified: `preserve_coalesced_targets`"
+            ),
+            action="reviewed",
+        )
+
+        self.assertTrue(suppress)
+        self.assertEqual(reason, "summary_in_context_only")
+
+    def test_classify_review_detail_suppresses_context_only_verified_identifiers(self):
+        self._set_pr_review_package(
+            [
+                {
+                    "filename": "bridge/github_to_mep.py",
+                    "status": "modified",
+                    "patch": (
+                        "+def preserve_coalesced_targets():\n"
+                        "+    return True\n"
+                    ),
+                },
+            ],
+        )
+        response = self._post_webhook(
+            _issue_comment_payload("@Hub-Sentinel review this PR"),
+            delivery_id="delivery-context-only-verified-identifiers",
+        )
+        self._flush_context(response.json()["context_id"])
+        execution = self.store.get_execution(response.json()["bridge_id"])
+        self.assertIsNotNone(execution)
+
+        suppress, reason = self.service._classify_review_writeback_detail(
+            execution or {},
+            (
+                "## Review Summary\n\n"
+                "Checked the coalesce path against the supplied diff.\n\n"
+                "Touched paths reviewed: `bridge/github_to_mep.py`\n\n"
+                "Risk areas checked: review writeback grounding\n\n"
+                "Checks performed: compared `preserve_coalesced_targets` against the changed retry path\n\n"
+                "Changed identifiers verified: `preserve_coalesced_targets`, `imagined_guard`"
+            ),
+            action="reviewed",
+        )
+
+        self.assertTrue(suppress)
+        self.assertEqual(reason, "verified_identifiers_in_context_only")
+        sanitized = self.service._sanitize_review_detail_for_reason(
+            (
+                "## Review Summary\n\n"
+                "Checked the coalesce path against the supplied diff.\n\n"
+                "Touched paths reviewed: `bridge/github_to_mep.py`\n\n"
+                "Risk areas checked: review writeback grounding\n\n"
+                "Checks performed: compared `preserve_coalesced_targets` against the changed retry path\n\n"
+                "Changed identifiers verified: `preserve_coalesced_targets`, `imagined_guard`"
+            ),
+            reason,
+        )
+        self.assertNotIn("Changed identifiers verified:", sanitized)
+
+    def test_classify_review_detail_suppresses_finding_with_mixed_changed_and_context_only_identifiers(self):
+        self._set_pr_review_package(
+            [
+                {
+                    "filename": "hub/main.py",
+                    "status": "modified",
+                    "patch": (
+                        "+def new_function_with_bug():\n"
+                        "+    x = 1 / 0\n"
+                    ),
+                },
+            ],
+        )
+        response = self._post_webhook(
+            _issue_comment_payload("@Hub-Sentinel review this PR"),
+            delivery_id="delivery-finding-mixed-identifiers",
+        )
+        self._flush_context(response.json()["context_id"])
+        execution = self.store.get_execution(response.json()["bridge_id"])
+        self.assertIsNotNone(execution)
+
+        suppress, reason = self.service._classify_review_writeback_detail(
+            execution or {},
+            (
+                "## Review Findings\n\n"
+                "1. **`new_function_with_bug` still depends on `imagined_guard`.** (`hub/main.py`): "
+                "The new crash path now flows through `imagined_guard`, so the regression is harder to detect."
+            ),
+            action="reviewed",
+        )
+
+        self.assertTrue(suppress)
+        self.assertEqual(reason, "finding_in_context_only")
+
     def test_status_callback_suppresses_summary_conflicting_with_changed_validation_logic(self):
         self._set_pr_review_package(
             [

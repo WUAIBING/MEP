@@ -906,6 +906,45 @@ class TestRuntimeReviewPrompts(unittest.TestCase):
         self.assertNotIn("Preserve coalesced targets", rendered)
         self.assertIn("verified changed identifiers `_record_pending_task_poll_failure`, `last_poll_status`", rendered)
 
+    def test_structured_review_rewrites_summary_and_observation_with_unallowed_identifiers(self):
+        rendered = mep_runtime._render_structured_review_with_task_data(  # noqa: SLF001
+            (
+                '{"summary":"`_record_pending_task_poll_failure` still looks safe, but `imagined_guard` now drives the retry path.",'
+                '"observation":"`last_poll_status` is real, but `imagined_guard` is the branch to watch.",'
+                '"touched_paths":["bridge/github_to_mep.py"],'
+                '"tests_reviewed":["tests/test_github_bridge.py"],'
+                '"verified_identifiers":["_record_pending_task_poll_failure","last_poll_status"],'
+                '"approval_recommendation":"comment"}'
+            ),
+            max_chars=1200,
+            task_data=self._bridge_review_task_data(),
+        )
+
+        self.assertIn("## Review Summary", rendered)
+        self.assertNotIn("imagined_guard", rendered)
+        self.assertIn("Touched paths reviewed: `bridge/github_to_mep.py`", rendered)
+        self.assertIn("Changed identifiers verified: `_record_pending_task_poll_failure`, `last_poll_status`", rendered)
+
+    def test_structured_review_drops_findings_with_mixed_real_and_fake_identifiers(self):
+        rendered = mep_runtime._render_structured_review_with_task_data(  # noqa: SLF001
+            (
+                '{"summary":"Checked the bridge diff.","observation":"The changed path stays narrow.",'
+                '"touched_paths":["bridge/github_to_mep.py"],'
+                '"tests_reviewed":["tests/test_github_bridge.py"],'
+                '"verified_identifiers":["_record_pending_task_poll_failure","last_poll_status"],'
+                '"findings":[{"file":"bridge/github_to_mep.py","issue":"Mixed identifier claim in `_record_pending_task_poll_failure`",'
+                '"rationale":"The retry path now depends on `imagined_guard`, so the second status update can be lost."}],'
+                '"approval_recommendation":"comment"}'
+            ),
+            max_chars=1200,
+            task_data=self._bridge_review_task_data(),
+        )
+
+        self.assertIn("## Review Summary", rendered)
+        self.assertNotIn("## Review Findings", rendered)
+        self.assertNotIn("imagined_guard", rendered)
+        self.assertNotIn("Mixed identifier claim", rendered)
+
     def test_structured_review_drops_findings_for_untouched_files(self):
         rendered = mep_runtime._render_structured_review_with_task_data(  # noqa: SLF001
             (

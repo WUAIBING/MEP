@@ -686,6 +686,38 @@ def _filter_review_list_to_allowed(values: list[str], allowed: list[str]) -> lis
     return filtered
 
 
+def _extract_review_identifier_tokens(text: Any) -> set[str]:
+    cleaned = str(text or "").strip()
+    if not cleaned:
+        return set()
+    excluded = {
+        "node_id",
+        "task_id",
+        "repo_name",
+        "issue_number",
+        "bridge_id",
+        "target_node_id",
+    }
+    tokens: set[str] = set()
+    for token in re.findall(r"`([A-Za-z_][A-Za-z0-9_]*)`", cleaned):
+        lowered = token.lower()
+        if len(lowered) >= 4 and lowered not in excluded:
+            tokens.add(lowered)
+    for token in re.findall(r"\b[A-Za-z_][A-Za-z0-9_]*_[A-Za-z0-9_]+\b", cleaned):
+        lowered = token.lower()
+        if len(lowered) >= 4 and lowered not in excluded:
+            tokens.add(lowered)
+    return tokens
+
+
+def _review_text_uses_only_allowed_identifiers(text: str, allowed_identifiers: list[str]) -> bool:
+    tokens = _extract_review_identifier_tokens(text)
+    if not tokens or not allowed_identifiers:
+        return True
+    allowed = {item.lower() for item in allowed_identifiers if item}
+    return tokens.issubset(allowed)
+
+
 def _system_prompt_for_task(
     task_data: dict[str, Any],
     *,
@@ -1952,6 +1984,10 @@ def _render_structured_review_with_task_data(
     checks_performed = _clean_review_list(parsed.get("checks_performed"), max_items=4, max_chars=120)
     verified_identifiers = _clean_review_list(parsed.get("verified_identifiers"), max_items=4, max_chars=80)
     verified_identifiers = _filter_review_list_to_allowed(verified_identifiers, allowed_identifiers)
+    if summary and not _review_text_uses_only_allowed_identifiers(summary, allowed_identifiers):
+        summary = ""
+    if observation and not _review_text_uses_only_allowed_identifiers(observation, allowed_identifiers):
+        observation = ""
     legacy_no_finding = _clean_review_text(parsed.get("why_no_finding"), max_chars=400)
     if _is_weak_review_text(legacy_no_finding):
         legacy_no_finding = ""
@@ -1968,6 +2004,8 @@ def _render_structured_review_with_task_data(
             rationale = _clean_review_text(item.get("rationale"), max_chars=400)
             combined = f"{issue} {rationale}".strip()
             if _is_weak_review_text(combined):
+                continue
+            if not _review_text_uses_only_allowed_identifiers(combined, allowed_identifiers):
                 continue
             file_name = _clean_review_label(item.get("file"), max_chars=80)
             if file_name and allowed_path_keys:
