@@ -42,21 +42,30 @@ except ImportError:  # pragma: no cover - direct file execution from node/ may n
     identity_paths = None  # type: ignore[assignment]
 
 try:
-    from clients.shared.review_patterns import has_partial_diff_caveat
+    from clients.shared.review_patterns import has_partial_diff_caveat as _shared_has_partial_diff_caveat
 except ImportError:  # pragma: no cover - direct file execution from node/ may not see repo root
-    def has_partial_diff_caveat(text: str) -> bool:
-        lowered = str(text or "").strip().lower()
-        if not lowered:
-            return False
-        return any(
-            re.search(pattern, lowered)
-            for pattern in (
-                r"\bnot fully shown(?:\s+in\s+the\s+diff)?\b(?:[.:;,])?",
-                r"\bpartial diff\b(?:[.:;,])?",
-                r"\bpartially shown\b(?:[.:;,])?",
-                r"\bwithout the full (?:diff|patch)\b(?:[.:;,])?",
-            )
+    _shared_has_partial_diff_caveat = None
+
+
+def _fallback_has_partial_diff_caveat(text: str) -> bool:
+    lowered = str(text or "").strip().lower()
+    if not lowered:
+        return False
+    return any(
+        re.search(pattern, lowered)
+        for pattern in (
+            r"\bnot fully shown(?:\s+in\s+the\s+diff)?\b(?:[.:;,])?",
+            r"\bpartial diff\b(?:[.:;,])?",
+            r"\bpartially shown\b(?:[.:;,])?",
+            r"\bwithout the full (?:diff|patch)\b(?:[.:;,])?",
         )
+    )
+
+
+def has_partial_diff_caveat(text: str) -> bool:
+    if _shared_has_partial_diff_caveat is not None:
+        return _shared_has_partial_diff_caveat(text)
+    return _fallback_has_partial_diff_caveat(text)
 
 
 DEFAULT_HUB_URL = os.getenv("HUB_URL", "http://localhost:8000")

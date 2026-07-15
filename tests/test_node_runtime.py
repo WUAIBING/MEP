@@ -901,6 +901,10 @@ class TestRuntimeReviewPrompts(unittest.TestCase):
             )
         )
 
+    def test_has_partial_diff_caveat_falls_back_when_shared_import_is_unavailable(self):
+        with patch.object(mep_runtime, "_shared_has_partial_diff_caveat", None):
+            self.assertTrue(mep_runtime.has_partial_diff_caveat("The test bodies are not fully shown in the diff."))
+
     def test_finalize_model_reply_drops_trailing_partial_word(self):
         rendered = mep_runtime._finalize_model_reply(  # noqa: SLF001
             (
