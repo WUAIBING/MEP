@@ -550,6 +550,16 @@ def _task_is_approval_review(task_data: dict[str, Any]) -> bool:
     return _review_intent_type(task_data) == "code.review.approve"
 
 
+def _review_checks_allow_approval(task_data: Optional[dict[str, Any]]) -> bool:
+    github_inputs = _review_github_inputs(task_data or {})
+    ci_checks = github_inputs.get("ci_checks")
+    if not isinstance(ci_checks, dict) or not ci_checks.get("has_checks"):
+        return True
+    # Bridge publication is fail-closed for approvals while checks are pending
+    # or failing, so the runtime should only emit approval when checks are green.
+    return bool(ci_checks.get("all_green"))
+
+
 def _review_mode_for_task(task_data: dict[str, Any]) -> str:
     github_inputs = _review_github_inputs(task_data)
     review_mode = _clean_review_label(github_inputs.get("review_mode"), max_chars=40).lower()
@@ -2917,11 +2927,17 @@ class RuntimeNode:
         intent = interbot_message.get("intent")
         intent_type = intent.get("type") if isinstance(intent, dict) else None
         if intent_type == "code.review.approve":
-            if not _approval_detail_supports_publishable_approval(detail, task_data=task_data):
+            if (
+                not _approval_detail_supports_publishable_approval(detail, task_data=task_data)
+                or not _review_checks_allow_approval(task_data)
+            ):
                 return "reviewed"
             return "approved"
         if intent_type == "code.review.request":
-            if _approval_detail_supports_publishable_approval(detail, task_data=task_data):
+            if (
+                _approval_detail_supports_publishable_approval(detail, task_data=task_data)
+                and _review_checks_allow_approval(task_data)
+            ):
                 return "approved"
             return "reviewed"
         if intent_type == "code.review.comment":
