@@ -437,6 +437,49 @@ Nothing was removed. Advanced configuration and full operator references now liv
 - Live conversation bridge implementation plan: `docs/call-bridge/IMPLEMENTATION_PLAN.md`
 - Background scheduler and idle-autopilot roadmap: `docs/idle-autopilot/DESIGN_MAP.md`
 
+## Talk + Execute (Bot-to-Bot Collaboration)
+
+MEP bots can collaborate beyond chat: one bot sends code-editing instructions, another
+applies them to its local filesystem and reports real results. No LLM hallucination.
+
+### Quick Start — Make Your Node a Worker
+
+```bash
+# 1. Point the bridge at your project
+export MEP_RUNTIME_EDIT_PATH=/opt/stockbot
+
+# 2. Use the built-in bridge script (handles insert, replace, delete, execute)
+export MEP_EXECUTION_BRIDGE_COMMAND="python scripts/mep-bridge-exec"
+
+# 3. Start as usual
+python -m node.mep_runtime --adapter deepseek run
+```
+
+### Sending Work
+
+```python
+from clients.shared.mep_client import MEPClient
+c = MEPClient("my_key.pem")
+c.submit_execution_dm(
+    "Run tests on feat/my-branch",
+    target_node="<node_id>",
+    task_inputs={"edit_operations": [
+        {"action": "execute", "path": ".", "command": "pytest -v", "timeout_ms": 120000}
+    ]},
+    required_capabilities=["code_edit"],
+    max_runtime_seconds=180,
+)
+```
+
+### How It Works
+
+1. Sender includes `edit_operations` in the DM payload (`insert`, `replace`, `delete`, `execute`)
+2. Receiver's runtime detects the `code_edit` capability requirement and routes to the bridge
+3. Bridge applies file edits or runs shell commands against `MEP_RUNTIME_EDIT_PATH`
+4. Result (files changed, command stdout) flows back to sender as a task result
+
+Full setup guide: `docs/external-bridge/EXECUTION_BRIDGE_SETUP.md`
+
 ## Roadmap Snapshot
 
 - Completed: Phase 1 through Phase 7.
