@@ -813,12 +813,54 @@ class TestRuntimeReviewPrompts(unittest.TestCase):
                 '"findings":[],"approval_recommendation":"comment"}'
             ),
             max_chars=1000,
-            task_data=self._bridge_review_task_data(),
+            task_data=self._bridge_review_task_data(
+                changed_identifiers=["_build_review_trial_result", "list_review_trials"]
+            ),
         )
 
         self.assertIn("Risk areas checked: trial persistence, endpoint decoding", rendered)
-        self.assertIn("Checks performed: verified suppression and publish paths mention `review_result_json`, checked `/bridge/review-trials` returns stored review metadata", rendered)
+        self.assertIn("Checks performed: reviewed the changed diff for `bridge/github_to_mep.py`, verified changed identifiers `_build_review_trial_result`, `list_review_trials` against the supplied review context, checked relevant changed tests `tests/test_github_bridge.py`", rendered)
         self.assertNotIn("Why no finding:", rendered)
+
+    def test_structured_review_replaces_model_checks_with_grounded_defaults_for_no_finding_reviews(self):
+        rendered = mep_runtime._render_structured_review_with_task_data(  # noqa: SLF001
+            (
+                '{"summary":"Checked the review trial ledger flow end to end.",'
+                '"observation":"`_build_review_trial_result` and `list_review_trials` stay aligned with the stored JSON payload.",'
+                '"touched_paths":["bridge/github_to_mep.py"],'
+                '"tests_reviewed":["tests/test_github_bridge.py"],'
+                '"risk_areas_checked":["trial persistence","endpoint decoding"],'
+                '"checks_performed":["Confirmed that `imagined_guard` keeps the publish path safe for retries"],'
+                '"verified_identifiers":["_build_review_trial_result","list_review_trials"],'
+                '"findings":[],"approval_recommendation":"comment"}'
+            ),
+            max_chars=1000,
+            task_data=self._bridge_review_task_data(
+                changed_identifiers=["_build_review_trial_result", "list_review_trials"]
+            ),
+        )
+
+        self.assertNotIn("imagined_guard", rendered)
+        self.assertIn("reviewed the changed diff for `bridge/github_to_mep.py`", rendered)
+        self.assertIn("verified changed identifiers `_build_review_trial_result`, `list_review_trials` against the supplied review context", rendered)
+
+    def test_clean_review_label_drops_partial_trailing_word_when_clipped(self):
+        cleaned = mep_runtime._clean_review_label(  # noqa: SLF001
+            "Confirmed that _filter_review_list_to_allowed uses exact matching and avoids trailing filteri",
+            max_chars=88,
+        )
+
+        self.assertNotIn("filteri", cleaned)
+        self.assertTrue(cleaned.endswith("trailing"))
+
+    def test_finalize_model_reply_drops_partial_trailing_word_after_clip(self):
+        rendered = mep_runtime._finalize_model_reply(  # noqa: SLF001
+            "## Review Summary\n\nChecks performed: confirmed the publish path stays grounded and avoids trailing filteri",
+            max_chars=96,
+        )
+
+        self.assertNotIn("filteri", rendered)
+        self.assertNotIn("filter.", rendered)
 
     def test_structured_review_fills_no_finding_defaults_from_task_data(self):
         rendered = mep_runtime._render_structured_review_with_task_data(  # noqa: SLF001

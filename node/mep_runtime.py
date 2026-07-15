@@ -668,6 +668,19 @@ def _clean_review_list(values: Any, *, max_items: int, max_chars: int) -> list[s
     return cleaned
 
 
+def _clip_without_partial_token(text: str, *, max_chars: int) -> str:
+    if len(text) <= max_chars:
+        return text
+    clipped = text[:max_chars].rstrip()
+    if not clipped:
+        return ""
+    if max_chars < len(text) and text[max_chars].isalnum() and clipped[-1].isalnum():
+        word_break = max(clipped.rfind(" "), clipped.rfind(", "), clipped.rfind("; "), clipped.rfind(": "))
+        if word_break >= max(20, max_chars // 2):
+            clipped = clipped[:word_break].rstrip(" ,;:")
+    return clipped
+
+
 def _filter_review_list_to_allowed(values: list[str], allowed: list[str]) -> list[str]:
     if not values:
         return []
@@ -958,7 +971,7 @@ def _clean_review_text(value: Any, *, max_chars: int) -> str:
         return ""
     text = re.sub(r"\s+", " ", text).strip()
     if len(text) > max_chars:
-        clipped = text[:max_chars].rstrip()
+        clipped = _clip_without_partial_token(text, max_chars=max_chars)
         sentence_break = max(clipped.rfind(". "), clipped.rfind("! "), clipped.rfind("? "))
         if sentence_break >= max(40, max_chars // 2):
             clipped = clipped[: sentence_break + 1].rstrip()
@@ -974,7 +987,7 @@ def _clean_review_label(value: Any, *, max_chars: int) -> str:
         return ""
     text = re.sub(r"\s+", " ", text).strip()
     if len(text) > max_chars:
-        text = text[:max_chars].rstrip()
+        text = _clip_without_partial_token(text, max_chars=max_chars)
     return text.rstrip(".,;: ")
 
 
@@ -1473,7 +1486,7 @@ def _finalize_model_reply(text: str, *, max_chars: int) -> str:
     cleaned = cleaned.replace("\r\n", "\n")
     cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
     if len(cleaned) > max_chars:
-        clipped = cleaned[:max_chars].rstrip()
+        clipped = _clip_without_partial_token(cleaned, max_chars=max_chars)
         breakpoints = [
             clipped.rfind("\n\n"),
             clipped.rfind("\n- "),
@@ -2024,13 +2037,12 @@ def _render_structured_review_with_task_data(
             verified_identifiers = allowed_identifiers[:3]
         if not risk_areas_checked:
             risk_areas_checked = _default_review_risk_areas(task_data)
-        if not checks_performed:
-            checks_performed = _default_review_checks(
-                touched_paths=touched_paths,
-                tests_reviewed=tests_reviewed,
-                verified_identifiers=verified_identifiers,
-                task_data=task_data,
-            )
+        checks_performed = _default_review_checks(
+            touched_paths=touched_paths,
+            tests_reviewed=tests_reviewed,
+            verified_identifiers=verified_identifiers,
+            task_data=task_data,
+        )
         if not summary:
             summary = _default_review_summary(
                 touched_paths=touched_paths,
@@ -2050,6 +2062,15 @@ def _render_structured_review_with_task_data(
                 touched_paths=touched_paths,
                 verified_identifiers=verified_identifiers,
             )
+    else:
+        synthesized_checks = _default_review_checks(
+            touched_paths=touched_paths,
+            tests_reviewed=tests_reviewed,
+            verified_identifiers=verified_identifiers,
+            task_data=task_data,
+        )
+        if synthesized_checks:
+            checks_performed = synthesized_checks
     sections: list[str] = []
     if findings:
         sections.append("## Review Findings")

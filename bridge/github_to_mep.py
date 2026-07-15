@@ -2220,6 +2220,28 @@ class GitHubToMEPBridgeService:
         return values
 
     @classmethod
+    def _list_entries_with_unsupported_identifiers(
+        cls,
+        values: list[str],
+        patch_info: dict[str, str],
+        *,
+        ignored_tokens: Optional[set[str]] = None,
+    ) -> list[str]:
+        if not values:
+            return []
+        full_patch = str(patch_info.get("full") or "")
+        unsupported: list[str] = []
+        ignored = {token.lower() for token in (ignored_tokens or set()) if token}
+        for item in values:
+            tokens = {token for token in cls._extract_identifier_tokens(item) if token not in ignored}
+            if not tokens:
+                continue
+            hallucinated = {token for token in tokens if token not in full_patch}
+            if hallucinated:
+                unsupported.append(item)
+        return unsupported
+
+    @classmethod
     def _grounded_code_tokens(cls, text: str, patch_info: dict[str, str]) -> set[str]:
         if not text or not patch_info:
             return set()
@@ -2696,6 +2718,11 @@ class GitHubToMEPBridgeService:
         observation_tokens = {token for token in observation_tokens if token not in path_identifier_tokens}
         summary_changed_tokens = {token for token in summary_changed_tokens if token not in path_identifier_tokens}
         observation_changed_tokens = {token for token in observation_changed_tokens if token not in path_identifier_tokens}
+        unsupported_check_entries = self._list_entries_with_unsupported_identifiers(
+            checks_performed,
+            anchored_patch_info,
+            ignored_tokens=path_identifier_tokens,
+        )
         reviewability = snapshot.get("reviewability") or {}
         reviewability_bucket = str(reviewability.get("bucket") or "standard").strip().lower()
         if has_findings and not anchored_paths:
@@ -2711,6 +2738,8 @@ class GitHubToMEPBridgeService:
                 return True, "ungrounded_finding"
         if verified_identifiers and unsupported_verified_identifiers:
             return True, "verified_identifiers_in_context_only"
+        if unsupported_check_entries:
+            return True, "checks_in_context_only"
         if reviewability_bucket == "low_signal" and not has_findings and action != "approved":
             return True, "low_signal_no_finding"
         if has_structured_sections and not has_findings:
@@ -2771,6 +2800,8 @@ class GitHubToMEPBridgeService:
             sanitized = re.sub(r"(?im)^##\s*Review Findings\b", "## Review Summary", sanitized, count=1)
         elif reason == "verified_identifiers_in_context_only":
             sanitized = re.sub(r"(?im)^\s*Changed identifiers verified:\s*.+(?:\n|$)", "", sanitized)
+        elif reason == "checks_in_context_only":
+            sanitized = re.sub(r"(?im)^\s*Checks performed:\s*.+(?:\n|$)", "", sanitized)
         elif reason in {"summary_conflicts_with_patch", "summary_in_context_only"}:
             sanitized = re.sub(
                 r"(?ims)^##\s*Review Summary\s*.*?(?=\n\s*Observation:|\n\s*Touched paths reviewed:|\n\s*Tests reviewed:|\n\s*Risk areas checked:|\n\s*Checks performed:|\n\s*Changed identifiers verified:|$)",
