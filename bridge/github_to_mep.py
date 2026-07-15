@@ -2150,6 +2150,13 @@ class GitHubToMEPBridgeService:
         return f"## Review Summary\n\n{blocker}\n\n{cleaned_detail}"
 
     @staticmethod
+    def _normalize_callback_status(status: Any) -> str:
+        normalized = str(status or "").strip().lower()
+        if normalized in {"success", "succeeded", "ok"}:
+            return "completed"
+        return normalized
+
+    @staticmethod
     def _normalize_review_reference(value: str) -> str:
         text = str(value or "").strip().strip("`'\"")
         text = text.lstrip("([{")
@@ -3540,9 +3547,10 @@ class GitHubToMEPBridgeService:
         expected_target = claims.get("target_node_id")
         if expected_target and update.target_node_id and expected_target != update.target_node_id:
             raise HTTPException(status_code=403, detail="target_node_id mismatch")
+        normalized_status = self._normalize_callback_status(update.status)
         resolved_action = update.action
         refreshed = execution
-        if str(update.status).strip().lower() == "completed":
+        if normalized_status == "completed":
             resolved_action, suppression_reason, review_result = self._write_back_to_github(execution, update)
             retry_queued = False
             if resolved_action == "suppressed":
@@ -3566,7 +3574,7 @@ class GitHubToMEPBridgeService:
             else:
                 self.store.update_execution(
                     update.bridge_id,
-                    status=update.status,
+                    status=normalized_status,
                     task_id=update.task_id,
                     action=resolved_action,
                     review_result=review_result,
@@ -3575,7 +3583,7 @@ class GitHubToMEPBridgeService:
         else:
             self.store.update_execution(
                 update.bridge_id,
-                status=update.status,
+                status=normalized_status or str(update.status or "").strip().lower(),
                 task_id=update.task_id,
                 action=update.action,
             )
@@ -3603,7 +3611,7 @@ class GitHubToMEPBridgeService:
             update.bridge_id,
             self._render_status_text(
                 event,
-                update.status,
+                normalized_status or str(update.status or "").strip().lower(),
                 task_id=update.task_id or refreshed.get("task_id"),
                 action=resolved_action,
                 detail=update.detail,
