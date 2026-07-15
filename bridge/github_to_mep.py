@@ -2576,7 +2576,7 @@ class GitHubToMEPBridgeService:
 
     @staticmethod
     def _suppression_reason_allows_retry(reason: Optional[str]) -> bool:
-        return reason not in {"approval_checks_pending", "approval_checks_not_green", "low_signal_no_finding"}
+        return reason not in {"low_signal_no_finding"}
 
     @classmethod
     def _verify_review_findings_against_patch(
@@ -2751,7 +2751,6 @@ class GitHubToMEPBridgeService:
             has_findings = bool(snapshot.get("has_findings"))
             checks_performed = snapshot.get("checks_performed") or []
             risk_areas_checked = snapshot.get("risk_areas_checked") or []
-            why_no_finding = str(snapshot.get("why_no_finding") or "").strip()
             if (
                 reviewability_bucket == "standard"
                 and anchored_paths
@@ -3669,6 +3668,15 @@ class GitHubToMEPBridgeService:
         target_alias = str(execution["target_alias"])
         retry_count = int(execution.get("retry_count") or 0) + 1
         github_inputs = self._execution_github_inputs(execution)
+        if str(execution.get("entity_type") or "").strip().lower() == "pr":
+            repo_full_name = str(execution.get("repo_full_name") or "").strip()
+            number = int(execution.get("issue_number") or 0)
+            if repo_full_name and number > 0:
+                fresh_review_package = self._fetch_pr_review_package(repo_full_name, number)
+                fresh_github_inputs = self._compact_review_package_for_task_inputs(fresh_review_package)
+                if fresh_github_inputs:
+                    # Preserve delivery-specific fields while refreshing mutable PR state.
+                    github_inputs = {**github_inputs, **fresh_github_inputs}
 
         # Build critique instructions
         critique = f"Your previous review was suppressed because: {reason or 'weak_output'}.\n"
