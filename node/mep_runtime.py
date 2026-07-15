@@ -3279,9 +3279,6 @@ class RuntimeNode:
             payload["action"] = action
         if detail:
             payload["detail"] = detail[:60000]
-        # #region debug-point B:bridge-status-request
-        import json, urllib.request; _p='.dbg/approve-callback-loss.env'; _u,_s='http://127.0.0.1:7777/event','approve-callback-loss'; exec("try:\n with open(_p, encoding='utf-8') as f: c=f.read(); _u=next((l.split('=',1)[1] for l in c.split('\\n') if l.startswith('DEBUG_SERVER_URL=')), _u); _s=next((l.split('=',1)[1] for l in c.split('\\n') if l.startswith('DEBUG_SESSION_ID=')), _s)\nexcept: pass"); exec("try:\n urllib.request.urlopen(urllib.request.Request(_u, data=json.dumps({'sessionId': _s, 'runId': 'pre', 'hypothesisId': 'B', 'location': 'node/mep_runtime.py:3218', 'msg': '[DEBUG] posting bridge status callback', 'data': {'task_id': task_id, 'bridge_id': bridge_metadata.get('bridge_id'), 'intent_type': _review_intent_type(task_data), 'status': status, 'action': action, 'status_endpoint': bridge_metadata.get('status_endpoint')}, 'ts': int(time.time() * 1000)}).encode(), headers={'Content-Type': 'application/json'}), timeout=2).read()\nexcept: pass")
-        # #endregion
         code, _body, raw = _safe_request(
             "POST",
             bridge_metadata["status_endpoint"],
@@ -3289,9 +3286,6 @@ class RuntimeNode:
             headers={"Authorization": f"Bearer {bridge_metadata['status_token']}"},
             timeout=20.0,
         )
-        # #region debug-point C:bridge-status-response
-        import json, urllib.request; _p='.dbg/approve-callback-loss.env'; _u,_s='http://127.0.0.1:7777/event','approve-callback-loss'; exec("try:\n with open(_p, encoding='utf-8') as f: c=f.read(); _u=next((l.split('=',1)[1] for l in c.split('\\n') if l.startswith('DEBUG_SERVER_URL=')), _u); _s=next((l.split('=',1)[1] for l in c.split('\\n') if l.startswith('DEBUG_SESSION_ID=')), _s)\nexcept: pass"); exec("try:\n urllib.request.urlopen(urllib.request.Request(_u, data=json.dumps({'sessionId': _s, 'runId': 'pre', 'hypothesisId': 'C', 'location': 'node/mep_runtime.py:3225', 'msg': '[DEBUG] bridge status callback returned', 'data': {'task_id': task_id, 'bridge_id': bridge_metadata.get('bridge_id'), 'status_code': code, 'raw_prefix': str(raw or '')[:240]}, 'ts': int(time.time() * 1000)}).encode(), headers={'Content-Type': 'application/json'}), timeout=2).read()\nexcept: pass")
-        # #endregion
         if code == 200:
             print(f"[mep run] bridge status reported task={task_id[:8]} bridge_id={bridge_metadata['bridge_id']}")
         else:
@@ -3968,7 +3962,7 @@ class RuntimeNode:
 
         result = self.adapter.generate_reply(instructions, adapter_task_data)
         # #region debug-point A:review-result
-        import json, urllib.request; _p='.dbg/approve-callback-loss.env'; _u,_s='http://127.0.0.1:7777/event','approve-callback-loss'; exec("try:\n with open(_p, encoding='utf-8') as f: c=f.read(); _u=next((l.split('=',1)[1] for l in c.split('\\n') if l.startswith('DEBUG_SERVER_URL=')), _u); _s=next((l.split('=',1)[1] for l in c.split('\\n') if l.startswith('DEBUG_SESSION_ID=')), _s)\nexcept: pass"); exec("try:\n urllib.request.urlopen(urllib.request.Request(_u, data=json.dumps({'sessionId': _s, 'runId': 'pre', 'hypothesisId': 'A', 'location': 'node/mep_runtime.py:3899', 'msg': '[DEBUG] generated review result for bridge-eligible task', 'data': {'task_id': task_id, 'intent_type': _review_intent_type(task_data), 'bridge_eligible': self._bridge_eligible_interbot_message(task_data, interbot_message), 'bridge_action': self._bridge_status_action(interbot_message, detail=result, task_data=task_data), 'result_prefix': str(result or '')[:180]}, 'ts': int(time.time() * 1000)}).encode(), headers={'Content-Type': 'application/json'}), timeout=2).read()\nexcept: pass")
+        _p='.dbg/approve-callback-loss.env'; _u,_s='http://127.0.0.1:7777/event','approve-callback-loss'; exec("try:\n with open(_p, encoding='utf-8') as f: c=f.read(); _u=next((l.split('=',1)[1] for l in c.split('\\n') if l.startswith('DEBUG_SERVER_URL=')), _u); _s=next((l.split('=',1)[1] for l in c.split('\\n') if l.startswith('DEBUG_SESSION_ID=')), _s)\nexcept: pass"); exec("try:\n urllib.request.urlopen(urllib.request.Request(_u, data=json.dumps({'sessionId': _s, 'runId': 'pre', 'hypothesisId': 'A', 'location': 'node/mep_runtime.py:3899', 'msg': '[DEBUG] generated review result for bridge-eligible task', 'data': {'task_id': task_id, 'intent_type': _review_intent_type(task_data), 'bridge_eligible': self._bridge_eligible_interbot_message(task_data, interbot_message), 'bridge_action': self._bridge_status_action(interbot_message, detail=result, task_data=task_data), 'result_prefix': str(result or '')[:180]}, 'ts': int(time.time() * 1000)}).encode(), headers={'Content-Type': 'application/json'}), timeout=2).read()\nexcept: pass")
         # #endregion
 
         # Fail-safe: a reviewer runtime must never let an adapter error (missing or
