@@ -798,6 +798,7 @@ def _system_prompt_for_task(
             "Use `risk_areas_checked` for 1-4 concrete risk themes you examined in the changed code. "
             "Use `checks_performed` for 1-4 specific verification steps you actually performed against the diff, tests, or workspace excerpts. "
             "When findings are empty, keep `summary` verdict-style and `observation` concrete; do not add filler sections or generic praise. "
+            "For no-finding reviews, never use generic approval language like `looks good`, `well-structured`, `clean patch`, or `LGTM`. "
             "Use `verified_identifiers` for exact function/variable/class names copied from changed lines in the supplied diff or workspace excerpts. "
             "Prefer real touched files and tests from the supplied GitHub inputs for `touched_paths` and `tests_reviewed`. "
             "For no-finding reviews, always anchor the output to the actual diff: include at least one touched path in `touched_paths`, "
@@ -1265,11 +1266,35 @@ _WEAK_REVIEW_PATTERNS = [
 ]
 
 
+_GENERIC_NO_FINDING_PATTERNS = [
+    r"\blooks good\b",
+    r"\blooks correct\b",
+    r"\bwell-structured\b",
+    r"\bwell structured\b",
+    r"\bwell-scoped\b",
+    r"\bwell scoped\b",
+    r"\bwell-contained\b",
+    r"\bwell contained\b",
+    r"\bclean change\b",
+    r"\bclean patch\b",
+    r"\blgtm\b",
+    r"\bno issues found\b",
+    r"\bno problems found\b",
+]
+
+
 def _is_weak_review_text(text: str) -> bool:
     lowered = text.strip().lower()
     if not lowered:
         return True
     return any(re.search(pattern, lowered) for pattern in _WEAK_REVIEW_PATTERNS)
+
+
+def _is_generic_no_finding_text(text: str) -> bool:
+    lowered = text.strip().lower()
+    if not lowered:
+        return False
+    return any(re.search(pattern, lowered) for pattern in _GENERIC_NO_FINDING_PATTERNS)
 
 
 def _default_review_risk_areas(task_data: Optional[dict[str, Any]]) -> list[str]:
@@ -1971,7 +1996,11 @@ def _render_structured_review_with_task_data(
                 findings.append(f"**{issue}**: {rationale or 'Check this logic.'}")
     if findings and allowed_identifiers and not verified_identifiers:
         findings = []
-    if not approval_mode and not findings:
+    if not findings:
+        if _is_generic_no_finding_text(summary):
+            summary = ""
+        if _is_generic_no_finding_text(observation):
+            observation = ""
         if not verified_identifiers:
             verified_identifiers = allowed_identifiers[:3]
         if not risk_areas_checked:
@@ -1990,6 +2019,8 @@ def _render_structured_review_with_task_data(
             )
         if not observation and legacy_no_finding:
             observation = legacy_no_finding
+        if _is_generic_no_finding_text(observation):
+            observation = ""
         if not observation and (touched_paths or verified_identifiers):
             observation = _default_review_observation(
                 touched_paths=touched_paths,
