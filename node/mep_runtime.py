@@ -3961,10 +3961,6 @@ class RuntimeNode:
                 return
 
         result = self.adapter.generate_reply(instructions, adapter_task_data)
-        # #region debug-point A:review-result
-        _p='.dbg/approve-callback-loss.env'; _u,_s='http://127.0.0.1:7777/event','approve-callback-loss'; exec("try:\n with open(_p, encoding='utf-8') as f: c=f.read(); _u=next((l.split('=',1)[1] for l in c.split('\\n') if l.startswith('DEBUG_SERVER_URL=')), _u); _s=next((l.split('=',1)[1] for l in c.split('\\n') if l.startswith('DEBUG_SESSION_ID=')), _s)\nexcept: pass"); exec("try:\n urllib.request.urlopen(urllib.request.Request(_u, data=json.dumps({'sessionId': _s, 'runId': 'pre', 'hypothesisId': 'A', 'location': 'node/mep_runtime.py:3899', 'msg': '[DEBUG] generated review result for bridge-eligible task', 'data': {'task_id': task_id, 'intent_type': _review_intent_type(task_data), 'bridge_eligible': self._bridge_eligible_interbot_message(task_data, interbot_message), 'bridge_action': self._bridge_status_action(interbot_message, detail=result, task_data=task_data), 'result_prefix': str(result or '')[:180]}, 'ts': int(time.time() * 1000)}).encode(), headers={'Content-Type': 'application/json'}), timeout=2).read()\nexcept: pass")
-        # #endregion
-
         # Fail-safe: a reviewer runtime must never let an adapter error (missing or
         # expired API key, HTTP error, timeout, empty completion) be written back as
         # a completed review/approval. Report a failed status with no review action so
