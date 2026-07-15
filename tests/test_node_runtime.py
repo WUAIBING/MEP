@@ -4,7 +4,7 @@ import json
 import os
 import tempfile
 import unittest
-from typing import Optional
+from typing import Any, Optional
 from unittest.mock import AsyncMock, patch
 
 from node.identity import MEPIdentity
@@ -1216,6 +1216,30 @@ class TestRuntimeWebSocketLoop(unittest.TestCase):
 
         self.assertEqual(pending_action, "reviewed")
         self.assertEqual(green_action, "approved")
+
+    def test_review_request_does_not_treat_truthy_non_bool_checks_as_green(self):
+        detail = (
+            "## Review Summary\n\n"
+            "Verified the approval gate stays low-risk.\n\n"
+            "Touched paths reviewed: `bridge/github_to_mep.py`\n\n"
+            "Tests reviewed: `tests/test_github_bridge.py`\n\n"
+            "Risk areas checked: approval gating, changed-line anchoring\n\n"
+            "Checks performed: traced approval suppression branches, compared changed identifiers against the diff\n\n"
+            "Changed identifiers verified: `_score_review_quality`, `_approval_quality_failure`"
+        )
+        task_data = TestRuntimeReviewPrompts._bridge_review_task_data(  # noqa: SLF001
+            intent_type="code.review.request",
+            changed_identifiers=["_score_review_quality", "_approval_quality_failure"],
+            ci_checks={"has_checks": True, "state": "green", "all_green": "true"},
+        )
+
+        action = mep_runtime.RuntimeNode._bridge_status_action(  # noqa: SLF001
+            json.loads(task_data["payload"]),
+            detail=detail,
+            task_data=task_data,
+        )
+
+        self.assertEqual(action, "reviewed")
 
     def test_process_task_reports_failed_status_when_adapter_errors_on_review(self):
         node = _runtime_node()

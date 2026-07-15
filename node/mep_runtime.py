@@ -557,7 +557,7 @@ def _review_checks_allow_approval(task_data: Optional[dict[str, Any]]) -> bool:
         return True
     # Bridge publication is fail-closed for approvals while checks are pending
     # or failing, so the runtime should only emit approval when checks are green.
-    return bool(ci_checks.get("all_green"))
+    return ci_checks.get("all_green") is True
 
 
 def _review_mode_for_task(task_data: dict[str, Any]) -> str:
