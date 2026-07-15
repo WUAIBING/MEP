@@ -987,6 +987,46 @@ class TestRuntimeReviewPrompts(unittest.TestCase):
         self.assertNotIn("imagined_guard", rendered)
         self.assertNotIn("Mixed identifier claim", rendered)
 
+    def test_structured_review_drops_findings_with_unsupported_code_snippets(self):
+        rendered = mep_runtime._render_structured_review_with_task_data(  # noqa: SLF001
+            (
+                '{"summary":"Checked the runtime diff.","observation":"The truncation helper changed in a narrow way.",'
+                '"touched_paths":["bridge/github_to_mep.py"],'
+                '"tests_reviewed":["tests/test_github_bridge.py"],'
+                '"verified_identifiers":["_record_pending_task_poll_failure","last_poll_status"],'
+                '"findings":[{"file":"bridge/github_to_mep.py","issue":"False fallback claim in `_record_pending_task_poll_failure`",'
+                '"rationale":"The branch now returns `patch_info.get(\'changed_identifiers\', [])`, which leaves stale identifiers behind."}],'
+                '"approval_recommendation":"comment"}'
+            ),
+            max_chars=1200,
+            task_data=self._bridge_review_task_data(),
+        )
+
+        self.assertIn("## Review Summary", rendered)
+        self.assertNotIn("## Review Findings", rendered)
+        self.assertNotIn("patch_info.get('changed_identifiers', [])", rendered)
+        self.assertNotIn("False fallback claim", rendered)
+
+    def test_structured_review_drops_malformed_checks_section_entries(self):
+        rendered = mep_runtime._render_structured_review_with_task_data(  # noqa: SLF001
+            (
+                '{"summary":"Checked the bridge diff.","observation":"The changed path stays narrow.",'
+                '"touched_paths":["bridge/github_to_mep.py"],'
+                '"tests_reviewed":["tests/test_github_bridge.py"],'
+                '"verified_identifiers":["_record_pending_task_poll_failure","last_poll_status"],'
+                '"checks_performed":["verified `_record_pending_task_poll_failure` updates `last_poll_status safely ha"],'
+                '"findings":[{"file":"bridge/github_to_mep.py","issue":"Guard remains scoped to `_record_pending_task_poll_failure`",'
+                '"rationale":"The diff still keeps the metrics update tied to the same helper."}],'
+                '"approval_recommendation":"comment"}'
+            ),
+            max_chars=1200,
+            task_data=self._bridge_review_task_data(),
+        )
+
+        self.assertIn("## Review Findings", rendered)
+        self.assertNotIn("Checks performed:", rendered)
+        self.assertNotIn("safely ha", rendered)
+
     def test_structured_review_drops_findings_for_untouched_files(self):
         rendered = mep_runtime._render_structured_review_with_task_data(  # noqa: SLF001
             (

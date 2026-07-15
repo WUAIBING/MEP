@@ -681,6 +681,55 @@ def _clip_without_partial_token(text: str, *, max_chars: int) -> str:
     return clipped
 
 
+def _extract_backticked_review_snippets(text: Any) -> list[str]:
+    cleaned = str(text or "").strip()
+    if not cleaned:
+        return []
+    snippets: list[str] = []
+    seen: set[str] = set()
+    for snippet in re.findall(r"`([^`\n]+)`", cleaned):
+        normalized = re.sub(r"\s+", " ", str(snippet or "").strip()).strip()
+        if not normalized:
+            continue
+        lowered = normalized.lower()
+        if lowered in seen:
+            continue
+        snippets.append(normalized)
+        seen.add(lowered)
+    return snippets
+
+
+def _has_unbalanced_backticks(text: Any) -> bool:
+    cleaned = str(text or "")
+    return bool(cleaned) and cleaned.count("`") % 2 == 1
+
+
+def _review_text_uses_only_allowed_snippets(
+    text: str,
+    *,
+    allowed_identifiers: list[str],
+    allowed_paths: list[str],
+    allowed_tests: list[str],
+) -> bool:
+    if _has_unbalanced_backticks(text):
+        return False
+    allowed = {
+        item.lower()
+        for item in list(allowed_identifiers) + list(allowed_paths) + list(allowed_tests)
+        if item
+    }
+    for snippet in _extract_backticked_review_snippets(text):
+        lowered = snippet.lower()
+        if lowered in allowed:
+            continue
+        if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", snippet):
+            if lowered in {item.lower() for item in allowed_identifiers if item}:
+                continue
+            return False
+        return False
+    return True
+
+
 def _filter_review_list_to_allowed(values: list[str], allowed: list[str]) -> list[str]:
     if not values:
         return []
@@ -1997,10 +2046,36 @@ def _render_structured_review_with_task_data(
     checks_performed = _clean_review_list(parsed.get("checks_performed"), max_items=4, max_chars=120)
     verified_identifiers = _clean_review_list(parsed.get("verified_identifiers"), max_items=4, max_chars=80)
     verified_identifiers = _filter_review_list_to_allowed(verified_identifiers, allowed_identifiers)
-    if summary and not _review_text_uses_only_allowed_identifiers(summary, allowed_identifiers):
+    if summary and (
+        not _review_text_uses_only_allowed_identifiers(summary, allowed_identifiers)
+        or not _review_text_uses_only_allowed_snippets(
+            summary,
+            allowed_identifiers=allowed_identifiers,
+            allowed_paths=allowed_paths,
+            allowed_tests=allowed_tests,
+        )
+    ):
         summary = ""
-    if observation and not _review_text_uses_only_allowed_identifiers(observation, allowed_identifiers):
+    if observation and (
+        not _review_text_uses_only_allowed_identifiers(observation, allowed_identifiers)
+        or not _review_text_uses_only_allowed_snippets(
+            observation,
+            allowed_identifiers=allowed_identifiers,
+            allowed_paths=allowed_paths,
+            allowed_tests=allowed_tests,
+        )
+    ):
         observation = ""
+    checks_performed = [
+        entry
+        for entry in checks_performed
+        if _review_text_uses_only_allowed_snippets(
+            entry,
+            allowed_identifiers=allowed_identifiers,
+            allowed_paths=allowed_paths,
+            allowed_tests=allowed_tests,
+        )
+    ]
     legacy_no_finding = _clean_review_text(parsed.get("why_no_finding"), max_chars=400)
     if _is_weak_review_text(legacy_no_finding):
         legacy_no_finding = ""
@@ -2019,6 +2094,13 @@ def _render_structured_review_with_task_data(
             if _is_weak_review_text(combined):
                 continue
             if not _review_text_uses_only_allowed_identifiers(combined, allowed_identifiers):
+                continue
+            if not _review_text_uses_only_allowed_snippets(
+                combined,
+                allowed_identifiers=allowed_identifiers,
+                allowed_paths=allowed_paths,
+                allowed_tests=allowed_tests,
+            ):
                 continue
             file_name = _clean_review_label(item.get("file"), max_chars=80)
             if file_name and allowed_path_keys:

@@ -2208,13 +2208,89 @@ class GitHubToMEPBridgeService:
         return str(match.group(1) or "").strip()
 
     @classmethod
+    def _split_review_section_items(cls, text: str) -> list[str]:
+        if not text:
+            return []
+        parts: list[str] = []
+        current: list[str] = []
+        in_backticks = False
+        for char in str(text):
+            if char == "`":
+                in_backticks = not in_backticks
+                current.append(char)
+                continue
+            if char == "," and not in_backticks:
+                part = "".join(current).strip()
+                if part:
+                    parts.append(part)
+                current = []
+                continue
+            current.append(char)
+        trailing = "".join(current).strip()
+        if trailing:
+            parts.append(trailing)
+        return parts
+
+    @staticmethod
+    def _extract_backticked_snippets(text: str) -> list[str]:
+        if not text:
+            return []
+        snippets: list[str] = []
+        seen: set[str] = set()
+        for snippet in re.findall(r"`([^`\n]+)`", str(text)):
+            cleaned = re.sub(r"\s+", " ", str(snippet or "").strip()).strip()
+            if not cleaned:
+                continue
+            lowered = cleaned.lower()
+            if lowered in seen:
+                continue
+            snippets.append(cleaned)
+            seen.add(lowered)
+        return snippets
+
+    @staticmethod
+    def _has_unbalanced_backticks(text: str) -> bool:
+        return bool(text) and str(text).count("`") % 2 == 1
+
+    @classmethod
+    def _list_entries_with_unsupported_code_snippets(
+        cls,
+        values: list[str],
+        patch_info: dict[str, str],
+        *,
+        allowed_snippets: Optional[set[str]] = None,
+    ) -> list[str]:
+        if not values:
+            return []
+        full_patch = str(patch_info.get("full") or "").lower()
+        allowed = {snippet.lower() for snippet in (allowed_snippets or set()) if snippet}
+        unsupported: list[str] = []
+        for item in values:
+            if cls._has_unbalanced_backticks(item):
+                unsupported.append(item)
+                continue
+            snippets = cls._extract_backticked_snippets(item)
+            bad_snippets = [
+                snippet
+                for snippet in snippets
+                if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", snippet)
+                and snippet.lower() not in allowed
+                and snippet.lower() not in full_patch
+            ]
+            if bad_snippets:
+                unsupported.append(item)
+        return unsupported
+
+    @classmethod
     def _extract_review_section_list(cls, detail: str, label: str) -> list[str]:
         text = cls._extract_review_section_text(detail, label)
         if not text:
             return []
         values: list[str] = []
-        for part in text.split(","):
-            cleaned = re.sub(r"\s+", " ", str(part or "").strip(" `")).strip()
+        for part in cls._split_review_section_items(text):
+            cleaned = re.sub(r"\s+", " ", str(part or "").strip()).strip()
+            if cleaned.startswith("`") and cleaned.endswith("`") and cleaned.count("`") == 2:
+                cleaned = cleaned[1:-1].strip()
             if cleaned and cleaned not in values:
                 values.append(cleaned)
         return values
@@ -2660,6 +2736,17 @@ class GitHubToMEPBridgeService:
             if identifier_tokens and not any(token in patch_info["full"] for token in identifier_tokens):
                 if not any(token in full_review_patch_info["full"] for token in identifier_tokens):
                     return "ungrounded_finding"
+            allowed_snippets = set(expected_paths)
+            snippets_for_tests = review_package.get("metadata", {}).get("github", {}).get("touched_tests")
+            if isinstance(snippets_for_tests, list):
+                allowed_snippets.update(str(item).strip() for item in snippets_for_tests if item)
+            unsupported_code_snippets = cls._list_entries_with_unsupported_code_snippets(
+                [finding_text],
+                patch_info,
+                allowed_snippets=allowed_snippets,
+            )
+            if unsupported_code_snippets:
+                return "finding_in_context_only"
             
             grounded_tokens = cls._grounded_code_tokens(finding_text, patch_info)
             changed_tokens = cls._changed_code_tokens(finding_text, patch_info)
@@ -2714,6 +2801,7 @@ class GitHubToMEPBridgeService:
         path_identifier_tokens: set[str] = set()
         for path_like in list(expected_paths) + list(snapshot.get("expected_tests") or []):
             path_identifier_tokens.update(self._extract_identifier_tokens(path_like))
+        allowed_snippets = {str(path_like).strip() for path_like in list(expected_paths) + list(snapshot.get("expected_tests") or []) if path_like}
         summary_tokens = {token for token in summary_tokens if token not in path_identifier_tokens}
         observation_tokens = {token for token in observation_tokens if token not in path_identifier_tokens}
         summary_changed_tokens = {token for token in summary_changed_tokens if token not in path_identifier_tokens}
@@ -2722,6 +2810,15 @@ class GitHubToMEPBridgeService:
             checks_performed,
             anchored_patch_info,
             ignored_tokens=path_identifier_tokens,
+        )
+        unsupported_check_entries.extend(
+            entry
+            for entry in self._list_entries_with_unsupported_code_snippets(
+                checks_performed,
+                anchored_patch_info,
+                allowed_snippets=allowed_snippets,
+            )
+            if entry not in unsupported_check_entries
         )
         reviewability = snapshot.get("reviewability") or {}
         reviewability_bucket = str(reviewability.get("bucket") or "standard").strip().lower()
@@ -2754,6 +2851,12 @@ class GitHubToMEPBridgeService:
                 }
                 if hallucinated_summary_tokens:
                     return True, "summary_in_context_only"
+                if self._list_entries_with_unsupported_code_snippets(
+                    [summary_text],
+                    anchored_patch_info,
+                    allowed_snippets=allowed_snippets,
+                ):
+                    return True, "summary_in_context_only"
                 if not summary_changed_tokens and not changed_tokens and not verified_identifiers:
                     return True, "summary_in_context_only"
             if observation_tokens:
@@ -2761,6 +2864,12 @@ class GitHubToMEPBridgeService:
                     token for token in (observation_tokens - observation_changed_tokens) if token not in anchored_patch_full
                 }
                 if hallucinated_observation_tokens:
+                    return True, "observation_in_context_only"
+                if self._list_entries_with_unsupported_code_snippets(
+                    [observation_text],
+                    anchored_patch_info,
+                    allowed_snippets=allowed_snippets,
+                ):
                     return True, "observation_in_context_only"
                 if not observation_changed_tokens and not changed_tokens:
                     return True, "observation_in_context_only"

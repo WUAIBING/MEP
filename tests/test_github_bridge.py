@@ -2733,7 +2733,7 @@ class TestGitHubToMEPBridge(unittest.TestCase):
         self.assertEqual(status_response.status_code, 200, status_response.text)
         self.assertEqual(len(self.github_session.posts), 0)
         self.assertIn("action: retrying", self.notifier.calls[-1]["text"])
-        self.assertEqual(self.service.github_writeback_metrics["last_suppressed_reason"], "summary_without_risk_coverage")
+        self.assertEqual(self.service.github_writeback_metrics["last_suppressed_reason"], "observation_in_context_only")
 
     def test_status_callback_salvages_checks_with_unsupported_identifier_by_stripping_checks_section(self):
         self._set_pr_review_package(
@@ -2799,6 +2799,76 @@ class TestGitHubToMEPBridge(unittest.TestCase):
         self.assertNotIn("imagined_guard", review_payload["body"])
         self.assertEqual(self.service.github_writeback_metrics["last_suppressed_reason"], None)
 
+    def test_extract_review_section_list_keeps_commas_inside_backticked_code_snippets(self):
+        values = self.service._extract_review_section_list(
+            "Checks performed: verified `_list_entries_with_unsupported_identifiers` uses `patch_info.get('changed_identifiers', [])`, confirmed `_cleanup_review_detail` strips stale sections",
+            "Checks performed",
+        )
+
+        self.assertEqual(
+            values,
+            [
+                "verified `_list_entries_with_unsupported_identifiers` uses `patch_info.get('changed_identifiers', [])`",
+                "confirmed `_cleanup_review_detail` strips stale sections",
+            ],
+        )
+
+    def test_status_callback_salvages_checks_with_unsupported_code_snippet_by_stripping_checks_section(self):
+        self._set_pr_review_package(
+            [
+                {
+                    "filename": "bridge/github_to_mep.py",
+                    "status": "modified",
+                    "additions": 12,
+                    "deletions": 0,
+                    "changes": 12,
+                    "patch": (
+                        "@@ -2221,0 +2221,12 @@\n"
+                        "+def _list_entries_with_unsupported_identifiers(values, patch_info):\n"
+                        "+    full_patch = str(patch_info.get(\"full\") or \"\")\n"
+                        "+    return []\n"
+                        "+\n"
+                        "+def _cleanup_review_detail(detail: str) -> str:\n"
+                        "+    return str(detail or \"\").strip()\n"
+                    ),
+                },
+            ],
+            pr_body="Hardens bridge review sanitization around unsupported identifiers.",
+        )
+        response = self._post_webhook(
+            _issue_comment_payload("@Hub-Sentinel review this PR", delivery_number=245),
+            delivery_id="delivery-checks-unsupported-code-snippet",
+        )
+        self.assertEqual(response.status_code, 200)
+        bridge_id = response.json()["bridge_id"]
+        self._flush_context(response.json()["context_id"])
+
+        token = self.service._generate_status_token(bridge_id, "node_target")
+        status_response = self.client.post(
+            "/bridge/status",
+            json={
+                "bridge_id": bridge_id,
+                "status": "completed",
+                "target_node_id": "node_target",
+                "task_id": "task-checks-unsupported-code-snippet",
+                "detail": (
+                    "## Review Summary\n\n"
+                    "The bridge now narrows unsupported identifier handling in `bridge/github_to_mep.py`.\n\n"
+                    "Observation: `_cleanup_review_detail` still trims surrounding whitespace before publishing the body.\n\n"
+                    "Risk areas checked: bridge review sanitization\n\n"
+                    "Checks performed: verified `_list_entries_with_unsupported_identifiers` uses `patch_info.get('changed_identifiers', [])`, confirmed `_cleanup_review_detail` strips stale sections\n\n"
+                    "Why no finding: The changed bridge helpers stay scoped to sanitization and review gating."
+                ),
+            },
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        self.assertEqual(status_response.status_code, 200, status_response.text)
+        self.assertEqual(len(self.github_session.posts), 1)
+        review_payload = self.github_session.posts[0]["json"]
+        self.assertNotIn("Checks performed:", review_payload["body"])
+        self.assertNotIn("patch_info.get('changed_identifiers', [])", review_payload["body"])
+        self.assertEqual(self.service.github_writeback_metrics["last_suppressed_reason"], None)
+
     def test_status_callback_suppresses_finding_grounded_only_to_context_lines(self):
         self._set_pr_review_package(
             [
@@ -2837,6 +2907,55 @@ class TestGitHubToMEPBridge(unittest.TestCase):
             headers={"Authorization": f"Bearer {token}"},
         )
         self.assertEqual(status_response.status_code, 200)
+        self.assertEqual(len(self.github_session.posts), 0)
+        self.assertEqual(self.service.github_writeback_metrics["last_suppressed_reason"], "finding_in_context_only")
+
+    def test_status_callback_suppresses_finding_with_unsupported_code_snippet_claim(self):
+        self._set_pr_review_package(
+            [
+                {
+                    "filename": "node/mep_runtime.py",
+                    "status": "modified",
+                    "patch": (
+                        "@@ -671,0 +671,12 @@\n"
+                        "+def _clip_without_partial_token(text: str, *, max_chars: int) -> str:\n"
+                        "+    clipped = text[:max_chars].rstrip()\n"
+                        "+    if not clipped:\n"
+                        "+        return \"\"\n"
+                        "+    if max_chars < len(text) and text[max_chars].isalnum() and clipped[-1].isalnum():\n"
+                        "+        word_break = max(clipped.rfind(\" \"), clipped.rfind(\", \"), clipped.rfind(\"; \"), clipped.rfind(\": \"))\n"
+                        "+        if word_break >= max(20, max_chars // 2):\n"
+                        "+            clipped = clipped[:word_break].rstrip(\" ,;:\")\n"
+                        "+    return clipped\n"
+                    ),
+                },
+            ],
+            pr_body="Hardens truncation cleanup for structured review output.",
+        )
+        response = self._post_webhook(
+            _issue_comment_payload("@Hub-Sentinel review this PR", delivery_number=246),
+            delivery_id="delivery-finding-unsupported-code-snippet",
+        )
+        bridge_id = response.json()["bridge_id"]
+        self._flush_context(response.json()["context_id"])
+
+        token = self.service._generate_status_token(bridge_id, "node_target")
+        status_response = self.client.post(
+            "/bridge/status",
+            json={
+                "bridge_id": bridge_id,
+                "status": "completed",
+                "target_node_id": "node_target",
+                "task_id": "task-finding-unsupported-code-snippet",
+                "detail": (
+                    "## Review Findings\n\n"
+                    "1. **`_clip_without_partial_token` returns `text[:max_chars]` when `text.rfind(' ', 0, max_chars)` fails.** (`node/mep_runtime.py`): "
+                    "That fallback leaves the trailing token fragment in place instead of trimming to the last safe boundary."
+                ),
+            },
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        self.assertEqual(status_response.status_code, 200, status_response.text)
         self.assertEqual(len(self.github_session.posts), 0)
         self.assertEqual(self.service.github_writeback_metrics["last_suppressed_reason"], "finding_in_context_only")
 
