@@ -189,6 +189,7 @@ class TestGitHubToMEPBridge(unittest.TestCase):
         *,
         pr_body: str = "Bridge review package",
         checks_payload: Optional[dict[str, Any]] = None,
+        fetch_cycles: int = 3,
     ) -> None:
         additions = sum(int(item.get("additions") or 0) for item in changed_files)
         deletions = sum(int(item.get("deletions") or 0) for item in changed_files)
@@ -209,14 +210,16 @@ class TestGitHubToMEPBridge(unittest.TestCase):
             },
         }
         checks_response = checks_payload or {"total_count": 0, "check_runs": []}
-        self.github_session.get_responses = [
-            _FakeResponse(pr_payload),
-            _FakeResponse(changed_files),
-            _FakeResponse(checks_response),
-            _FakeResponse(pr_payload),
-            _FakeResponse(changed_files),
-            _FakeResponse(checks_response),
-        ]
+        responses = []
+        for _ in range(fetch_cycles):
+            responses.extend(
+                [
+                    _FakeResponse(pr_payload),
+                    _FakeResponse(changed_files),
+                    _FakeResponse(checks_response),
+                ]
+            )
+        self.github_session.get_responses = responses
 
     def _post_webhook(self, payload: dict, *, delivery_id: str, event_name: str = "issue_comment"):
         body = json.dumps(payload).encode("utf-8")
@@ -729,7 +732,7 @@ class TestGitHubToMEPBridge(unittest.TestCase):
         self.assertEqual(self.service.github_writeback_metrics["last_suppressed_reason"], "approval_without_test_awareness")
         self.assertGreaterEqual(self.service.github_writeback_metrics["last_quality_score"], 2)
 
-    def test_status_callback_suppresses_approve_when_checks_pending_without_retry(self):
+    def test_status_callback_queues_retry_when_approve_checks_are_pending(self):
         self._set_pr_review_package(
             [
                 {
@@ -798,24 +801,29 @@ class TestGitHubToMEPBridge(unittest.TestCase):
         )
         self.assertEqual(status_response.status_code, 200, status_response.text)
         self.assertEqual(len(self.github_session.posts), 0)
-        self.assertEqual(len(self.submission.calls), 1)
-        self.assertIn("action: suppressed", self.notifier.calls[-1]["text"])
+        self.assertEqual(len(self.submission.calls), 2)
+        self.assertIn("action: retrying", self.notifier.calls[-1]["text"])
         self.assertEqual(self.service.github_writeback_metrics["last_suppressed_reason"], "approval_checks_pending")
 
         execution = self.store.get_execution(bridge_id)
         self.assertIsNotNone(execution)
         trial = execution["review_result"]
         self.assertEqual(trial["attempted_action"], "approved")
-        self.assertEqual(trial["resolved_action"], "suppressed")
+        self.assertEqual(trial["resolved_action"], "retrying")
         self.assertTrue(trial["suppressed"])
         self.assertEqual(trial["suppression_reason"], "approval_checks_pending")
         self.assertEqual(trial["ci_state"], "pending")
-        self.assertFalse(trial["retry_queued"])
+        self.assertTrue(trial["retry_queued"])
+        self.assertEqual(trial["retry_count"], 1)
         self.assertEqual(trial["head_sha"], "headsha123")
         self.assertEqual(trial["anchored_path_count"], 2)
         self.assertGreaterEqual(trial["quality_score"], 4)
+        self.assertEqual(execution["status"], "queued")
+        self.assertEqual(execution["action"], "retrying")
+        self.assertEqual(execution["task_id"], "task-2")
+        self.assertEqual(execution["retry_count"], 1)
 
-    def test_status_callback_suppresses_approve_when_checks_fail_without_retry(self):
+    def test_status_callback_queues_retry_when_approve_checks_fail(self):
         self._set_pr_review_package(
             [
                 {
@@ -889,9 +897,21 @@ class TestGitHubToMEPBridge(unittest.TestCase):
         )
         self.assertEqual(status_response.status_code, 200, status_response.text)
         self.assertEqual(len(self.github_session.posts), 0)
-        self.assertEqual(len(self.submission.calls), 1)
-        self.assertIn("action: suppressed", self.notifier.calls[-1]["text"])
+        self.assertEqual(len(self.submission.calls), 2)
+        self.assertIn("action: retrying", self.notifier.calls[-1]["text"])
         self.assertEqual(self.service.github_writeback_metrics["last_suppressed_reason"], "approval_checks_not_green")
+
+        execution = self.store.get_execution(bridge_id)
+        self.assertIsNotNone(execution)
+        trial = execution["review_result"]
+        self.assertEqual(trial["resolved_action"], "retrying")
+        self.assertTrue(trial["retry_queued"])
+        self.assertEqual(trial["retry_count"], 1)
+        self.assertEqual(trial["suppression_reason"], "approval_checks_not_green")
+        self.assertEqual(execution["status"], "queued")
+        self.assertEqual(execution["action"], "retrying")
+        self.assertEqual(execution["task_id"], "task-2")
+        self.assertEqual(execution["retry_count"], 1)
 
     def test_status_callback_allows_approve_with_grounded_code_and_test_awareness(self):
         self._set_pr_review_package(
@@ -1826,6 +1846,109 @@ class TestGitHubToMEPBridge(unittest.TestCase):
         self.assertEqual(github_inputs["head_ref"], "headref")
         self.assertEqual(github_inputs["repo_clone_url"], "https://github.com/example/repo.git")
         self.assertEqual(github_inputs["touched_paths"], ["bridge/github_to_mep.py"])
+
+    def test_retry_task_refreshes_ci_checks_for_suppressed_approval(self):
+        changed_files = [
+            {
+                "filename": "bridge/github_to_mep.py",
+                "status": "modified",
+                "additions": 4,
+                "deletions": 1,
+                "changes": 5,
+                "patch": (
+                    "@@ -1,2 +1,5 @@\n"
+                    "+def preserve_retry_context():\n"
+                    "+    return True\n"
+                ),
+            }
+        ]
+        pr_payload = {
+            "body": "Ensures retry submissions refresh mutable PR metadata.",
+            "changed_files": len(changed_files),
+            "additions": 4,
+            "deletions": 1,
+            "commits": 1,
+            "head": {
+                "sha": "headsha123",
+                "ref": "headref",
+                "repo": {"clone_url": "https://github.com/example/repo.git"},
+            },
+            "base": {
+                "sha": "basesha456",
+                "ref": "baseref",
+            },
+        }
+        pending_checks = {
+            "total_count": 1,
+            "check_runs": [
+                {
+                    "name": "test (windows-latest, 3.10)",
+                    "status": "in_progress",
+                    "conclusion": None,
+                }
+            ],
+        }
+        green_checks = {
+            "total_count": 2,
+            "check_runs": [
+                {
+                    "name": "test (ubuntu-latest, 3.10)",
+                    "status": "completed",
+                    "conclusion": "success",
+                },
+                {
+                    "name": "test (windows-latest, 3.10)",
+                    "status": "completed",
+                    "conclusion": "success",
+                },
+            ],
+        }
+        self.github_session.get_responses = [
+            _FakeResponse(pr_payload),
+            _FakeResponse(changed_files),
+            _FakeResponse(pending_checks),
+            _FakeResponse(pr_payload),
+            _FakeResponse(changed_files),
+            _FakeResponse(pending_checks),
+            _FakeResponse(pr_payload),
+            _FakeResponse(changed_files),
+            _FakeResponse(green_checks),
+        ]
+        response = self._post_webhook(
+            _issue_comment_payload("@Hub-Sentinel approve this PR", delivery_number=234),
+            delivery_id="delivery-retry-ci-refresh",
+        )
+        self.assertEqual(response.status_code, 200)
+        bridge_id = response.json()["bridge_id"]
+        self._flush_context(response.json()["context_id"])
+
+        token = self.service._generate_status_token(bridge_id, "node_target")
+        status_response = self.client.post(
+            "/bridge/status",
+            json={
+                "bridge_id": bridge_id,
+                "status": "completed",
+                "target_node_id": "node_target",
+                "detail": (
+                    "## Review Summary\n\n"
+                    "The PR keeps retry handling focused.\n\n"
+                    "Observation: `preserve_retry_context` is narrow and grounded.\n\n"
+                    "Touched paths reviewed: `bridge/github_to_mep.py`\n\n"
+                    "Tests reviewed: `tests/test_github_bridge.py`."
+                ),
+                "action": "approved",
+            },
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        self.assertEqual(status_response.status_code, 200, status_response.text)
+        self.assertEqual(len(self.submission.calls), 2)
+        retry_envelope = self.submission.calls[-1]["envelope"]
+        github_inputs = retry_envelope["task"]["inputs"]["github"]
+        self.assertEqual(github_inputs["head_sha"], "headsha123")
+        self.assertEqual(github_inputs["head_ref"], "headref")
+        self.assertEqual(github_inputs["repo_clone_url"], "https://github.com/example/repo.git")
+        self.assertEqual(github_inputs["ci_checks"]["state"], "green")
+        self.assertTrue(github_inputs["ci_checks"]["all_green"])
 
     def test_pr_review_submission_compacts_review_package_payload(self):
         large_patch = "@@ -1,1 +1,120 @@\n" + "\n".join(
