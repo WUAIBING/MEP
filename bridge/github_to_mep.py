@@ -139,6 +139,9 @@ _SPECULATIVE_FINDING_PATTERNS = [
     r"\bappears to\b",
     r"\bseems to\b",
     r"\bcould indicate\b",
+    r"\blikely\s+(?:drop|drops|filter|filters|skip|skips|alter|alters|misalign|misaligns)\b",
+    r"\bmay\s+(?:silently\s+)?(?:drop|skip|alter|misalign|filter)\b",
+    r"\bcould cause\b",
 ]
 
 
@@ -2377,6 +2380,18 @@ class GitHubToMEPBridgeService:
             return False
         return any(re.search(pattern, lowered) for pattern in _SPECULATIVE_FINDING_PATTERNS)
 
+    @classmethod
+    def _list_speculative_review_entries(
+        cls, values: list[str], patch_info: dict[str, str]
+    ) -> list[str]:
+        speculative: list[str] = []
+        for item in values or []:
+            if not cls._is_speculative_finding(item):
+                continue
+            if len(cls._changed_code_tokens(item, patch_info)) < 2:
+                speculative.append(item)
+        return speculative
+
     @staticmethod
     def _has_partial_diff_caveat(text: str) -> bool:
         return _has_partial_diff_caveat_text(text)
@@ -2854,6 +2869,10 @@ class GitHubToMEPBridgeService:
             )
             if entry not in unsupported_check_entries
         )
+        speculative_check_entries = self._list_speculative_review_entries(
+            checks_performed,
+            anchored_patch_info,
+        )
         reviewability = snapshot.get("reviewability") or {}
         reviewability_bucket = str(reviewability.get("bucket") or "standard").strip().lower()
         if has_findings and not anchored_paths:
@@ -2872,11 +2891,15 @@ class GitHubToMEPBridgeService:
                 return True, "partial_diff_caveat"
         if verified_identifiers and unsupported_verified_identifiers:
             return True, "verified_identifiers_in_context_only"
-        if unsupported_check_entries:
+        if unsupported_check_entries or speculative_check_entries:
             return True, "checks_in_context_only"
         if reviewability_bucket == "low_signal" and not has_findings and action != "approved":
             return True, "low_signal_no_finding"
         if has_structured_sections and not has_findings:
+            if observation_text and self._is_speculative_finding(observation_text) and len(observation_changed_tokens) < 2:
+                return True, "observation_in_context_only"
+            if summary_text and self._is_speculative_finding(summary_text) and len(summary_changed_tokens) < 2:
+                return True, "summary_in_context_only"
             if summary_text and anchored_paths and review_package:
                 if self._finding_conflicts_with_patch(summary_text, anchored_patch_info["full"]) or self._finding_conflicts_with_patch(detail or "", anchored_patch_info["full"]):
                     return True, "summary_conflicts_with_patch"
@@ -2944,6 +2967,16 @@ class GitHubToMEPBridgeService:
         elif reason in {"ungrounded_finding", "finding_in_context_only", "speculative_finding"}:
             sanitized = re.sub(r"(?im)^\s*\d+\.\s+\*\*.+(?:\n|$)", "", sanitized)
             sanitized = re.sub(r"(?im)^##\s*Review Findings\b", "## Review Summary", sanitized, count=1)
+            if reason == "speculative_finding":
+                observation_match = re.search(r"(?im)^\s*Observation:\s*(.+)$", sanitized)
+                if observation_match and cls._is_speculative_finding(observation_match.group(1)):
+                    sanitized = re.sub(r"(?im)^\s*Observation:\s*.+(?:\n|$)", "", sanitized)
+                checks_match = re.search(r"(?im)^\s*Checks performed:\s*(.+)$", sanitized)
+                if checks_match and cls._list_speculative_review_entries(
+                    cls._split_review_section_items(checks_match.group(1)),
+                    {"full": "", "changes": ""},
+                ):
+                    sanitized = re.sub(r"(?im)^\s*Checks performed:\s*.+(?:\n|$)", "", sanitized)
         elif reason == "verified_identifiers_in_context_only":
             sanitized = re.sub(r"(?im)^\s*Changed identifiers verified:\s*.+(?:\n|$)", "", sanitized)
         elif reason == "checks_in_context_only":

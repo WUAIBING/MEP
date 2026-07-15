@@ -2328,6 +2328,99 @@ class TestGitHubToMEPBridge(unittest.TestCase):
         self.assertNotIn("verification is limited", review_payload["body"])
         self.assertEqual(self.service.github_writeback_metrics["last_suppressed_reason"], None)
 
+    def test_status_callback_salvages_speculative_parser_internal_claims(self):
+        self._set_pr_review_package(
+            [
+                {
+                    "filename": "bridge/github_to_mep.py",
+                    "status": "modified",
+                    "additions": 10,
+                    "deletions": 0,
+                    "changes": 10,
+                    "patch": (
+                        "@@ -2240,0 +2241,10 @@\n"
+                        "+def _split_review_section_items(cls, text: str) -> list[str]:\n"
+                        "+    if not text:\n"
+                        "+        return []\n"
+                        "+    parts: list[str] = []\n"
+                        "+    current: list[str] = []\n"
+                        "+    in_backticks = False\n"
+                        "+    for char in str(text):\n"
+                        "+        if char == ',':\n"
+                        "+            pass\n"
+                    ),
+                },
+                {
+                    "filename": "node/mep_runtime.py",
+                    "status": "modified",
+                    "additions": 8,
+                    "deletions": 1,
+                    "changes": 9,
+                    "patch": (
+                        "@@ -697,0 +697,8 @@\n"
+                        "+def _clip_without_partial_token(text: str, *, max_chars: int) -> str:\n"
+                        "+    clipped = text[:max_chars].rstrip()\n"
+                        "+    if max_chars < len(text):\n"
+                        "+        return clipped\n"
+                    ),
+                },
+                {
+                    "filename": "tests/test_github_bridge.py",
+                    "status": "modified",
+                    "additions": 16,
+                    "deletions": 0,
+                    "changes": 16,
+                    "patch": (
+                        "@@ -2329,0 +2330,16 @@\n"
+                        "+def test_status_callback_salvages_speculative_parser_internal_claims(self):\n"
+                        "+    self.assertEqual(len(self.github_session.posts), 1)\n"
+                    ),
+                },
+            ],
+            pr_body="Consolidates reviewer correctness hardening.",
+        )
+        response = self._post_webhook(
+            _issue_comment_payload("@Hub-Sentinel review this PR", delivery_number=313),
+            delivery_id="delivery-speculative-parser-claims",
+        )
+        self.assertEqual(response.status_code, 200)
+        bridge_id = response.json()["bridge_id"]
+        self._flush_context(response.json()["context_id"])
+
+        token = self.service._generate_status_token(bridge_id, "node_target")
+        status_response = self.client.post(
+            "/bridge/status",
+            json={
+                "bridge_id": bridge_id,
+                "status": "completed",
+                "target_node_id": "node_target",
+                "task_id": "task-speculative-parser-claims",
+                "detail": (
+                    "## Review Findings\n\n"
+                    "The PR consolidates reviewer correctness hardening across bridge and runtime modules.\n\n"
+                    "Observation: In `bridge/github_to_mep.py`, the new `_split_review_section_items` method splits text and likely filters out empty strings.\n\n"
+                    "Touched paths reviewed: `bridge/github_to_mep.py`, `node/mep_runtime.py`, `tests/test_github_bridge.py`\n\n"
+                    "Tests reviewed: `tests/test_github_bridge.py`\n\n"
+                    "Risk areas checked: correctness/regression around the changed behavior, fallback-path drift\n\n"
+                    "Checks performed: Verified that the new `_split_review_section_items` method splits text and likely filters out empty strings, Checked that `_clip_without_partial_token` clips text without ensuring token boundaries, but ca\n\n"
+                    "Changed identifiers verified: `_split_review_section_items`, `_clip_without_partial_token`\n\n"
+                    "1. **The new `_split_review_section_items` method may silently drop empty or whitespace-only items, altering the structure of review sections that rely on blank lines as separators.** (`bridge/github_to_mep.py`): "
+                    "The method splits text and likely filters out empty strings, which could cause downstream parsing to misalign items or skip sections."
+                ),
+            },
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        self.assertEqual(status_response.status_code, 200, status_response.text)
+        self.assertEqual(len(self.github_session.posts), 1)
+        review_payload = self.github_session.posts[0]["json"]
+        self.assertEqual(review_payload["event"], "COMMENT")
+        self.assertIn("## Review Summary", review_payload["body"])
+        self.assertNotIn("## Review Findings", review_payload["body"])
+        self.assertNotIn("likely filters out empty strings", review_payload["body"])
+        self.assertNotIn("may silently drop", review_payload["body"])
+        self.assertNotIn("Checks performed:", review_payload["body"])
+        self.assertEqual(self.service.github_writeback_metrics["last_suppressed_reason"], None)
+
     def test_has_partial_diff_caveat_matches_trailing_colon(self):
         self.assertIs(
             review_patterns.PARTIAL_DIFF_CAVEAT_PATTERNS,

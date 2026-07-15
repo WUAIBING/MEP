@@ -882,6 +882,15 @@ class TestRuntimeReviewPrompts(unittest.TestCase):
         self.assertNotIn("filteri", cleaned)
         self.assertTrue(cleaned.endswith("trailing"))
 
+    def test_clean_review_label_drops_short_trailing_fragment_when_clipped(self):
+        cleaned = mep_runtime._clean_review_label(  # noqa: SLF001
+            "Checked that _clip_without_partial_token clips text without ensuring token boundaries, but ca",
+            max_chars=92,
+        )
+
+        self.assertNotIn("but ca", cleaned)
+        self.assertTrue(cleaned.endswith("boundaries"))
+
     def test_finalize_model_reply_drops_partial_trailing_word_after_clip(self):
         rendered = mep_runtime._finalize_model_reply(  # noqa: SLF001
             "## Review Summary\n\nChecks performed: confirmed the publish path stays grounded and avoids trailing filteri",

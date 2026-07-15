@@ -1061,8 +1061,18 @@ def _clean_review_label(value: Any, *, max_chars: int) -> str:
     if not text:
         return ""
     text = re.sub(r"\s+", " ", text).strip()
-    if len(text) > max_chars:
+    clipped_from_longer = len(text) > max_chars
+    if clipped_from_longer:
         text = _clip_without_partial_token(text, max_chars=max_chars)
+    if clipped_from_longer and text and text[-1].isalnum():
+        trailing_word_break = text.rfind(" ")
+        trailing_fragment = text[trailing_word_break + 1 :] if trailing_word_break >= 0 else text
+        if re.fullmatch(r"[A-Za-z]{1,2}", trailing_fragment or ""):
+            text = text[:trailing_word_break].rstrip() if trailing_word_break >= 0 else ""
+        trailing_word_break = text.rfind(" ")
+        trailing_fragment = text[trailing_word_break + 1 :] if trailing_word_break >= 0 else text
+        if str(trailing_fragment or "").lower() in {"and", "or", "but", "so"}:
+            text = text[:trailing_word_break].rstrip() if trailing_word_break >= 0 else ""
     return text.rstrip(".,;: ")
 
 
