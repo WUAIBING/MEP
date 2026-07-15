@@ -2307,7 +2307,7 @@ class TestGitHubToMEPBridge(unittest.TestCase):
                 "detail": (
                     "## Review Summary\n\n"
                     "The retry handling changes stay focused on approval suppression paths.\n\n"
-                    "Observation: The test bodies are not fully shown in the diff: verification is limited.\n\n"
+                    "Observation: The test bodies are not fully shown in the diff.\n\n"
                     "Touched paths reviewed: `bridge/github_to_mep.py`, `tests/test_github_bridge.py`\n\n"
                     "Tests reviewed: `tests/test_github_bridge.py`\n\n"
                     "Risk areas checked: retry queuing, stale metadata refresh\n\n"
@@ -2325,6 +2325,13 @@ class TestGitHubToMEPBridge(unittest.TestCase):
         self.assertNotIn("not fully shown in the diff", review_payload["body"])
         self.assertNotIn("verification is limited", review_payload["body"])
         self.assertEqual(self.service.github_writeback_metrics["last_suppressed_reason"], None)
+
+    def test_has_partial_diff_caveat_matches_trailing_colon(self):
+        self.assertTrue(
+            self.service._has_partial_diff_caveat(  # noqa: SLF001
+                "Observation: Partial diff: verification is limited."
+            )
+        )
 
     def test_status_callback_suppresses_finding_conflicting_with_patch_evidence(self):
         self._set_pr_review_package(

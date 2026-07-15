@@ -871,7 +871,7 @@ class TestRuntimeReviewPrompts(unittest.TestCase):
         rendered = mep_runtime._render_structured_review_with_task_data(  # noqa: SLF001
             (
                 '{"summary":"The retry update stays narrowly scoped.",'
-                '"observation":"The test bodies are not fully shown in the diff: verification is limited.",'
+                '"observation":"The test bodies are not fully shown in the diff.",'
                 '"findings":[],"approval_recommendation":"comment"}'
             ),
             max_chars=1000,
@@ -889,6 +889,13 @@ class TestRuntimeReviewPrompts(unittest.TestCase):
         self.assertNotIn("verification is limited", rendered)
         self.assertIn("_suppression_reason_allows_retry", rendered)
         self.assertIn("_issue_retry_task", rendered)
+
+    def test_is_weak_review_text_matches_partial_diff_caveat_with_trailing_colon(self):
+        self.assertTrue(
+            mep_runtime._is_weak_review_text(  # noqa: SLF001
+                "Observation: Partial diff: verification is limited."
+            )
+        )
 
     def test_finalize_model_reply_drops_trailing_partial_word(self):
         rendered = mep_runtime._finalize_model_reply(  # noqa: SLF001
