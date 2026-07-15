@@ -526,6 +526,7 @@ class TestRuntimeReviewPrompts(unittest.TestCase):
         self.assertIn("mention the changed tests", prompt)
         self.assertIn("state the scope is low-risk", prompt)
         self.assertIn("checks are pending or failing", prompt)
+        self.assertIn("never use generic approval language", prompt)
         self.assertIn("Diff restatement without risk coverage is not a sufficient review", prompt)
 
     def test_recheck_review_prompt_mentions_follow_up_verification_mode(self):
@@ -849,7 +850,7 @@ class TestRuntimeReviewPrompts(unittest.TestCase):
                 '"why_no_finding":"No issues found after review.",'
                 '"findings":[],"approval_recommendation":"comment"}'
             ),
-            max_chars=1000,
+            max_chars=1400,
             task_data=self._bridge_review_task_data(
                 changed_identifiers=["verify_signature", "_evict_expired_nonces"],
                 touched_paths=["hub/auth.py", "hub/db.py"],
@@ -858,12 +859,81 @@ class TestRuntimeReviewPrompts(unittest.TestCase):
         )
 
         self.assertIn("## Review Summary", rendered)
+        self.assertIn(
+            "Reviewed the changed behavior around `verify_signature`, `_evict_expired_nonces` and did not find a concrete issue supported by the diff.",
+            rendered,
+        )
+        self.assertIn(
+            "Observation: `verify_signature`, `_evict_expired_nonces` stay scoped to `hub/auth.py`, and the changed test context in `tests/test_hub_api.py` supports the reviewed low-risk path.",
+            rendered,
+        )
         self.assertIn("Touched paths reviewed: `hub/auth.py`, `hub/db.py`", rendered)
         self.assertIn("Tests reviewed: `tests/test_hub_api.py`", rendered)
         self.assertIn("Changed identifiers verified: `verify_signature`, `_evict_expired_nonces`", rendered)
-        self.assertIn("The patch looks good overall.", rendered)
-        self.assertIn("Observation: The change is well-structured.", rendered)
+        self.assertNotIn("The patch looks good overall.", rendered)
+        self.assertNotIn("Observation: The change is well-structured.", rendered)
         self.assertNotIn("Why no finding:", rendered)
+
+    def test_structured_approval_review_rewrites_generic_no_finding_text_to_grounded_anchors(self):
+        rendered = mep_runtime._render_structured_review_with_task_data(  # noqa: SLF001
+            (
+                '{"summary":"LGTM, the patch looks good.",'
+                '"observation":"The change is well-structured.",'
+                '"touched_paths":["bridge/github_to_mep.py"],'
+                '"tests_reviewed":["tests/test_github_bridge.py"],'
+                '"verified_identifiers":["_score_review_quality","_approval_quality_failure"],'
+                '"findings":[],"approval_recommendation":"approve"}'
+            ),
+            max_chars=1400,
+            task_data=self._bridge_review_task_data(
+                intent_type="code.review.approve",
+                changed_identifiers=["_score_review_quality", "_approval_quality_failure"],
+            ),
+        )
+
+        self.assertIn("## Review Summary", rendered)
+        self.assertIn(
+            "Reviewed the changed behavior around `_score_review_quality`, `_approval_quality_failure` and did not find a concrete issue supported by the diff.",
+            rendered,
+        )
+        self.assertIn(
+            "Observation: `_score_review_quality`, `_approval_quality_failure` stay scoped to `bridge/github_to_mep.py`, and the changed test context in `tests/test_github_bridge.py` supports the reviewed low-risk path.",
+            rendered,
+        )
+        self.assertIn("Risk areas checked:", rendered)
+        self.assertIn("Checks performed:", rendered)
+        self.assertIn("Tests reviewed: `tests/test_github_bridge.py`", rendered)
+        self.assertIn(
+            "Changed identifiers verified: `_score_review_quality`, `_approval_quality_failure`",
+            rendered,
+        )
+        self.assertNotIn("LGTM", rendered)
+        self.assertNotIn("looks good", rendered)
+
+    def test_structured_review_rewrites_hyphenated_generic_no_finding_text(self):
+        rendered = mep_runtime._render_structured_review_with_task_data(  # noqa: SLF001
+            (
+                '{"summary":"Looks-Good overall.",'
+                '"observation":"The change is well-structured.",'
+                '"findings":[],"approval_recommendation":"comment"}'
+            ),
+            max_chars=1400,
+            task_data=self._bridge_review_task_data(
+                changed_identifiers=["verify_signature", "_evict_expired_nonces"],
+                touched_paths=["hub/auth.py", "hub/db.py"],
+                touched_tests=["tests/test_hub_api.py"],
+            ),
+        )
+
+        self.assertIn(
+            "Reviewed the changed behavior around `verify_signature`, `_evict_expired_nonces` and did not find a concrete issue supported by the diff.",
+            rendered,
+        )
+        self.assertIn(
+            "Observation: `verify_signature`, `_evict_expired_nonces` stay scoped to `hub/auth.py`, and the changed test context in `tests/test_hub_api.py` supports the reviewed low-risk path.",
+            rendered,
+        )
+        self.assertNotIn("Looks-Good overall.", rendered)
 
     def test_structured_review_synthesizes_grounded_summary_from_non_json_reply(self):
         rendered = mep_runtime._render_structured_review_with_task_data(  # noqa: SLF001
