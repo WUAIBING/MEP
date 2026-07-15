@@ -100,6 +100,11 @@ _QUALITY_SCORE_WEIGHTS = {
     "explicit_checks": 1.0,
     "test_awareness": 1.0,
     "approval_low_risk": 1.0,
+    # Heuristic patch-grounding adjustment for concrete findings. This is not a
+    # semantic proof: it only discounts or rewards contradiction classes and
+    # changed-line evidence that the bridge can verify from the diff itself.
+    "finding_contradicted": -2.0,
+    "finding_verified": 1.0,
 }
 _LOW_RISK_CLAIM_RE = re.compile(
     r"\b(?:"
@@ -2338,6 +2343,20 @@ class GitHubToMEPBridgeService:
             )
             if any(token in lowered_patch for token in allowlist_membership_tokens):
                 return True
+        normalization_absence_patterns = (
+            r"\bcase[- ]sensitive\b",
+            r"\bdoes not normalize case\b",
+            r"\bwithout normalizing case\b",
+            r"\bmissing case normalization\b",
+            r"\bcase[- ]insensitive variants? (?:are|is) not covered\b",
+        )
+        normalization_evidence_tokens = (
+            ".lower(",
+            ".casefold(",
+            "re.ignorecase",
+        )
+        if any(re.search(pattern, lowered_finding) for pattern in normalization_absence_patterns):
+            return any(token in lowered_patch for token in normalization_evidence_tokens)
         return False
 
     @staticmethod
@@ -2361,6 +2380,84 @@ class GitHubToMEPBridgeService:
                     "changes": changes_only,
                 }
         return patches
+
+    @classmethod
+    def _classify_finding_correctness_against_patch(
+        cls,
+        finding_text: str,
+        matched_paths: set[str],
+        patches_by_path: dict[str, dict[str, str]],
+    ) -> str:
+        patch_info = {
+            "full": "\n".join(patches_by_path.get(path, {}).get("full", "") for path in matched_paths),
+            "changes": "\n".join(patches_by_path.get(path, {}).get("changes", "") for path in matched_paths),
+        }
+        if not patch_info["full"]:
+            return "unverifiable"
+
+        # Heuristic only: this catches structured contradiction classes already
+        # modeled by _finding_conflicts_with_patch plus changed-line grounding.
+        if cls._finding_conflicts_with_patch(finding_text, patch_info["full"]):
+            return "contradicted"
+
+        identifier_tokens = cls._extract_identifier_tokens(finding_text)
+        if identifier_tokens and not any(token in patch_info["full"] for token in identifier_tokens):
+            return "unsupported"
+
+        grounded_tokens = cls._grounded_code_tokens(finding_text, patch_info)
+        changed_tokens = {token for token in grounded_tokens if token in patch_info["changes"]}
+
+        if identifier_tokens and not changed_tokens:
+            return "unsupported"
+        if cls._is_speculative_finding(finding_text) and len(grounded_tokens) < 2:
+            return "unsupported"
+        if changed_tokens:
+            return "verified"
+        if grounded_tokens or cls._is_auth_absence_claim(finding_text):
+            return "unsupported"
+        return "unverifiable"
+
+    @classmethod
+    def _classify_review_finding_correctness(
+        cls,
+        detail: str,
+        review_package: dict[str, Any],
+        expected_paths: list[str],
+    ) -> str:
+        findings = cls._extract_review_finding_entries(detail)
+        if not findings or not review_package or not expected_paths:
+            return "unverifiable"
+        patches_by_path = cls._patch_text_by_path(review_package)
+        saw_verified = False
+        saw_unsupported = False
+        saw_unverifiable = False
+        for file_hint, finding_text in findings:
+            matched_paths = cls._match_path_reference(file_hint, expected_paths) if file_hint else set()
+            if not matched_paths:
+                matched_paths = cls._grounded_review_paths(finding_text, expected_paths)
+            if not matched_paths:
+                saw_unsupported = True
+                continue
+            correctness = cls._classify_finding_correctness_against_patch(
+                finding_text,
+                matched_paths,
+                patches_by_path,
+            )
+            if correctness == "contradicted":
+                return "contradicted"
+            if correctness == "verified":
+                saw_verified = True
+            elif correctness == "unsupported":
+                saw_unsupported = True
+            else:
+                saw_unverifiable = True
+        if saw_unsupported:
+            return "unsupported"
+        if saw_verified:
+            return "verified"
+        if saw_unverifiable:
+            return "unverifiable"
+        return "unverifiable"
 
     @staticmethod
     def _summarize_pr_checks(check_runs_payload: Any) -> dict[str, Any]:
@@ -2465,6 +2562,11 @@ class GitHubToMEPBridgeService:
         )
         grounded_tokens = self._grounded_code_tokens(detail or "", anchored_patch_info)
         changed_tokens = {token for token in grounded_tokens if token in anchored_patch_info["changes"]}
+        finding_correctness = self._classify_review_finding_correctness(
+            detail or "",
+            review_package,
+            expected_paths,
+        )
         mentions_tests = bool(anchored_tests)
         if not mentions_tests and expected_tests:
             mentions_tests = bool(re.search(r"\btest(?:s|ed|ing)?\b", lowered))
@@ -2490,6 +2592,7 @@ class GitHubToMEPBridgeService:
             "has_structured_sections": has_structured_sections,
             "grounded_tokens": grounded_tokens,
             "changed_tokens": changed_tokens,
+            "finding_correctness": finding_correctness,
             "mentions_tests": mentions_tests,
         }
 
@@ -2507,6 +2610,7 @@ class GitHubToMEPBridgeService:
         verified_identifiers = snapshot.get("verified_identifiers") or []
         expected_tests = snapshot.get("expected_tests") or []
         mentions_tests = bool(snapshot.get("mentions_tests"))
+        finding_correctness = str(snapshot.get("finding_correctness") or "").strip().lower()
         lowered = str(snapshot.get("lowered") or "")
 
         if anchored_paths:
@@ -2529,6 +2633,12 @@ class GitHubToMEPBridgeService:
         if has_findings:
             raw_score += _QUALITY_SCORE_WEIGHTS["review_substance"]
             reasons.append("concrete_findings")
+            if finding_correctness == "contradicted":
+                raw_score += _QUALITY_SCORE_WEIGHTS["finding_contradicted"]
+                reasons.append("finding_contradicted_by_patch")
+            elif finding_correctness == "verified":
+                raw_score += _QUALITY_SCORE_WEIGHTS["finding_verified"]
+                reasons.append("finding_verified_against_patch")
         elif (summary_text or observation_text) and (changed_tokens or grounded_tokens or verified_identifiers):
             raw_score += _QUALITY_SCORE_WEIGHTS["review_substance"] / 2
             reasons.append("grounded_summary_or_observation")
@@ -2547,7 +2657,7 @@ class GitHubToMEPBridgeService:
         if action == "approved" and _LOW_RISK_CLAIM_RE.search(lowered):
             raw_score += _QUALITY_SCORE_WEIGHTS["approval_low_risk"]
             reasons.append("explicit_low_risk_claim")
-        score = int(round(min(raw_score, 10.0)))
+        score = int(round(max(0.0, min(raw_score, 10.0))))
         return score, reasons
 
     def _approval_quality_failure(self, snapshot: dict[str, Any], score: int) -> Optional[str]:
