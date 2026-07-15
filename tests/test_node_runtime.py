@@ -695,7 +695,7 @@ class TestRuntimeReviewPrompts(unittest.TestCase):
                 '"verified_identifiers":["_score_review_quality","_approval_quality_failure"],'
                 '"findings":[],"approval_recommendation":"approve"}'
             ),
-            max_chars=1000,
+            max_chars=1400,
             task_data=self._bridge_review_task_data(
                 intent_type="code.review.approve",
                 changed_identifiers=["_score_review_quality", "_approval_quality_failure"],
@@ -705,6 +705,34 @@ class TestRuntimeReviewPrompts(unittest.TestCase):
         self.assertIn("## Review Summary", rendered)
         self.assertIn("Changed identifiers verified: `_score_review_quality`, `_approval_quality_failure`", rendered)
         self.assertIn("Tests reviewed: `tests/test_github_bridge.py`", rendered)
+
+    def test_structured_approval_review_replaces_behavior_overstatement_with_grounded_defaults(self):
+        rendered = mep_runtime._render_structured_review_with_task_data(  # noqa: SLF001
+            (
+                '{"summary":"The snippet-grounding change looks correct and well-tested.",'
+                '"observation":"`_extract_backticked_review_snippets` strips and lowercases text before extraction, and `_split_review_section_items` uses `in_backticks` to avoid comma drift.",'
+                '"touched_paths":["bridge/github_to_mep.py"],'
+                '"tests_reviewed":["tests/test_github_bridge.py"],'
+                '"verified_identifiers":["_split_review_section_items","_extract_backticked_review_snippets"],'
+                '"findings":[],"approval_recommendation":"approve"}'
+            ),
+            max_chars=1200,
+            task_data=self._bridge_review_task_data(
+                intent_type="code.review.approve",
+                changed_identifiers=["_split_review_section_items", "_extract_backticked_review_snippets"],
+            ),
+        )
+
+        self.assertIn("## Review Summary", rendered)
+        self.assertNotIn("strips and lowercases text before extraction", rendered)
+        self.assertIn(
+            "Reviewed the changed behavior around `_split_review_section_items`, `_extract_backticked_review_snippets` and did not find a concrete issue supported by the diff.",
+            rendered,
+        )
+        self.assertIn(
+            "Observation: `_split_review_section_items`, `_extract_backticked_review_snippets` stay scoped to `bridge/github_to_mep.py`, and the changed test context in `tests/test_github_bridge.py` supports the reviewed low-risk path.",
+            rendered,
+        )
 
     def test_approval_bridge_action_downgrades_when_rendered_review_still_has_findings(self):
         task_data = self._bridge_review_task_data(
