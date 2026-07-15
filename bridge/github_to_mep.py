@@ -125,6 +125,14 @@ _WEAK_GITHUB_REVIEW_PATTERNS = [
     r"\bno blocking issues\b",
     r"\bfocused runtime tests\b",
 ]
+_PARTIAL_DIFF_CAVEAT_PATTERNS = [
+    r"\bnot fully shown\b",
+    r"\bnot fully shown in the diff\b",
+    r"\bpartial diff\b",
+    r"\bpartially shown\b",
+    r"\bwithout the full diff\b",
+    r"\bwithout the full patch\b",
+]
 _SPECULATIVE_FINDING_PATTERNS = [
     r"\bif intended\b",
     r"\bif .*? intended for\b",
@@ -2242,6 +2250,13 @@ class GitHubToMEPBridgeService:
         return any(re.search(pattern, lowered) for pattern in _SPECULATIVE_FINDING_PATTERNS)
 
     @staticmethod
+    def _has_partial_diff_caveat(text: str) -> bool:
+        lowered = str(text or "").strip().lower()
+        if not lowered:
+            return False
+        return any(re.search(pattern, lowered) for pattern in _PARTIAL_DIFF_CAVEAT_PATTERNS)
+
+    @staticmethod
     def _is_auth_absence_claim(text: str) -> bool:
         lowered = str(text or "").lower()
         if "authentication" not in lowered and "authorization" not in lowered:
@@ -2663,6 +2678,8 @@ class GitHubToMEPBridgeService:
         if reviewability_bucket == "low_signal" and not has_findings and action != "approved":
             return True, "low_signal_no_finding"
         if has_structured_sections and not has_findings:
+            if self._has_partial_diff_caveat(observation_text):
+                return True, "partial_diff_caveat"
             if summary_text and anchored_paths and review_package:
                 if self._finding_conflicts_with_patch(summary_text, anchored_patch_info["full"]) or self._finding_conflicts_with_patch(detail or "", anchored_patch_info["full"]):
                     return True, "summary_conflicts_with_patch"
@@ -2705,7 +2722,7 @@ class GitHubToMEPBridgeService:
         if not text or not reason:
             return text
         sanitized = text
-        if reason in {"generic_observation", "observation_in_context_only"}:
+        if reason in {"generic_observation", "observation_in_context_only", "partial_diff_caveat"}:
             sanitized = re.sub(r"(?im)^\s*Observation:\s*.+(?:\n|$)", "", sanitized)
         elif reason in {"ungrounded_finding", "finding_in_context_only", "speculative_finding"}:
             sanitized = re.sub(r"(?im)^\s*\d+\.\s+\*\*.+(?:\n|$)", "", sanitized)

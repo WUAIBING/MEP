@@ -1267,6 +1267,10 @@ _WEAK_REVIEW_PATTERNS = [
     r"\bimpossible to verify\b",
     r"\bwithout seeing\b",
     r"\bwithout the full\b",
+    r"\bnot fully shown\b",
+    r"\bnot fully shown in the diff\b",
+    r"\bpartial diff\b",
+    r"\bpartially shown\b",
     r"\bdoes not show\b",
     r"\bdoesn't show\b",
     r"\bnot enough context\b",
@@ -1448,19 +1452,31 @@ def _finalize_model_reply(text: str, *, max_chars: int) -> str:
             clipped.rfind(". "),
             clipped.rfind("! "),
             clipped.rfind("? "),
+            clipped.rfind("; "),
+            clipped.rfind(": "),
         ]
         best_break = max(breakpoints)
         if best_break >= max(120, max_chars // 2):
-            if clipped[best_break : best_break + 2] in {". ", "! ", "? "}:
+            if clipped[best_break : best_break + 2] in {". ", "! ", "? ", "; ", ": "}:
                 clipped = clipped[: best_break + 1].rstrip()
             else:
                 clipped = clipped[:best_break].rstrip()
         cleaned = clipped
     if cleaned and cleaned[-1] not in ".!?":
+        trailing_word_break = cleaned.rfind(" ")
+        trailing_fragment = cleaned[trailing_word_break + 1 :] if trailing_word_break >= 0 else cleaned
+        if (
+            trailing_word_break >= max(80, len(cleaned) - 40)
+            and trailing_fragment
+            and re.fullmatch(r"[A-Za-z]{1,12}", trailing_fragment)
+        ):
+            cleaned = cleaned[:trailing_word_break].rstrip()
         last_sentence = max(cleaned.rfind(". "), cleaned.rfind("! "), cleaned.rfind("? "))
         if last_sentence >= max(80, len(cleaned) // 2):
             cleaned = cleaned[: last_sentence + 1].rstrip()
-        if cleaned and cleaned[-1] not in ".!?":
+        if cleaned.endswith((",", ";", ":")):
+            cleaned = cleaned[:-1].rstrip() + "."
+        elif cleaned and cleaned[-1] not in ".!?":
             cleaned += "."
     return cleaned
 
