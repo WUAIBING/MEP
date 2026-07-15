@@ -2867,6 +2867,9 @@ class GitHubToMEPBridgeService:
         if has_findings and anchored_paths and review_package:
             if self._finding_conflicts_with_patch(detail or "", anchored_patch_info["full"]):
                 return True, "ungrounded_finding"
+        if has_structured_sections and not has_findings:
+            if self._has_partial_diff_caveat(observation_text):
+                return True, "partial_diff_caveat"
         if verified_identifiers and unsupported_verified_identifiers:
             return True, "verified_identifiers_in_context_only"
         if unsupported_check_entries:
@@ -2874,8 +2877,6 @@ class GitHubToMEPBridgeService:
         if reviewability_bucket == "low_signal" and not has_findings and action != "approved":
             return True, "low_signal_no_finding"
         if has_structured_sections and not has_findings:
-            if self._has_partial_diff_caveat(observation_text):
-                return True, "partial_diff_caveat"
             if summary_text and anchored_paths and review_package:
                 if self._finding_conflicts_with_patch(summary_text, anchored_patch_info["full"]) or self._finding_conflicts_with_patch(detail or "", anchored_patch_info["full"]):
                     return True, "summary_conflicts_with_patch"
