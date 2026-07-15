@@ -3575,6 +3575,14 @@ class RuntimeNode:
     async def process_task(self, task_data: dict[str, Any]) -> None:
         task_id = str(task_data.get("id") or "")
         payload = str(task_data.get("payload") or "")
+        # Decrypt DM payload so interbot envelope is parseable JSON
+        try:
+            from clients.shared.dm_crypto import decode_dm_envelope, decrypt_dm_payload
+            envelope = decode_dm_envelope(payload)
+            if envelope:
+                payload = decrypt_dm_payload(envelope, self.identity.private_enc_key)
+        except Exception:
+            pass
         instructions = payload
         adapter_task_data = copy.deepcopy(task_data)
         interbot_message: Optional[dict[str, Any]] = None
@@ -3722,8 +3730,8 @@ class RuntimeNode:
                 prompt=instructions,
             )
             try:
-                bridge_result = asyncio.run(
-                    execute_bridge_command(bridge_request, timeout_seconds=600)
+                bridge_result = await execute_bridge_command(
+                    bridge_request, timeout_seconds=600
                 )
             except Exception as exc:  # noqa: BLE001
                 bridge_result = build_execution_unavailable_result(
