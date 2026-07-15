@@ -1,0 +1,44 @@
+import sys, json, os, subprocess as sp
+
+request = json.load(sys.stdin)
+ops = request.get("task", {}).get("inputs", {}).get("edit_operations", [])
+edit_path = os.environ.get("MEP_RUNTIME_EDIT_PATH", os.getcwd())
+files_edited = []
+command_outputs = []
+
+for op in ops:
+    action = op.get("action", "")
+    p = str(op.get("path", op.get("file", "")))
+    
+    if action == "execute":
+        cmd = op.get("command", "")
+        timeout_s = max(1, int(op.get("timeout_ms", 30000)) / 1000)
+        r = sp.run(cmd, shell=True, capture_output=True, text=True, cwd=edit_path, timeout=timeout_s)
+        out = (r.stdout + r.stderr).strip()
+        command_outputs.append(out[-3000:] if len(out) > 3000 else out)
+    elif action == "delete":
+        filepath = os.path.join(edit_path, p.lstrip("/").lstrip("\\"))
+        if os.path.isfile(filepath):
+            os.remove(filepath)
+            files_edited.append(filepath)
+    elif action in ("insert", "append", "replace"):
+        filepath = os.path.join(edit_path, p.lstrip("/").lstrip("\\"))
+        os.makedirs(os.path.dirname(filepath) or ".", exist_ok=True)
+        mode = "w" if action == "replace" else "a"
+        with open(filepath, mode, encoding="utf-8") as f:
+            f.write(op.get("content", ""))
+        files_edited.append(filepath)
+
+result = {
+    "execution_started": len(ops) > 0,
+    "workspace_opened": bool(edit_path),
+    "file_edited": len(files_edited) > 0,
+    "file_path": files_edited[0] if files_edited else None,
+    "diff_summary": "\n".join(command_outputs[-5:]) if command_outputs else (f"{len(files_edited)} files edited" if files_edited else None),
+    "branch": None,
+    "commit_sha": None,
+    "pr": None,
+    "status": "ok",
+    "operations_applied": len(ops)
+}
+print(json.dumps(result, ensure_ascii=False))

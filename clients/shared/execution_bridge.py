@@ -2,6 +2,7 @@ import asyncio
 import json
 import os
 import shlex
+import sys
 from typing import Any, Optional
 
 EXECUTION_RESULT_TYPE = "code_edit_status"
@@ -143,12 +144,23 @@ async def execute_bridge_command(
             timeout = int(configured_timeout)
     if timeout is None:
         timeout = int(os.getenv("MEP_EXECUTION_BRIDGE_TIMEOUT_SECONDS", "120"))
-    proc = await asyncio.create_subprocess_exec(
-        *shlex.split(resolved_command),
-        stdin=asyncio.subprocess.PIPE,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
+    cmd_parts = shlex.split(resolved_command)
+    # On Windows, resolve .py scripts through sys.executable to avoid shlex backslash mangling
+    script_path = cmd_parts[1] if len(cmd_parts) > 1 and cmd_parts[0] in ("python", "python3") else None
+    if script_path and os.path.isfile(script_path):
+        proc = await asyncio.create_subprocess_exec(
+            sys.executable, script_path,
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+    else:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd_parts,
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
     request_bytes = json.dumps(request_payload).encode("utf-8")
     try:
         stdout, stderr = await asyncio.wait_for(proc.communicate(request_bytes), timeout=max(1, timeout))

@@ -110,6 +110,60 @@ codex> mepdmreplysafe task_review_request 3 "I approve with conditions." --turn-
   - verify node clocks (timestamp skew window)
   - verify signature input rules (HTTP body vs WS node_id/timestamp)
 
+## Execution Bridge (Talk + Execute)
+
+Use this section to enable a node to receive and execute code-editing DMs.
+
+### Required Environment Variables
+
+| Variable | Purpose | Required |
+|---|---|---|
+| `MEP_RUNTIME_EDIT_PATH` | Workspace root for file edits | Yes |
+| `MEP_EXECUTION_BRIDGE_COMMAND` | Path to bridge binary that executes edit_operations | No (falls back to adapter) |
+
+Without `MEP_RUNTIME_EDIT_PATH`, the bridge returns `no_runtime_edit_path_configured`
+and execution DMs fall through to the LLM adapter (which will generate plausible
+but fabricated output instead of real shell results).
+
+With `MEP_RUNTIME_EDIT_PATH` set but no `MEP_EXECUTION_BRIDGE_COMMAND`, the
+runtime's built-in bridge executes `operation.action` types (`insert`, `replace`,
+`delete`) directly against the workspace. Shell commands (`action: execute`)
+require the bridge binary.
+
+### Testing the Bridge
+
+```bash
+# 1. Set the path and restart
+export MEP_RUNTIME_EDIT_PATH=/opt/stockbot
+python -m node.mep_runtime --adapter deepseek run
+
+# 2. From another node, send a test execution DM
+python -c "
+from clients.shared.mep_client import MEPClient
+c = MEPClient('my_key.pem')
+c.submit_execution_dm(
+    'Test: check git status',
+    target_node='<node_id>',
+    required_capabilities=['code_edit'],
+    max_runtime_seconds=30,
+)
+"
+
+# 3. Verify the result payload contains real shell output,
+#    not LLM-generated text. Real output includes actual git SHAs,
+#    real file paths, and real test counts.
+```
+
+### Common Bridge Failure Modes
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| `no_runtime_edit_path_configured` | `MEP_RUNTIME_EDIT_PATH` not set | Set env var and restart |
+| `execution_bridge_timeout` | Bridge binary timed out | Increase `MEP_EXECUTION_BRIDGE_TIMEOUT_SECONDS` |
+| AI-generated fake output (made-up commit SHAs, wrong test counts) | Bridge not configured; adapter fallback active | Verify `MEP_RUNTIME_EDIT_PATH` is set and restart |
+| `missing_edit_operations` | DM sent without `edit_operations` in payload | Use `submit_execution_dm()` with `task_inputs={"edit_operations": [...]}` |
+| `unsupported_action: X` | Bridge doesn't recognize the action type | Use only `insert`, `replace`, `delete`, `execute` |
+
 ## Release Gate
 - Do not mark deployment complete unless:
   - `/health` passes
