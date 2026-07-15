@@ -4,7 +4,7 @@ import json
 import os
 import tempfile
 import unittest
-from typing import Optional
+from typing import Any, Optional
 from unittest.mock import AsyncMock, patch
 
 from node.identity import MEPIdentity
@@ -422,6 +422,7 @@ class TestRuntimeReviewPrompts(unittest.TestCase):
         touched_paths: Optional[list[str]] = None,
         touched_tests: Optional[list[str]] = None,
         review_mode: str = "discovery_review",
+        ci_checks: Optional[dict[str, Any]] = None,
     ) -> dict:
         identifiers = changed_identifiers or [
             "_record_pending_task_poll_failure",
@@ -457,6 +458,7 @@ class TestRuntimeReviewPrompts(unittest.TestCase):
                                 "review_mode": review_mode,
                                 "touched_paths": github_touched_paths,
                                 "touched_tests": github_touched_tests,
+                                "ci_checks": ci_checks or {"has_checks": False, "state": "none", "all_green": False},
                                 "risk_pack": {
                                     "changed_identifiers": identifiers
                                 },
@@ -1152,6 +1154,92 @@ class TestRuntimeWebSocketLoop(unittest.TestCase):
         complete_mock.assert_called_once_with("task_bridge_review", detail)
         request_mock.assert_called_once()
         self.assertEqual(request_mock.call_args.kwargs["json_body"]["action"], "approved")
+
+    def test_process_task_downgrades_grounded_approval_when_checks_pending(self):
+        node = _runtime_node()
+        detail = (
+            "## Review Summary\n\n"
+            "Verified the approval gate stays low-risk.\n\n"
+            "Touched paths reviewed: `bridge/github_to_mep.py`\n\n"
+            "Tests reviewed: `tests/test_github_bridge.py`\n\n"
+            "Risk areas checked: approval gating, changed-line anchoring\n\n"
+            "Checks performed: traced approval suppression branches, compared changed identifiers against the diff\n\n"
+            "Changed identifiers verified: `_score_review_quality`, `_approval_quality_failure`"
+        )
+        task_data = TestRuntimeReviewPrompts._bridge_review_task_data(  # noqa: SLF001
+            intent_type="code.review.approve",
+            changed_identifiers=["_score_review_quality", "_approval_quality_failure"],
+            ci_checks={"has_checks": True, "state": "pending", "all_green": False},
+        )
+        with (
+            patch.object(node.adapter, "generate_reply", return_value=detail),
+            patch.object(node, "complete") as complete_mock,
+            patch("node.mep_runtime._safe_request", return_value=(200, {}, "")) as request_mock,
+        ):
+            asyncio.run(node.process_task(task_data))
+
+        complete_mock.assert_called_once_with("task_bridge_review", detail)
+        request_mock.assert_called_once()
+        self.assertEqual(request_mock.call_args.kwargs["json_body"]["action"], "reviewed")
+
+    def test_review_request_only_upgrades_to_approved_when_checks_green(self):
+        detail = (
+            "## Review Summary\n\n"
+            "Verified the approval gate stays low-risk.\n\n"
+            "Touched paths reviewed: `bridge/github_to_mep.py`\n\n"
+            "Tests reviewed: `tests/test_github_bridge.py`\n\n"
+            "Risk areas checked: approval gating, changed-line anchoring\n\n"
+            "Checks performed: traced approval suppression branches, compared changed identifiers against the diff\n\n"
+            "Changed identifiers verified: `_score_review_quality`, `_approval_quality_failure`"
+        )
+        pending_task_data = TestRuntimeReviewPrompts._bridge_review_task_data(  # noqa: SLF001
+            intent_type="code.review.request",
+            changed_identifiers=["_score_review_quality", "_approval_quality_failure"],
+            ci_checks={"has_checks": True, "state": "pending", "all_green": False},
+        )
+        green_task_data = TestRuntimeReviewPrompts._bridge_review_task_data(  # noqa: SLF001
+            intent_type="code.review.request",
+            changed_identifiers=["_score_review_quality", "_approval_quality_failure"],
+            ci_checks={"has_checks": True, "state": "green", "all_green": True},
+        )
+
+        pending_action = mep_runtime.RuntimeNode._bridge_status_action(  # noqa: SLF001
+            json.loads(pending_task_data["payload"]),
+            detail=detail,
+            task_data=pending_task_data,
+        )
+        green_action = mep_runtime.RuntimeNode._bridge_status_action(  # noqa: SLF001
+            json.loads(green_task_data["payload"]),
+            detail=detail,
+            task_data=green_task_data,
+        )
+
+        self.assertEqual(pending_action, "reviewed")
+        self.assertEqual(green_action, "approved")
+
+    def test_review_request_does_not_treat_truthy_non_bool_checks_as_green(self):
+        detail = (
+            "## Review Summary\n\n"
+            "Verified the approval gate stays low-risk.\n\n"
+            "Touched paths reviewed: `bridge/github_to_mep.py`\n\n"
+            "Tests reviewed: `tests/test_github_bridge.py`\n\n"
+            "Risk areas checked: approval gating, changed-line anchoring\n\n"
+            "Checks performed: traced approval suppression branches, compared changed identifiers against the diff\n\n"
+            "Changed identifiers verified: `_score_review_quality`, `_approval_quality_failure`"
+        )
+        task_data = TestRuntimeReviewPrompts._bridge_review_task_data(  # noqa: SLF001
+            intent_type="code.review.request",
+            changed_identifiers=["_score_review_quality", "_approval_quality_failure"],
+            ci_checks={"has_checks": True, "state": "green", "all_green": "true"},
+        )
+
+        action = mep_runtime.RuntimeNode._bridge_status_action(  # noqa: SLF001
+            json.loads(task_data["payload"]),
+            detail=detail,
+            task_data=task_data,
+        )
+
+        self.assertEqual(action, "reviewed")
 
     def test_process_task_reports_failed_status_when_adapter_errors_on_review(self):
         node = _runtime_node()
