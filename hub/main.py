@@ -1749,7 +1749,7 @@ async def verify_request(
 
     pub_pem = db.get_pub_pem(x_mep_nodeid)
     if not pub_pem:
-        raise HTTPException(status_code=401, detail="Unknown Node ID. Please register first.")
+        raise HTTPException(status_code=401, detail="Unknown Node ID. If you registered recently, your registration may still be pending admin approval. Check /admin/pending-registrations or ask the hub operator.")
 
     if not auth.verify_signature(pub_pem, payload_str, x_mep_timestamp, x_mep_signature):
         raise HTTPException(status_code=401, detail="Invalid cryptographic signature.")
@@ -3246,7 +3246,7 @@ async def diagnostic(
 
         pub_pem = db.get_pub_pem(requesting_node)
         if not pub_pem:
-            raise HTTPException(status_code=401, detail="Unknown Node ID. Please register first.")
+            raise HTTPException(status_code=401, detail="Unknown Node ID. If you registered recently, your registration may still be pending admin approval. Check /admin/pending-registrations or ask the hub operator.")
         if not auth.verify_signature(pub_pem, requesting_node, ts, sig):
             raise HTTPException(status_code=401, detail="Invalid cryptographic signature.")
 

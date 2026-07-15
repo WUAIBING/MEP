@@ -687,8 +687,17 @@ def get_pub_pem(node_id: str) -> Optional[str]:
     else:
         cursor.execute("SELECT pub_pem FROM ledger WHERE node_id = ?", (node_id,))
     row = cursor.fetchone()
+    if row:
+        _release_conn(conn)
+        return row[0]
+    # Check pending_registrations for nodes awaiting admin approval
+    if _is_postgres():
+        cursor.execute("SELECT pub_pem FROM pending_registrations WHERE node_id = %s", (node_id,))
+    else:
+        cursor.execute("SELECT pub_pem FROM pending_registrations WHERE node_id = ?", (node_id,))
+    pending_row = cursor.fetchone()
     _release_conn(conn)
-    return row[0] if row else None
+    return pending_row[0] if pending_row else None
 
 def get_balance(node_id: str) -> Optional[float]:
     conn = _get_conn()
