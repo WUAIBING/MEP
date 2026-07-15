@@ -16,6 +16,11 @@ for op in ops:
         r = sp.run(cmd, shell=True, capture_output=True, text=True, cwd=edit_path, timeout=timeout_s)
         out = (r.stdout + r.stderr).strip()
         command_outputs.append(out[-3000:] if len(out) > 3000 else out)
+    elif action == "delete":
+        filepath = os.path.join(edit_path, p.lstrip("/").lstrip("\\"))
+        if os.path.isfile(filepath):
+            os.remove(filepath)
+            files_edited.append(filepath)
     elif action in ("insert", "append", "replace"):
         filepath = os.path.join(edit_path, p.lstrip("/").lstrip("\\"))
         os.makedirs(os.path.dirname(filepath) or ".", exist_ok=True)
