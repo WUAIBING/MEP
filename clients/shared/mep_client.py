@@ -1014,7 +1014,7 @@ class MEPClient:
             return None
         if not isinstance(parsed, dict):
             return None
-        if parsed.get("spec_version") != "mep.interbot.v1":
+        if parsed.get("spec_version") not in ("mep.interbot.v1", "mep.execution-bridge.v1"):
             return None
         return parsed
 
