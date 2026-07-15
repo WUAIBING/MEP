@@ -139,6 +139,9 @@ _SPECULATIVE_FINDING_PATTERNS = [
     r"\bappears to\b",
     r"\bseems to\b",
     r"\bcould indicate\b",
+    r"\blikely\s+(?:drop|drops|filter|filters|skip|skips|alter|alters|misalign|misaligns)\b",
+    r"\bmay\s+(?:silently\s+)?(?:drop|skip|alter|misalign|filter)\b",
+    r"\bcould cause\b",
 ]
 
 
@@ -2108,6 +2111,52 @@ class GitHubToMEPBridgeService:
         return text[:max_chars]
 
     @staticmethod
+    def _render_ci_status_blocker(snapshot: dict[str, Any], reason: Optional[str]) -> str:
+        ci_checks = snapshot.get("ci_checks") or {}
+        summary = []
+        for item in ci_checks.get("summary", []):
+            if not isinstance(item, dict):
+                continue
+            name = str(item.get("name") or "").strip()
+            state = str(item.get("state") or "").strip().lower() or "unknown"
+            if name:
+                summary.append(f"`{name}` is `{state}`")
+        if reason == "approval_checks_pending":
+            lead = "GitHub CI is still running, so this PR cannot be approved yet. Please wait for CI to finish and fix any failing checks before re-requesting approval."
+        else:
+            lead = "GitHub CI is not green, so this PR cannot be approved yet. Please fix the failing checks before re-requesting approval."
+        if summary:
+            return f"{lead}\n\nCurrent CI status: {', '.join(summary[:4])}."
+        return lead
+
+    @classmethod
+    def _detail_with_ci_blocker(
+        cls,
+        detail: Optional[str],
+        snapshot: dict[str, Any],
+        reason: Optional[str],
+    ) -> str:
+        blocker = cls._render_ci_status_blocker(snapshot, reason)
+        cleaned_detail = str(detail or "").strip()
+        if not cleaned_detail:
+            return f"## Review Summary\n\n{blocker}"
+        if cleaned_detail.lstrip().startswith("## Review Summary"):
+            return re.sub(
+                r"(?is)^\s*##\s*Review Summary\s*",
+                f"## Review Summary\n\n{blocker}\n\n",
+                cleaned_detail,
+                count=1,
+            )
+        return f"## Review Summary\n\n{blocker}\n\n{cleaned_detail}"
+
+    @staticmethod
+    def _normalize_callback_status(status: Any) -> str:
+        normalized = str(status or "").strip().lower()
+        if normalized in {"success", "succeeded", "ok"}:
+            return "completed"
+        return normalized
+
+    @staticmethod
     def _normalize_review_reference(value: str) -> str:
         text = str(value or "").strip().strip("`'\"")
         text = text.lstrip("([{")
@@ -2238,16 +2287,114 @@ class GitHubToMEPBridgeService:
         return str(match.group(1) or "").strip()
 
     @classmethod
+    def _split_review_section_items(cls, text: str) -> list[str]:
+        if not text:
+            return []
+        parts: list[str] = []
+        current: list[str] = []
+        in_backticks = False
+        for char in str(text):
+            if char == "`":
+                in_backticks = not in_backticks
+                current.append(char)
+                continue
+            if char == "," and not in_backticks:
+                part = "".join(current).strip()
+                if part:
+                    parts.append(part)
+                current = []
+                continue
+            current.append(char)
+        trailing = "".join(current).strip()
+        if trailing:
+            parts.append(trailing)
+        return parts
+
+    @staticmethod
+    def _extract_backticked_snippets(text: str) -> list[str]:
+        if not text:
+            return []
+        snippets: list[str] = []
+        seen: set[str] = set()
+        for snippet in re.findall(r"`([^`\n]+)`", str(text)):
+            cleaned = re.sub(r"\s+", " ", str(snippet or "").strip()).strip()
+            if not cleaned:
+                continue
+            lowered = cleaned.lower()
+            if lowered in seen:
+                continue
+            snippets.append(cleaned)
+            seen.add(lowered)
+        return snippets
+
+    @staticmethod
+    def _has_unbalanced_backticks(text: str) -> bool:
+        return bool(text) and str(text).count("`") % 2 == 1
+
+    @classmethod
+    def _list_entries_with_unsupported_code_snippets(
+        cls,
+        values: list[str],
+        patch_info: dict[str, str],
+        *,
+        allowed_snippets: Optional[set[str]] = None,
+    ) -> list[str]:
+        if not values:
+            return []
+        full_patch = str(patch_info.get("full") or "").lower()
+        allowed = {snippet.lower() for snippet in (allowed_snippets or set()) if snippet}
+        unsupported: list[str] = []
+        for item in values:
+            if cls._has_unbalanced_backticks(item):
+                unsupported.append(item)
+                continue
+            snippets = cls._extract_backticked_snippets(item)
+            bad_snippets = [
+                snippet
+                for snippet in snippets
+                if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", snippet)
+                and snippet.lower() not in allowed
+                and snippet.lower() not in full_patch
+            ]
+            if bad_snippets:
+                unsupported.append(item)
+        return unsupported
+
+    @classmethod
     def _extract_review_section_list(cls, detail: str, label: str) -> list[str]:
         text = cls._extract_review_section_text(detail, label)
         if not text:
             return []
         values: list[str] = []
-        for part in text.split(","):
-            cleaned = re.sub(r"\s+", " ", str(part or "").strip(" `")).strip()
+        for part in cls._split_review_section_items(text):
+            cleaned = re.sub(r"\s+", " ", str(part or "").strip()).strip()
+            if cleaned.startswith("`") and cleaned.endswith("`") and cleaned.count("`") == 2:
+                cleaned = cleaned[1:-1].strip()
             if cleaned and cleaned not in values:
                 values.append(cleaned)
         return values
+
+    @classmethod
+    def _list_entries_with_unsupported_identifiers(
+        cls,
+        values: list[str],
+        patch_info: dict[str, str],
+        *,
+        ignored_tokens: Optional[set[str]] = None,
+    ) -> list[str]:
+        if not values:
+            return []
+        full_patch = str(patch_info.get("full") or "")
+        unsupported: list[str] = []
+        ignored = {token.lower() for token in (ignored_tokens or set()) if token}
+        for item in values:
+            tokens = {token for token in cls._extract_identifier_tokens(item) if token not in ignored}
+            if not tokens:
+                continue
+            hallucinated = {token for token in tokens if token not in full_patch}
+            if hallucinated:
+                unsupported.append(item)
+        return unsupported
 
     @classmethod
     def _grounded_code_tokens(cls, text: str, patch_info: dict[str, str]) -> set[str]:
@@ -2264,12 +2411,32 @@ class GitHubToMEPBridgeService:
 
         return grounded | context_grounded
 
+    @classmethod
+    def _changed_code_tokens(cls, text: str, patch_info: dict[str, str]) -> set[str]:
+        if not text or not patch_info:
+            return set()
+        tokens = cls._extract_identifier_tokens(text)
+        changed_text = patch_info.get("changes", "").lower()
+        return {token for token in tokens if token in changed_text}
+
     @staticmethod
     def _is_speculative_finding(text: str) -> bool:
         lowered = str(text or "").strip().lower()
         if not lowered:
             return False
         return any(re.search(pattern, lowered) for pattern in _SPECULATIVE_FINDING_PATTERNS)
+
+    @classmethod
+    def _list_speculative_review_entries(
+        cls, values: list[str], patch_info: dict[str, str]
+    ) -> list[str]:
+        speculative: list[str] = []
+        for item in values or []:
+            if not cls._is_speculative_finding(item):
+                continue
+            if len(cls._changed_code_tokens(item, patch_info)) < 2:
+                speculative.append(item)
+        return speculative
 
     @staticmethod
     def _has_partial_diff_caveat(text: str) -> bool:
@@ -2498,7 +2665,22 @@ class GitHubToMEPBridgeService:
             )
         )
         grounded_tokens = self._grounded_code_tokens(detail or "", anchored_patch_info)
-        changed_tokens = {token for token in grounded_tokens if token in anchored_patch_info["changes"]}
+        changed_tokens = self._changed_code_tokens(detail or "", anchored_patch_info)
+        changed_text = anchored_patch_info["changes"]
+        changed_verified_identifiers: list[str] = []
+        unsupported_verified_identifiers: list[str] = []
+        for item in verified_identifiers:
+            identifier_tokens = self._extract_identifier_tokens(item)
+            if not item or not identifier_tokens:
+                continue
+            if all(token in changed_text for token in identifier_tokens):
+                changed_verified_identifiers.append(item)
+            else:
+                unsupported_verified_identifiers.append(item)
+        summary_tokens = self._extract_identifier_tokens(summary_text)
+        summary_changed_tokens = self._changed_code_tokens(summary_text, anchored_patch_info)
+        observation_tokens = self._extract_identifier_tokens(observation_text)
+        observation_changed_tokens = self._changed_code_tokens(observation_text, anchored_patch_info)
         mentions_tests = bool(anchored_tests)
         if not mentions_tests and expected_tests:
             mentions_tests = bool(re.search(r"\btest(?:s|ed|ing)?\b", lowered))
@@ -2520,10 +2702,16 @@ class GitHubToMEPBridgeService:
             "risk_areas_checked": risk_areas_checked,
             "checks_performed": checks_performed,
             "verified_identifiers": verified_identifiers,
+            "changed_verified_identifiers": changed_verified_identifiers,
+            "unsupported_verified_identifiers": unsupported_verified_identifiers,
             "why_no_finding": why_no_finding,
             "has_structured_sections": has_structured_sections,
             "grounded_tokens": grounded_tokens,
             "changed_tokens": changed_tokens,
+            "summary_tokens": summary_tokens,
+            "summary_changed_tokens": summary_changed_tokens,
+            "observation_tokens": observation_tokens,
+            "observation_changed_tokens": observation_changed_tokens,
             "mentions_tests": mentions_tests,
         }
 
@@ -2538,7 +2726,7 @@ class GitHubToMEPBridgeService:
         observation_text = str(snapshot.get("observation_text") or "").strip()
         risk_areas_checked = snapshot.get("risk_areas_checked") or []
         checks_performed = snapshot.get("checks_performed") or []
-        verified_identifiers = snapshot.get("verified_identifiers") or []
+        changed_verified_identifiers = snapshot.get("changed_verified_identifiers") or []
         expected_tests = snapshot.get("expected_tests") or []
         mentions_tests = bool(snapshot.get("mentions_tests"))
         lowered = str(snapshot.get("lowered") or "")
@@ -2550,20 +2738,20 @@ class GitHubToMEPBridgeService:
         if len(anchored_paths) >= 2:
             reasons.append("multi_path_anchor")
         changed_evidence_count = len(changed_tokens)
-        if not changed_evidence_count and verified_identifiers:
-            changed_evidence_count = min(len(verified_identifiers), 2)
+        if not changed_evidence_count and changed_verified_identifiers:
+            changed_evidence_count = min(len(changed_verified_identifiers), 2)
         if changed_evidence_count:
             changed_code_units = min(changed_evidence_count, 2) / 2
             raw_score += changed_code_units * _QUALITY_SCORE_WEIGHTS["changed_code_evidence"]
             reasons.append("changed_code_evidence")
-        if len(changed_tokens) >= 2 or len(verified_identifiers) >= 2:
+        if len(changed_tokens) >= 2 or len(changed_verified_identifiers) >= 2:
             reasons.append("multiple_changed_identifiers")
-        elif verified_identifiers:
+        elif changed_verified_identifiers:
             reasons.append("verified_changed_identifiers")
         if has_findings:
             raw_score += _QUALITY_SCORE_WEIGHTS["review_substance"]
             reasons.append("concrete_findings")
-        elif (summary_text or observation_text) and (changed_tokens or grounded_tokens or verified_identifiers):
+        elif (summary_text or observation_text) and (changed_tokens or grounded_tokens or changed_verified_identifiers):
             raw_score += _QUALITY_SCORE_WEIGHTS["review_substance"] / 2
             reasons.append("grounded_summary_or_observation")
         if risk_areas_checked:
@@ -2581,7 +2769,7 @@ class GitHubToMEPBridgeService:
         if action == "approved" and _LOW_RISK_CLAIM_RE.search(lowered):
             raw_score += _QUALITY_SCORE_WEIGHTS["approval_low_risk"]
             reasons.append("explicit_low_risk_claim")
-        score = int(round(min(raw_score, 10.0)))
+        score = int(round(max(0.0, min(raw_score, 10.0))))
         return score, reasons
 
     def _approval_quality_failure(self, snapshot: dict[str, Any], score: int) -> Optional[str]:
@@ -2623,6 +2811,10 @@ class GitHubToMEPBridgeService:
         if not findings or not review_package or not expected_paths:
             return None
         patches_by_path = cls._patch_text_by_path(review_package)
+        full_review_patch_info = {
+            "full": "\n".join(patches_by_path.get(path, {}).get("full", "") for path in expected_paths),
+            "changes": "\n".join(patches_by_path.get(path, {}).get("changes", "") for path in expected_paths),
+        }
         for file_hint, finding_text in findings:
             if cls._is_auth_absence_claim(finding_text) and not cls._extract_identifier_tokens(finding_text):
                 return "ungrounded_finding"
@@ -2641,13 +2833,31 @@ class GitHubToMEPBridgeService:
                 return "ungrounded_finding"
             identifier_tokens = cls._extract_identifier_tokens(finding_text)
             if identifier_tokens and not any(token in patch_info["full"] for token in identifier_tokens):
-                return "ungrounded_finding"
+                if not any(token in full_review_patch_info["full"] for token in identifier_tokens):
+                    return "ungrounded_finding"
+            allowed_snippets = set(expected_paths)
+            snippets_for_tests = review_package.get("metadata", {}).get("github", {}).get("touched_tests")
+            if isinstance(snippets_for_tests, list):
+                allowed_snippets.update(str(item).strip() for item in snippets_for_tests if item)
+            unsupported_code_snippets = cls._list_entries_with_unsupported_code_snippets(
+                [finding_text],
+                patch_info,
+                allowed_snippets=allowed_snippets,
+            )
+            if unsupported_code_snippets:
+                return "finding_in_context_only"
             
             grounded_tokens = cls._grounded_code_tokens(finding_text, patch_info)
-            changed_tokens = {t for t in grounded_tokens if t in patch_info["changes"]}
-            
-            if identifier_tokens and not changed_tokens:
-                # Finding mentions code identifiers, but none of them are in the actual diff (+/-)
+            changed_tokens = cls._changed_code_tokens(finding_text, patch_info)
+            cross_path_changed_tokens = cls._changed_code_tokens(finding_text, full_review_patch_info)
+            unsupported_identifier_tokens = identifier_tokens - changed_tokens - cross_path_changed_tokens
+            hallucinated_identifier_tokens = {
+                token for token in unsupported_identifier_tokens if token not in full_review_patch_info["full"]
+            }
+
+            if identifier_tokens and not (changed_tokens or cross_path_changed_tokens):
+                return "finding_in_context_only"
+            if hallucinated_identifier_tokens:
                 return "finding_in_context_only"
 
             if cls._is_speculative_finding(finding_text) and len(grounded_tokens) < 2:
@@ -2674,13 +2884,45 @@ class GitHubToMEPBridgeService:
         has_findings = bool(snapshot.get("has_findings"))
         observation_text = str(snapshot.get("observation_text") or "")
         summary_text = str(snapshot.get("summary_text") or "")
+        anchored_patch_full = str(anchored_patch_info.get("full") or "")
         risk_areas_checked = snapshot.get("risk_areas_checked") or []
         checks_performed = snapshot.get("checks_performed") or []
         verified_identifiers = snapshot.get("verified_identifiers") or []
+        unsupported_verified_identifiers = snapshot.get("unsupported_verified_identifiers") or []
         has_structured_sections = bool(snapshot.get("has_structured_sections"))
         why_no_finding = str(snapshot.get("why_no_finding") or "").strip()
         grounded_tokens = snapshot.get("grounded_tokens") or set()
         changed_tokens = snapshot.get("changed_tokens") or set()
+        summary_tokens = snapshot.get("summary_tokens") or set()
+        summary_changed_tokens = snapshot.get("summary_changed_tokens") or set()
+        observation_tokens = snapshot.get("observation_tokens") or set()
+        observation_changed_tokens = snapshot.get("observation_changed_tokens") or set()
+        path_identifier_tokens: set[str] = set()
+        for path_like in list(expected_paths) + list(snapshot.get("expected_tests") or []):
+            path_identifier_tokens.update(self._extract_identifier_tokens(path_like))
+        allowed_snippets = {str(path_like).strip() for path_like in list(expected_paths) + list(snapshot.get("expected_tests") or []) if path_like}
+        summary_tokens = {token for token in summary_tokens if token not in path_identifier_tokens}
+        observation_tokens = {token for token in observation_tokens if token not in path_identifier_tokens}
+        summary_changed_tokens = {token for token in summary_changed_tokens if token not in path_identifier_tokens}
+        observation_changed_tokens = {token for token in observation_changed_tokens if token not in path_identifier_tokens}
+        unsupported_check_entries = self._list_entries_with_unsupported_identifiers(
+            checks_performed,
+            anchored_patch_info,
+            ignored_tokens=path_identifier_tokens,
+        )
+        unsupported_check_entries.extend(
+            entry
+            for entry in self._list_entries_with_unsupported_code_snippets(
+                checks_performed,
+                anchored_patch_info,
+                allowed_snippets=allowed_snippets,
+            )
+            if entry not in unsupported_check_entries
+        )
+        speculative_check_entries = self._list_speculative_review_entries(
+            checks_performed,
+            anchored_patch_info,
+        )
         reviewability = snapshot.get("reviewability") or {}
         reviewability_bucket = str(reviewability.get("bucket") or "standard").strip().lower()
         if has_findings and not anchored_paths:
@@ -2694,24 +2936,53 @@ class GitHubToMEPBridgeService:
         if has_findings and anchored_paths and review_package:
             if self._finding_conflicts_with_patch(detail or "", anchored_patch_info["full"]):
                 return True, "ungrounded_finding"
-        if reviewability_bucket == "low_signal" and not has_findings and action != "approved":
-            return True, "low_signal_no_finding"
         if has_structured_sections and not has_findings:
             if self._has_partial_diff_caveat(observation_text):
                 return True, "partial_diff_caveat"
+        if verified_identifiers and unsupported_verified_identifiers:
+            return True, "verified_identifiers_in_context_only"
+        if unsupported_check_entries or speculative_check_entries:
+            return True, "checks_in_context_only"
+        if reviewability_bucket == "low_signal" and not has_findings and action != "approved":
+            return True, "low_signal_no_finding"
+        if has_structured_sections and not has_findings:
+            if observation_text and self._is_speculative_finding(observation_text) and len(observation_changed_tokens) < 2:
+                return True, "observation_in_context_only"
+            if summary_text and self._is_speculative_finding(summary_text) and len(summary_changed_tokens) < 2:
+                return True, "summary_in_context_only"
             if summary_text and anchored_paths and review_package:
                 if self._finding_conflicts_with_patch(summary_text, anchored_patch_info["full"]) or self._finding_conflicts_with_patch(detail or "", anchored_patch_info["full"]):
                     return True, "summary_conflicts_with_patch"
             if not observation_text and not grounded_tokens and not checks_performed and not risk_areas_checked:
                 return True, "summary_without_code_evidence"
-            summary_tokens = self._extract_identifier_tokens(summary_text)
-            if summary_tokens and not changed_tokens and not verified_identifiers:
-                return True, "summary_in_context_only"
-            observation_tokens = self._extract_identifier_tokens(observation_text)
-            
-            # Phase 3A: Summary-only reviews must anchor to at least one changed token if they mention code
-            if observation_tokens and not changed_tokens:
-                return True, "observation_in_context_only"
+            if summary_tokens:
+                hallucinated_summary_tokens = {
+                    token for token in (summary_tokens - summary_changed_tokens) if token not in anchored_patch_full
+                }
+                if hallucinated_summary_tokens:
+                    return True, "summary_in_context_only"
+                if self._list_entries_with_unsupported_code_snippets(
+                    [summary_text],
+                    anchored_patch_info,
+                    allowed_snippets=allowed_snippets,
+                ):
+                    return True, "summary_in_context_only"
+                if not summary_changed_tokens and not changed_tokens and not verified_identifiers:
+                    return True, "summary_in_context_only"
+            if observation_tokens:
+                hallucinated_observation_tokens = {
+                    token for token in (observation_tokens - observation_changed_tokens) if token not in anchored_patch_full
+                }
+                if hallucinated_observation_tokens:
+                    return True, "observation_in_context_only"
+                if self._list_entries_with_unsupported_code_snippets(
+                    [observation_text],
+                    anchored_patch_info,
+                    allowed_snippets=allowed_snippets,
+                ):
+                    return True, "observation_in_context_only"
+                if not observation_changed_tokens and not changed_tokens:
+                    return True, "observation_in_context_only"
 
             if observation_text and not grounded_tokens and len(observation_tokens) < 2:
                 return True, "generic_observation"
@@ -2746,6 +3017,20 @@ class GitHubToMEPBridgeService:
         elif reason in {"ungrounded_finding", "finding_in_context_only", "speculative_finding"}:
             sanitized = re.sub(r"(?im)^\s*\d+\.\s+\*\*.+(?:\n|$)", "", sanitized)
             sanitized = re.sub(r"(?im)^##\s*Review Findings\b", "## Review Summary", sanitized, count=1)
+            if reason == "speculative_finding":
+                observation_match = re.search(r"(?im)^\s*Observation:\s*(.+)$", sanitized)
+                if observation_match and cls._is_speculative_finding(observation_match.group(1)):
+                    sanitized = re.sub(r"(?im)^\s*Observation:\s*.+(?:\n|$)", "", sanitized)
+                checks_match = re.search(r"(?im)^\s*Checks performed:\s*(.+)$", sanitized)
+                if checks_match and cls._list_speculative_review_entries(
+                    cls._split_review_section_items(checks_match.group(1)),
+                    {"full": "", "changes": ""},
+                ):
+                    sanitized = re.sub(r"(?im)^\s*Checks performed:\s*.+(?:\n|$)", "", sanitized)
+        elif reason == "verified_identifiers_in_context_only":
+            sanitized = re.sub(r"(?im)^\s*Changed identifiers verified:\s*.+(?:\n|$)", "", sanitized)
+        elif reason == "checks_in_context_only":
+            sanitized = re.sub(r"(?im)^\s*Checks performed:\s*.+(?:\n|$)", "", sanitized)
         elif reason in {"summary_conflicts_with_patch", "summary_in_context_only"}:
             sanitized = re.sub(
                 r"(?ims)^##\s*Review Summary\s*.*?(?=\n\s*Observation:|\n\s*Touched paths reviewed:|\n\s*Tests reviewed:|\n\s*Risk areas checked:|\n\s*Checks performed:|\n\s*Changed identifiers verified:|$)",
@@ -3157,16 +3442,33 @@ class GitHubToMEPBridgeService:
         self._record_github_writeback_attempt(action, update.detail)
         review_result: Optional[dict[str, Any]] = None
         detail_to_publish = update.detail
+        downgrade_reason: Optional[str] = None
         if review_action:
             snapshot = self._build_review_snapshot(execution, detail_to_publish)
-            suppress, reason = self._classify_review_writeback_detail(
-                execution,
-                detail_to_publish,
-                snapshot=snapshot,
-                action=action,
-            )
             score, reasons = self._score_review_quality(snapshot, action=action)
             self._record_review_quality(score, reasons)
+            reason = None
+            if action == "approved":
+                reason = self._approval_quality_failure(snapshot, score)
+                if reason in {"approval_checks_pending", "approval_checks_not_green"}:
+                    action = "reviewed"
+                    downgrade_reason = reason
+                    review_action = entity_type == "pr" and action in review_events
+                    detail_to_publish = self._detail_with_ci_blocker(detail_to_publish, snapshot, reason)
+                    snapshot = self._build_review_snapshot(execution, detail_to_publish)
+                    score, reasons = self._score_review_quality(snapshot, action=action)
+                    self._record_review_quality(score, reasons)
+                    reason = None
+            if downgrade_reason in {"approval_checks_pending", "approval_checks_not_green"}:
+                suppress = False
+                reason = None
+            else:
+                suppress, reason = self._classify_review_writeback_detail(
+                    execution,
+                    detail_to_publish,
+                    snapshot=snapshot,
+                    action=action,
+                )
             if not suppress and action == "approved":
                 reason = self._approval_quality_failure(snapshot, score)
                 suppress = reason is not None
@@ -3223,7 +3525,7 @@ class GitHubToMEPBridgeService:
             review_result = self._build_review_trial_result(
                 execution,
                 update,
-                attempted_action=action,
+                attempted_action=str(update.action or action).strip().lower() or action,
                 resolved_action=action,
                 review_action=review_action,
                 snapshot=snapshot,
@@ -3231,6 +3533,8 @@ class GitHubToMEPBridgeService:
                 reasons=reasons,
                 suppression_reason=None,
             )
+            if str(update.action or "").strip().lower() == "approved" and action == "reviewed" and downgrade_reason:
+                review_result["downgrade_reason"] = downgrade_reason
             return action, None, review_result
         self._post_github_comment(repo_full_name, number, body, github_token)
         self._record_github_writeback_publish("commented", review_action=False)
@@ -3247,9 +3551,10 @@ class GitHubToMEPBridgeService:
         expected_target = claims.get("target_node_id")
         if expected_target and update.target_node_id and expected_target != update.target_node_id:
             raise HTTPException(status_code=403, detail="target_node_id mismatch")
+        normalized_status = self._normalize_callback_status(update.status)
         resolved_action = update.action
         refreshed = execution
-        if str(update.status).strip().lower() == "completed":
+        if normalized_status == "completed":
             resolved_action, suppression_reason, review_result = self._write_back_to_github(execution, update)
             retry_queued = False
             if resolved_action == "suppressed":
@@ -3273,7 +3578,7 @@ class GitHubToMEPBridgeService:
             else:
                 self.store.update_execution(
                     update.bridge_id,
-                    status=update.status,
+                    status=normalized_status,
                     task_id=update.task_id,
                     action=resolved_action,
                     review_result=review_result,
@@ -3282,7 +3587,7 @@ class GitHubToMEPBridgeService:
         else:
             self.store.update_execution(
                 update.bridge_id,
-                status=update.status,
+                status=normalized_status or str(update.status or "").strip().lower(),
                 task_id=update.task_id,
                 action=update.action,
             )
@@ -3310,7 +3615,7 @@ class GitHubToMEPBridgeService:
             update.bridge_id,
             self._render_status_text(
                 event,
-                update.status,
+                normalized_status or str(update.status or "").strip().lower(),
                 task_id=update.task_id or refreshed.get("task_id"),
                 action=resolved_action,
                 detail=update.detail,

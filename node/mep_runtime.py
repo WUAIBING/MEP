@@ -579,6 +579,38 @@ def _review_github_inputs(task_data: dict[str, Any]) -> dict[str, Any]:
     return github_inputs if isinstance(github_inputs, dict) else {}
 
 
+def _review_patch_visible_identifier_tokens(task_data: Optional[dict[str, Any]]) -> set[str]:
+    github_inputs = _review_github_inputs(task_data or {})
+    visible_tokens: set[str] = set()
+    changed_files = github_inputs.get("changed_files")
+    if isinstance(changed_files, list):
+        for item in changed_files:
+            if not isinstance(item, dict):
+                continue
+            visible_tokens.update(_extract_review_identifier_tokens(item.get("patch_excerpt")))
+    hunk_contexts = github_inputs.get("hunk_contexts")
+    if isinstance(hunk_contexts, list):
+        for item in hunk_contexts:
+            if not isinstance(item, dict):
+                continue
+            visible_tokens.update(_extract_review_identifier_tokens(item.get("changed_lines")))
+            visible_tokens.update(_extract_review_identifier_tokens(item.get("hunk_header")))
+    return visible_tokens
+
+
+def _filter_review_identifiers_to_patch_visibility(
+    values: list[str],
+    *,
+    task_data: Optional[dict[str, Any]],
+) -> list[str]:
+    if not values:
+        return []
+    visible_tokens = _review_patch_visible_identifier_tokens(task_data)
+    if not visible_tokens:
+        return values
+    return [item for item in values if item.lower() in visible_tokens]
+
+
 def _review_intent_type(task_data: dict[str, Any]) -> str:
     interbot_message = _interbot_message_from_task_data(task_data)
     intent: Any = task_data.get("intent")
@@ -709,6 +741,113 @@ def _clean_review_list(values: Any, *, max_items: int, max_chars: int) -> list[s
     return cleaned
 
 
+def _clean_review_identifier_list(values: Any, *, max_items: int, max_chars: int) -> list[str]:
+    if not isinstance(values, list):
+        return []
+    cleaned: list[str] = []
+    seen: set[str] = set()
+    for item in values:
+        entry = str(item or "").strip()
+        if not entry:
+            continue
+        entry = re.sub(r"\s+", " ", entry).strip()
+        if len(entry) > max_chars or not _is_renderable_review_identifier(entry):
+            continue
+        key = entry.lower()
+        if key in seen:
+            continue
+        cleaned.append(entry)
+        seen.add(key)
+        if len(cleaned) >= max_items:
+            break
+    return cleaned
+
+
+def _trim_dangling_review_tail(text: str, *, clipped_from_longer: bool) -> str:
+    cleaned = str(text or "").rstrip()
+    if not cleaned or not cleaned[-1].isalnum():
+        return cleaned
+    while cleaned and cleaned[-1].isalnum():
+        trailing_word_break = cleaned.rfind(" ")
+        trailing_fragment = cleaned[trailing_word_break + 1 :] if trailing_word_break >= 0 else cleaned
+        lowered = str(trailing_fragment or "").lower()
+        if not trailing_fragment or any(char in trailing_fragment for char in "`/\\."):
+            break
+        if re.fullmatch(r"[a-z]", trailing_fragment or "") and len(cleaned) >= 40:
+            cleaned = cleaned[:trailing_word_break].rstrip() if trailing_word_break >= 0 else ""
+            continue
+        if clipped_from_longer and re.fullmatch(r"[A-Za-z]{1,2}", trailing_fragment or ""):
+            cleaned = cleaned[:trailing_word_break].rstrip() if trailing_word_break >= 0 else ""
+            continue
+        if lowered in {"and", "or", "but", "so"}:
+            cleaned = cleaned[:trailing_word_break].rstrip() if trailing_word_break >= 0 else ""
+            continue
+        break
+    return cleaned
+
+
+def _clip_without_partial_token(text: str, *, max_chars: int) -> str:
+    if len(text) <= max_chars:
+        return text
+    clipped = text[:max_chars].rstrip()
+    if not clipped:
+        return ""
+    if max_chars < len(text) and text[max_chars].isalnum() and clipped[-1].isalnum():
+        word_break = max(clipped.rfind(" "), clipped.rfind(", "), clipped.rfind("; "), clipped.rfind(": "))
+        if word_break >= max(20, max_chars // 2):
+            clipped = clipped[:word_break].rstrip(" ,;:")
+    return clipped
+
+
+def _extract_backticked_review_snippets(text: Any) -> list[str]:
+    cleaned = str(text or "").strip()
+    if not cleaned:
+        return []
+    snippets: list[str] = []
+    seen: set[str] = set()
+    for snippet in re.findall(r"`([^`\n]+)`", cleaned):
+        normalized = re.sub(r"\s+", " ", str(snippet or "").strip()).strip()
+        if not normalized:
+            continue
+        lowered = normalized.lower()
+        if lowered in seen:
+            continue
+        snippets.append(normalized)
+        seen.add(lowered)
+    return snippets
+
+
+def _has_unbalanced_backticks(text: Any) -> bool:
+    cleaned = str(text or "")
+    return bool(cleaned) and cleaned.count("`") % 2 == 1
+
+
+def _review_text_uses_only_allowed_snippets(
+    text: str,
+    *,
+    allowed_identifiers: list[str],
+    allowed_paths: list[str],
+    allowed_tests: list[str],
+) -> bool:
+    if _has_unbalanced_backticks(text):
+        return False
+    allowed = {
+        item.lower()
+        for item in list(allowed_identifiers) + list(allowed_paths) + list(allowed_tests)
+        if item
+    }
+    for snippet in _extract_backticked_review_snippets(text):
+        lowered = snippet.lower()
+        if lowered in allowed:
+            continue
+        if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", snippet):
+            if lowered in {item.lower() for item in allowed_identifiers if item}:
+                continue
+            return False
+        return False
+    return True
+
+
 def _filter_review_list_to_allowed(values: list[str], allowed: list[str]) -> list[str]:
     if not values:
         return []
@@ -725,6 +864,59 @@ def _filter_review_list_to_allowed(values: list[str], allowed: list[str]) -> lis
         filtered.append(matched)
         seen.add(normalized)
     return filtered
+
+
+def _is_renderable_review_identifier(value: Any) -> bool:
+    cleaned = str(value or "").strip()
+    return bool(cleaned) and bool(re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", cleaned))
+
+
+def _filter_renderable_review_identifiers(values: list[str]) -> list[str]:
+    if not values:
+        return []
+    filtered: list[str] = []
+    seen: set[str] = set()
+    for item in values:
+        if not _is_renderable_review_identifier(item):
+            continue
+        normalized = item.lower()
+        if normalized in seen:
+            continue
+        filtered.append(item)
+        seen.add(normalized)
+    return filtered
+
+
+def _extract_review_identifier_tokens(text: Any) -> set[str]:
+    cleaned = str(text or "").strip()
+    if not cleaned:
+        return set()
+    excluded = {
+        "node_id",
+        "task_id",
+        "repo_name",
+        "issue_number",
+        "bridge_id",
+        "target_node_id",
+    }
+    tokens: set[str] = set()
+    for token in re.findall(r"`([A-Za-z_][A-Za-z0-9_]*)`", cleaned):
+        lowered = token.lower()
+        if len(lowered) >= 4 and lowered not in excluded:
+            tokens.add(lowered)
+    for token in re.findall(r"\b[A-Za-z_][A-Za-z0-9_]*_[A-Za-z0-9_]+\b", cleaned):
+        lowered = token.lower()
+        if len(lowered) >= 4 and lowered not in excluded:
+            tokens.add(lowered)
+    return tokens
+
+
+def _review_text_uses_only_allowed_identifiers(text: str, allowed_identifiers: list[str]) -> bool:
+    tokens = _extract_review_identifier_tokens(text)
+    if not tokens or not allowed_identifiers:
+        return True
+    allowed = {item.lower() for item in allowed_identifiers if item}
+    return tokens.issubset(allowed)
 
 
 def _system_prompt_for_task(
@@ -967,7 +1159,7 @@ def _clean_review_text(value: Any, *, max_chars: int) -> str:
         return ""
     text = re.sub(r"\s+", " ", text).strip()
     if len(text) > max_chars:
-        clipped = text[:max_chars].rstrip()
+        clipped = _clip_without_partial_token(text, max_chars=max_chars)
         sentence_break = max(clipped.rfind(". "), clipped.rfind("! "), clipped.rfind("? "))
         if sentence_break >= max(40, max_chars // 2):
             clipped = clipped[: sentence_break + 1].rstrip()
@@ -982,8 +1174,11 @@ def _clean_review_label(value: Any, *, max_chars: int) -> str:
     if not text:
         return ""
     text = re.sub(r"\s+", " ", text).strip()
-    if len(text) > max_chars:
-        text = text[:max_chars].rstrip()
+    clipped_from_longer = len(text) > max_chars
+    if clipped_from_longer:
+        text = _clip_without_partial_token(text, max_chars=max_chars)
+    if text and text[-1].isalnum():
+        text = _trim_dangling_review_tail(text, clipped_from_longer=clipped_from_longer)
     return text.rstrip(".,;: ")
 
 
@@ -1020,9 +1215,13 @@ def _approval_detail_supports_publishable_approval(
     touched_tests = _clean_review_list(github_inputs.get("touched_tests"), max_items=3, max_chars=120)
     risk_pack = github_inputs.get("risk_pack")
     changed_identifiers = (
-        _clean_review_list(risk_pack.get("changed_identifiers"), max_items=8, max_chars=80)
+        _clean_review_identifier_list(risk_pack.get("changed_identifiers"), max_items=8, max_chars=80)
         if isinstance(risk_pack, dict)
         else []
+    )
+    changed_identifiers = _filter_review_identifiers_to_patch_visibility(
+        changed_identifiers,
+        task_data=task_data,
     )
     touched_paths = _clean_review_list(github_inputs.get("touched_paths"), max_items=4, max_chars=120)
     if touched_tests and "Tests reviewed:" not in text:
@@ -1435,9 +1634,13 @@ def _render_default_structured_review(
     tests_reviewed = _clean_review_list(github_inputs.get("touched_tests"), max_items=3, max_chars=120)
     risk_pack = github_inputs.get("risk_pack")
     verified_identifiers = (
-        _clean_review_list(risk_pack.get("changed_identifiers"), max_items=3, max_chars=80)
+        _clean_review_identifier_list(risk_pack.get("changed_identifiers"), max_items=3, max_chars=80)
         if isinstance(risk_pack, dict)
         else []
+    )
+    verified_identifiers = _filter_review_identifiers_to_patch_visibility(
+        verified_identifiers,
+        task_data=task_data,
     )
     risk_areas_checked = _default_review_risk_areas(task_data)
     checks_performed = _default_review_checks(
@@ -1482,7 +1685,7 @@ def _finalize_model_reply(text: str, *, max_chars: int) -> str:
     cleaned = cleaned.replace("\r\n", "\n")
     cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
     if len(cleaned) > max_chars:
-        clipped = cleaned[:max_chars].rstrip()
+        clipped = _clip_without_partial_token(cleaned, max_chars=max_chars)
         breakpoints = [
             clipped.rfind("\n\n"),
             clipped.rfind("\n- "),
@@ -1979,13 +2182,17 @@ def _render_structured_review_with_task_data(
     allowed_tests = _clean_review_list(github_inputs.get("touched_tests"), max_items=3, max_chars=120)
     risk_pack = github_inputs.get("risk_pack")
     allowed_identifiers = (
-        _clean_review_list(
+        _clean_review_identifier_list(
             risk_pack.get("changed_identifiers"),
             max_items=8,
             max_chars=80,
         )
         if isinstance(risk_pack, dict)
         else []
+    )
+    allowed_identifiers = _filter_review_identifiers_to_patch_visibility(
+        allowed_identifiers,
+        task_data=task_data,
     )
     summary = _clean_review_text(parsed.get("summary"), max_chars=500)
     if _is_weak_review_text(summary):
@@ -2003,8 +2210,38 @@ def _render_structured_review_with_task_data(
         tests_reviewed = allowed_tests
     risk_areas_checked = _clean_review_list(parsed.get("risk_areas_checked"), max_items=4, max_chars=100)
     checks_performed = _clean_review_list(parsed.get("checks_performed"), max_items=4, max_chars=120)
-    verified_identifiers = _clean_review_list(parsed.get("verified_identifiers"), max_items=4, max_chars=80)
+    verified_identifiers = _clean_review_identifier_list(parsed.get("verified_identifiers"), max_items=4, max_chars=80)
     verified_identifiers = _filter_review_list_to_allowed(verified_identifiers, allowed_identifiers)
+    if summary and (
+        not _review_text_uses_only_allowed_identifiers(summary, allowed_identifiers)
+        or not _review_text_uses_only_allowed_snippets(
+            summary,
+            allowed_identifiers=allowed_identifiers,
+            allowed_paths=allowed_paths,
+            allowed_tests=allowed_tests,
+        )
+    ):
+        summary = ""
+    if observation and (
+        not _review_text_uses_only_allowed_identifiers(observation, allowed_identifiers)
+        or not _review_text_uses_only_allowed_snippets(
+            observation,
+            allowed_identifiers=allowed_identifiers,
+            allowed_paths=allowed_paths,
+            allowed_tests=allowed_tests,
+        )
+    ):
+        observation = ""
+    checks_performed = [
+        entry
+        for entry in checks_performed
+        if _review_text_uses_only_allowed_snippets(
+            entry,
+            allowed_identifiers=allowed_identifiers,
+            allowed_paths=allowed_paths,
+            allowed_tests=allowed_tests,
+        )
+    ]
     legacy_no_finding = _clean_review_text(parsed.get("why_no_finding"), max_chars=400)
     if _is_weak_review_text(legacy_no_finding):
         legacy_no_finding = ""
@@ -2021,6 +2258,15 @@ def _render_structured_review_with_task_data(
             rationale = _clean_review_text(item.get("rationale"), max_chars=400)
             combined = f"{issue} {rationale}".strip()
             if _is_weak_review_text(combined):
+                continue
+            if not _review_text_uses_only_allowed_identifiers(combined, allowed_identifiers):
+                continue
+            if not _review_text_uses_only_allowed_snippets(
+                combined,
+                allowed_identifiers=allowed_identifiers,
+                allowed_paths=allowed_paths,
+                allowed_tests=allowed_tests,
+            ):
                 continue
             file_name = _clean_review_label(item.get("file"), max_chars=80)
             if file_name and allowed_path_keys:
@@ -2039,13 +2285,12 @@ def _render_structured_review_with_task_data(
             verified_identifiers = allowed_identifiers[:3]
         if not risk_areas_checked:
             risk_areas_checked = _default_review_risk_areas(task_data)
-        if not checks_performed:
-            checks_performed = _default_review_checks(
-                touched_paths=touched_paths,
-                tests_reviewed=tests_reviewed,
-                verified_identifiers=verified_identifiers,
-                task_data=task_data,
-            )
+        checks_performed = _default_review_checks(
+            touched_paths=touched_paths,
+            tests_reviewed=tests_reviewed,
+            verified_identifiers=verified_identifiers,
+            task_data=task_data,
+        )
         if not summary:
             summary = _default_review_summary(
                 touched_paths=touched_paths,
@@ -2064,6 +2309,29 @@ def _render_structured_review_with_task_data(
             summary = _default_review_summary(
                 touched_paths=touched_paths,
                 verified_identifiers=verified_identifiers,
+            )
+    else:
+        if not findings and not verified_identifiers:
+            verified_identifiers = allowed_identifiers[:3]
+        if not findings and not risk_areas_checked:
+            risk_areas_checked = _default_review_risk_areas(task_data)
+        synthesized_checks = _default_review_checks(
+            touched_paths=touched_paths,
+            tests_reviewed=tests_reviewed,
+            verified_identifiers=verified_identifiers,
+            task_data=task_data,
+        )
+        if synthesized_checks:
+            checks_performed = synthesized_checks
+        if not findings:
+            summary = _default_review_summary(
+                touched_paths=touched_paths,
+                verified_identifiers=verified_identifiers,
+            )
+            observation = _default_review_observation(
+                touched_paths=touched_paths,
+                verified_identifiers=verified_identifiers,
+                tests_reviewed=tests_reviewed,
             )
     sections: list[str] = []
     if findings:
@@ -3743,7 +4011,6 @@ class RuntimeNode:
             return
 
         result = self.adapter.generate_reply(instructions, adapter_task_data)
-
         # Fail-safe: a reviewer runtime must never let an adapter error (missing or
         # expired API key, HTTP error, timeout, empty completion) be written back as
         # a completed review/approval. Report a failed status with no review action so

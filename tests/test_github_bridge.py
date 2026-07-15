@@ -734,7 +734,7 @@ class TestGitHubToMEPBridge(unittest.TestCase):
         self.assertEqual(self.service.github_writeback_metrics["last_suppressed_reason"], "approval_without_test_awareness")
         self.assertGreaterEqual(self.service.github_writeback_metrics["last_quality_score"], 2)
 
-    def test_status_callback_queues_retry_when_approve_checks_are_pending(self):
+    def test_status_callback_publishes_reviewed_blocker_when_approve_checks_are_pending(self):
         self._set_pr_review_package(
             [
                 {
@@ -802,30 +802,32 @@ class TestGitHubToMEPBridge(unittest.TestCase):
             headers={"Authorization": f"Bearer {token}"},
         )
         self.assertEqual(status_response.status_code, 200, status_response.text)
-        self.assertEqual(len(self.github_session.posts), 0)
-        self.assertEqual(len(self.submission.calls), 2)
-        self.assertIn("action: retrying", self.notifier.calls[-1]["text"])
-        self.assertEqual(self.service.github_writeback_metrics["last_suppressed_reason"], "approval_checks_pending")
+        self.assertEqual(len(self.github_session.posts), 1)
+        self.assertEqual(self.github_session.posts[0]["json"]["event"], "COMMENT")
+        self.assertIn("GitHub CI is still running", self.github_session.posts[0]["json"]["body"])
+        self.assertIn("Please wait for CI to finish", self.github_session.posts[0]["json"]["body"])
+        self.assertIn("`test (windows-latest, 3.10)` is `in_progress`", self.github_session.posts[0]["json"]["body"])
 
         execution = self.store.get_execution(bridge_id)
         self.assertIsNotNone(execution)
         trial = execution["review_result"]
         self.assertEqual(trial["attempted_action"], "approved")
-        self.assertEqual(trial["resolved_action"], "retrying")
-        self.assertTrue(trial["suppressed"])
-        self.assertEqual(trial["suppression_reason"], "approval_checks_pending")
+        self.assertEqual(trial["resolved_action"], "reviewed")
+        self.assertFalse(trial["suppressed"])
+        self.assertIsNone(trial["suppression_reason"])
+        self.assertEqual(trial["downgrade_reason"], "approval_checks_pending")
         self.assertEqual(trial["ci_state"], "pending")
-        self.assertTrue(trial["retry_queued"])
-        self.assertEqual(trial["retry_count"], 1)
+        self.assertFalse(trial["retry_queued"])
+        self.assertEqual(trial["retry_count"], 0)
         self.assertEqual(trial["head_sha"], "headsha123")
         self.assertEqual(trial["anchored_path_count"], 2)
         self.assertGreaterEqual(trial["quality_score"], 4)
-        self.assertEqual(execution["status"], "queued")
-        self.assertEqual(execution["action"], "retrying")
-        self.assertEqual(execution["task_id"], "task-2")
-        self.assertEqual(execution["retry_count"], 1)
+        self.assertEqual(execution["status"], "completed")
+        self.assertEqual(execution["action"], "reviewed")
+        self.assertEqual(execution["task_id"], "task-approve-checks-pending")
+        self.assertEqual(execution["retry_count"], 0)
 
-    def test_status_callback_queues_retry_when_approve_checks_fail(self):
+    def test_status_callback_publishes_reviewed_blocker_when_approve_checks_fail(self):
         self._set_pr_review_package(
             [
                 {
@@ -898,22 +900,26 @@ class TestGitHubToMEPBridge(unittest.TestCase):
             headers={"Authorization": f"Bearer {token}"},
         )
         self.assertEqual(status_response.status_code, 200, status_response.text)
-        self.assertEqual(len(self.github_session.posts), 0)
-        self.assertEqual(len(self.submission.calls), 2)
-        self.assertIn("action: retrying", self.notifier.calls[-1]["text"])
-        self.assertEqual(self.service.github_writeback_metrics["last_suppressed_reason"], "approval_checks_not_green")
+        self.assertEqual(len(self.github_session.posts), 1)
+        self.assertEqual(self.github_session.posts[0]["json"]["event"], "COMMENT")
+        self.assertIn("GitHub CI is not green", self.github_session.posts[0]["json"]["body"])
+        self.assertIn("Please fix the failing checks", self.github_session.posts[0]["json"]["body"])
+        self.assertIn("`test (windows-latest, 3.10)` is `failure`", self.github_session.posts[0]["json"]["body"])
 
         execution = self.store.get_execution(bridge_id)
         self.assertIsNotNone(execution)
         trial = execution["review_result"]
-        self.assertEqual(trial["resolved_action"], "retrying")
-        self.assertTrue(trial["retry_queued"])
-        self.assertEqual(trial["retry_count"], 1)
-        self.assertEqual(trial["suppression_reason"], "approval_checks_not_green")
-        self.assertEqual(execution["status"], "queued")
-        self.assertEqual(execution["action"], "retrying")
-        self.assertEqual(execution["task_id"], "task-2")
-        self.assertEqual(execution["retry_count"], 1)
+        self.assertEqual(trial["attempted_action"], "approved")
+        self.assertEqual(trial["resolved_action"], "reviewed")
+        self.assertFalse(trial["suppressed"])
+        self.assertIsNone(trial["suppression_reason"])
+        self.assertEqual(trial["downgrade_reason"], "approval_checks_not_green")
+        self.assertFalse(trial["retry_queued"])
+        self.assertEqual(trial["retry_count"], 0)
+        self.assertEqual(execution["status"], "completed")
+        self.assertEqual(execution["action"], "reviewed")
+        self.assertEqual(execution["task_id"], "task-approve-checks-fail")
+        self.assertEqual(execution["retry_count"], 0)
 
     def test_status_callback_allows_approve_with_grounded_code_and_test_awareness(self):
         self._set_pr_review_package(
@@ -1265,6 +1271,53 @@ class TestGitHubToMEPBridge(unittest.TestCase):
         self.assertEqual(execution["review_result"]["retry_count"], 1)
         self.assertTrue(execution["review_result"]["suppressed"])
         self.assertFalse(execution["review_result"]["published"])
+
+    def test_success_status_callback_is_normalized_to_completed_for_writeback(self):
+        response = self._post_webhook(
+            _issue_comment_payload("@Hub-Sentinel approve this PR", delivery_number=249),
+            delivery_id="delivery-success-normalized",
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        bridge_id = response.json()["bridge_id"]
+        self._flush_context(response.json()["context_id"])
+
+        token = self.service._generate_status_token(bridge_id, "node_target")
+        with patch.object(
+            self.service,
+            "_write_back_to_github",
+            return_value=("reviewed", None, {"published": True, "suppressed": False}),
+        ) as writeback_mock:
+            status_response = self.client.post(
+                "/bridge/status",
+                json={
+                    "bridge_id": bridge_id,
+                    "status": "success",
+                    "target_node_id": "node_target",
+                    "task_id": "task-success-normalized",
+                    "action": "approved",
+                    "detail": "## Review Summary\n\nGrounded review body.",
+                },
+                headers={"Authorization": f"Bearer {token}"},
+            )
+
+        self.assertEqual(status_response.status_code, 200, status_response.text)
+        writeback_mock.assert_called_once()
+
+        execution = self.store.get_execution(bridge_id)
+        assert execution is not None
+        self.assertEqual(execution["status"], "completed")
+        self.assertEqual(execution["task_id"], "task-success-normalized")
+        self.assertEqual(execution["action"], "reviewed")
+        self.assertEqual(
+            execution["review_result"],
+            {
+                "published": True,
+                "suppressed": False,
+                "resolved_action": "reviewed",
+                "retry_queued": False,
+                "retry_count": 0,
+            },
+        )
 
     def test_review_benchmarks_endpoint_returns_seeded_catalog(self):
         response = self.client.get("/bridge/review-benchmarks")
@@ -1849,73 +1902,46 @@ class TestGitHubToMEPBridge(unittest.TestCase):
         self.assertEqual(github_inputs["repo_clone_url"], "https://github.com/example/repo.git")
         self.assertEqual(github_inputs["touched_paths"], ["bridge/github_to_mep.py"])
 
-    def test_retry_task_refreshes_ci_checks_for_suppressed_approval(self):
-        changed_files = [
-            {
-                "filename": "bridge/github_to_mep.py",
-                "status": "modified",
-                "additions": 4,
-                "deletions": 1,
-                "changes": 5,
-                "patch": (
-                    "@@ -1,2 +1,5 @@\n"
-                    "+def preserve_retry_context():\n"
-                    "+    return True\n"
-                ),
-            }
-        ]
-        pr_payload = {
-            "body": "Ensures retry submissions refresh mutable PR metadata.",
-            "changed_files": len(changed_files),
-            "additions": 4,
-            "deletions": 1,
-            "commits": 1,
-            "head": {
-                "sha": "headsha123",
-                "ref": "headref",
-                "repo": {"clone_url": "https://github.com/example/repo.git"},
-            },
-            "base": {
-                "sha": "basesha456",
-                "ref": "baseref",
-            },
-        }
-        pending_checks = {
-            "total_count": 1,
-            "check_runs": [
+    def test_non_green_approval_publishes_reviewed_blocker_without_retry(self):
+        self._set_pr_review_package(
+            [
                 {
-                    "name": "test (windows-latest, 3.10)",
-                    "status": "in_progress",
-                    "conclusion": None,
-                }
-            ],
-        }
-        green_checks = {
-            "total_count": 2,
-            "check_runs": [
-                {
-                    "name": "test (ubuntu-latest, 3.10)",
-                    "status": "completed",
-                    "conclusion": "success",
+                    "filename": "node/mep_runtime.py",
+                    "status": "modified",
+                    "additions": 6,
+                    "deletions": 1,
+                    "changes": 7,
+                    "patch": (
+                        "@@ -945,0 +945,6 @@\n"
+                        "+def _record_pending_task_poll_failure(self, status: int, detail: str) -> None:\n"
+                        "+    self.pending_task_recovery_metrics['last_poll_status'] = status\n"
+                    ),
                 },
                 {
-                    "name": "test (windows-latest, 3.10)",
-                    "status": "completed",
-                    "conclusion": "success",
+                    "filename": "tests/test_node_runtime.py",
+                    "status": "modified",
+                    "additions": 8,
+                    "deletions": 0,
+                    "changes": 8,
+                    "patch": (
+                        "@@ -494,0 +494,8 @@\n"
+                        "+def test_fetch_pending_tasks_uses_authenticated_get(self):\n"
+                        "+    self.assertEqual(tasks, [{'id': 'task_pending'}])\n"
+                    ),
                 },
             ],
-        }
-        self.github_session.get_responses = [
-            _FakeResponse(pr_payload),
-            _FakeResponse(changed_files),
-            _FakeResponse(pending_checks),
-            _FakeResponse(pr_payload),
-            _FakeResponse(changed_files),
-            _FakeResponse(pending_checks),
-            _FakeResponse(pr_payload),
-            _FakeResponse(changed_files),
-            _FakeResponse(green_checks),
-        ]
+            pr_body="Adds pending-task recovery observability and focused runtime tests.",
+            checks_payload={
+                "total_count": 1,
+                "check_runs": [
+                    {
+                        "name": "test (windows-latest, 3.10)",
+                        "status": "in_progress",
+                        "conclusion": None,
+                    }
+                ],
+            },
+        )
         response = self._post_webhook(
             _issue_comment_payload("@Hub-Sentinel approve this PR", delivery_number=234),
             delivery_id="delivery-retry-ci-refresh",
@@ -1933,24 +1959,21 @@ class TestGitHubToMEPBridge(unittest.TestCase):
                 "target_node_id": "node_target",
                 "detail": (
                     "## Review Summary\n\n"
-                    "The PR keeps retry handling focused.\n\n"
-                    "Observation: `preserve_retry_context` is narrow and grounded.\n\n"
-                    "Touched paths reviewed: `bridge/github_to_mep.py`\n\n"
-                    "Tests reviewed: `tests/test_github_bridge.py`."
+                    "The PR adds pending-task recovery observability in `node/mep_runtime.py` and keeps the verification path narrow.\n\n"
+                    "Observation: `_record_pending_task_poll_failure` now records `last_poll_status`, and the changed test keeps the recovery behavior covered. No risky changes.\n\n"
+                    "Touched paths reviewed: `node/mep_runtime.py`, `tests/test_node_runtime.py`\n\n"
+                    "Tests reviewed: `tests/test_node_runtime.py`."
                 ),
                 "action": "approved",
             },
             headers={"Authorization": f"Bearer {token}"},
         )
         self.assertEqual(status_response.status_code, 200, status_response.text)
-        self.assertEqual(len(self.submission.calls), 2)
-        retry_envelope = self.submission.calls[-1]["envelope"]
-        github_inputs = retry_envelope["task"]["inputs"]["github"]
-        self.assertEqual(github_inputs["head_sha"], "headsha123")
-        self.assertEqual(github_inputs["head_ref"], "headref")
-        self.assertEqual(github_inputs["repo_clone_url"], "https://github.com/example/repo.git")
-        self.assertEqual(github_inputs["ci_checks"]["state"], "green")
-        self.assertTrue(github_inputs["ci_checks"]["all_green"])
+        self.assertEqual(len(self.submission.calls), 1)
+        self.assertEqual(len(self.github_session.posts), 1)
+        self.assertEqual(self.github_session.posts[0]["json"]["event"], "COMMENT")
+        self.assertIn("GitHub CI is still running", self.github_session.posts[0]["json"]["body"])
+        self.assertIn("`test (windows-latest, 3.10)` is `in_progress`", self.github_session.posts[0]["json"]["body"])
 
     def test_pr_review_submission_compacts_review_package_payload(self):
         large_patch = "@@ -1,1 +1,120 @@\n" + "\n".join(
@@ -2326,6 +2349,99 @@ class TestGitHubToMEPBridge(unittest.TestCase):
         self.assertIn("## Review Summary", review_payload["body"])
         self.assertNotIn("not fully shown in the diff", review_payload["body"])
         self.assertNotIn("verification is limited", review_payload["body"])
+        self.assertEqual(self.service.github_writeback_metrics["last_suppressed_reason"], None)
+
+    def test_status_callback_salvages_speculative_parser_internal_claims(self):
+        self._set_pr_review_package(
+            [
+                {
+                    "filename": "bridge/github_to_mep.py",
+                    "status": "modified",
+                    "additions": 10,
+                    "deletions": 0,
+                    "changes": 10,
+                    "patch": (
+                        "@@ -2240,0 +2241,10 @@\n"
+                        "+def _split_review_section_items(cls, text: str) -> list[str]:\n"
+                        "+    if not text:\n"
+                        "+        return []\n"
+                        "+    parts: list[str] = []\n"
+                        "+    current: list[str] = []\n"
+                        "+    in_backticks = False\n"
+                        "+    for char in str(text):\n"
+                        "+        if char == ',':\n"
+                        "+            pass\n"
+                    ),
+                },
+                {
+                    "filename": "node/mep_runtime.py",
+                    "status": "modified",
+                    "additions": 8,
+                    "deletions": 1,
+                    "changes": 9,
+                    "patch": (
+                        "@@ -697,0 +697,8 @@\n"
+                        "+def _clip_without_partial_token(text: str, *, max_chars: int) -> str:\n"
+                        "+    clipped = text[:max_chars].rstrip()\n"
+                        "+    if max_chars < len(text):\n"
+                        "+        return clipped\n"
+                    ),
+                },
+                {
+                    "filename": "tests/test_github_bridge.py",
+                    "status": "modified",
+                    "additions": 16,
+                    "deletions": 0,
+                    "changes": 16,
+                    "patch": (
+                        "@@ -2329,0 +2330,16 @@\n"
+                        "+def test_status_callback_salvages_speculative_parser_internal_claims(self):\n"
+                        "+    self.assertEqual(len(self.github_session.posts), 1)\n"
+                    ),
+                },
+            ],
+            pr_body="Consolidates reviewer correctness hardening.",
+        )
+        response = self._post_webhook(
+            _issue_comment_payload("@Hub-Sentinel review this PR", delivery_number=313),
+            delivery_id="delivery-speculative-parser-claims",
+        )
+        self.assertEqual(response.status_code, 200)
+        bridge_id = response.json()["bridge_id"]
+        self._flush_context(response.json()["context_id"])
+
+        token = self.service._generate_status_token(bridge_id, "node_target")
+        status_response = self.client.post(
+            "/bridge/status",
+            json={
+                "bridge_id": bridge_id,
+                "status": "completed",
+                "target_node_id": "node_target",
+                "task_id": "task-speculative-parser-claims",
+                "detail": (
+                    "## Review Findings\n\n"
+                    "The PR consolidates reviewer correctness hardening across bridge and runtime modules.\n\n"
+                    "Observation: In `bridge/github_to_mep.py`, the new `_split_review_section_items` method splits text and likely filters out empty strings.\n\n"
+                    "Touched paths reviewed: `bridge/github_to_mep.py`, `node/mep_runtime.py`, `tests/test_github_bridge.py`\n\n"
+                    "Tests reviewed: `tests/test_github_bridge.py`\n\n"
+                    "Risk areas checked: correctness/regression around the changed behavior, fallback-path drift\n\n"
+                    "Checks performed: Verified that the new `_split_review_section_items` method splits text and likely filters out empty strings, Checked that `_clip_without_partial_token` clips text without ensuring token boundaries, but ca\n\n"
+                    "Changed identifiers verified: `_split_review_section_items`, `_clip_without_partial_token`\n\n"
+                    "1. **The new `_split_review_section_items` method may silently drop empty or whitespace-only items, altering the structure of review sections that rely on blank lines as separators.** (`bridge/github_to_mep.py`): "
+                    "The method splits text and likely filters out empty strings, which could cause downstream parsing to misalign items or skip sections."
+                ),
+            },
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        self.assertEqual(status_response.status_code, 200, status_response.text)
+        self.assertEqual(len(self.github_session.posts), 1)
+        review_payload = self.github_session.posts[0]["json"]
+        self.assertEqual(review_payload["event"], "COMMENT")
+        self.assertIn("## Review Summary", review_payload["body"])
+        self.assertNotIn("## Review Findings", review_payload["body"])
+        self.assertNotIn("likely filters out empty strings", review_payload["body"])
+        self.assertNotIn("may silently drop", review_payload["body"])
+        self.assertNotIn("Checks performed:", review_payload["body"])
         self.assertEqual(self.service.github_writeback_metrics["last_suppressed_reason"], None)
 
     def test_has_partial_diff_caveat_matches_trailing_colon(self):
@@ -2822,7 +2938,141 @@ class TestGitHubToMEPBridge(unittest.TestCase):
         self.assertEqual(status_response.status_code, 200, status_response.text)
         self.assertEqual(len(self.github_session.posts), 0)
         self.assertIn("action: retrying", self.notifier.calls[-1]["text"])
-        self.assertEqual(self.service.github_writeback_metrics["last_suppressed_reason"], "summary_without_risk_coverage")
+        self.assertEqual(self.service.github_writeback_metrics["last_suppressed_reason"], "observation_in_context_only")
+
+    def test_status_callback_salvages_checks_with_unsupported_identifier_by_stripping_checks_section(self):
+        self._set_pr_review_package(
+            [
+                {
+                    "filename": "node/mep_runtime.py",
+                    "status": "modified",
+                    "additions": 10,
+                    "deletions": 1,
+                    "changes": 11,
+                    "patch": (
+                        "@@ -945,0 +945,10 @@\n"
+                        "+def _record_pending_task_poll_failure(self, status: int, detail: str) -> None:\n"
+                        "+    self.pending_task_recovery_metrics['last_poll_status'] = status\n"
+                    ),
+                },
+                {
+                    "filename": "tests/test_node_runtime.py",
+                    "status": "modified",
+                    "additions": 8,
+                    "deletions": 0,
+                    "changes": 8,
+                    "patch": (
+                        "@@ -494,0 +494,8 @@\n"
+                        "+def test_fetch_pending_tasks_uses_authenticated_get(self):\n"
+                        "+    self.assertEqual(tasks, [{'id': 'task_pending'}])\n"
+                    ),
+                },
+            ],
+            pr_body="Adds pending-task recovery observability and focused runtime tests.",
+        )
+        response = self._post_webhook(
+            _issue_comment_payload("@Hub-Sentinel review this PR", delivery_number=244),
+            delivery_id="delivery-checks-in-context-only",
+        )
+        self.assertEqual(response.status_code, 200)
+        bridge_id = response.json()["bridge_id"]
+        self._flush_context(response.json()["context_id"])
+
+        token = self.service._generate_status_token(bridge_id, "node_target")
+        status_response = self.client.post(
+            "/bridge/status",
+            json={
+                "bridge_id": bridge_id,
+                "status": "completed",
+                "target_node_id": "node_target",
+                "task_id": "task-checks-in-context-only",
+                "detail": (
+                    "## Review Summary\n\n"
+                    "The PR adds pending-task recovery observability in `node/mep_runtime.py` and corresponding tests in `tests/test_node_runtime.py`.\n\n"
+                    "Observation: `_record_pending_task_poll_failure` now records `last_poll_status`, so the recovery metrics stay visible.\n\n"
+                    "Risk areas checked: metrics correctness, test coverage\n\n"
+                    "Checks performed: verified `_record_pending_task_poll_failure` writes `last_poll_status`, confirmed `imagined_guard` keeps the retry filter stable\n\n"
+                    "Why no finding: The changed metrics write is narrowly scoped and the changed test covers the intended recovery path."
+                ),
+            },
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        self.assertEqual(status_response.status_code, 200, status_response.text)
+        self.assertEqual(len(self.github_session.posts), 1)
+        review_payload = self.github_session.posts[0]["json"]
+        self.assertNotIn("Checks performed:", review_payload["body"])
+        self.assertNotIn("imagined_guard", review_payload["body"])
+        self.assertEqual(self.service.github_writeback_metrics["last_suppressed_reason"], None)
+
+    def test_extract_review_section_list_keeps_commas_inside_backticked_code_snippets(self):
+        values = self.service._extract_review_section_list(
+            "Checks performed: verified `_list_entries_with_unsupported_identifiers` uses `patch_info.get('changed_identifiers', [])`, confirmed `_cleanup_review_detail` strips stale sections",
+            "Checks performed",
+        )
+
+        self.assertEqual(
+            values,
+            [
+                "verified `_list_entries_with_unsupported_identifiers` uses `patch_info.get('changed_identifiers', [])`",
+                "confirmed `_cleanup_review_detail` strips stale sections",
+            ],
+        )
+
+    def test_status_callback_salvages_checks_with_unsupported_code_snippet_by_stripping_checks_section(self):
+        self._set_pr_review_package(
+            [
+                {
+                    "filename": "bridge/github_to_mep.py",
+                    "status": "modified",
+                    "additions": 12,
+                    "deletions": 0,
+                    "changes": 12,
+                    "patch": (
+                        "@@ -2221,0 +2221,12 @@\n"
+                        "+def _list_entries_with_unsupported_identifiers(values, patch_info):\n"
+                        "+    full_patch = str(patch_info.get(\"full\") or \"\")\n"
+                        "+    return []\n"
+                        "+\n"
+                        "+def _cleanup_review_detail(detail: str) -> str:\n"
+                        "+    return str(detail or \"\").strip()\n"
+                    ),
+                },
+            ],
+            pr_body="Hardens bridge review sanitization around unsupported identifiers.",
+        )
+        response = self._post_webhook(
+            _issue_comment_payload("@Hub-Sentinel review this PR", delivery_number=245),
+            delivery_id="delivery-checks-unsupported-code-snippet",
+        )
+        self.assertEqual(response.status_code, 200)
+        bridge_id = response.json()["bridge_id"]
+        self._flush_context(response.json()["context_id"])
+
+        token = self.service._generate_status_token(bridge_id, "node_target")
+        status_response = self.client.post(
+            "/bridge/status",
+            json={
+                "bridge_id": bridge_id,
+                "status": "completed",
+                "target_node_id": "node_target",
+                "task_id": "task-checks-unsupported-code-snippet",
+                "detail": (
+                    "## Review Summary\n\n"
+                    "The bridge now narrows unsupported identifier handling in `bridge/github_to_mep.py`.\n\n"
+                    "Observation: `_cleanup_review_detail` still trims surrounding whitespace before publishing the body.\n\n"
+                    "Risk areas checked: bridge review sanitization\n\n"
+                    "Checks performed: verified `_list_entries_with_unsupported_identifiers` uses `patch_info.get('changed_identifiers', [])`, confirmed `_cleanup_review_detail` strips stale sections\n\n"
+                    "Why no finding: The changed bridge helpers stay scoped to sanitization and review gating."
+                ),
+            },
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        self.assertEqual(status_response.status_code, 200, status_response.text)
+        self.assertEqual(len(self.github_session.posts), 1)
+        review_payload = self.github_session.posts[0]["json"]
+        self.assertNotIn("Checks performed:", review_payload["body"])
+        self.assertNotIn("patch_info.get('changed_identifiers', [])", review_payload["body"])
+        self.assertEqual(self.service.github_writeback_metrics["last_suppressed_reason"], None)
 
     def test_status_callback_suppresses_finding_grounded_only_to_context_lines(self):
         self._set_pr_review_package(
@@ -2865,6 +3115,55 @@ class TestGitHubToMEPBridge(unittest.TestCase):
         self.assertEqual(len(self.github_session.posts), 0)
         self.assertEqual(self.service.github_writeback_metrics["last_suppressed_reason"], "finding_in_context_only")
 
+    def test_status_callback_suppresses_finding_with_unsupported_code_snippet_claim(self):
+        self._set_pr_review_package(
+            [
+                {
+                    "filename": "node/mep_runtime.py",
+                    "status": "modified",
+                    "patch": (
+                        "@@ -671,0 +671,12 @@\n"
+                        "+def _clip_without_partial_token(text: str, *, max_chars: int) -> str:\n"
+                        "+    clipped = text[:max_chars].rstrip()\n"
+                        "+    if not clipped:\n"
+                        "+        return \"\"\n"
+                        "+    if max_chars < len(text) and text[max_chars].isalnum() and clipped[-1].isalnum():\n"
+                        "+        word_break = max(clipped.rfind(\" \"), clipped.rfind(\", \"), clipped.rfind(\"; \"), clipped.rfind(\": \"))\n"
+                        "+        if word_break >= max(20, max_chars // 2):\n"
+                        "+            clipped = clipped[:word_break].rstrip(\" ,;:\")\n"
+                        "+    return clipped\n"
+                    ),
+                },
+            ],
+            pr_body="Hardens truncation cleanup for structured review output.",
+        )
+        response = self._post_webhook(
+            _issue_comment_payload("@Hub-Sentinel review this PR", delivery_number=246),
+            delivery_id="delivery-finding-unsupported-code-snippet",
+        )
+        bridge_id = response.json()["bridge_id"]
+        self._flush_context(response.json()["context_id"])
+
+        token = self.service._generate_status_token(bridge_id, "node_target")
+        status_response = self.client.post(
+            "/bridge/status",
+            json={
+                "bridge_id": bridge_id,
+                "status": "completed",
+                "target_node_id": "node_target",
+                "task_id": "task-finding-unsupported-code-snippet",
+                "detail": (
+                    "## Review Findings\n\n"
+                    "1. **`_clip_without_partial_token` returns `text[:max_chars]` when `text.rfind(' ', 0, max_chars)` fails.** (`node/mep_runtime.py`): "
+                    "That fallback leaves the trailing token fragment in place instead of trimming to the last safe boundary."
+                ),
+            },
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        self.assertEqual(status_response.status_code, 200, status_response.text)
+        self.assertEqual(len(self.github_session.posts), 0)
+        self.assertEqual(self.service.github_writeback_metrics["last_suppressed_reason"], "finding_in_context_only")
+
     def test_status_callback_suppresses_observation_grounded_only_to_context_lines(self):
         self._set_pr_review_package(
             [
@@ -2903,6 +3202,163 @@ class TestGitHubToMEPBridge(unittest.TestCase):
         self.assertEqual(status_response.status_code, 200)
         self.assertEqual(len(self.github_session.posts), 0)
         self.assertEqual(self.service.github_writeback_metrics["last_suppressed_reason"], "observation_in_context_only")
+
+    def test_classify_review_detail_suppresses_summary_with_mixed_changed_and_context_only_identifiers(self):
+        self._set_pr_review_package(
+            [
+                {
+                    "filename": "bridge/github_to_mep.py",
+                    "status": "modified",
+                    "patch": (
+                        "+def preserve_coalesced_targets():\n"
+                        "+    return True\n"
+                    ),
+                },
+            ],
+        )
+        response = self._post_webhook(
+            _issue_comment_payload("@Hub-Sentinel review this PR"),
+            delivery_id="delivery-summary-mixed-identifiers",
+        )
+        self._flush_context(response.json()["context_id"])
+        execution = self.store.get_execution(response.json()["bridge_id"])
+        self.assertIsNotNone(execution)
+
+        suppress, reason = self.service._classify_review_writeback_detail(
+            execution or {},
+            (
+                "## Review Summary\n\n"
+                "`preserve_coalesced_targets` still looks safe, but `imagined_guard` now controls the retry path.\n\n"
+                "Touched paths reviewed: `bridge/github_to_mep.py`\n\n"
+                "Risk areas checked: review writeback grounding\n\n"
+                "Checks performed: compared `preserve_coalesced_targets` against the changed retry path\n\n"
+                "Changed identifiers verified: `preserve_coalesced_targets`"
+            ),
+            action="reviewed",
+        )
+
+        self.assertTrue(suppress)
+        self.assertEqual(reason, "summary_in_context_only")
+
+    def test_classify_review_detail_suppresses_context_only_verified_identifiers(self):
+        self._set_pr_review_package(
+            [
+                {
+                    "filename": "bridge/github_to_mep.py",
+                    "status": "modified",
+                    "patch": (
+                        "+def preserve_coalesced_targets():\n"
+                        "+    return True\n"
+                    ),
+                },
+            ],
+        )
+        response = self._post_webhook(
+            _issue_comment_payload("@Hub-Sentinel review this PR"),
+            delivery_id="delivery-context-only-verified-identifiers",
+        )
+        self._flush_context(response.json()["context_id"])
+        execution = self.store.get_execution(response.json()["bridge_id"])
+        self.assertIsNotNone(execution)
+
+        suppress, reason = self.service._classify_review_writeback_detail(
+            execution or {},
+            (
+                "## Review Summary\n\n"
+                "Checked the coalesce path against the supplied diff.\n\n"
+                "Touched paths reviewed: `bridge/github_to_mep.py`\n\n"
+                "Risk areas checked: review writeback grounding\n\n"
+                "Checks performed: compared `preserve_coalesced_targets` against the changed retry path\n\n"
+                "Changed identifiers verified: `preserve_coalesced_targets`, `imagined_guard`"
+            ),
+            action="reviewed",
+        )
+
+        self.assertTrue(suppress)
+        self.assertEqual(reason, "verified_identifiers_in_context_only")
+        sanitized = self.service._sanitize_review_detail_for_reason(
+            (
+                "## Review Summary\n\n"
+                "Checked the coalesce path against the supplied diff.\n\n"
+                "Touched paths reviewed: `bridge/github_to_mep.py`\n\n"
+                "Risk areas checked: review writeback grounding\n\n"
+                "Checks performed: compared `preserve_coalesced_targets` against the changed retry path\n\n"
+                "Changed identifiers verified: `preserve_coalesced_targets`, `imagined_guard`"
+            ),
+            reason,
+        )
+        self.assertNotIn("Changed identifiers verified:", sanitized)
+
+    def test_classify_review_detail_allows_verified_identifiers_with_backticks_and_trailing_punctuation(self):
+        self._set_pr_review_package(
+            [
+                {
+                    "filename": "tests/test_github_bridge.py",
+                    "status": "modified",
+                    "patch": (
+                        "+def test_status_callback_publishes_reviewed_blocker_when_approve_checks_are_pending(self):\n"
+                        "+    assert review_payload\n"
+                    ),
+                },
+            ],
+        )
+        response = self._post_webhook(
+            _issue_comment_payload("@Hub-Sentinel review this PR"),
+            delivery_id="delivery-verified-identifiers-punctuation",
+        )
+        self._flush_context(response.json()["context_id"])
+        execution = self.store.get_execution(response.json()["bridge_id"])
+        self.assertIsNotNone(execution)
+
+        suppress, reason = self.service._classify_review_writeback_detail(
+            execution or {},
+            (
+                "## Review Summary\n\n"
+                "Checked the blocker path against the supplied diff.\n\n"
+                "Touched paths reviewed: `tests/test_github_bridge.py`\n\n"
+                "Risk areas checked: approval blocker publication\n\n"
+                "Checks performed: compared `test_status_callback_publishes_reviewed_blocker_when_approve_checks_are_pending` against the changed test path\n\n"
+                "Changed identifiers verified: `test_status_callback_publishes_reviewed_blocker_when_approve_checks_are_pending`."
+            ),
+            action="reviewed",
+        )
+
+        self.assertFalse(suppress)
+        self.assertNotEqual(reason, "verified_identifiers_in_context_only")
+
+    def test_classify_review_detail_suppresses_finding_with_mixed_changed_and_context_only_identifiers(self):
+        self._set_pr_review_package(
+            [
+                {
+                    "filename": "hub/main.py",
+                    "status": "modified",
+                    "patch": (
+                        "+def new_function_with_bug():\n"
+                        "+    x = 1 / 0\n"
+                    ),
+                },
+            ],
+        )
+        response = self._post_webhook(
+            _issue_comment_payload("@Hub-Sentinel review this PR"),
+            delivery_id="delivery-finding-mixed-identifiers",
+        )
+        self._flush_context(response.json()["context_id"])
+        execution = self.store.get_execution(response.json()["bridge_id"])
+        self.assertIsNotNone(execution)
+
+        suppress, reason = self.service._classify_review_writeback_detail(
+            execution or {},
+            (
+                "## Review Findings\n\n"
+                "1. **`new_function_with_bug` still depends on `imagined_guard`.** (`hub/main.py`): "
+                "The new crash path now flows through `imagined_guard`, so the regression is harder to detect."
+            ),
+            action="reviewed",
+        )
+
+        self.assertTrue(suppress)
+        self.assertEqual(reason, "finding_in_context_only")
 
     def test_status_callback_suppresses_summary_conflicting_with_changed_validation_logic(self):
         self._set_pr_review_package(
