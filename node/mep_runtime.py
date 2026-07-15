@@ -3710,13 +3710,11 @@ class RuntimeNode:
         # ── Execution bridge gate: route code-editing tasks to the real bridge,
         # not the LLM adapter. LLMs hallucinate shell output; bridges execute.
         # Falls through to adapter when bridge functions aren't importable (None).
-        is_execution = False
         if (
             interbot_message is not None
             and is_execution_request is not None
             and is_execution_request(interbot_message)
         ):
-            is_execution = True
             bridge_request = build_execution_bridge_request(
                 interbot_message,
                 consumer_id=str(task_data.get("consumer_id") or ""),
