@@ -694,6 +694,29 @@ def _clean_review_list(values: Any, *, max_items: int, max_chars: int) -> list[s
     return cleaned
 
 
+def _trim_dangling_review_tail(text: str, *, clipped_from_longer: bool) -> str:
+    cleaned = str(text or "").rstrip()
+    if not cleaned or not cleaned[-1].isalnum():
+        return cleaned
+    while cleaned and cleaned[-1].isalnum():
+        trailing_word_break = cleaned.rfind(" ")
+        trailing_fragment = cleaned[trailing_word_break + 1 :] if trailing_word_break >= 0 else cleaned
+        lowered = str(trailing_fragment or "").lower()
+        if not trailing_fragment or any(char in trailing_fragment for char in "`/\\."):
+            break
+        if re.fullmatch(r"[a-z]", trailing_fragment or "") and len(cleaned) >= 40:
+            cleaned = cleaned[:trailing_word_break].rstrip() if trailing_word_break >= 0 else ""
+            continue
+        if clipped_from_longer and re.fullmatch(r"[A-Za-z]{1,2}", trailing_fragment or ""):
+            cleaned = cleaned[:trailing_word_break].rstrip() if trailing_word_break >= 0 else ""
+            continue
+        if lowered in {"and", "or", "but", "so"}:
+            cleaned = cleaned[:trailing_word_break].rstrip() if trailing_word_break >= 0 else ""
+            continue
+        break
+    return cleaned
+
+
 def _clip_without_partial_token(text: str, *, max_chars: int) -> str:
     if len(text) <= max_chars:
         return text
@@ -770,6 +793,27 @@ def _filter_review_list_to_allowed(values: list[str], allowed: list[str]) -> lis
         if not matched or normalized in seen:
             continue
         filtered.append(matched)
+        seen.add(normalized)
+    return filtered
+
+
+def _is_renderable_review_identifier(value: Any) -> bool:
+    cleaned = str(value or "").strip()
+    return bool(cleaned) and bool(re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", cleaned))
+
+
+def _filter_renderable_review_identifiers(values: list[str]) -> list[str]:
+    if not values:
+        return []
+    filtered: list[str] = []
+    seen: set[str] = set()
+    for item in values:
+        if not _is_renderable_review_identifier(item):
+            continue
+        normalized = item.lower()
+        if normalized in seen:
+            continue
+        filtered.append(item)
         seen.add(normalized)
     return filtered
 
@@ -1064,15 +1108,8 @@ def _clean_review_label(value: Any, *, max_chars: int) -> str:
     clipped_from_longer = len(text) > max_chars
     if clipped_from_longer:
         text = _clip_without_partial_token(text, max_chars=max_chars)
-    if clipped_from_longer and text and text[-1].isalnum():
-        trailing_word_break = text.rfind(" ")
-        trailing_fragment = text[trailing_word_break + 1 :] if trailing_word_break >= 0 else text
-        if re.fullmatch(r"[A-Za-z]{1,2}", trailing_fragment or ""):
-            text = text[:trailing_word_break].rstrip() if trailing_word_break >= 0 else ""
-        trailing_word_break = text.rfind(" ")
-        trailing_fragment = text[trailing_word_break + 1 :] if trailing_word_break >= 0 else text
-        if str(trailing_fragment or "").lower() in {"and", "or", "but", "so"}:
-            text = text[:trailing_word_break].rstrip() if trailing_word_break >= 0 else ""
+    if text and text[-1].isalnum():
+        text = _trim_dangling_review_tail(text, clipped_from_longer=clipped_from_longer)
     return text.rstrip(".,;: ")
 
 
@@ -2076,6 +2113,7 @@ def _render_structured_review_with_task_data(
         if isinstance(risk_pack, dict)
         else []
     )
+    allowed_identifiers = _filter_renderable_review_identifiers(allowed_identifiers)
     summary = _clean_review_text(parsed.get("summary"), max_chars=500)
     if _is_weak_review_text(summary):
         summary = ""
@@ -2093,6 +2131,7 @@ def _render_structured_review_with_task_data(
     risk_areas_checked = _clean_review_list(parsed.get("risk_areas_checked"), max_items=4, max_chars=100)
     checks_performed = _clean_review_list(parsed.get("checks_performed"), max_items=4, max_chars=120)
     verified_identifiers = _clean_review_list(parsed.get("verified_identifiers"), max_items=4, max_chars=80)
+    verified_identifiers = _filter_renderable_review_identifiers(verified_identifiers)
     verified_identifiers = _filter_review_list_to_allowed(verified_identifiers, allowed_identifiers)
     if summary and (
         not _review_text_uses_only_allowed_identifiers(summary, allowed_identifiers)

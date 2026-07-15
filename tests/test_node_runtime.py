@@ -891,6 +891,15 @@ class TestRuntimeReviewPrompts(unittest.TestCase):
         self.assertNotIn("but ca", cleaned)
         self.assertTrue(cleaned.endswith("boundaries"))
 
+    def test_clean_review_label_drops_dangling_single_letter_tail_without_local_clip(self):
+        cleaned = mep_runtime._clean_review_label(  # noqa: SLF001
+            "Confirmed that the publish path stays grounded and the verification trail remains safe f",
+            max_chars=120,
+        )
+
+        self.assertNotIn("safe f", cleaned)
+        self.assertTrue(cleaned.endswith("safe"))
+
     def test_finalize_model_reply_drops_partial_trailing_word_after_clip(self):
         rendered = mep_runtime._finalize_model_reply(  # noqa: SLF001
             "## Review Summary\n\nChecks performed: confirmed the publish path stays grounded and avoids trailing filteri",
@@ -1115,6 +1124,24 @@ class TestRuntimeReviewPrompts(unittest.TestCase):
         self.assertIn("## Review Findings", rendered)
         self.assertNotIn("Checks performed:", rendered)
         self.assertNotIn("safely ha", rendered)
+
+    def test_structured_review_drops_non_identifier_verified_identifiers(self):
+        rendered = mep_runtime._render_structured_review_with_task_data(  # noqa: SLF001
+            (
+                '{"summary":"Checked the bridge diff.","observation":"The changed path stays narrow.",'
+                '"touched_paths":["bridge/github_to_mep.py"],'
+                '"tests_reviewed":["tests/test_github_bridge.py"],'
+                '"verified_identifiers":["[A-Za-z_][A-Za-z0-9_]*_[A-Za-z0-9_]+","last_poll_status"],'
+                '"findings":[],"approval_recommendation":"comment"}'
+            ),
+            max_chars=1200,
+            task_data=self._bridge_review_task_data(
+                changed_identifiers=["_record_pending_task_poll_failure", "last_poll_status"]
+            ),
+        )
+
+        self.assertIn("Changed identifiers verified: `last_poll_status`", rendered)
+        self.assertNotIn("[A-Za-z_][A-Za-z0-9_]*_[A-Za-z0-9_]+", rendered)
 
     def test_structured_review_drops_findings_for_untouched_files(self):
         rendered = mep_runtime._render_structured_review_with_task_data(  # noqa: SLF001
