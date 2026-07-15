@@ -7,6 +7,7 @@ import unittest
 from typing import Any, Optional
 from unittest.mock import AsyncMock, patch
 
+from clients.shared import review_patterns
 from node.identity import MEPIdentity
 from node import mep_runtime
 
@@ -866,6 +867,57 @@ class TestRuntimeReviewPrompts(unittest.TestCase):
         self.assertIn("The patch looks good overall.", rendered)
         self.assertIn("Observation: The change is well-structured.", rendered)
         self.assertNotIn("Why no finding:", rendered)
+
+    def test_structured_review_rewrites_partial_diff_caveat_to_grounded_observation(self):
+        rendered = mep_runtime._render_structured_review_with_task_data(  # noqa: SLF001
+            (
+                '{"summary":"The retry update stays narrowly scoped.",'
+                '"observation":"The test bodies are not fully shown in the diff.",'
+                '"findings":[],"approval_recommendation":"comment"}'
+            ),
+            max_chars=1000,
+            task_data=self._bridge_review_task_data(
+                changed_identifiers=["_suppression_reason_allows_retry", "_issue_retry_task"],
+                touched_paths=["bridge/github_to_mep.py", "tests/test_github_bridge.py"],
+                touched_tests=["tests/test_github_bridge.py"],
+            ),
+        )
+
+        self.assertIn("## Review Summary", rendered)
+        self.assertIn("The retry update stays narrowly scoped.", rendered)
+        self.assertIn("Observation:", rendered)
+        self.assertNotIn("not fully shown in the diff", rendered)
+        self.assertNotIn("verification is limited", rendered)
+        self.assertIn("_suppression_reason_allows_retry", rendered)
+        self.assertIn("_issue_retry_task", rendered)
+
+    def test_is_weak_review_text_matches_partial_diff_caveat_with_trailing_colon(self):
+        self.assertTrue(
+            review_patterns.has_partial_diff_caveat("Observation: Partial diff: verification is limited.")
+        )
+        self.assertTrue(
+            mep_runtime._is_weak_review_text(  # noqa: SLF001
+                "Observation: Partial diff: verification is limited."
+            )
+        )
+
+    def test_has_partial_diff_caveat_falls_back_when_shared_import_is_unavailable(self):
+        with patch.object(mep_runtime, "_shared_has_partial_diff_caveat", None):
+            self.assertTrue(mep_runtime.has_partial_diff_caveat("The test bodies are not fully shown in the diff."))
+
+    def test_finalize_model_reply_drops_trailing_partial_word(self):
+        rendered = mep_runtime._finalize_model_reply(  # noqa: SLF001
+            (
+                "## Review Summary\n\n"
+                "The retry update stays grounded and test-aware; "
+                "verification remains aligned with the diff and avoids dangling caveats."
+            ),
+            max_chars=95,
+        )
+
+        self.assertTrue(rendered.endswith("."))
+        self.assertNotIn("veri.", rendered)
+        self.assertNotIn("dangli.", rendered)
 
     def test_structured_review_synthesizes_grounded_summary_from_non_json_reply(self):
         rendered = mep_runtime._render_structured_review_with_task_data(  # noqa: SLF001

@@ -22,6 +22,11 @@ from pydantic import BaseModel, Field
 from clients.shared.identity import MEPIdentity
 from node.task_envelope import build_task_envelope
 
+try:
+    from clients.shared import review_patterns as _shared_review_patterns
+except ImportError:  # pragma: no cover - direct file execution may not see repo root
+    _shared_review_patterns = None
+
 
 SUPPORTED_GITHUB_EVENTS = {"issue_comment", "pull_request", "pull_request_review_comment"}
 DEFAULT_TRIGGER_VERBS = {
@@ -142,6 +147,31 @@ def _env_bool(name: str, default: bool) -> bool:
     if raw is None:
         return default
     return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _fallback_partial_diff_caveat_patterns() -> tuple[str, ...]:
+    return (
+        r"\bnot fully shown(?:\s+in\s+the\s+diff)?\b(?:[.:;,])?",
+        r"\bpartial diff\b(?:[.:;,])?",
+        r"\bpartially shown\b(?:[.:;,])?",
+        r"\bwithout the full (?:diff|patch)\b(?:[.:;,])?",
+    )
+
+
+_PARTIAL_DIFF_CAVEAT_PATTERNS = (
+    _shared_review_patterns.PARTIAL_DIFF_CAVEAT_PATTERNS
+    if _shared_review_patterns is not None
+    else _fallback_partial_diff_caveat_patterns()
+)
+
+
+def _has_partial_diff_caveat_text(text: str) -> bool:
+    if _shared_review_patterns is not None:
+        return _shared_review_patterns.has_partial_diff_caveat(text)
+    lowered = str(text or "").strip().lower()
+    if not lowered:
+        return False
+    return any(re.search(pattern, lowered) for pattern in _PARTIAL_DIFF_CAVEAT_PATTERNS)
 
 
 def _split_csv(raw: str) -> list[str]:
@@ -2250,6 +2280,10 @@ class GitHubToMEPBridgeService:
         return any(re.search(pattern, lowered) for pattern in _SPECULATIVE_FINDING_PATTERNS)
 
     @staticmethod
+    def _has_partial_diff_caveat(text: str) -> bool:
+        return _has_partial_diff_caveat_text(text)
+
+    @staticmethod
     def _is_auth_absence_claim(text: str) -> bool:
         lowered = str(text or "").lower()
         if "authentication" not in lowered and "authorization" not in lowered:
@@ -2714,6 +2748,8 @@ class GitHubToMEPBridgeService:
         if reviewability_bucket == "low_signal" and not has_findings and action != "approved":
             return True, "low_signal_no_finding"
         if has_structured_sections and not has_findings:
+            if self._has_partial_diff_caveat(observation_text):
+                return True, "partial_diff_caveat"
             if summary_text and anchored_paths and review_package:
                 if self._finding_conflicts_with_patch(summary_text, anchored_patch_info["full"]) or self._finding_conflicts_with_patch(detail or "", anchored_patch_info["full"]):
                     return True, "summary_conflicts_with_patch"
