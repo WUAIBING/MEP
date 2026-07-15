@@ -2111,6 +2111,45 @@ class GitHubToMEPBridgeService:
         return text[:max_chars]
 
     @staticmethod
+    def _render_ci_status_blocker(snapshot: dict[str, Any], reason: Optional[str]) -> str:
+        ci_checks = snapshot.get("ci_checks") or {}
+        summary = []
+        for item in ci_checks.get("summary", []):
+            if not isinstance(item, dict):
+                continue
+            name = str(item.get("name") or "").strip()
+            state = str(item.get("state") or "").strip().lower() or "unknown"
+            if name:
+                summary.append(f"`{name}` is `{state}`")
+        if reason == "approval_checks_pending":
+            lead = "GitHub CI is still running, so this PR cannot be approved yet. Please wait for CI to finish and fix any failing checks before re-requesting approval."
+        else:
+            lead = "GitHub CI is not green, so this PR cannot be approved yet. Please fix the failing checks before re-requesting approval."
+        if summary:
+            return f"{lead}\n\nCurrent CI status: {', '.join(summary[:4])}."
+        return lead
+
+    @classmethod
+    def _detail_with_ci_blocker(
+        cls,
+        detail: Optional[str],
+        snapshot: dict[str, Any],
+        reason: Optional[str],
+    ) -> str:
+        blocker = cls._render_ci_status_blocker(snapshot, reason)
+        cleaned_detail = str(detail or "").strip()
+        if not cleaned_detail:
+            return f"## Review Summary\n\n{blocker}"
+        if cleaned_detail.lstrip().startswith("## Review Summary"):
+            return re.sub(
+                r"(?is)^\s*##\s*Review Summary\s*",
+                f"## Review Summary\n\n{blocker}\n\n",
+                cleaned_detail,
+                count=1,
+            )
+        return f"## Review Summary\n\n{blocker}\n\n{cleaned_detail}"
+
+    @staticmethod
     def _normalize_review_reference(value: str) -> str:
         text = str(value or "").strip().strip("`'\"")
         text = text.lstrip("([{")
@@ -3392,16 +3431,33 @@ class GitHubToMEPBridgeService:
         self._record_github_writeback_attempt(action, update.detail)
         review_result: Optional[dict[str, Any]] = None
         detail_to_publish = update.detail
+        downgrade_reason: Optional[str] = None
         if review_action:
             snapshot = self._build_review_snapshot(execution, detail_to_publish)
-            suppress, reason = self._classify_review_writeback_detail(
-                execution,
-                detail_to_publish,
-                snapshot=snapshot,
-                action=action,
-            )
             score, reasons = self._score_review_quality(snapshot, action=action)
             self._record_review_quality(score, reasons)
+            reason = None
+            if action == "approved":
+                reason = self._approval_quality_failure(snapshot, score)
+                if reason in {"approval_checks_pending", "approval_checks_not_green"}:
+                    action = "reviewed"
+                    downgrade_reason = reason
+                    review_action = entity_type == "pr" and action in review_events
+                    detail_to_publish = self._detail_with_ci_blocker(detail_to_publish, snapshot, reason)
+                    snapshot = self._build_review_snapshot(execution, detail_to_publish)
+                    score, reasons = self._score_review_quality(snapshot, action=action)
+                    self._record_review_quality(score, reasons)
+                    reason = None
+            if downgrade_reason in {"approval_checks_pending", "approval_checks_not_green"}:
+                suppress = False
+                reason = None
+            else:
+                suppress, reason = self._classify_review_writeback_detail(
+                    execution,
+                    detail_to_publish,
+                    snapshot=snapshot,
+                    action=action,
+                )
             if not suppress and action == "approved":
                 reason = self._approval_quality_failure(snapshot, score)
                 suppress = reason is not None
@@ -3458,7 +3514,7 @@ class GitHubToMEPBridgeService:
             review_result = self._build_review_trial_result(
                 execution,
                 update,
-                attempted_action=action,
+                attempted_action=str(update.action or action).strip().lower() or action,
                 resolved_action=action,
                 review_action=review_action,
                 snapshot=snapshot,
@@ -3466,6 +3522,8 @@ class GitHubToMEPBridgeService:
                 reasons=reasons,
                 suppression_reason=None,
             )
+            if str(update.action or "").strip().lower() == "approved" and action == "reviewed" and downgrade_reason:
+                review_result["downgrade_reason"] = downgrade_reason
             return action, None, review_result
         self._post_github_comment(repo_full_name, number, body, github_token)
         self._record_github_writeback_publish("commented", review_action=False)
