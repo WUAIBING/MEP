@@ -716,6 +716,110 @@ def _repo_audit_lenses_for_task(task_data: dict[str, Any]) -> list[str]:
     return lenses[:6]
 
 
+def _deep_review_triggers(task_data: Optional[dict[str, Any]]) -> list[str]:
+    github_inputs = _review_github_inputs(task_data or {})
+    touched_paths = _clean_review_list(github_inputs.get("touched_paths"), max_items=8, max_chars=120)
+    touched_tests = _clean_review_list(github_inputs.get("touched_tests"), max_items=6, max_chars=120)
+    risk_pack = github_inputs.get("risk_pack")
+    risk_pack = risk_pack if isinstance(risk_pack, dict) else {}
+    signal_parts: list[str] = []
+    signal_parts.extend(touched_paths)
+    signal_parts.extend(touched_tests)
+    signal_parts.extend(_clean_review_list(risk_pack.get("touched_non_test_paths"), max_items=8, max_chars=120))
+    signal_parts.extend(_clean_review_identifier_list(risk_pack.get("changed_identifiers"), max_items=12, max_chars=80))
+    signal_blob = " ".join(part.lower() for part in signal_parts if part)
+    triggers: list[str] = []
+
+    def _add_trigger(label: str) -> None:
+        if label and label not in triggers:
+            triggers.append(label)
+
+    if any(token in signal_blob for token in ("auth", "identity", "signature", "verify", "token", "pem", "pubkey")):
+        _add_trigger("auth or identity logic")
+    if any(token in signal_blob for token in ("approval", "permission", "allow", "grant", "review", "policy")):
+        _add_trigger("approval or permission gates")
+    if any(token in signal_blob for token in ("bridge", "github_to_mep", "callback", "webhook", "route", "writeback")):
+        _add_trigger("bridge routing or callback normalization")
+    ci_checks = github_inputs.get("ci_checks")
+    if isinstance(ci_checks, dict) and ci_checks.get("has_checks"):
+        _add_trigger("ci gate handling")
+    if any(token in signal_blob for token in ("dispatch", "submit", "complete", "writeback", "settlement", "relay")):
+        _add_trigger("task dispatch or writeback paths")
+    if any(token in signal_blob for token in ("state", "online", "offline", "connected", "heartbeat", "ws", "websocket", "retry", "timeout")):
+        _add_trigger("state transitions or reconnect paths")
+    if any(token in signal_blob for token in ("bounty", "seconds", "ledger", "economics", "billing", "payment")):
+        _add_trigger("money or billing paths")
+    if any(token in signal_blob for token in ("secret", "config", "env", "environment", "token", "key", "runtime")):
+        _add_trigger("secrets, config, or environment-driven trust")
+    return triggers[:5]
+
+
+def _deep_review_targets(task_data: Optional[dict[str, Any]], *, max_items: int = 5) -> list[str]:
+    github_inputs = _review_github_inputs(task_data or {})
+    risk_pack = github_inputs.get("risk_pack")
+    risk_pack = risk_pack if isinstance(risk_pack, dict) else {}
+    candidates: list[str] = []
+    candidates.extend(_clean_review_identifier_list(risk_pack.get("changed_identifiers"), max_items=10, max_chars=80))
+    for collection in (
+        _clean_review_list(risk_pack.get("touched_non_test_paths"), max_items=6, max_chars=120),
+        _clean_review_list(github_inputs.get("touched_paths"), max_items=6, max_chars=120),
+    ):
+        for item in collection:
+            normalized = str(item or "").replace("\\", "/").strip()
+            if not normalized:
+                continue
+            basename = os.path.basename(normalized)
+            stem, _ext = os.path.splitext(basename)
+            candidates.extend(candidate for candidate in (normalized, basename, stem) if candidate)
+    cleaned: list[str] = []
+    seen: set[str] = set()
+    for item in candidates:
+        text = _clean_review_label(item, max_chars=120)
+        if len(text) < 3:
+            continue
+        lowered = text.lower()
+        if lowered in seen:
+            continue
+        cleaned.append(text)
+        seen.add(lowered)
+        if len(cleaned) >= max_items:
+            break
+    return cleaned
+
+
+def _deep_review_prompt_hint(task_data: Optional[dict[str, Any]]) -> str:
+    triggers = _deep_review_triggers(task_data)
+    if not triggers:
+        return ""
+    targets = _deep_review_targets(task_data)
+    hint = (
+        " Deep-review escalation is active because the change touches "
+        + ", ".join(triggers[:3])
+        + ". Before approving or concluding a grounded no-finding review, expand changed helpers and entry points to relevant call sites, nearby guards, enforcing callers, and contradiction paths."
+    )
+    if targets:
+        hint += " Prioritize call-site expansion around " + ", ".join(f"`{item}`" for item in targets[:4]) + "."
+    return hint
+
+
+def _render_deep_review_guidance(task_data: Optional[dict[str, Any]], *, max_chars: int = 900) -> str:
+    triggers = _deep_review_triggers(task_data)
+    if not triggers:
+        return ""
+    targets = _deep_review_targets(task_data)
+    sections = [
+        "Deep review escalation is active for this task.",
+        "Triggers: " + ", ".join(triggers),
+        "Required review behavior: expand changed helpers to call sites, inspect same-file guards, and rule out enforcing callers or contradiction paths before approving.",
+    ]
+    if targets:
+        sections.append("Call-site expansion targets: " + ", ".join(f"`{item}`" for item in targets))
+    rendered = "\n".join(sections)
+    if len(rendered) > max_chars:
+        return rendered[: max_chars - 3].rstrip() + "..."
+    return rendered
+
+
 def _candidate_priority_rank(priority: str) -> int:
     normalized = str(priority or "").strip().lower()
     order = {"critical": 0, "high": 1, "medium": 2, "low": 3}
@@ -761,6 +865,177 @@ def _clean_review_identifier_list(values: Any, *, max_items: int, max_chars: int
         if len(cleaned) >= max_items:
             break
     return cleaned
+
+
+@dataclass
+class RuntimeToolRun:
+    tool: str
+    purpose: str
+    status: str
+    summary: str
+    scope: str = ""
+    evidence: Optional[list[str]] = None
+    metadata: Optional[dict[str, Any]] = None
+
+    def to_dict(self) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "tool": _clean_review_label(self.tool, max_chars=40),
+            "purpose": _clean_review_text(self.purpose, max_chars=180),
+            "status": _clean_review_label(self.status, max_chars=20),
+            "summary": _clean_review_text(self.summary, max_chars=260),
+        }
+        scope = _clean_review_label(self.scope, max_chars=120)
+        if scope:
+            payload["scope"] = scope
+        evidence = _clean_review_list(self.evidence or [], max_items=4, max_chars=220)
+        if evidence:
+            payload["evidence"] = evidence
+        if isinstance(self.metadata, dict):
+            cleaned_metadata: dict[str, Any] = {}
+            for key, value in list(self.metadata.items())[:6]:
+                normalized_key = _clean_review_label(key, max_chars=40)
+                if not normalized_key:
+                    continue
+                if isinstance(value, (str, int, float, bool)) or value is None:
+                    cleaned_metadata[normalized_key] = value
+                else:
+                    cleaned_value = _clean_review_text(str(value), max_chars=160)
+                    if cleaned_value:
+                        cleaned_metadata[normalized_key] = cleaned_value
+            if cleaned_metadata:
+                payload["metadata"] = cleaned_metadata
+        return payload
+
+
+def _runtime_tool_bundle(task_data: Optional[dict[str, Any]]) -> dict[str, Any]:
+    task = task_data.get("task") if isinstance(task_data, dict) else None
+    if not isinstance(task, dict) and isinstance(task_data, dict):
+        interbot_message = _interbot_message_from_task_data(task_data)
+        if isinstance(interbot_message, dict) and isinstance(interbot_message.get("task"), dict):
+            task = interbot_message.get("task")
+    inputs = task.get("inputs") if isinstance(task, dict) else None
+    bundle = inputs.get("runtime_tool_bundle") if isinstance(inputs, dict) else None
+    return bundle if isinstance(bundle, dict) else {}
+
+
+def _runtime_tool_run_entries(task_data: Optional[dict[str, Any]]) -> list[dict[str, Any]]:
+    bundle = _runtime_tool_bundle(task_data)
+    runs = bundle.get("runs")
+    if not isinstance(runs, list):
+        return []
+    cleaned_runs: list[dict[str, Any]] = []
+    for item in runs[:8]:
+        if not isinstance(item, dict):
+            continue
+        tool = _clean_review_label(item.get("tool"), max_chars=40)
+        status = _clean_review_label(item.get("status"), max_chars=20)
+        summary = _clean_review_text(item.get("summary"), max_chars=260)
+        if not tool or not status or not summary:
+            continue
+        entry = {"tool": tool, "status": status, "summary": summary}
+        purpose = _clean_review_text(item.get("purpose"), max_chars=180)
+        scope = _clean_review_label(item.get("scope"), max_chars=120)
+        evidence = _clean_review_list(item.get("evidence"), max_items=4, max_chars=220)
+        if purpose:
+            entry["purpose"] = purpose
+        if scope:
+            entry["scope"] = scope
+        if evidence:
+            entry["evidence"] = evidence
+        cleaned_runs.append(entry)
+    return cleaned_runs
+
+
+def _runtime_tool_check_summaries(task_data: Optional[dict[str, Any]], *, max_items: int) -> list[str]:
+    checks: list[str] = []
+    seen: set[str] = set()
+    for item in _runtime_tool_run_entries(task_data):
+        status = str(item.get("status") or "").strip().lower()
+        tool = str(item.get("tool") or "").strip()
+        summary = _clean_review_text(item.get("summary"), max_chars=180)
+        if status not in {"success", "skipped"} or not tool or not summary:
+            continue
+        text = f"{tool}: {summary}"
+        lowered = text.lower()
+        if lowered in seen:
+            continue
+        checks.append(text)
+        seen.add(lowered)
+        if len(checks) >= max_items:
+            break
+    return checks
+
+
+def _runtime_tool_successful_runs(task_data: Optional[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [
+        item
+        for item in _runtime_tool_run_entries(task_data)
+        if str(item.get("status") or "").strip().lower() == "success"
+    ]
+
+
+def _runtime_tool_evidence_satisfies_approval(task_data: Optional[dict[str, Any]]) -> bool:
+    successful_runs = _runtime_tool_successful_runs(task_data)
+    successful_tools = {
+        str(item.get("tool") or "").strip().lower()
+        for item in successful_runs
+        if str(item.get("tool") or "").strip()
+    }
+    evidenceful_runs = [item for item in successful_runs if item.get("evidence")]
+    if "workspace_read" not in successful_tools:
+        return False
+    if not successful_tools.intersection({"workspace_search", "workspace_git", "github_context", "targeted_verify"}):
+        return False
+    if len(successful_runs) < 2 or not evidenceful_runs:
+        return False
+    if _deep_review_triggers(task_data) and not successful_tools.intersection({"workspace_search", "github_context"}):
+        return False
+    return True
+
+
+def _render_runtime_tool_bundle(bundle: dict[str, Any], *, max_chars: int = 2200) -> str:
+    if not isinstance(bundle, dict):
+        return ""
+    contract_version = _clean_review_label(bundle.get("contract_version"), max_chars=60)
+    task_mode = _clean_review_label(bundle.get("task_mode"), max_chars=40)
+    runs = bundle.get("runs")
+    if not isinstance(runs, list):
+        return ""
+    sections = ["Runtime tool evidence bundle:"]
+    if contract_version:
+        descriptor = f"- Contract: `{contract_version}`"
+        if task_mode:
+            descriptor += f" (`{task_mode}`)"
+        sections.append(descriptor)
+    remaining = max_chars - sum(len(part) + 2 for part in sections)
+    added = 0
+    for item in runs[:8]:
+        if not isinstance(item, dict):
+            continue
+        tool = _clean_review_label(item.get("tool"), max_chars=40)
+        status = _clean_review_label(item.get("status"), max_chars=20)
+        summary = _clean_review_text(item.get("summary"), max_chars=220)
+        if not tool or not status or not summary:
+            continue
+        purpose = _clean_review_text(item.get("purpose"), max_chars=140)
+        scope = _clean_review_label(item.get("scope"), max_chars=100)
+        bits = [f"- `{tool}` [{status}] {summary}"]
+        if purpose:
+            bits.append(f"Purpose: {purpose}")
+        if scope:
+            bits.append(f"Scope: `{scope}`")
+        evidence = _clean_review_list(item.get("evidence"), max_items=3, max_chars=160)
+        if evidence:
+            bits.append("Evidence: " + " | ".join(evidence))
+        block = "\n".join(bits)
+        if len(block) > remaining:
+            break
+        sections.append(block)
+        remaining -= len(block) + 2
+        added += 1
+    if added == 0:
+        return ""
+    return "\n\n".join(sections)
 
 
 def _trim_dangling_review_tail(text: str, *, clipped_from_longer: bool) -> str:
@@ -997,6 +1272,7 @@ def _system_prompt_for_task(
         approval_mode = _task_is_approval_review(task_data)
         review_mode = _review_mode_for_task(task_data)
         workspace_path = str(github_inputs.get("local_workspace_path") or "").strip()
+        deep_review_hint = _deep_review_prompt_hint(task_data)
         workspace_hint = ""
         if workspace_path:
             workspace_hint = (
@@ -1025,6 +1301,7 @@ def _system_prompt_for_task(
                 "in `verified_identifiers`, mention the changed tests when any are provided, and explicitly state the scope is low-risk. "
                 "If the supplied PR checks are pending or failing, use `comment` instead of `approve`. "
                 "If any finding survives verification, use `comment` instead of `approve`. "
+                "Only approve when the runtime tool evidence bundle shows authoritative workspace evidence, at least one cross-file or git/github expansion step, and no contradictory verification signal. "
                 "If you cannot satisfy that evidence bar, use `comment` instead of `approve`."
             )
         return (
@@ -1054,7 +1331,7 @@ def _system_prompt_for_task(
             "Do not speculate about unseen code, do not ask for more context, and do not include chain-of-thought or any text outside the JSON object. "
             "If the change looks good, keep findings empty, use summary to state the overall conclusion, list the risk areas and checks you covered, keep observation concrete, and set approval_recommendation to approve or comment. "
             "Diff restatement without risk coverage is not a sufficient review. Keep the "
-            f"response within {review_max_chars} characters.{review_mode_hint}{approval_hint}{workspace_hint}"
+            f"response within {review_max_chars} characters.{review_mode_hint}{approval_hint}{deep_review_hint}{workspace_hint}"
         )
     return (
         "You are a helpful MEP (Miao Exchange Protocol) bot. "
@@ -1072,6 +1349,7 @@ def _candidate_system_prompt_for_task(task_data: dict[str, Any], *, review_max_c
         if review_mode == "recheck_review"
         else "This is a discovery pass, so optimize for finding the strongest previously-unreported bug or regression risk first. "
     )
+    deep_review_hint = _deep_review_prompt_hint(task_data)
     return (
         "You are the candidate-generation pass for a MEP GitHub code review. "
         "Scan the supplied PR context, diff excerpts, risk pack, workspace context, and verification output. "
@@ -1081,7 +1359,7 @@ def _candidate_system_prompt_for_task(task_data: dict[str, Any], *, review_max_c
         "Prefer at most one candidate per lens, rank the highest-impact candidate first, and bias toward correctness, trust-boundary, state-transition, rollback, migration, and test-gap risks over style comments. "
         "Each candidate must be concrete, tied to a changed file, and phrased as a potential bug or regression worth verifying. "
         "Use `evidence` for 1-3 exact identifiers, tests, or changed behaviors from the supplied context that make the hypothesis worth verifying. "
-        f"{mode_hint}"
+        f"{mode_hint}{deep_review_hint}"
         "Do not summarize the PR. Do not give praise. Do not include chain-of-thought. "
         "If nothing looks risky enough to verify, return an empty `risk_candidates` list and use `coverage` to note what you inspected."
     )
@@ -1097,6 +1375,7 @@ def _verification_system_prompt_for_task(task_data: dict[str, Any], *, review_ma
         if review_mode == "recheck_review"
         else "Because this is `discovery_review`, prioritize confirming the strongest fresh candidate rather than spreading attention across many medium-signal ideas. "
     )
+    deep_review_hint = _deep_review_prompt_hint(task_data)
     return (
         f"{base} This is the verification pass. The user message may include provisional candidate risks from an earlier pass. "
         "Treat those candidates as hypotheses only. Promote a candidate into `findings` only when the supplied diff, workspace context, tests, or verification output directly support it. "
@@ -1110,7 +1389,7 @@ def _verification_system_prompt_for_task(task_data: dict[str, Any], *, review_ma
         "If `summary` or `observation` says a helper lacks validation, guard logic, or checks, that claim must survive nearby contradiction from the changed lines themselves. "
         "If a candidate predicts a Python runtime exception, verify the exact failing operator or method call from the changed lines before promoting it. "
         "Do not promote `TypeError` or `unhashable` claims that are based only on ordinary allowlist membership checks for optional values. "
-        f"{mode_hint}"
+        f"{mode_hint}{deep_review_hint}"
         "In approval mode, any surviving finding must force `approval_recommendation` away from `approve`."
     )
 
@@ -1235,6 +1514,8 @@ def _approval_detail_supports_publishable_approval(
             identifiers=changed_identifiers,
         ):
             return False
+    if _task_requires_review_prompt(task_data or {}) and not _runtime_tool_evidence_satisfies_approval(task_data):
+        return False
     return True
 
 
@@ -1544,6 +1825,7 @@ def _default_review_checks(
     task_data: Optional[dict[str, Any]],
 ) -> list[str]:
     checks: list[str] = []
+    checks.extend(_runtime_tool_check_summaries(task_data, max_items=2))
     if touched_paths:
         rendered_paths = ", ".join(f"`{path}`" for path in touched_paths[:3])
         checks.append(f"reviewed the changed diff for {rendered_paths}")
@@ -1559,7 +1841,17 @@ def _default_review_checks(
         state = _clean_review_label(ci_checks.get("state"), max_chars=40)
         if state:
             checks.append(f"noted GitHub checks were `{state}` at review time")
-    return checks[:4]
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for item in checks:
+        lowered = item.lower()
+        if lowered in seen:
+            continue
+        deduped.append(item)
+        seen.add(lowered)
+        if len(deduped) >= 4:
+            break
+    return deduped
 
 
 def _default_no_finding_reason(
@@ -1744,8 +2036,10 @@ def _default_repo_audit_checks(
     repo_url: str,
     ref: str,
     inventory_paths: list[str],
+    task_data: Optional[dict[str, Any]] = None,
 ) -> list[str]:
     checks: list[str] = []
+    checks.extend(_runtime_tool_check_summaries(task_data, max_items=2))
     if repo_url:
         if ref:
             checks.append(f"checked out `{repo_url}` at ref `{ref}`")
@@ -1756,7 +2050,17 @@ def _default_repo_audit_checks(
         checks.append(f"verified findings only against the supplied tracked-file inventory, including {sample}")
     else:
         checks.append("refused to publish findings without an authoritative tracked-file inventory")
-    return checks[:4]
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for item in checks:
+        lowered = item.lower()
+        if lowered in seen:
+            continue
+        deduped.append(item)
+        seen.add(lowered)
+        if len(deduped) >= 4:
+            break
+    return deduped
 
 
 def _default_repo_audit_risk_areas(task_data: Optional[dict[str, Any]]) -> list[str]:
@@ -1903,7 +2207,12 @@ def _render_default_repo_audit(
         summary = ""
     if not summary:
         summary = _default_repo_audit_summary(repo_url=repo_url, ref=ref, inventory_paths=inventory_paths)
-    checks_performed = _default_repo_audit_checks(repo_url=repo_url, ref=ref, inventory_paths=inventory_paths)
+    checks_performed = _default_repo_audit_checks(
+        repo_url=repo_url,
+        ref=ref,
+        inventory_paths=inventory_paths,
+        task_data=task_data,
+    )
     risk_areas_checked = _default_repo_audit_risk_areas(task_data)
     why_no_finding = (
         "No published finding survived verification against the checked-out workspace inventory and supplied file excerpts."
@@ -2124,7 +2433,12 @@ def _render_structured_repo_audit_with_task_data(
             areas_not_deeply_reviewed=areas_not_deeply_reviewed,
         )
     if not checks_performed:
-        checks_performed = _default_repo_audit_checks(repo_url=repo_url, ref=ref, inventory_paths=inventory_paths)
+        checks_performed = _default_repo_audit_checks(
+            repo_url=repo_url,
+            ref=ref,
+            inventory_paths=inventory_paths,
+            task_data=task_data,
+        )
     if not rendered_findings and not why_no_finding:
         why_no_finding = (
             "No top finding remained after filtering to grounded, invariant-backed claims with concrete developer impact."
@@ -2311,6 +2625,7 @@ def _render_structured_review_with_task_data(
                 verified_identifiers=verified_identifiers,
             )
     else:
+        approval_evidence_ok = _runtime_tool_evidence_satisfies_approval(task_data)
         if not findings and not verified_identifiers:
             verified_identifiers = allowed_identifiers[:3]
         if not findings and not risk_areas_checked:
@@ -2324,15 +2639,23 @@ def _render_structured_review_with_task_data(
         if synthesized_checks:
             checks_performed = synthesized_checks
         if not findings:
-            summary = _default_review_summary(
-                touched_paths=touched_paths,
-                verified_identifiers=verified_identifiers,
-            )
-            observation = _default_review_observation(
-                touched_paths=touched_paths,
-                verified_identifiers=verified_identifiers,
-                tests_reviewed=tests_reviewed,
-            )
+            if approval_evidence_ok:
+                summary = _default_review_summary(
+                    touched_paths=touched_paths,
+                    verified_identifiers=verified_identifiers,
+                )
+                observation = _default_review_observation(
+                    touched_paths=touched_paths,
+                    verified_identifiers=verified_identifiers,
+                    tests_reviewed=tests_reviewed,
+                )
+            else:
+                summary = (
+                    "Reviewed the changed behavior, but the runtime evidence bundle did not yet clear the approval bar."
+                )
+                observation = (
+                    "Keep this as a grounded comment until authoritative workspace evidence, cross-file expansion, and verification coverage are strong enough to approve."
+                )
     sections: list[str] = []
     if findings:
         sections.append("## Review Findings")
@@ -2857,6 +3180,232 @@ class WorkspaceManager:
         return "\n\n".join(sections), inventory
 
     @staticmethod
+    def _workspace_search_terms(
+        *,
+        touched_paths: Optional[list[str]] = None,
+        touched_tests: Optional[list[str]] = None,
+        risk_pack: Optional[dict[str, Any]] = None,
+        inventory_paths: Optional[list[str]] = None,
+        max_terms: int = 8,
+    ) -> list[str]:
+        risk_pack = risk_pack if isinstance(risk_pack, dict) else {}
+        touched_paths = touched_paths if isinstance(touched_paths, list) else []
+        touched_tests = touched_tests if isinstance(touched_tests, list) else []
+        inventory_paths = inventory_paths if isinstance(inventory_paths, list) else []
+        raw_candidates: list[str] = []
+        raw_candidates.extend(
+            str(item).strip()
+            for item in (risk_pack.get("changed_identifiers") or [])
+            if str(item).strip()
+        )
+        for collection in (touched_paths, touched_tests):
+            for item in collection:
+                normalized = str(item or "").replace("\\", "/").strip()
+                if not normalized:
+                    continue
+                basename = os.path.basename(normalized)
+                stem, _ext = os.path.splitext(basename)
+                raw_candidates.extend(candidate for candidate in (basename, stem) if candidate)
+        if not raw_candidates:
+            for path in inventory_paths[:10]:
+                normalized = str(path or "").replace("\\", "/").strip()
+                if not normalized:
+                    continue
+                basename = os.path.basename(normalized)
+                stem, _ext = os.path.splitext(basename)
+                lowered = stem.lower()
+                if lowered in {"readme", "license", "dockerfile", "requirements", "pyproject", "package"}:
+                    continue
+                if stem:
+                    raw_candidates.append(stem)
+        terms: list[str] = []
+        seen: set[str] = set()
+        for candidate in raw_candidates:
+            text = str(candidate or "").strip()
+            if len(text) < 3:
+                continue
+            lowered = text.lower()
+            if lowered in seen:
+                continue
+            seen.add(lowered)
+            terms.append(text)
+            if len(terms) >= max_terms:
+                break
+        return terms
+
+    @classmethod
+    def _python_workspace_search(
+        cls,
+        workspace_path: str,
+        term: str,
+        *,
+        max_matches: int = 4,
+        max_line_chars: int = 220,
+    ) -> list[str]:
+        normalized_term = str(term or "").strip().lower()
+        if not normalized_term:
+            return []
+        hits: list[str] = []
+        for root, dirs, files in os.walk(workspace_path):
+            dirs[:] = [name for name in dirs if name != ".git"]
+            for name in files:
+                absolute = os.path.join(root, name)
+                relative = os.path.relpath(absolute, workspace_path).replace("\\", "/")
+                if not cls._is_repo_audit_text_path(relative):
+                    continue
+                try:
+                    with open(absolute, "r", encoding="utf-8", errors="replace") as handle:
+                        for line_no, raw_line in enumerate(handle, start=1):
+                            if normalized_term not in raw_line.lower():
+                                continue
+                            snippet = raw_line.rstrip()
+                            if len(snippet) > max_line_chars:
+                                snippet = snippet[: max_line_chars - 3].rstrip() + "..."
+                            hits.append(f"{relative}:{line_no}: {snippet}")
+                            if len(hits) >= max_matches:
+                                return hits
+                except OSError:
+                    continue
+        return hits
+
+    @classmethod
+    def _workspace_search_matches(
+        cls,
+        workspace_path: str,
+        term: str,
+        *,
+        max_matches: int = 4,
+        max_line_chars: int = 220,
+    ) -> list[str]:
+        normalized_term = str(term or "").strip()
+        if not normalized_term or not workspace_path or not os.path.isdir(workspace_path):
+            return []
+        if shutil.which("rg"):
+            try:
+                result = subprocess.run(
+                    [
+                        "rg",
+                        "-n",
+                        "-m",
+                        str(max_matches),
+                        "--no-heading",
+                        "--fixed-strings",
+                        normalized_term,
+                        ".",
+                    ],
+                    cwd=workspace_path,
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                    timeout=20,
+                )
+                if result.returncode in (0, 1):
+                    hits: list[str] = []
+                    for raw_line in result.stdout.splitlines():
+                        snippet = raw_line.rstrip()
+                        if len(snippet) > max_line_chars:
+                            snippet = snippet[: max_line_chars - 3].rstrip() + "..."
+                        if snippet:
+                            hits.append(snippet)
+                        if len(hits) >= max_matches:
+                            break
+                    if hits:
+                        return hits
+            except Exception:  # noqa: BLE001
+                pass
+        return cls._python_workspace_search(
+            workspace_path,
+            normalized_term,
+            max_matches=max_matches,
+            max_line_chars=max_line_chars,
+        )
+
+    def build_workspace_search_context(
+        self,
+        workspace_path: str,
+        *,
+        touched_paths: Optional[list[str]] = None,
+        touched_tests: Optional[list[str]] = None,
+        risk_pack: Optional[dict[str, Any]] = None,
+        inventory_paths: Optional[list[str]] = None,
+        max_terms: int = 6,
+        max_matches_per_term: int = 4,
+        max_chars: int = 12000,
+    ) -> str:
+        if not workspace_path or not os.path.isdir(workspace_path):
+            return ""
+        search_terms = self._workspace_search_terms(
+            touched_paths=touched_paths,
+            touched_tests=touched_tests,
+            risk_pack=risk_pack,
+            inventory_paths=inventory_paths,
+            max_terms=max_terms,
+        )
+        if not search_terms:
+            return ""
+        sections = ["workspace_search hits from the checked-out workspace:"]
+        remaining = max_chars - len(sections[0]) - 2
+        added = 0
+        for term in search_terms:
+            if remaining <= 400:
+                break
+            matches = self._workspace_search_matches(
+                workspace_path,
+                term,
+                max_matches=max_matches_per_term,
+            )
+            if not matches:
+                continue
+            block = f"### {term}\n```text\n" + "\n".join(matches) + "\n```"
+            if len(block) > remaining:
+                continue
+            sections.append(block)
+            remaining -= len(block) + 2
+            added += 1
+        if added == 0:
+            return ""
+        return "\n\n".join(sections)
+
+    def build_workspace_git_context(
+        self,
+        workspace_path: str,
+        *,
+        touched_paths: Optional[list[str]] = None,
+        inventory_paths: Optional[list[str]] = None,
+        max_chars: int = 4000,
+    ) -> str:
+        if not workspace_path or not os.path.isdir(workspace_path):
+            return ""
+        touched_paths = touched_paths if isinstance(touched_paths, list) else []
+        inventory_paths = inventory_paths if isinstance(inventory_paths, list) else []
+        sections = ["workspace_git snapshot from the checked-out workspace:"]
+        code, out = self._run_git(workspace_path, ["rev-parse", "HEAD"])
+        if code == 0 and out.strip():
+            head_sha = out.strip().splitlines()[-1].strip()
+            sections.append(f"- HEAD commit: {head_sha}")
+        code, out = self._run_git(workspace_path, ["status", "--short", "--untracked-files=no"])
+        if code == 0:
+            status_body = out.strip()
+            if status_body:
+                sections.append("- Git status: dirty")
+                sections.append(f"```text\n{status_body[:1200].rstrip()}\n```")
+            else:
+                sections.append("- Git status: clean")
+        tracked_candidates = [str(item).strip() for item in [*touched_paths, *inventory_paths[:12]] if str(item).strip()]
+        if tracked_candidates:
+            code, out = self._run_git(workspace_path, ["ls-files", "--", *tracked_candidates])
+            if code == 0 and out.strip():
+                tracked = [line.strip().replace("\\", "/") for line in out.splitlines() if line.strip()]
+                if tracked:
+                    listing = "\n".join(f"- {path}" for path in tracked[:12])
+                    sections.append("Tracked target paths visible inside this workspace:")
+                    sections.append(listing)
+        rendered = "\n\n".join(sections)
+        if len(rendered) > max_chars:
+            return rendered[: max_chars - 3].rstrip() + "..."
+        return rendered
+
+    @staticmethod
     def _resolve_repo_file(workspace_path: str, relative_path: str) -> Optional[str]:
         normalized_relative = str(relative_path or "").replace("\\", "/").strip("/")
         if not normalized_relative:
@@ -3308,6 +3857,121 @@ class RuntimeNode:
                 f"[mep run] bridge status failed task={task_id[:8]} "
                 f"bridge_id={bridge_metadata['bridge_id']} status={code} detail={raw}"
             )
+
+    @staticmethod
+    def _github_api_headers() -> dict[str, str]:
+        headers = {
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+            "User-Agent": "mep-runtime",
+        }
+        token = str(os.getenv("MEP_GITHUB_TOKEN") or os.getenv("GITHUB_TOKEN") or "").strip()
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
+        return headers
+
+    def _fetch_github_pr_context(self, github_inputs: dict[str, Any]) -> dict[str, Any]:
+        repo_full_name = _clean_review_label(github_inputs.get("repo_full_name"), max_chars=200)
+        number = github_inputs.get("number")
+        entity_type = _clean_review_label(github_inputs.get("entity_type"), max_chars=20).lower()
+        if not repo_full_name or entity_type != "pr":
+            return {}
+        token = str(os.getenv("MEP_GITHUB_TOKEN") or os.getenv("GITHUB_TOKEN") or "").strip()
+        if not token and not _env_truthy("MEP_GITHUB_CONTEXT_FETCH_PUBLIC"):
+            return {}
+        try:
+            pr_number = int(number)
+        except (TypeError, ValueError):
+            return {}
+        code, body, _raw = _safe_request(
+            "GET",
+            f"https://api.github.com/repos/{repo_full_name}/pulls/{pr_number}",
+            headers=self._github_api_headers(),
+            timeout=15.0,
+        )
+        return body if code == 200 and isinstance(body, dict) else {}
+
+    def _build_github_context(self, github_inputs: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+        repo_full_name = _clean_review_label(github_inputs.get("repo_full_name"), max_chars=200)
+        entity_type = _clean_review_label(github_inputs.get("entity_type"), max_chars=20).lower()
+        number_text = _clean_review_label(github_inputs.get("number"), max_chars=20)
+        fetched = self._fetch_github_pr_context(github_inputs)
+        title = _clean_review_text(
+            fetched.get("title") or github_inputs.get("title"),
+            max_chars=220,
+        )
+        body = _clean_review_text(
+            fetched.get("body") or github_inputs.get("body"),
+            max_chars=320,
+        )
+        body = re.sub(r"\s+", " ", body).strip()
+        author = _clean_review_label(
+            (fetched.get("user") or {}).get("login") if isinstance(fetched.get("user"), dict) else github_inputs.get("author_login"),
+            max_chars=80,
+        )
+        head_ref = _clean_review_label(
+            ((fetched.get("head") or {}).get("ref") if isinstance(fetched.get("head"), dict) else None) or github_inputs.get("head_ref"),
+            max_chars=120,
+        )
+        base_ref = _clean_review_label(
+            ((fetched.get("base") or {}).get("ref") if isinstance(fetched.get("base"), dict) else None) or github_inputs.get("base_ref"),
+            max_chars=120,
+        )
+        labels_raw = fetched.get("labels") if isinstance(fetched.get("labels"), list) else github_inputs.get("labels")
+        labels: list[str] = []
+        if isinstance(labels_raw, list):
+            for item in labels_raw[:6]:
+                if isinstance(item, dict):
+                    text = _clean_review_label(item.get("name"), max_chars=60)
+                else:
+                    text = _clean_review_label(item, max_chars=60)
+                if text:
+                    labels.append(text)
+        ci_checks = github_inputs.get("ci_checks")
+        ci_state = _clean_review_label(ci_checks.get("state"), max_chars=40) if isinstance(ci_checks, dict) else ""
+        changed_files = github_inputs.get("changed_files")
+        changed_file_count = len(changed_files) if isinstance(changed_files, list) else 0
+        sections = ["GitHub context:"]
+        scope = repo_full_name or "GitHub review task"
+        if entity_type == "pr" and number_text:
+            scope = f"{scope}#{number_text}"
+        sections.append(f"- Scope: `{scope}`")
+        if title:
+            sections.append(f"- Title: {title}")
+        if author:
+            sections.append(f"- Author: `{author}`")
+        review_mode = _clean_review_label(github_inputs.get("review_mode"), max_chars=40)
+        if review_mode:
+            sections.append(f"- Review mode: `{review_mode}`")
+        if head_ref or base_ref:
+            if head_ref and base_ref:
+                sections.append(f"- Head/Base: `{head_ref}` -> `{base_ref}`")
+            elif head_ref:
+                sections.append(f"- Head ref: `{head_ref}`")
+            else:
+                sections.append(f"- Base ref: `{base_ref}`")
+        if changed_file_count:
+            sections.append(f"- Changed files in payload: {changed_file_count}")
+        if ci_state:
+            sections.append(f"- GitHub checks state: `{ci_state}`")
+        if labels:
+            sections.append("- Labels: " + ", ".join(f"`{item}`" for item in labels[:4]))
+        if body:
+            sections.append(f"- PR body excerpt: {body[:240]}")
+        rendered = "\n".join(sections)
+        payload = {
+            "scope": scope,
+            "title": title,
+            "author": author,
+            "review_mode": review_mode,
+            "head_ref": head_ref,
+            "base_ref": base_ref,
+            "labels": labels[:4],
+            "ci_state": ci_state,
+            "body_excerpt": body[:240],
+            "source": "github_api" if fetched else "task_inputs",
+        }
+        return (rendered if len(sections) > 1 else "", payload)
 
     def register(self, alias: Optional[str]) -> tuple[bool, str]:
         payload = {
@@ -3864,6 +4528,34 @@ class RuntimeNode:
         github_inputs = dict(inputs.get("github") or {}) if isinstance(inputs.get("github"), dict) else {}
         repo_audit_inputs = dict(inputs.get("repo_audit") or {}) if isinstance(inputs.get("repo_audit"), dict) else {}
         repo_audit_required = _task_requires_repo_audit_contract(task_data)
+        runtime_tool_runs: list[dict[str, Any]] = []
+
+        def _record_runtime_tool_run(
+            tool: str,
+            *,
+            purpose: str,
+            status: str,
+            summary: str,
+            scope: str = "",
+            evidence: Optional[list[str]] = None,
+            metadata: Optional[dict[str, Any]] = None,
+        ) -> None:
+            entry = RuntimeToolRun(
+                tool=tool,
+                purpose=purpose,
+                status=status,
+                summary=summary,
+                scope=scope,
+                evidence=evidence,
+                metadata=metadata,
+            ).to_dict()
+            runtime_tool_runs.append(entry)
+            print(
+                f"[mep tools] task={task_id[:8]} "
+                f"tool={entry.get('tool')} status={entry.get('status')} "
+                f"summary={entry.get('summary')}"
+            )
+
         if repo_audit_required:
             print(
                 "[mep repo_audit] task contract "
@@ -3881,6 +4573,25 @@ class RuntimeNode:
 
         # Phase 4: Sync workspace if this is a GitHub PR task
         if interbot_message:
+            github_context_text, github_context_payload = await asyncio.to_thread(
+                self._build_github_context,
+                github_inputs,
+            )
+            if github_context_text:
+                instructions = f"{instructions}\n\n{github_context_text}"
+                github_inputs["runtime_github_context"] = github_context_payload
+                _record_runtime_tool_run(
+                    "github_context",
+                    purpose="Enrich review grounding with PR metadata beyond the raw DM payload",
+                    status="success",
+                    summary="assembled normalized GitHub PR context for the current review task",
+                    scope="pr_review",
+                    evidence=[
+                        github_context_payload.get("scope") or "",
+                        github_context_payload.get("head_ref") or github_context_payload.get("base_ref") or "",
+                    ],
+                    metadata={"source": github_context_payload.get("source")},
+                )
             repo_url = github_inputs.get("repo_clone_url")
             head_sha = github_inputs.get("head_sha")
             head_ref = github_inputs.get("head_ref")
@@ -3904,9 +4615,65 @@ class RuntimeNode:
                     )
                     if workspace_context:
                         instructions = f"{instructions}\n\nAdditional local workspace context:\n{workspace_context}"
+                        _record_runtime_tool_run(
+                            "workspace_read",
+                            purpose="Read the checked-out PR workspace around touched files and tests",
+                            status="success",
+                            summary="assembled authoritative local review context from the synced PR workspace",
+                            scope="pr_review",
+                            evidence=[
+                                *[str(path) for path in touched_paths[:2]],
+                                *[str(path) for path in touched_tests[:1]],
+                            ],
+                            metadata={"workspace_path": workspace_path},
+                        )
+                    workspace_search_context = await asyncio.to_thread(
+                        self.workspace.build_workspace_search_context,
+                        workspace_path,
+                        touched_paths=touched_paths,
+                        touched_tests=touched_tests,
+                        risk_pack=github_inputs.get("risk_pack"),
+                    )
+                    if workspace_search_context:
+                        instructions = f"{instructions}\n\nAdditional workspace_search evidence:\n{workspace_search_context}"
+                        _record_runtime_tool_run(
+                            "workspace_search",
+                            purpose="Expand touched code to nearby identifiers, call sites, and tests",
+                            status="success",
+                            summary="searched the synced PR workspace for changed identifiers and nearby evidence",
+                            scope="pr_review",
+                            evidence=self.workspace._workspace_search_terms(
+                                touched_paths=touched_paths,
+                                touched_tests=touched_tests,
+                                risk_pack=github_inputs.get("risk_pack"),
+                                max_terms=3,
+                            ),
+                        )
+                    workspace_git_context = await asyncio.to_thread(
+                        self.workspace.build_workspace_git_context,
+                        workspace_path,
+                        touched_paths=touched_paths,
+                    )
+                    if workspace_git_context:
+                        instructions = f"{instructions}\n\nAdditional workspace_git evidence:\n{workspace_git_context}"
+                        _record_runtime_tool_run(
+                            "workspace_git",
+                            purpose="Anchor review evidence to the exact checked-out PR workspace state",
+                            status="success",
+                            summary="captured git head and tracked-path state for the synced PR workspace",
+                            scope="pr_review",
+                            evidence=[str(path) for path in touched_paths[:2]],
+                        )
                     verification_note = self.workspace.verification_policy_note(adapter_task_data)
                     if verification_note:
                         instructions = f"{instructions}\n\n{verification_note}"
+                        _record_runtime_tool_run(
+                            "targeted_verify",
+                            purpose="Run allowlisted verification only when policy permits it",
+                            status="skipped",
+                            summary=verification_note,
+                            scope="pr_review",
+                        )
                     else:
                         verification_report = await asyncio.to_thread(
                             self.workspace.build_verification_report,
@@ -3916,9 +4683,29 @@ class RuntimeNode:
                         )
                         if verification_report:
                             instructions = f"{instructions}\n\n{verification_report}"
+                            _record_runtime_tool_run(
+                                "targeted_verify",
+                                purpose="Run allowlisted verification against the checked-out PR head",
+                                status="success",
+                                summary="ran targeted verification on the synced PR workspace",
+                                scope="pr_review",
+                                evidence=[str(path) for path in touched_tests[:2] or touched_paths[:2]],
+                            )
+                        else:
+                            _record_runtime_tool_run(
+                                "targeted_verify",
+                                purpose="Run allowlisted verification against the checked-out PR head",
+                                status="skipped",
+                                summary="verification policy allowed checks, but no automated verification output was produced",
+                                scope="pr_review",
+                            )
                 else:
                     print(f"[mep workspace] sync failed: {path_or_err}")
                     # We continue anyway, but the adapter might be working on stale code
+
+            deep_review_guidance = _render_deep_review_guidance(adapter_task_data)
+            if deep_review_guidance:
+                instructions = f"{instructions}\n\n{deep_review_guidance}"
 
             intent = interbot_message.get("intent")
             if isinstance(intent, dict):
@@ -3948,10 +4735,75 @@ class RuntimeNode:
                     self.complete(task_id, detail)
                     return
                 instructions = f"{instructions}\n\nAuthoritative local repo audit context:\n{audit_context}"
+                _record_runtime_tool_run(
+                    "workspace_read",
+                    purpose="Read the checked-out audit workspace and tracked-file inventory",
+                    status="success",
+                    summary="assembled authoritative local repo-audit context from the synced workspace",
+                    scope="repo_audit",
+                    evidence=[str(path) for path in inventory_paths[:3]],
+                    metadata={"workspace_path": repo_workspace_path},
+                )
+                repo_audit_search_context = await asyncio.to_thread(
+                    self.workspace.build_workspace_search_context,
+                    repo_workspace_path,
+                    inventory_paths=inventory_paths,
+                )
+                if repo_audit_search_context:
+                    instructions = f"{instructions}\n\nAdditional repo workspace_search evidence:\n{repo_audit_search_context}"
+                    _record_runtime_tool_run(
+                        "workspace_search",
+                        purpose="Expand the audit beyond inventory headlines into concrete cross-file evidence",
+                        status="success",
+                        summary="searched the synced audit workspace for high-signal inventory terms",
+                        scope="repo_audit",
+                        evidence=self.workspace._workspace_search_terms(
+                            inventory_paths=inventory_paths,
+                            max_terms=3,
+                        ),
+                    )
+                repo_audit_git_context = await asyncio.to_thread(
+                    self.workspace.build_workspace_git_context,
+                    repo_workspace_path,
+                    inventory_paths=inventory_paths,
+                )
+                if repo_audit_git_context:
+                    instructions = f"{instructions}\n\nAdditional repo workspace_git evidence:\n{repo_audit_git_context}"
+                    _record_runtime_tool_run(
+                        "workspace_git",
+                        purpose="Anchor repo-audit findings to the exact synced workspace state",
+                        status="success",
+                        summary="captured git head and tracked inventory visibility for the audit workspace",
+                        scope="repo_audit",
+                        evidence=[str(path) for path in inventory_paths[:3]],
+                    )
             else:
                 print(f"[mep repo_audit] sync failed: {path_or_err}")
                 self.complete(task_id, f"[repo audit] workspace sync failed: {path_or_err}")
                 return
+
+        existing_runtime_bundle = inputs.get("runtime_tool_bundle") if isinstance(inputs.get("runtime_tool_bundle"), dict) else {}
+        existing_runs = existing_runtime_bundle.get("runs") if isinstance(existing_runtime_bundle.get("runs"), list) else []
+        merged_runs: list[dict[str, Any]] = []
+        seen_tool_scope: set[tuple[str, str]] = set()
+        for item in [*existing_runs, *runtime_tool_runs]:
+            if not isinstance(item, dict):
+                continue
+            tool = _clean_review_label(item.get("tool"), max_chars=40)
+            scope = _clean_review_label(item.get("scope"), max_chars=80)
+            key = (tool.lower(), scope.lower())
+            if not tool or key in seen_tool_scope:
+                continue
+            merged_runs.append(copy.deepcopy(item))
+            seen_tool_scope.add(key)
+        runtime_tool_bundle = {
+            "contract_version": "mep.runtime_tools.v1",
+            "task_mode": "repo_audit" if repo_audit_required else "review",
+            "runs": merged_runs,
+        }
+        runtime_tool_bundle_text = _render_runtime_tool_bundle(runtime_tool_bundle)
+        if runtime_tool_bundle_text:
+            instructions = f"{instructions}\n\n{runtime_tool_bundle_text}"
 
         task_copy = copy.deepcopy(task) if isinstance(task, dict) else {}
         inputs_copy = copy.deepcopy(inputs) if isinstance(inputs, dict) else {}
@@ -3959,6 +4811,8 @@ class RuntimeNode:
             inputs_copy["github"] = github_inputs
         if repo_audit_inputs:
             inputs_copy["repo_audit"] = repo_audit_inputs
+        if merged_runs:
+            inputs_copy["runtime_tool_bundle"] = runtime_tool_bundle
         if inputs_copy:
             task_copy["inputs"] = inputs_copy
         if task_copy:
@@ -4017,25 +4871,25 @@ class RuntimeNode:
         # the bridge does not publish a decision built on error text.
         if (
             interbot_message is not None
-            and self._bridge_status_action(interbot_message, detail=result, task_data=task_data) is not None
+            and self._bridge_status_action(interbot_message, detail=result, task_data=adapter_task_data) is not None
             and _is_adapter_error(result)
         ):
             self.complete(task_id, result)
             self._report_bridge_status(
                 interbot_message,
-                task_data=task_data,
+                task_data=adapter_task_data,
                 task_id=task_id,
                 status="failed",
                 detail=f"Reviewer runtime produced no publishable review; adapter error: {result[:1000]}",
             )
             return
 
-        if self._bridge_eligible_interbot_message(task_data, interbot_message):
-            bridged = await self._attempt_live_call_bridge(task_data, interbot_message, result)
+        if self._bridge_eligible_interbot_message(adapter_task_data, interbot_message):
+            bridged = await self._attempt_live_call_bridge(adapter_task_data, interbot_message, result)
             if bridged:
                 self._report_bridge_status(
                     interbot_message,
-                    task_data=task_data,
+                    task_data=adapter_task_data,
                     task_id=task_id,
                     status="completed",
                     detail=result,
@@ -4050,7 +4904,7 @@ class RuntimeNode:
             self.complete(task_id, self._dm_fallback_settlement(task_id, dm_response))
             self._report_bridge_status(
                 interbot_message,
-                task_data=task_data,
+                task_data=adapter_task_data,
                 task_id=task_id,
                 status="completed",
                 detail=result,
@@ -4059,7 +4913,7 @@ class RuntimeNode:
         self.complete(task_id, result)
         self._report_bridge_status(
             interbot_message,
-            task_data=task_data,
+            task_data=adapter_task_data,
             task_id=task_id,
             status="completed",
             detail=result,
