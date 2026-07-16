@@ -1825,7 +1825,6 @@ def _default_review_checks(
     task_data: Optional[dict[str, Any]],
 ) -> list[str]:
     checks: list[str] = []
-    checks.extend(_runtime_tool_check_summaries(task_data, max_items=2))
     if touched_paths:
         rendered_paths = ", ".join(f"`{path}`" for path in touched_paths[:3])
         checks.append(f"reviewed the changed diff for {rendered_paths}")
@@ -2039,7 +2038,6 @@ def _default_repo_audit_checks(
     task_data: Optional[dict[str, Any]] = None,
 ) -> list[str]:
     checks: list[str] = []
-    checks.extend(_runtime_tool_check_summaries(task_data, max_items=2))
     if repo_url:
         if ref:
             checks.append(f"checked out `{repo_url}` at ref `{ref}`")
@@ -4528,6 +4526,8 @@ class RuntimeNode:
         github_inputs = dict(inputs.get("github") or {}) if isinstance(inputs.get("github"), dict) else {}
         repo_audit_inputs = dict(inputs.get("repo_audit") or {}) if isinstance(inputs.get("repo_audit"), dict) else {}
         repo_audit_required = _task_requires_repo_audit_contract(task_data)
+        review_prompt_required = _task_requires_review_prompt(adapter_task_data)
+        repo_audit_prompt_required = _task_requires_repo_audit_prompt(adapter_task_data)
         runtime_tool_runs: list[dict[str, Any]] = []
 
         def _record_runtime_tool_run(
@@ -4573,25 +4573,26 @@ class RuntimeNode:
 
         # Phase 4: Sync workspace if this is a GitHub PR task
         if interbot_message:
-            github_context_text, github_context_payload = await asyncio.to_thread(
-                self._build_github_context,
-                github_inputs,
-            )
-            if github_context_text:
-                instructions = f"{instructions}\n\n{github_context_text}"
-                github_inputs["runtime_github_context"] = github_context_payload
-                _record_runtime_tool_run(
-                    "github_context",
-                    purpose="Enrich review grounding with PR metadata beyond the raw DM payload",
-                    status="success",
-                    summary="assembled normalized GitHub PR context for the current review task",
-                    scope="pr_review",
-                    evidence=[
-                        github_context_payload.get("scope") or "",
-                        github_context_payload.get("head_ref") or github_context_payload.get("base_ref") or "",
-                    ],
-                    metadata={"source": github_context_payload.get("source")},
+            if review_prompt_required:
+                github_context_text, github_context_payload = await asyncio.to_thread(
+                    self._build_github_context,
+                    github_inputs,
                 )
+                if github_context_text:
+                    instructions = f"{instructions}\n\n{github_context_text}"
+                    github_inputs["runtime_github_context"] = github_context_payload
+                    _record_runtime_tool_run(
+                        "github_context",
+                        purpose="Enrich review grounding with PR metadata beyond the raw DM payload",
+                        status="success",
+                        summary="assembled normalized GitHub PR context for the current review task",
+                        scope="pr_review",
+                        evidence=[
+                            github_context_payload.get("scope") or "",
+                            github_context_payload.get("head_ref") or github_context_payload.get("base_ref") or "",
+                        ],
+                        metadata={"source": github_context_payload.get("source")},
+                    )
             repo_url = github_inputs.get("repo_clone_url")
             head_sha = github_inputs.get("head_sha")
             head_ref = github_inputs.get("head_ref")
@@ -4703,9 +4704,10 @@ class RuntimeNode:
                     print(f"[mep workspace] sync failed: {path_or_err}")
                     # We continue anyway, but the adapter might be working on stale code
 
-            deep_review_guidance = _render_deep_review_guidance(adapter_task_data)
-            if deep_review_guidance:
-                instructions = f"{instructions}\n\n{deep_review_guidance}"
+            if review_prompt_required:
+                deep_review_guidance = _render_deep_review_guidance(adapter_task_data)
+                if deep_review_guidance:
+                    instructions = f"{instructions}\n\n{deep_review_guidance}"
 
             intent = interbot_message.get("intent")
             if isinstance(intent, dict):
@@ -4796,14 +4798,16 @@ class RuntimeNode:
                 continue
             merged_runs.append(copy.deepcopy(item))
             seen_tool_scope.add(key)
-        runtime_tool_bundle = {
-            "contract_version": "mep.runtime_tools.v1",
-            "task_mode": "repo_audit" if repo_audit_required else "review",
-            "runs": merged_runs,
-        }
-        runtime_tool_bundle_text = _render_runtime_tool_bundle(runtime_tool_bundle)
-        if runtime_tool_bundle_text:
-            instructions = f"{instructions}\n\n{runtime_tool_bundle_text}"
+        runtime_tool_bundle: Optional[dict[str, Any]] = None
+        if review_prompt_required or repo_audit_prompt_required or merged_runs:
+            runtime_tool_bundle = {
+                "contract_version": "mep.runtime_tools.v1",
+                "task_mode": "repo_audit" if repo_audit_required else "review",
+                "runs": merged_runs,
+            }
+            runtime_tool_bundle_text = _render_runtime_tool_bundle(runtime_tool_bundle)
+            if runtime_tool_bundle_text:
+                instructions = f"{instructions}\n\n{runtime_tool_bundle_text}"
 
         task_copy = copy.deepcopy(task) if isinstance(task, dict) else {}
         inputs_copy = copy.deepcopy(inputs) if isinstance(inputs, dict) else {}
@@ -4811,7 +4815,7 @@ class RuntimeNode:
             inputs_copy["github"] = github_inputs
         if repo_audit_inputs:
             inputs_copy["repo_audit"] = repo_audit_inputs
-        if merged_runs:
+        if runtime_tool_bundle and merged_runs:
             inputs_copy["runtime_tool_bundle"] = runtime_tool_bundle
         if inputs_copy:
             task_copy["inputs"] = inputs_copy
