@@ -1174,6 +1174,80 @@ class TestGitHubToMEPBridge(unittest.TestCase):
         self.assertEqual(response.json()["reason"], "non_actionable")
         self.assertEqual(len(self.submission.calls), 0)
 
+    def test_green_ci_webhook_bootstraps_review_when_no_prior_execution_exists(self):
+        changed_files = [
+            {
+                "filename": "bridge/github_to_mep.py",
+                "status": "modified",
+                "additions": 8,
+                "deletions": 0,
+                "changes": 8,
+                "patch": (
+                    "@@ -1324,0 +1324,8 @@\n"
+                    "+def bootstrap_green_ci_review(self):\n"
+                    "+    return 'queued'\n"
+                ),
+            },
+            {
+                "filename": "tests/test_github_bridge.py",
+                "status": "modified",
+                "additions": 8,
+                "deletions": 0,
+                "changes": 8,
+                "patch": (
+                    "@@ -1095,0 +1095,8 @@\n"
+                    "+def test_green_ci_webhook_bootstraps_review_when_no_prior_execution_exists(self):\n"
+                    "+    assert response.json()['status'] == 'buffered'\n"
+                ),
+            },
+        ]
+        self._set_pr_review_package(
+            changed_files,
+            pr_body="Adds CI-green bootstrap coverage for the GitHub bridge review loop.",
+            checks_payload={
+                "total_count": 2,
+                "check_runs": [
+                    {
+                        "name": "test (ubuntu-latest, 3.10)",
+                        "status": "completed",
+                        "conclusion": "success",
+                    },
+                    {
+                        "name": "test (windows-latest, 3.10)",
+                        "status": "completed",
+                        "conclusion": "success",
+                    },
+                ],
+            },
+            fetch_cycles=2,
+        )
+
+        response = self._post_webhook(
+            _check_suite_payload(pr_number=323),
+            delivery_id="delivery-ci-bootstrap-review",
+            event_name="check_suite",
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["status"], "buffered")
+        self._flush_context(response.json()["context_id"])
+
+        self.assertEqual(len(self.submission.calls), 1)
+        call = self.submission.calls[0]
+        self.assertEqual(call["target_node_id"], "node_target")
+        self.assertEqual(call["intent_type"], "code.review.request")
+
+        github_inputs = call["envelope"]["task"]["inputs"]["github"]
+        instructions = call["envelope"]["task"]["instructions"]
+        self.assertEqual(github_inputs["followup_reason"], "ci_green_bootstrap")
+        self.assertEqual(github_inputs["followup_target_alias"], "Hub Sentinel")
+        self.assertEqual(github_inputs["followup_target_node_id"], "node_target")
+        self.assertEqual(github_inputs["trigger_verb"], "review")
+        self.assertEqual(github_inputs["review_mode"], "discovery_review")
+        self.assertEqual(github_inputs["source_event"], "check_suite")
+        self.assertEqual(github_inputs["ci_checks"]["state"], "green")
+        self.assertIn("Automatic bootstrap: GitHub CI is green", instructions)
+        self.assertEqual(len(self.github_session.posts), 0)
+
     def test_status_callback_allows_approve_with_grounded_code_and_test_awareness(self):
         self._set_pr_review_package(
             [

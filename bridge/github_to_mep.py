@@ -1352,9 +1352,78 @@ class GitHubToMEPBridgeService:
             number = pr_ref.get("number")
             if not isinstance(number, int) or number <= 0:
                 continue
+            review_package = self._fetch_pr_review_package(repo_full_name, number)
+            ci_checks = review_package.get("ci_checks") or {}
+            if not ci_checks.get("has_checks") or not ci_checks.get("all_green"):
+                return None
             latest_execution = self.store.get_latest_execution_for_pr(repo_full_name, number)
             if latest_execution is None:
-                continue
+                bootstrap_target_node_id = self.config.target_node_id.strip()
+                bootstrap_target_alias = self.config.target_alias.strip() or "Hub Sentinel"
+                if not bootstrap_target_node_id:
+                    continue
+                url = str(pr_ref.get("html_url") or f"https://github.com/{repo_full_name}/pull/{number}").strip()
+                review_mode = self._review_mode_for_verb("review")
+                review_context = str(review_package.get("instructions_context") or "")
+                title = str(review_package.get("title") or f"PR #{number}").strip() or f"PR #{number}"
+                trigger_text = (
+                    "Automatic bootstrap: GitHub CI is green and no prior bridge execution exists. "
+                    "Review the latest diff and checks, and only publish grounded findings or a grounded no-finding review."
+                )
+                bootstrap_github_inputs = {
+                    "repo_full_name": repo_full_name,
+                    "entity_type": "pr",
+                    "number": number,
+                    "url": url,
+                    "actor_login": actor_login,
+                    "author_association": "",
+                    "delivery_id": delivery_id,
+                    "source_event": github_event,
+                    "source_action": action,
+                    "trigger_verb": "review",
+                    "review_mode": review_mode,
+                    "followup_reason": "ci_green_bootstrap",
+                    "followup_target_alias": bootstrap_target_alias,
+                    "followup_target_node_id": bootstrap_target_node_id,
+                }
+                compact_review_package = self._compact_review_package_for_task_inputs(review_package)
+                for key, value in compact_review_package.items():
+                    if key != "instructions_context":
+                        bootstrap_github_inputs[key] = value
+                instructions = self._build_instructions(
+                    repo_full_name=repo_full_name,
+                    entity_type="pr",
+                    number=number,
+                    title=title,
+                    url=url,
+                    actor_login=actor_login,
+                    action=action,
+                    imperative_verb="review",
+                    review_mode=review_mode,
+                    trigger_text=trigger_text,
+                    review_context=review_context,
+                )
+                owner, repo_name = repo_full_name.split("/", 1)
+                return NormalizedGitHubEvent(
+                    delivery_id=delivery_id,
+                    source_event=github_event,
+                    source_action=action,
+                    repo_full_name=repo_full_name,
+                    entity_type="pr",
+                    number=number,
+                    title=title,
+                    url=url,
+                    actor_login=actor_login,
+                    author_association="",
+                    context_id=f"github-{owner}-{repo_name}-pr-{number}",
+                    imperative_verb="review",
+                    intent_type=DEFAULT_TRIGGER_VERBS["review"],
+                    instructions=instructions,
+                    raw_trigger_text="",
+                    github_inputs=bootstrap_github_inputs,
+                    coalesced_delivery_ids=[delivery_id],
+                    coalesced_actions=[action],
+                )
             latest_review_result = latest_execution.get("review_result") or {}
             latest_github_inputs = self._execution_github_inputs(latest_execution)
             if not latest_review_result:
@@ -1367,11 +1436,6 @@ class GitHubToMEPBridgeService:
             ):
                 return None
             if str(latest_github_inputs.get("followup_reason") or "").strip() == "ci_green_webhook":
-                return None
-
-            review_package = self._fetch_pr_review_package(repo_full_name, number)
-            ci_checks = review_package.get("ci_checks") or {}
-            if not ci_checks.get("has_checks") or not ci_checks.get("all_green"):
                 return None
 
             url = str(
