@@ -734,6 +734,8 @@ def _deep_review_triggers(task_data: Optional[dict[str, Any]]) -> list[str]:
         if label and label not in triggers:
             triggers.append(label)
 
+    # Some tokens intentionally overlap across trust buckets so risky changes
+    # like `token` or `writeback` can light up both auth and workflow lenses.
     if any(token in signal_blob for token in ("auth", "identity", "signature", "verify", "token", "pem", "pubkey")):
         _add_trigger("auth or identity logic")
     if any(token in signal_blob for token in ("approval", "permission", "allow", "grant", "review", "policy")):
