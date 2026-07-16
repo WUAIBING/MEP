@@ -425,6 +425,7 @@ class TestRuntimeReviewPrompts(unittest.TestCase):
         changed_files: Optional[list[dict[str, Any]]] = None,
         review_mode: str = "discovery_review",
         ci_checks: Optional[dict[str, Any]] = None,
+        runtime_tool_bundle: Optional[dict[str, Any]] = None,
     ) -> dict:
         identifiers = changed_identifiers or [
             "_record_pending_task_poll_failure",
@@ -432,6 +433,44 @@ class TestRuntimeReviewPrompts(unittest.TestCase):
         ]
         github_touched_paths = touched_paths or ["bridge/github_to_mep.py"]
         github_touched_tests = touched_tests if touched_tests is not None else ["tests/test_github_bridge.py"]
+        bundle = runtime_tool_bundle or {
+            "contract_version": "mep.runtime_tools.v1",
+            "task_mode": "review",
+            "runs": [
+                {
+                    "tool": "github_context",
+                    "purpose": "Enrich PR metadata",
+                    "status": "success",
+                    "summary": "assembled normalized GitHub PR context for the current review task",
+                    "scope": "pr_review",
+                    "evidence": ["WUAIBING/MEP#246", "feature/test"],
+                },
+                {
+                    "tool": "workspace_read",
+                    "purpose": "Read the checked-out PR workspace",
+                    "status": "success",
+                    "summary": "assembled authoritative local review context from the synced PR workspace",
+                    "scope": "pr_review",
+                    "evidence": ["bridge/github_to_mep.py", "tests/test_github_bridge.py"],
+                },
+                {
+                    "tool": "workspace_search",
+                    "purpose": "Expand touched code to nearby identifiers and call sites",
+                    "status": "success",
+                    "summary": "searched the synced PR workspace for changed identifiers and nearby evidence",
+                    "scope": "pr_review",
+                    "evidence": identifiers[:2],
+                },
+                {
+                    "tool": "workspace_git",
+                    "purpose": "Anchor review evidence to the exact checked-out workspace state",
+                    "status": "success",
+                    "summary": "captured git head and tracked-path state for the synced PR workspace",
+                    "scope": "pr_review",
+                    "evidence": ["bridge/github_to_mep.py"],
+                },
+            ],
+        }
         return {
             "id": "task_bridge_review",
             "bounty": 0.0,
@@ -457,6 +496,10 @@ class TestRuntimeReviewPrompts(unittest.TestCase):
                                 "repo_full_name": "WUAIBING/MEP",
                                 "entity_type": "pr",
                                 "number": 246,
+                                "title": "Tighten bridge review grounding",
+                                "body": "Improve PR review grounding and approval behavior.",
+                                "head_ref": "feature/test",
+                                "base_ref": "main",
                                 "review_mode": review_mode,
                                 "touched_paths": github_touched_paths,
                                 "touched_tests": github_touched_tests,
@@ -466,6 +509,7 @@ class TestRuntimeReviewPrompts(unittest.TestCase):
                                     "changed_identifiers": identifiers
                                 },
                             },
+                            "runtime_tool_bundle": bundle,
                         },
                     },
                     "economics": {"bounty_seconds": 0.0, "currency": "SECONDS"},
@@ -544,6 +588,21 @@ class TestRuntimeReviewPrompts(unittest.TestCase):
         self.assertIn("Review mode is `recheck_review`.", prompt)
         self.assertIn("follow-up verification pass", prompt)
         self.assertIn("Do not invent fresh low-signal concerns", prompt)
+
+    def test_review_prompt_escalates_deep_review_for_triggered_paths(self):
+        task_data = self._bridge_review_task_data(
+            touched_paths=["hub/db.py"],
+            changed_identifiers=["get_pub_pem", "connected_nodes"],
+        )
+        prompt = mep_runtime._system_prompt_for_task(  # noqa: SLF001
+            task_data,
+            generic_max_chars=300,
+            review_max_chars=1000,
+        )
+
+        self.assertIn("Deep-review escalation is active", prompt)
+        self.assertIn("call sites", prompt)
+        self.assertIn("`get_pub_pem`", prompt)
 
     def test_review_prompt_blocks_summary_claims_that_ignore_nearby_validation_guards(self):
         prompt = mep_runtime._system_prompt_for_task(  # noqa: SLF001
@@ -781,6 +840,41 @@ class TestRuntimeReviewPrompts(unittest.TestCase):
         )
 
         self.assertEqual(action, "approved")
+
+    def test_approval_bridge_action_downgrades_when_runtime_tool_evidence_is_weak(self):
+        task_data = self._bridge_review_task_data(
+            intent_type="code.review.approve",
+            changed_identifiers=["_score_review_quality", "_approval_quality_failure"],
+            runtime_tool_bundle={
+                "contract_version": "mep.runtime_tools.v1",
+                "task_mode": "review",
+                "runs": [
+                    {
+                        "tool": "workspace_read",
+                        "status": "success",
+                        "summary": "assembled local context",
+                        "evidence": ["bridge/github_to_mep.py"],
+                    }
+                ],
+            },
+        )
+        detail = (
+            "## Review Summary\n\n"
+            "Verified the approval gate stays low-risk.\n\n"
+            "Touched paths reviewed: `bridge/github_to_mep.py`\n\n"
+            "Tests reviewed: `tests/test_github_bridge.py`\n\n"
+            "Risk areas checked: approval gating, changed-line anchoring\n\n"
+            "Checks performed: traced approval suppression branches, compared changed identifiers against the diff\n\n"
+            "Changed identifiers verified: `_score_review_quality`, `_approval_quality_failure`"
+        )
+
+        action = mep_runtime.RuntimeNode._bridge_status_action(  # noqa: SLF001
+            mep_runtime._interbot_message_from_task_data(task_data),  # noqa: SLF001
+            detail=detail,
+            task_data=task_data,
+        )
+
+        self.assertEqual(action, "reviewed")
 
     def test_recheck_review_request_bridge_action_upgrades_to_approved_for_grounded_no_finding_review(self):
         task_data = self._bridge_review_task_data(
@@ -1868,6 +1962,140 @@ class TestRuntimeWebSocketLoop(unittest.TestCase):
         self.assertIn("Automated verification run", instructions)
         self.assertNotIn("Automated verification checks were skipped", instructions)
 
+    def test_process_task_includes_workspace_tool_evidence_for_pr_reviews(self):
+        node = _runtime_node()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            os.makedirs(os.path.join(tmpdir, "bridge"), exist_ok=True)
+            with open(os.path.join(tmpdir, "bridge", "github_to_mep.py"), "w", encoding="utf-8") as handle:
+                handle.write("def live_sync_context():\n    return True\n")
+
+            task_data = TestRuntimeReviewPrompts._bridge_review_task_data()
+            payload = json.loads(task_data["payload"])
+            payload["task"]["inputs"]["github"].update(
+                {
+                    "repo_clone_url": "https://github.com/example/repo.git",
+                    "head_sha": "abc12345",
+                    "head_ref": "feature/test",
+                }
+            )
+            task_data["payload"] = json.dumps(payload)
+
+            with (
+                patch.object(
+                    node,
+                    "_build_github_context",
+                    return_value=(
+                        "GitHub context:\n- Scope: `WUAIBING/MEP#246`\n- Title: Tighten bridge review grounding",
+                        {"scope": "WUAIBING/MEP#246", "head_ref": "feature/test", "source": "task_inputs"},
+                    ),
+                ),
+                patch.object(node.workspace, "sync_pr_workspace", return_value=(True, tmpdir)),
+                patch.object(node.workspace, "build_review_context", return_value="Local workspace path: tmpdir"),
+                patch.object(node.workspace, "build_workspace_search_context", return_value="workspace_search hits from the checked-out workspace:\n\n### live_sync_context"),
+                patch.object(node.workspace, "build_workspace_git_context", return_value="workspace_git snapshot from the checked-out workspace:\n\n- HEAD commit: abc12345"),
+                patch.object(node.workspace, "build_verification_report", return_value="") as verify_mock,
+                patch.object(node.adapter, "generate_reply", return_value="reply") as adapter_mock,
+                patch.object(node, "complete"),
+            ):
+                asyncio.run(node.process_task(task_data))
+
+        self.assertTrue(verify_mock.called)
+        instructions, adapter_task_data = adapter_mock.call_args.args
+        self.assertIn("GitHub context:", instructions)
+        self.assertIn("Additional workspace_search evidence:", instructions)
+        self.assertIn("Additional workspace_git evidence:", instructions)
+        self.assertIn("Deep review escalation is active for this task.", instructions)
+        self.assertIn("Runtime tool evidence bundle:", instructions)
+        runtime_tool_bundle = adapter_task_data["task"]["inputs"]["runtime_tool_bundle"]
+        self.assertEqual(runtime_tool_bundle["contract_version"], "mep.runtime_tools.v1")
+        self.assertEqual(runtime_tool_bundle["task_mode"], "review")
+        self.assertEqual(
+            [item["tool"] for item in runtime_tool_bundle["runs"]],
+            ["github_context", "workspace_read", "workspace_search", "workspace_git", "targeted_verify"],
+        )
+
+    def test_build_github_context_prefers_api_fields_when_available(self):
+        node = _runtime_node()
+        github_inputs = {
+            "repo_full_name": "WUAIBING/MEP",
+            "entity_type": "pr",
+            "number": 246,
+            "review_mode": "discovery_review",
+            "ci_checks": {"has_checks": True, "state": "success", "all_green": True},
+        }
+        with patch.object(
+            node,
+            "_fetch_github_pr_context",
+            return_value={
+                "title": "Investigate trust boundary drift",
+                "body": "Focus on auth callers and approval routing.",
+                "user": {"login": "alice"},
+                "head": {"ref": "feature/runtime-tools"},
+                "base": {"ref": "main"},
+                "labels": [{"name": "review-runtime"}],
+            },
+        ):
+            rendered, payload = node._build_github_context(github_inputs)
+
+        self.assertIn("GitHub context:", rendered)
+        self.assertIn("Investigate trust boundary drift", rendered)
+        self.assertIn("`feature/runtime-tools` -> `main`", rendered)
+        self.assertEqual(payload["source"], "github_api")
+
+    def test_process_task_attaches_runtime_tool_bundle_for_repo_audit(self):
+        node = _runtime_node()
+        task_data = {
+            "id": "task_repo_audit",
+            "bounty": 0.0,
+            "payload": "Run a repo audit for github.com/WUAIBING/MEP.",
+            "intent": {"type": "repo_audit.request"},
+            "task": {
+                "instructions": "Run a repo audit for github.com/WUAIBING/MEP.",
+                "inputs": {
+                    "repo_audit": {
+                        "repo_url": "github.com/WUAIBING/MEP",
+                        "ref": "main",
+                        "audit_type": "full_repo_audit",
+                    }
+                },
+            },
+        }
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with (
+                patch.object(node.workspace, "sync_repo_audit_workspace", return_value=(True, tmpdir)),
+                patch.object(
+                    node.workspace,
+                    "build_repo_audit_context",
+                    return_value=("Local workspace path: tmpdir\n- README.md", ["README.md", "node/mep_runtime.py"]),
+                ),
+                patch.object(
+                    node.workspace,
+                    "build_workspace_search_context",
+                    return_value="workspace_search hits from the checked-out workspace:\n\n### mep_runtime",
+                ),
+                patch.object(
+                    node.workspace,
+                    "build_workspace_git_context",
+                    return_value="workspace_git snapshot from the checked-out workspace:\n\n- HEAD commit: abc12345",
+                ),
+                patch.object(node.adapter, "generate_reply", return_value="repo audit reply") as adapter_mock,
+                patch.object(node, "complete"),
+            ):
+                asyncio.run(node.process_task(task_data))
+
+        instructions, adapter_task_data = adapter_mock.call_args.args
+        self.assertIn("Additional repo workspace_search evidence:", instructions)
+        self.assertIn("Additional repo workspace_git evidence:", instructions)
+        self.assertIn("Runtime tool evidence bundle:", instructions)
+        runtime_tool_bundle = adapter_task_data["task"]["inputs"]["runtime_tool_bundle"]
+        self.assertEqual(runtime_tool_bundle["contract_version"], "mep.runtime_tools.v1")
+        self.assertEqual(runtime_tool_bundle["task_mode"], "repo_audit")
+        self.assertEqual(
+            [item["tool"] for item in runtime_tool_bundle["runs"]],
+            ["workspace_read", "workspace_search", "workspace_git"],
+        )
+
     def test_process_task_live_bridge_sends_frame_and_settles_when_call_is_accepted(self):
         node = _runtime_node()
         node.live_call_enabled = True
@@ -2287,6 +2515,53 @@ class TestWorkspaceReviewContext(unittest.TestCase):
                 "",
             )
 
+    def test_build_workspace_search_context_uses_python_fallback_when_rg_missing(self):
+        with (
+            tempfile.TemporaryDirectory() as tmp,
+            patch("node.mep_runtime.shutil.which", return_value=None),
+        ):
+            os.makedirs(os.path.join(tmp, "bridge"), exist_ok=True)
+            with open(os.path.join(tmp, "bridge", "github_to_mep.py"), "w", encoding="utf-8") as handle:
+                handle.write(
+                    "def build_review_context():\n"
+                    "    focus_value = 'ready'\n"
+                    "    return focus_value\n"
+                )
+            wm = mep_runtime.WorkspaceManager(tmp)
+            ctx = wm.build_workspace_search_context(
+                tmp,
+                touched_paths=["bridge/github_to_mep.py"],
+                risk_pack={"changed_identifiers": ["build_review_context", "focus_value"]},
+            )
+
+        self.assertIn("workspace_search hits from the checked-out workspace", ctx)
+        self.assertIn("build_review_context", ctx)
+        self.assertIn("focus_value", ctx)
+
+    def test_build_workspace_git_context_reports_head_and_tracked_targets(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            wm = mep_runtime.WorkspaceManager(tmp)
+
+            def fake_run_git(_cwd, args, *, timeout_seconds=60):
+                if args == ["rev-parse", "HEAD"]:
+                    return 0, "abc12345deadbeef"
+                if args == ["status", "--short", "--untracked-files=no"]:
+                    return 0, ""
+                if args[:2] == ["ls-files", "--"]:
+                    return 0, "bridge/github_to_mep.py\n"
+                return 0, ""
+
+            with patch.object(wm, "_run_git", side_effect=fake_run_git):
+                ctx = wm.build_workspace_git_context(
+                    tmp,
+                    touched_paths=["bridge/github_to_mep.py"],
+                )
+
+        self.assertIn("workspace_git snapshot from the checked-out workspace", ctx)
+        self.assertIn("abc12345deadbeef", ctx)
+        self.assertIn("Git status: clean", ctx)
+        self.assertIn("bridge/github_to_mep.py", ctx)
+
     def test_build_repo_audit_context_returns_inventory_and_key_files(self):
         with tempfile.TemporaryDirectory() as tmp:
             os.makedirs(os.path.join(tmp, "node"), exist_ok=True)
@@ -2306,6 +2581,24 @@ class TestWorkspaceReviewContext(unittest.TestCase):
         self.assertIn("Tracked file inventory", ctx)
         self.assertIn("README.md", ctx)
         self.assertIn("runtime_main", ctx)
+
+    def test_build_workspace_search_context_uses_inventory_terms_for_repo_audit(self):
+        with (
+            tempfile.TemporaryDirectory() as tmp,
+            patch("node.mep_runtime.shutil.which", return_value=None),
+        ):
+            os.makedirs(os.path.join(tmp, "node"), exist_ok=True)
+            with open(os.path.join(tmp, "node", "mep_runtime.py"), "w", encoding="utf-8") as handle:
+                handle.write("def mep_runtime_main():\n    return 'ok'\n")
+            wm = mep_runtime.WorkspaceManager(tmp)
+            ctx = wm.build_workspace_search_context(
+                tmp,
+                inventory_paths=["README.md", "node/mep_runtime.py"],
+            )
+
+        self.assertIn("workspace_search hits from the checked-out workspace", ctx)
+        self.assertIn("mep_runtime", ctx)
+        self.assertIn("mep_runtime_main", ctx)
 
     def test_sync_repo_audit_workspace_fetches_target_ref_without_all_tags(self):
         with tempfile.TemporaryDirectory() as tmp:
