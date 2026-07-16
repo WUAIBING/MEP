@@ -1359,12 +1359,12 @@ class GitHubToMEPBridgeService:
             latest_github_inputs = self._execution_github_inputs(latest_execution)
             if not latest_review_result:
                 return None
-            if str(latest_review_result.get("resolved_action") or "").strip() != "reviewed":
-                return None
-            if str(latest_review_result.get("attempted_action") or "").strip() != "approved":
-                return None
             downgrade_reason = str(latest_review_result.get("downgrade_reason") or "").strip()
-            if downgrade_reason not in {"approval_checks_pending", "approval_checks_not_green"}:
+            if not self._is_ci_downgraded_approval_execution(
+                latest_execution,
+                latest_review_result=latest_review_result,
+                downgrade_reason=downgrade_reason,
+            ):
                 return None
             if str(latest_github_inputs.get("followup_reason") or "").strip() == "ci_green_webhook":
                 return None
@@ -1442,6 +1442,23 @@ class GitHubToMEPBridgeService:
                 coalesced_actions=[action],
             )
         return None
+
+    @staticmethod
+    def _is_ci_downgraded_approval_execution(
+        execution: dict[str, Any],
+        *,
+        latest_review_result: Optional[dict[str, Any]] = None,
+        downgrade_reason: Optional[str] = None,
+    ) -> bool:
+        review_result = latest_review_result or {}
+        resolved_action = str(review_result.get("resolved_action") or execution.get("action") or "").strip()
+        attempted_action = str(review_result.get("attempted_action") or "").strip()
+        normalized_reason = str(downgrade_reason or review_result.get("downgrade_reason") or "").strip()
+        return (
+            resolved_action == "reviewed"
+            and attempted_action == "approved"
+            and normalized_reason in {"approval_checks_pending", "approval_checks_not_green"}
+        )
 
     def _get_targets_for_event(
         self, event: NormalizedGitHubEvent

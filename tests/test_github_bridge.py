@@ -1092,6 +1092,88 @@ class TestGitHubToMEPBridge(unittest.TestCase):
         self.assertEqual(duplicate_response.json()["reason"], "non_actionable")
         self.assertEqual(len(self.submission.calls), 2)
 
+    def test_green_ci_webhook_ignores_latest_execution_without_ci_downgraded_approval_guard(self):
+        event = NormalizedGitHubEvent(
+            delivery_id="delivery-seeded",
+            source_event="issue_comment",
+            source_action="created",
+            repo_full_name="WUAIBING/MEP",
+            entity_type="pr",
+            number=322,
+            title="PR 322",
+            url="https://github.com/WUAIBING/MEP/pull/322",
+            actor_login="moltbot",
+            author_association="COLLABORATOR",
+            context_id="github-WUAIBING-MEP-pr-322",
+            imperative_verb="approve",
+            intent_type="code.review.approve",
+            instructions="seeded execution for guard coverage",
+            raw_trigger_text="@Hub-Sentinel approve this PR",
+            github_inputs={
+                "url": "https://github.com/WUAIBING/MEP/pull/322",
+                "review_mode": "discovery_review",
+            },
+        )
+        self.store.create_execution(
+            event,
+            "br-seeded-322",
+            "node_target",
+            target_alias="Hub Sentinel",
+            instructions=event.instructions,
+        )
+        self.store.update_execution(
+            "br-seeded-322",
+            status="completed",
+            action="reviewed",
+            review_result={
+                "attempted_action": "approved",
+                "resolved_action": "reviewed",
+                "published": True,
+                "suppressed": False,
+                "retry_queued": False,
+                "retry_count": 0,
+            },
+        )
+        self._set_pr_review_package(
+            [
+                {
+                    "filename": "bridge/github_to_mep.py",
+                    "status": "modified",
+                    "additions": 3,
+                    "deletions": 0,
+                    "changes": 3,
+                    "patch": "@@ -1,0 +1,3 @@\n+def green_ci_followup_guard():\n+    return True\n",
+                }
+            ],
+            pr_body="Seeded CI-green follow-up guard coverage.",
+            checks_payload={
+                "total_count": 2,
+                "check_runs": [
+                    {
+                        "name": "test (ubuntu-latest, 3.10)",
+                        "status": "completed",
+                        "conclusion": "success",
+                    },
+                    {
+                        "name": "test (windows-latest, 3.10)",
+                        "status": "completed",
+                        "conclusion": "success",
+                    },
+                ],
+            },
+            fetch_cycles=2,
+        )
+
+        response = self._post_webhook(
+            _check_run_payload(pr_number=322),
+            delivery_id="delivery-ci-followup-guard",
+            event_name="check_run",
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["status"], "ignored")
+        self.assertEqual(response.json()["reason"], "non_actionable")
+        self.assertEqual(len(self.submission.calls), 0)
+
     def test_status_callback_allows_approve_with_grounded_code_and_test_awareness(self):
         self._set_pr_review_package(
             [
