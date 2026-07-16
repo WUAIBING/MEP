@@ -598,6 +598,35 @@ def _review_patch_visible_identifier_tokens(task_data: Optional[dict[str, Any]])
     return visible_tokens
 
 
+def _review_has_patch_grounding_context(task_data: Optional[dict[str, Any]]) -> bool:
+    github_inputs = _review_github_inputs(task_data or {})
+    changed_files = github_inputs.get("changed_files")
+    if isinstance(changed_files, list) and any(isinstance(item, dict) for item in changed_files):
+        return True
+    hunk_contexts = github_inputs.get("hunk_contexts")
+    if isinstance(hunk_contexts, list) and any(isinstance(item, dict) for item in hunk_contexts):
+        return True
+    return False
+
+
+def _review_patch_changed_identifier_tokens(task_data: Optional[dict[str, Any]]) -> set[str]:
+    github_inputs = _review_github_inputs(task_data or {})
+    changed_tokens: set[str] = set()
+    changed_files = github_inputs.get("changed_files")
+    if isinstance(changed_files, list):
+        for item in changed_files:
+            if not isinstance(item, dict):
+                continue
+            changed_tokens.update(_extract_review_identifier_tokens(item.get("patch_excerpt")))
+    hunk_contexts = github_inputs.get("hunk_contexts")
+    if isinstance(hunk_contexts, list):
+        for item in hunk_contexts:
+            if not isinstance(item, dict):
+                continue
+            changed_tokens.update(_extract_review_identifier_tokens(item.get("changed_lines")))
+    return changed_tokens
+
+
 def _filter_review_identifiers_to_patch_visibility(
     values: list[str],
     *,
@@ -609,6 +638,35 @@ def _filter_review_identifiers_to_patch_visibility(
     if not visible_tokens:
         return values
     return [item for item in values if item.lower() in visible_tokens]
+
+
+def _filter_review_identifiers_to_changed_patch(
+    values: list[str],
+    *,
+    task_data: Optional[dict[str, Any]],
+) -> list[str]:
+    if not values:
+        return []
+    changed_tokens = _review_patch_changed_identifier_tokens(task_data)
+    if not changed_tokens:
+        return values if not _review_has_patch_grounding_context(task_data) else []
+    return [item for item in values if item.lower() in changed_tokens]
+
+
+def _filter_review_identifiers_to_allowed(values: list[str], allowed_identifiers: list[str]) -> list[str]:
+    if not values or not allowed_identifiers:
+        return []
+    allowed = {item.lower(): item for item in allowed_identifiers if item}
+    filtered: list[str] = []
+    seen: set[str] = set()
+    for item in values:
+        normalized = item.lower()
+        matched = allowed.get(normalized)
+        if not matched or normalized in seen:
+            continue
+        filtered.append(matched)
+        seen.add(normalized)
+    return filtered
 
 
 def _review_intent_type(task_data: dict[str, Any]) -> str:
@@ -1190,6 +1248,16 @@ def _review_text_uses_only_allowed_identifiers(text: str, allowed_identifiers: l
     tokens = _extract_review_identifier_tokens(text)
     if not tokens or not allowed_identifiers:
         return True
+    allowed = {item.lower() for item in allowed_identifiers if item}
+    return tokens.issubset(allowed)
+
+
+def _review_text_uses_only_changed_identifiers(text: str, allowed_identifiers: list[str]) -> bool:
+    tokens = _extract_review_identifier_tokens(text)
+    if not tokens:
+        return True
+    if not allowed_identifiers:
+        return False
     allowed = {item.lower() for item in allowed_identifiers if item}
     return tokens.issubset(allowed)
 
@@ -1929,7 +1997,7 @@ def _render_default_structured_review(
         if isinstance(risk_pack, dict)
         else []
     )
-    verified_identifiers = _filter_review_identifiers_to_patch_visibility(
+    verified_identifiers = _filter_review_identifiers_to_changed_patch(
         verified_identifiers,
         task_data=task_data,
     )
@@ -2506,6 +2574,10 @@ def _render_structured_review_with_task_data(
         allowed_identifiers,
         task_data=task_data,
     )
+    changed_line_identifiers = _filter_review_identifiers_to_changed_patch(
+        allowed_identifiers,
+        task_data=task_data,
+    )
     summary = _clean_review_text(parsed.get("summary"), max_chars=500)
     if _is_weak_review_text(summary):
         summary = ""
@@ -2523,7 +2595,7 @@ def _render_structured_review_with_task_data(
     risk_areas_checked = _clean_review_list(parsed.get("risk_areas_checked"), max_items=4, max_chars=100)
     checks_performed = _clean_review_list(parsed.get("checks_performed"), max_items=4, max_chars=120)
     verified_identifiers = _clean_review_identifier_list(parsed.get("verified_identifiers"), max_items=4, max_chars=80)
-    verified_identifiers = _filter_review_list_to_allowed(verified_identifiers, allowed_identifiers)
+    verified_identifiers = _filter_review_identifiers_to_allowed(verified_identifiers, allowed_identifiers)
     if summary and (
         not _review_text_uses_only_allowed_identifiers(summary, allowed_identifiers)
         or not _review_text_uses_only_allowed_snippets(
@@ -2593,8 +2665,18 @@ def _render_structured_review_with_task_data(
     if findings and allowed_identifiers and not verified_identifiers:
         findings = []
     if not approval_mode and not findings:
+        verified_identifiers = _filter_review_identifiers_to_allowed(verified_identifiers, changed_line_identifiers)
+        if summary and not _review_text_uses_only_changed_identifiers(summary, changed_line_identifiers):
+            summary = ""
+        if observation and not _review_text_uses_only_changed_identifiers(observation, changed_line_identifiers):
+            observation = ""
+        checks_performed = [
+            entry
+            for entry in checks_performed
+            if _review_text_uses_only_changed_identifiers(entry, changed_line_identifiers)
+        ]
         if not verified_identifiers:
-            verified_identifiers = allowed_identifiers[:3]
+            verified_identifiers = changed_line_identifiers[:3]
         if not risk_areas_checked:
             risk_areas_checked = _default_review_risk_areas(task_data)
         checks_performed = _default_review_checks(

@@ -796,6 +796,42 @@ class TestRuntimeReviewPrompts(unittest.TestCase):
             rendered,
         )
 
+    def test_structured_review_omits_context_only_verified_identifiers_for_comment_only_change(self):
+        rendered = mep_runtime._render_structured_review_with_task_data(  # noqa: SLF001
+            (
+                '{"summary":"Checked `_add_trigger` and found no blocker.",'
+                '"observation":"`_add_trigger` stays scoped to `node/mep_runtime.py`.",'
+                '"touched_paths":["node/mep_runtime.py"],'
+                '"tests_reviewed":["tests/test_node_runtime.py"],'
+                '"verified_identifiers":["_add_trigger"],'
+                '"findings":[]}'
+            ),
+            max_chars=1200,
+            task_data=self._bridge_review_task_data(
+                changed_identifiers=["_add_trigger"],
+                touched_paths=["node/mep_runtime.py"],
+                touched_tests=["tests/test_node_runtime.py"],
+                changed_files=[
+                    {
+                        "filename": "node/mep_runtime.py",
+                        "status": "modified",
+                        "patch_excerpt": "+    # Some tokens intentionally overlap across trust buckets.\n",
+                    },
+                    {
+                        "filename": "tests/test_node_runtime.py",
+                        "status": "modified",
+                        "patch_excerpt": "+def test_comment_only_grounding(self):\n+    assert True\n",
+                    },
+                ],
+            ),
+        )
+
+        self.assertIn("## Review Summary", rendered)
+        self.assertIn("Touched paths reviewed: `node/mep_runtime.py`", rendered)
+        self.assertIn("Tests reviewed: `tests/test_node_runtime.py`", rendered)
+        self.assertNotIn("Changed identifiers verified:", rendered)
+        self.assertNotIn("_add_trigger` stays scoped", rendered)
+
     def test_approval_bridge_action_downgrades_when_rendered_review_still_has_findings(self):
         task_data = self._bridge_review_task_data(
             intent_type="code.review.approve",
