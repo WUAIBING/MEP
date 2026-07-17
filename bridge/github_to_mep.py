@@ -148,6 +148,9 @@ _SPECULATIVE_FINDING_PATTERNS = [
     r"\blikely\s+(?:drop|drops|filter|filters|skip|skips|alter|alters|misalign|misaligns)\b",
     r"\bmay\s+(?:silently\s+)?(?:drop|skip|alter|misalign|filter)\b",
     r"\bcould cause\b",
+    r"\bmay\s+cause\b",
+    r"\bcould\s+lead\s+to\b",
+    r"\btooling issues?\b",
 ]
 
 
@@ -2980,6 +2983,9 @@ class GitHubToMEPBridgeService:
         expected_tests = snapshot.get("expected_tests") or []
         mentions_tests = bool(snapshot.get("mentions_tests"))
         lowered = str(snapshot.get("lowered") or "")
+        reviewability_bucket = str(
+            ((snapshot.get("reviewability") or {}).get("bucket") or "standard")
+        ).strip().lower()
 
         if anchored_paths:
             path_anchor_units = min(len(anchored_paths), 2) / 2
@@ -2999,8 +3005,18 @@ class GitHubToMEPBridgeService:
         elif changed_verified_identifiers:
             reasons.append("verified_changed_identifiers")
         if has_findings:
-            raw_score += _QUALITY_SCORE_WEIGHTS["review_substance"]
-            reasons.append("concrete_findings")
+            finding_substance_weight = _QUALITY_SCORE_WEIGHTS["review_substance"]
+            speculative_low_signal_finding = (
+                reviewability_bucket == "low_signal"
+                and changed_evidence_count < 2
+                and self._is_speculative_finding("\n".join(filter(None, [summary_text, observation_text, lowered])))
+            )
+            if speculative_low_signal_finding:
+                finding_substance_weight /= 2
+                reasons.append("speculative_low_signal_finding")
+            else:
+                reasons.append("concrete_findings")
+            raw_score += finding_substance_weight
         elif (summary_text or observation_text) and (changed_tokens or grounded_tokens or changed_verified_identifiers):
             raw_score += _QUALITY_SCORE_WEIGHTS["review_substance"] / 2
             reasons.append("grounded_summary_or_observation")

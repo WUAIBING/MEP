@@ -1391,6 +1391,43 @@ class TestGitHubToMEPBridge(unittest.TestCase):
         self.assertEqual(score, 10)
         self.assertIn("explicit_low_risk_claim", reasons)
 
+    def test_score_review_quality_downweights_speculative_low_signal_finding(self):
+        score, reasons = self.service._score_review_quality(  # noqa: SLF001
+            {
+                "anchored_paths": {
+                    "docs/node-reputation/DESIGN.md",
+                    "docs/node-reputation/node-reputation-v1.schema.json",
+                },
+                "changed_tokens": set(),
+                "grounded_tokens": {"id"},
+                "has_findings": True,
+                "summary_text": (
+                    "PR adds draft specification documents for node reputation and identifies a potential schema id consistency issue."
+                ),
+                "observation_text": (
+                    "The schema id points to an external repository, which may cause resolution failures in local validation."
+                ),
+                "risk_areas_checked": ["schema id consistency", "test coverage for new JSON schema"],
+                "checks_performed": [
+                    "verified the id field against the added schema file",
+                    "checked the PR for new validation tests",
+                ],
+                "changed_verified_identifiers": ["id"],
+                "expected_tests": [],
+                "mentions_tests": True,
+                "lowered": (
+                    "the schema id points to an external repository, which may cause resolution failures "
+                    "and could lead to tooling issues in local validation. tests reviewed."
+                ),
+                "reviewability": {"bucket": "low_signal"},
+            },
+            action="reviewed",
+        )
+
+        self.assertEqual(score, 7)
+        self.assertIn("speculative_low_signal_finding", reasons)
+        self.assertNotIn("concrete_findings", reasons)
+
     def test_score_review_quality_empty_snapshot_returns_zero(self):
         score, reasons = self.service._score_review_quality({}, action="reviewed")  # noqa: SLF001
 
@@ -3834,6 +3871,76 @@ class TestGitHubToMEPBridge(unittest.TestCase):
                     "Reviewed PR #123 onboarding dependency validation.\n\n"
                     "1. **The dependency validation only checks `REQUIRED_PACKAGES`, but the rest of the validation flow may be incomplete.** (`node/mep_runtime.py`): "
                     "If intended for broader startup validation, this suggests incomplete implementation and potentially leaving other dependencies unvalidated."
+                ),
+            },
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        self.assertEqual(status_response.status_code, 200, status_response.text)
+        self.assertEqual(len(self.github_session.posts), 0)
+        self.assertEqual(self.service.github_writeback_metrics["last_suppressed_reason"], "speculative_finding")
+
+    def test_status_callback_suppresses_speculative_docs_schema_finding(self):
+        self._set_pr_review_package(
+            [
+                {
+                    "filename": "docs/node-reputation/DESIGN.md",
+                    "status": "added",
+                    "additions": 120,
+                    "deletions": 0,
+                    "changes": 120,
+                    "patch": (
+                        "@@ -0,0 +1,6 @@\n"
+                        "+# MEP Node Reputation v1\n"
+                        "+\n"
+                        "+MEP_START_BONUS_ENABLED=false\n"
+                        "+MEP_VERIFICATION_THRESHOLD_DEFAULT=10\n"
+                        "+MEP_VERIFY_DETERMINISTIC=true\n"
+                    ),
+                },
+                {
+                    "filename": "docs/node-reputation/node-reputation-v1.schema.json",
+                    "status": "added",
+                    "additions": 20,
+                    "deletions": 0,
+                    "changes": 20,
+                    "patch": (
+                        "@@ -0,0 +1,8 @@\n"
+                        "+{\n"
+                        '+  "$schema": "https://json-schema.org/draft/2020-12/schema",\n'
+                        '+  "$id": "https://github.com/WUAIBING/MEP-spec/schemas/node-reputation-v1.schema.json",\n'
+                        '+  "title": "MEP Node Reputation v1"\n'
+                        "+}\n"
+                    ),
+                },
+            ],
+            pr_body="Adds draft node reputation design and schema artifacts.",
+        )
+        response = self._post_webhook(
+            _issue_comment_payload("@Hub-Sentinel review this PR", delivery_number=125),
+            delivery_id="delivery-speculative-docs-schema-finding",
+        )
+        self.assertEqual(response.status_code, 200)
+        bridge_id = response.json()["bridge_id"]
+        self._flush_context(response.json()["context_id"])
+
+        token = self.service._generate_status_token(bridge_id, "node_target")
+        status_response = self.client.post(
+            "/bridge/status",
+            json={
+                "bridge_id": bridge_id,
+                "status": "completed",
+                "target_node_id": "node_target",
+                "task_id": "task-speculative-docs-schema-finding",
+                "detail": (
+                    "## Review Findings\n\n"
+                    "PR adds draft specification documents for MEP node reputation system; identified a potential schema id consistency issue for review.\n\n"
+                    "Observation: The DESIGN.md includes explicit open decision markers to facilitate inline discussion, aligning with the draft PR intent.\n\n"
+                    "Touched paths reviewed: `docs/node-reputation/DESIGN.md`, `docs/node-reputation/node-reputation-v1.schema.json`\n\n"
+                    "Risk areas checked: schema id consistency with repository structure, test coverage for new JSON schema, design doc identifier definitions\n\n"
+                    "Checks performed: verified the id field in node-reputation-v1.schema.json for alignment with the MEP repo, checked PR changes for new validation test files, scanned DESIGN.md for identifier clarity\n\n"
+                    "Changed identifiers verified: `id`\n\n"
+                    "1. **Schema id points to external repository (WUAIBING/MEP-spec), which may cause resolution failures if used for validation within MEP repo.** (`docs/node-reputation/node-reputation-v1.schema.json`): "
+                    "The id is set to an external repository path and could lead to tooling issues or misalignment when this schema is referenced for validation in the MEP context."
                 ),
             },
             headers={"Authorization": f"Bearer {token}"},
