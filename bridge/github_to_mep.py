@@ -28,13 +28,7 @@ except ImportError:  # pragma: no cover - direct file execution may not see repo
     _shared_review_patterns = None
 
 
-SUPPORTED_GITHUB_EVENTS = {
-    "issue_comment",
-    "pull_request",
-    "pull_request_review_comment",
-    "check_run",
-    "check_suite",
-}
+SUPPORTED_GITHUB_EVENTS = {"issue_comment", "pull_request", "pull_request_review_comment"}
 DEFAULT_TRIGGER_VERBS = {
     "review": "code.review.request",
     "rereview": "code.review.request",
@@ -731,29 +725,6 @@ class BridgeStore:
         record["review_feedback"] = self._decode_json_dict(record.get("review_feedback_json"))
         return record
 
-    def get_latest_execution_for_pr(self, repo_full_name: str, issue_number: int) -> Optional[dict[str, Any]]:
-        conn = self._connect()
-        cursor = conn.cursor()
-        cursor.execute(
-            """
-            SELECT *
-            FROM bridge_executions
-            WHERE repo_full_name = ? AND issue_number = ? AND entity_type = 'pr'
-            ORDER BY updated_at DESC
-            LIMIT 1
-            """,
-            (repo_full_name, issue_number),
-        )
-        row = cursor.fetchone()
-        conn.close()
-        if row is None:
-            return None
-        record = dict(row)
-        record["github_inputs"] = self._decode_json_dict(record.get("github_inputs_json"))
-        record["review_result"] = self._decode_json_dict(record.get("review_result_json"))
-        record["review_feedback"] = self._decode_json_dict(record.get("review_feedback_json"))
-        return record
-
     def list_recent_review_trials(self, *, limit: int = 20) -> list[dict[str, Any]]:
         safe_limit = max(1, min(int(limit), 200))
         conn = self._connect()
@@ -1206,13 +1177,6 @@ class GitHubToMEPBridgeService:
             return None
         if self.config.allowed_repos and repo_full_name not in self.config.allowed_repos:
             return None
-        if github_event in {"check_run", "check_suite"}:
-            return self._normalize_ci_followup_event(
-                delivery_id=delivery_id,
-                github_event=github_event,
-                payload=payload,
-                repo_full_name=repo_full_name,
-            )
 
         action = str(payload.get("action") or "").strip() or "unknown"
         entity_type = "pr"
@@ -1324,224 +1288,10 @@ class GitHubToMEPBridgeService:
             coalesced_actions=[action],
         )
 
-    def _normalize_ci_followup_event(
-        self,
-        *,
-        delivery_id: str,
-        github_event: str,
-        payload: dict[str, Any],
-        repo_full_name: str,
-    ) -> Optional[NormalizedGitHubEvent]:
-        action = str(payload.get("action") or "").strip() or "unknown"
-        check_key = "check_run" if github_event == "check_run" else "check_suite"
-        check_payload = payload.get(check_key)
-        if not isinstance(check_payload, dict):
-            return None
-        status = str(check_payload.get("status") or "").strip().lower()
-        if action != "completed" or status != "completed":
-            return None
-        conclusion = str(check_payload.get("conclusion") or "").strip().lower()
-        if conclusion not in {"success", "neutral", "skipped"}:
-            return None
-        pr_refs = check_payload.get("pull_requests")
-        if not isinstance(pr_refs, list) or not pr_refs:
-            return None
-        sender = payload.get("sender") if isinstance(payload.get("sender"), dict) else {}
-        actor_login = str(sender.get("login") or "github-actions[bot]")
-
-        for pr_ref in pr_refs:
-            if not isinstance(pr_ref, dict):
-                continue
-            number = pr_ref.get("number")
-            if not isinstance(number, int) or number <= 0:
-                continue
-            review_package = self._fetch_pr_review_package(repo_full_name, number)
-            ci_checks = review_package.get("ci_checks") or {}
-            if not ci_checks.get("has_checks") or not ci_checks.get("all_green"):
-                return None
-            latest_execution = self.store.get_latest_execution_for_pr(repo_full_name, number)
-            if latest_execution is None:
-                bootstrap_target_node_id = self.config.target_node_id.strip()
-                bootstrap_target_alias = self.config.target_alias.strip() or "Hub Sentinel"
-                if not bootstrap_target_node_id:
-                    continue
-                url = str(pr_ref.get("html_url") or f"https://github.com/{repo_full_name}/pull/{number}").strip()
-                review_mode = self._review_mode_for_verb("review")
-                review_context = str(review_package.get("instructions_context") or "")
-                title = str(review_package.get("title") or f"PR #{number}").strip() or f"PR #{number}"
-                trigger_text = (
-                    "Automatic bootstrap: GitHub CI is green and no prior bridge execution exists. "
-                    "Review the latest diff and checks, and only publish grounded findings or a grounded no-finding review."
-                )
-                bootstrap_github_inputs = {
-                    "repo_full_name": repo_full_name,
-                    "entity_type": "pr",
-                    "number": number,
-                    "url": url,
-                    "actor_login": actor_login,
-                    "author_association": "",
-                    "delivery_id": delivery_id,
-                    "source_event": github_event,
-                    "source_action": action,
-                    "trigger_verb": "review",
-                    "review_mode": review_mode,
-                    "followup_reason": "ci_green_bootstrap",
-                    "followup_target_alias": bootstrap_target_alias,
-                    "followup_target_node_id": bootstrap_target_node_id,
-                }
-                compact_review_package = self._compact_review_package_for_task_inputs(review_package)
-                for key, value in compact_review_package.items():
-                    if key != "instructions_context":
-                        bootstrap_github_inputs[key] = value
-                instructions = self._build_instructions(
-                    repo_full_name=repo_full_name,
-                    entity_type="pr",
-                    number=number,
-                    title=title,
-                    url=url,
-                    actor_login=actor_login,
-                    action=action,
-                    imperative_verb="review",
-                    review_mode=review_mode,
-                    trigger_text=trigger_text,
-                    review_context=review_context,
-                )
-                owner, repo_name = repo_full_name.split("/", 1)
-                return NormalizedGitHubEvent(
-                    delivery_id=delivery_id,
-                    source_event=github_event,
-                    source_action=action,
-                    repo_full_name=repo_full_name,
-                    entity_type="pr",
-                    number=number,
-                    title=title,
-                    url=url,
-                    actor_login=actor_login,
-                    author_association="",
-                    context_id=f"github-{owner}-{repo_name}-pr-{number}",
-                    imperative_verb="review",
-                    intent_type=DEFAULT_TRIGGER_VERBS["review"],
-                    instructions=instructions,
-                    raw_trigger_text="",
-                    github_inputs=bootstrap_github_inputs,
-                    coalesced_delivery_ids=[delivery_id],
-                    coalesced_actions=[action],
-                )
-            latest_review_result = latest_execution.get("review_result") or {}
-            latest_github_inputs = self._execution_github_inputs(latest_execution)
-            if not latest_review_result:
-                return None
-            downgrade_reason = str(latest_review_result.get("downgrade_reason") or "").strip()
-            if not self._is_ci_downgraded_approval_execution(
-                latest_execution,
-                latest_review_result=latest_review_result,
-                downgrade_reason=downgrade_reason,
-            ):
-                return None
-            if str(latest_github_inputs.get("followup_reason") or "").strip() == "ci_green_webhook":
-                return None
-
-            url = str(
-                latest_github_inputs.get("url")
-                or pr_ref.get("html_url")
-                or f"https://github.com/{repo_full_name}/pull/{number}"
-            ).strip()
-            imperative_verb = str(latest_execution.get("imperative_verb") or "approve").strip() or "approve"
-            review_mode = str(latest_github_inputs.get("review_mode") or self._review_mode_for_verb(imperative_verb)).strip()
-            intent_type = str(latest_execution.get("intent_type") or DEFAULT_TRIGGER_VERBS["approve"]).strip()
-            review_context = str(review_package.get("instructions_context") or "")
-            title = str(latest_github_inputs.get("title") or f"PR #{number}").strip() or f"PR #{number}"
-            trigger_text = (
-                "Automatic follow-up: GitHub CI turned green after an earlier approval attempt was downgraded. "
-                "Re-evaluate the latest diff and checks, and only approve if the evidence is still grounded."
-            )
-            followup_github_inputs = {
-                **latest_github_inputs,
-                "delivery_id": delivery_id,
-                "source_event": github_event,
-                "source_action": action,
-                "trigger_verb": imperative_verb,
-                "review_mode": review_mode,
-                "followup_reason": "ci_green_webhook",
-                "followup_of_bridge_id": str(latest_execution.get("bridge_id") or ""),
-                "followup_target_alias": str(latest_execution.get("target_alias") or "").strip(),
-                "followup_target_node_id": str(latest_execution.get("target_node_id") or "").strip(),
-            }
-            compact_review_package = self._compact_review_package_for_task_inputs(review_package)
-            for key, value in compact_review_package.items():
-                if key != "instructions_context":
-                    followup_github_inputs[key] = value
-            instructions = self._build_instructions(
-                repo_full_name=repo_full_name,
-                entity_type="pr",
-                number=number,
-                title=title,
-                url=url,
-                actor_login=actor_login,
-                action=action,
-                imperative_verb=imperative_verb,
-                review_mode=review_mode,
-                trigger_text=trigger_text,
-                review_context=review_context,
-            )
-            context_id = str(latest_execution.get("context_id") or "").strip()
-            if not context_id:
-                owner, repo_name = repo_full_name.split("/", 1)
-                context_id = f"github-{owner}-{repo_name}-pr-{number}"
-            return NormalizedGitHubEvent(
-                delivery_id=delivery_id,
-                source_event=github_event,
-                source_action=action,
-                repo_full_name=repo_full_name,
-                entity_type="pr",
-                number=number,
-                title=title,
-                url=url,
-                actor_login=actor_login,
-                author_association="",
-                context_id=context_id,
-                imperative_verb=imperative_verb,
-                intent_type=intent_type,
-                instructions=instructions,
-                raw_trigger_text="",
-                github_inputs=followup_github_inputs,
-                coalesced_delivery_ids=[delivery_id],
-                coalesced_actions=[action],
-            )
-        return None
-
-    @staticmethod
-    def _is_ci_downgraded_approval_execution(
-        execution: dict[str, Any],
-        *,
-        latest_review_result: Optional[dict[str, Any]] = None,
-        downgrade_reason: Optional[str] = None,
-    ) -> bool:
-        review_result = latest_review_result or {}
-        resolved_action = str(review_result.get("resolved_action") or execution.get("action") or "").strip()
-        attempted_action = str(review_result.get("attempted_action") or "").strip()
-        normalized_reason = str(downgrade_reason or review_result.get("downgrade_reason") or "").strip()
-        return (
-            resolved_action == "reviewed"
-            and attempted_action == "approved"
-            and normalized_reason in {"approval_checks_pending", "approval_checks_not_green"}
-        )
-
     def _get_targets_for_event(
         self, event: NormalizedGitHubEvent
     ) -> list[TriggerMatch]:
         """Re-extract multi-target triggers from a normalized event's trigger text."""
-        explicit_alias = str(event.github_inputs.get("followup_target_alias") or "").strip()
-        explicit_node_id = str(event.github_inputs.get("followup_target_node_id") or "").strip()
-        if explicit_alias and explicit_node_id:
-            return [
-                TriggerMatch(
-                    alias=explicit_alias,
-                    verb=event.imperative_verb,
-                    intent_type=event.intent_type,
-                    node_id=explicit_node_id,
-                )
-            ]
         return self._extract_triggers(event.raw_trigger_text)
 
     @staticmethod
@@ -3049,11 +2799,13 @@ class GitHubToMEPBridgeService:
             return "approval_contains_findings"
         if not snapshot.get("anchored_paths"):
             return "approval_without_touched_path_anchor"
-        if not snapshot.get("changed_tokens"):
+        if not snapshot.get("changed_tokens") and not snapshot.get("changed_verified_identifiers"):
             return "approval_without_changed_code_evidence"
+        if not snapshot.get("changed_verified_identifiers"):
+            return "approval_without_verified_evidence"
         if snapshot.get("expected_tests") and not snapshot.get("mentions_tests"):
             return "approval_without_test_awareness"
-        if score < 6:
+        if score < 7:
             return "approval_below_quality_bar"
         return None
 
@@ -4297,6 +4049,8 @@ class GitHubToMEPBridgeService:
             critique += "The code identifiers you mentioned are in the file context but NOT in the actual changed lines (+/-). Please focus your review on the actual changes."
         elif reason == "approval_without_changed_code_evidence":
             critique += "You attempted to approve the PR without citing changed-line code evidence. Reference concrete identifiers from the actual diff before approving."
+        elif reason == "approval_without_verified_evidence":
+            critique += "You attempted to approve the PR without listing explicit verified changed identifiers. Add a 'Changed identifiers verified:' section with concrete identifiers from the actual diff before approving."
         elif reason == "approval_without_test_awareness":
             critique += "You attempted to approve the PR without acknowledging the relevant changed tests. Re-check the diff and mention the test coverage you relied on."
         elif reason == "approval_below_quality_bar":
