@@ -16,6 +16,7 @@ hub_data/
 !.env.example
 
 # Execution artifacts
+.dbg/
 provider.log
 temp_script.py
 temp_script.sh
