@@ -3070,6 +3070,39 @@ class GitHubToMEPBridgeService:
         return reason not in {"low_signal_no_finding"}
 
     @classmethod
+    def _tune_quality_weights_from_feedback(cls, feedback_verdicts: list[str], current_weights: dict[str, float]) -> dict[str, float]:
+        """Adjust _QUALITY_SCORE_WEIGHTS based on human feedback verdicts.
+
+        - false_positive: decrease evidence weights (overly sensitive reviewer)
+        - missed_issue: increase evidence weights (not deep enough)
+        - useful: no change (balanced)
+
+        Returns a new weights dict (does not mutate the input).
+        """
+        weights = dict(current_weights)
+        if not feedback_verdicts:
+            return weights
+        false_positives = sum(1 for v in feedback_verdicts if v == "false_positive")
+        missed = sum(1 for v in feedback_verdicts if v == "missed_issue")
+        total = len(feedback_verdicts)
+        if total == 0:
+            return weights
+        # If >30% are false positives, slightly reduce evidence weights
+        if false_positives / total > 0.3:
+            for key in ("path_anchor", "changed_code_evidence", "review_substance"):
+                if key in weights:
+                    weights[key] = max(0.5, weights[key] - 0.2)
+        # If >20% are missed issues, increase evidence weights
+        if missed / total > 0.2:
+            for key in ("path_anchor", "changed_code_evidence", "risk_coverage"):
+                if key in weights:
+                    weights[key] = min(5.0, weights[key] + 0.2)
+        # Clamp all weights to [0.5, 5.0]
+        for key in weights:
+            weights[key] = max(0.5, min(5.0, weights[key]))
+        return weights
+
+    @classmethod
     def _verify_review_findings_against_patch(
         cls,
         detail: str,
@@ -4053,6 +4086,23 @@ class GitHubToMEPBridgeService:
         elif existing.get("notes"):
             feedback["notes"] = str(existing.get("notes"))
         self.store.update_execution(bridge_id, review_feedback=feedback)
+
+        # After every Nth feedback, tune quality score weights
+        if verdict and os.environ.get("MEP_FEEDBACK_TUNE_WEIGHTS", "").strip() in ("1", "true"):
+            recent = self.store.list_recent_review_trials(limit=50)
+            verdicts = [
+                str(t.get("review_feedback", {}).get("verdict") or "").strip().lower()
+                for t in recent
+                if t.get("review_feedback", {}).get("verdict")
+            ]
+            if len(verdicts) >= 5:
+                new_weights = self._tune_quality_weights_from_feedback(verdicts, _QUALITY_SCORE_WEIGHTS)
+                changed = {k: v for k, v in new_weights.items() if _QUALITY_SCORE_WEIGHTS.get(k) != v}
+                if changed:
+                    for k, v in new_weights.items():
+                        _QUALITY_SCORE_WEIGHTS[k] = v
+                    print(f"[mep feedback] tuned quality weights: {changed} (based on {len(verdicts)} verdicts)")
+
         return {"status": "ok", "bridge_id": bridge_id, "review_feedback": feedback}
 
     def label_review_trials_batch(self, update: BridgeReviewBatchLabelUpdate, token: str) -> dict[str, Any]:
