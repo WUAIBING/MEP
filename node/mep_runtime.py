@@ -3396,6 +3396,22 @@ class WorkspaceManager:
 
     def _run_git(self, cwd: str, args: list[str], *, timeout_seconds: int = 60) -> tuple[int, str]:
         try:
+            # Sanitize environment for git subprocesses to prevent
+            # hostile repo hooks/config from leaking secrets or executing
+            # uncontrolled code. Keep only essential env vars.
+            safe_env = {
+                "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+                "HOME": os.environ.get("HOME", "/tmp"),
+                "USER": os.environ.get("USER", "nobody"),
+                "USERPROFILE": os.environ.get("USERPROFILE", os.environ.get("HOME", "/tmp")),
+                "SYSTEMROOT": os.environ.get("SYSTEMROOT", ""),
+                "TMP": os.environ.get("TMP", "/tmp"),
+                "TEMP": os.environ.get("TEMP", "/tmp"),
+                "GIT_CONFIG_NOSYSTEM": "1",
+                "GIT_CONFIG_NOGLOBAL": "1",
+                "GIT_TERMINAL_PROMPT": "0",
+                "GCM_INTERACTIVE": "Never",
+            }
             result = subprocess.run(
                 ["git", *args],
                 cwd=cwd,
@@ -3403,6 +3419,7 @@ class WorkspaceManager:
                 text=True,
                 check=False,
                 timeout=timeout_seconds,
+                env=safe_env,
             )
             return result.returncode, (result.stdout + result.stderr).strip()
         except Exception as exc:  # noqa: BLE001
@@ -3707,7 +3724,12 @@ class WorkspaceManager:
         if not normalized_term:
             return []
         hits: list[str] = []
+        _search_start = time.monotonic()
+        _search_timeout = 30.0  # seconds
         for root, dirs, files in os.walk(workspace_path):
+            if time.monotonic() - _search_start > _search_timeout:
+                hits.append("[workspace_search] search timed out after 30s")
+                break
             dirs[:] = [name for name in dirs if name != ".git"]
             for name in files:
                 absolute = os.path.join(root, name)
@@ -4104,6 +4126,34 @@ class WorkspaceManager:
             if path and os.path.isfile(path):
                 resolved.append(text)
         return resolved
+
+    @staticmethod
+    def _scan_for_secrets(text: str, max_findings: int = 8) -> list[str]:
+        """Scan workspace text for potential secrets before prompt injection.
+
+        Returns a list of redacted lines. The caller should either abort or
+        redact the marked lines before sending to the LLM provider.
+        """
+        findings: list[str] = []
+        patterns = [
+            (r'(?:sk-[a-zA-Z0-9]{20,})', 'OpenAI key'),
+            (r'(?:gh[pousr]_[a-zA-Z0-9]{20,})', 'GitHub token'),
+            (r'(?:AKIA[0-9A-Z]{16})', 'AWS access key'),
+            (r'(?:AIza[0-9A-Za-z_-]{35})', 'Google API key'),
+            (r'(?:Bearer\s+[a-zA-Z0-9_\-\.]{20,})', 'Bearer token'),
+            (r'(?:password|passwd|secret)\s*[:=]\s*[\'"][^\'"]+[\'"]', 'Hardcoded password'),
+            (r'(?:api[_-]?key|apikey)\s*[:=]\s*[\'"][^\'"]+[\'"]', 'API key assignment'),
+            (r'(?:DATABASE_URL|REDIS_URL|MONGODB_URI)\s*[:=]\s*[\'"][^\'"]+[\'"]', 'Database URL'),
+        ]
+        import re
+
+        for line in text.splitlines():
+            for pattern, label in patterns:
+                if re.search(pattern, line, re.IGNORECASE):
+                    findings.append(f"[SECRET-SCAN:{label}] {line[:120]}")
+                    if len(findings) >= max_findings:
+                        return findings
+        return findings
 
     def verification_policy_note(self, task_data: dict[str, Any]) -> str:
         github_inputs = _review_github_inputs(task_data)
@@ -5168,7 +5218,17 @@ class RuntimeNode:
                             )
                 else:
                     print(f"[mep workspace] sync failed: {path_or_err}")
-                    # We continue anyway, but the adapter might be working on stale code
+                    # Fail closed: a reviewer running on stale or missing
+                    # workspace code cannot produce grounded output.
+                    self.complete(task_id, f"[review runtime] workspace sync failed: {path_or_err}")
+                    self._report_bridge_status(
+                        interbot_message,
+                        task_data=adapter_task_data,
+                        task_id=task_id,
+                        status="failed",
+                        detail=f"Workspace sync failed; review aborted to avoid publishing on stale code: {path_or_err}",
+                    )
+                    return
 
             if review_prompt_required:
                 deep_review_guidance = _render_deep_review_guidance(adapter_task_data)
@@ -5338,6 +5398,13 @@ class RuntimeNode:
         adapter_task_data["__workspace"] = self.workspace
         adapter_task_data["__workspace_path"] = workspace_path
         adapter_task_data["__runtime_tool_runs"] = runtime_tool_runs
+
+        # P1: scan workspace context for secrets before sending to provider
+        _secret_findings = self.workspace._scan_for_secrets(instructions)
+        if _secret_findings:
+            print(f"[mep security] secret scan flagged {len(_secret_findings)} potential leaks; review will proceed but secrets are noted")
+            for finding in _secret_findings:
+                print(f"  {finding}")
 
         result = self.adapter.generate_reply(instructions, adapter_task_data)
         adapter_metrics = getattr(self.adapter, "last_review_metrics", None) or None
