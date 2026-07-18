@@ -770,7 +770,8 @@ class TestGitHubToMEPBridge(unittest.TestCase):
                     "## Review Summary\n\n"
                     "The PR adds pending-task recovery observability in `node/mep_runtime.py`.\n\n"
                     "Observation: `_record_pending_task_poll_failure` now records `last_poll_status`, which makes the recovery metrics more actionable.\n\n"
-                    "Touched paths reviewed: `node/mep_runtime.py`."
+                    "Touched paths reviewed: `node/mep_runtime.py`.\n\n"
+                    "Changed identifiers verified: `_record_pending_task_poll_failure`, `last_poll_status`."
                 ),
             },
             headers={"Authorization": f"Bearer {token}"},
@@ -1315,6 +1316,9 @@ class TestGitHubToMEPBridge(unittest.TestCase):
                     "The PR adds pending-task recovery observability in `node/mep_runtime.py` and keeps the verification path narrow.\n\n"
                     "Observation: `_record_pending_task_poll_failure` now records `last_poll_status`, and the changed test keeps the recovery behavior covered. No risky changes.\n\n"
                     "Touched paths reviewed: `node/mep_runtime.py`, `tests/test_node_runtime.py`\n\n"
+                    "Changed identifiers verified: `_record_pending_task_poll_failure`, `last_poll_status`\n\n"
+                    "Risk areas checked: recovery observability\n\n"
+                    "Checks performed: reviewed changed diff, verified test coverage\n\n"
                     "Tests reviewed: `tests/test_node_runtime.py`."
                 ),
             },
@@ -1324,7 +1328,7 @@ class TestGitHubToMEPBridge(unittest.TestCase):
         self.assertEqual(len(self.github_session.posts), 1)
         self.assertEqual(self.github_session.posts[0]["json"]["event"], "APPROVE")
         self.assertEqual(self.service.github_writeback_metrics["suppressed_approvals"], 0)
-        self.assertGreaterEqual(self.service.github_writeback_metrics["last_quality_score"], 4)
+        self.assertGreaterEqual(self.service.github_writeback_metrics["last_quality_score"], 7)
 
     def test_score_review_quality_accepts_professional_low_risk_approval_phrasing(self):
         score, reasons = self.service._score_review_quality(  # noqa: SLF001
@@ -1391,11 +1395,98 @@ class TestGitHubToMEPBridge(unittest.TestCase):
         self.assertEqual(score, 10)
         self.assertIn("explicit_low_risk_claim", reasons)
 
+    def test_score_review_quality_downweights_speculative_low_signal_finding(self):
+        score, reasons = self.service._score_review_quality(  # noqa: SLF001
+            {
+                "anchored_paths": {
+                    "docs/node-reputation/DESIGN.md",
+                    "docs/node-reputation/node-reputation-v1.schema.json",
+                },
+                "changed_tokens": set(),
+                "grounded_tokens": {"id"},
+                "has_findings": True,
+                "summary_text": (
+                    "PR adds draft specification documents for node reputation and identifies a potential schema id consistency issue."
+                ),
+                "observation_text": (
+                    "The schema id points to an external repository, which may cause resolution failures in local validation."
+                ),
+                "risk_areas_checked": ["schema id consistency", "test coverage for new JSON schema"],
+                "checks_performed": [
+                    "verified the id field against the added schema file",
+                    "checked the PR for new validation tests",
+                ],
+                "changed_verified_identifiers": ["id"],
+                "expected_tests": [],
+                "mentions_tests": True,
+                "lowered": (
+                    "the schema id points to an external repository, which may cause resolution failures "
+                    "and could lead to tooling issues in local validation. tests reviewed."
+                ),
+                "reviewability": {"bucket": "low_signal"},
+            },
+            action="reviewed",
+        )
+
+        self.assertEqual(score, 7)
+        self.assertIn("speculative_low_signal_finding", reasons)
+        self.assertNotIn("concrete_findings", reasons)
+
     def test_score_review_quality_empty_snapshot_returns_zero(self):
         score, reasons = self.service._score_review_quality({}, action="reviewed")  # noqa: SLF001
 
         self.assertEqual(score, 0)
         self.assertEqual(reasons, [])
+
+    def test_approval_without_verified_identifiers_is_suppressed(self):
+        self._set_pr_review_package(
+            [
+                {
+                    "filename": "bridge/github_to_mep.py",
+                    "additions": 1,
+                    "deletions": 0,
+                    "patch": "+    'may_cause': r'\\bmay\\s+cause\\b',\n",
+                },
+                {
+                    "filename": "tests/test_github_bridge.py",
+                    "additions": 1,
+                    "deletions": 0,
+                    "patch": "+    def test_score_review_quality_downweights_speculative_low_signal_finding(self):\n",
+                },
+            ],
+        )
+        response = self._post_webhook(
+            _issue_comment_payload("@Hub-Sentinel approve this PR", delivery_number=247),
+            delivery_id="delivery-approve-without-verified",
+        )
+        self.assertEqual(response.status_code, 200)
+        bridge_id = response.json()["bridge_id"]
+        self._flush_context(response.json()["context_id"])
+
+        token = self.service._generate_status_token(bridge_id, "node_target")
+        status_response = self.client.post(
+            "/bridge/status",
+            json={
+                "bridge_id": bridge_id,
+                "status": "completed",
+                "target_node_id": "node_target",
+                "task_id": "task-approve-without-verified",
+                "action": "approved",
+                "detail": (
+                    "## Review Summary\n\n"
+                    "Verified `may_cause` and `test_score_review_quality_downweights_speculative_low_signal_finding` in the diff. "
+                    "The changes look scoped and low-risk. No concrete issue found.\n\n"
+                    "Touched paths reviewed: `bridge/github_to_mep.py`, `tests/test_github_bridge.py`\n\n"
+                    "Risk areas checked: suppression logic\n\n"
+                    "Checks performed: reviewed changed diff\n\n"
+                    "Tests reviewed: `tests/test_github_bridge.py`."
+                ),
+            },
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        self.assertEqual(status_response.status_code, 200, status_response.text)
+        self.assertEqual(self.service.github_writeback_metrics["suppressed_approvals"], 1)
+        self.assertEqual(self.service.github_writeback_metrics["last_suppressed_reason"], "approval_without_verified_evidence")
 
     def test_review_trials_endpoint_returns_latest_trial_results(self):
         self._set_pr_review_package(
@@ -1464,6 +1555,9 @@ class TestGitHubToMEPBridge(unittest.TestCase):
                     "The PR adds pending-task recovery observability in `node/mep_runtime.py` and keeps the verification path narrow.\n\n"
                     "Observation: `_record_pending_task_poll_failure` now records `last_poll_status`, and the changed test keeps the recovery behavior covered. No risky changes.\n\n"
                     "Touched paths reviewed: `node/mep_runtime.py`, `tests/test_node_runtime.py`\n\n"
+                    "Changed identifiers verified: `_record_pending_task_poll_failure`, `last_poll_status`\n\n"
+                    "Risk areas checked: recovery observability\n\n"
+                    "Checks performed: reviewed changed diff\n\n"
                     "Tests reviewed: `tests/test_node_runtime.py`."
                 ),
             },
@@ -1855,6 +1949,9 @@ class TestGitHubToMEPBridge(unittest.TestCase):
                     "The PR adds pending-task recovery observability in `node/mep_runtime.py` and keeps the verification path narrow.\n\n"
                     "Observation: `_record_pending_task_poll_failure` now records `last_poll_status`, and the changed test keeps the recovery behavior covered. No risky changes.\n\n"
                     "Touched paths reviewed: `node/mep_runtime.py`, `tests/test_node_runtime.py`\n\n"
+                    "Changed identifiers verified: `_record_pending_task_poll_failure`, `last_poll_status`\n\n"
+                    "Risk areas checked: recovery observability\n\n"
+                    "Checks performed: reviewed changed diff\n\n"
                     "Tests reviewed: `tests/test_node_runtime.py`."
                 ),
             },
@@ -3842,6 +3939,76 @@ class TestGitHubToMEPBridge(unittest.TestCase):
         self.assertEqual(len(self.github_session.posts), 0)
         self.assertEqual(self.service.github_writeback_metrics["last_suppressed_reason"], "speculative_finding")
 
+    def test_status_callback_suppresses_speculative_docs_schema_finding(self):
+        self._set_pr_review_package(
+            [
+                {
+                    "filename": "docs/node-reputation/DESIGN.md",
+                    "status": "added",
+                    "additions": 120,
+                    "deletions": 0,
+                    "changes": 120,
+                    "patch": (
+                        "@@ -0,0 +1,6 @@\n"
+                        "+# MEP Node Reputation v1\n"
+                        "+\n"
+                        "+MEP_START_BONUS_ENABLED=false\n"
+                        "+MEP_VERIFICATION_THRESHOLD_DEFAULT=10\n"
+                        "+MEP_VERIFY_DETERMINISTIC=true\n"
+                    ),
+                },
+                {
+                    "filename": "docs/node-reputation/node-reputation-v1.schema.json",
+                    "status": "added",
+                    "additions": 20,
+                    "deletions": 0,
+                    "changes": 20,
+                    "patch": (
+                        "@@ -0,0 +1,8 @@\n"
+                        "+{\n"
+                        '+  "$schema": "https://json-schema.org/draft/2020-12/schema",\n'
+                        '+  "$id": "https://github.com/WUAIBING/MEP-spec/schemas/node-reputation-v1.schema.json",\n'
+                        '+  "title": "MEP Node Reputation v1"\n'
+                        "+}\n"
+                    ),
+                },
+            ],
+            pr_body="Adds draft node reputation design and schema artifacts.",
+        )
+        response = self._post_webhook(
+            _issue_comment_payload("@Hub-Sentinel review this PR", delivery_number=125),
+            delivery_id="delivery-speculative-docs-schema-finding",
+        )
+        self.assertEqual(response.status_code, 200)
+        bridge_id = response.json()["bridge_id"]
+        self._flush_context(response.json()["context_id"])
+
+        token = self.service._generate_status_token(bridge_id, "node_target")
+        status_response = self.client.post(
+            "/bridge/status",
+            json={
+                "bridge_id": bridge_id,
+                "status": "completed",
+                "target_node_id": "node_target",
+                "task_id": "task-speculative-docs-schema-finding",
+                "detail": (
+                    "## Review Findings\n\n"
+                    "PR adds draft specification documents for MEP node reputation system; identified a potential schema id consistency issue for review.\n\n"
+                    "Observation: The DESIGN.md includes explicit open decision markers to facilitate inline discussion, aligning with the draft PR intent.\n\n"
+                    "Touched paths reviewed: `docs/node-reputation/DESIGN.md`, `docs/node-reputation/node-reputation-v1.schema.json`\n\n"
+                    "Risk areas checked: schema id consistency with repository structure, test coverage for new JSON schema, design doc identifier definitions\n\n"
+                    "Checks performed: verified the id field in node-reputation-v1.schema.json for alignment with the MEP repo, checked PR changes for new validation test files, scanned DESIGN.md for identifier clarity\n\n"
+                    "Changed identifiers verified: `id`\n\n"
+                    "1. **Schema id points to external repository (WUAIBING/MEP-spec), which may cause resolution failures if used for validation within MEP repo.** (`docs/node-reputation/node-reputation-v1.schema.json`): "
+                    "The id is set to an external repository path and could lead to tooling issues or misalignment when this schema is referenced for validation in the MEP context."
+                ),
+            },
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        self.assertEqual(status_response.status_code, 200, status_response.text)
+        self.assertEqual(len(self.github_session.posts), 0)
+        self.assertEqual(self.service.github_writeback_metrics["last_suppressed_reason"], "speculative_finding")
+
     def test_status_callback_suppresses_hashability_claim_from_allowlist_membership(self):
         self._set_pr_review_package(
             [
@@ -4061,6 +4228,64 @@ class TestGitHubToMEPBridge(unittest.TestCase):
         self.assertEqual(response.json()["status"], "ignored")
         time.sleep(0.05)
         self.assertEqual(len(self.submission.calls), 0)
+
+    def test_render_github_writeback_body_includes_review_metrics_in_marker(self):
+        body = self.service._render_github_writeback_body(
+            "br-metrics-1",
+            "reviewed",
+            "Review complete.",
+            review_metrics={
+                "model": "gpt-4o",
+                "tokens_in": 1234,
+                "tokens_out": 567,
+                "token_source": "provider",
+                "tools_called": 3,
+                "review_passes": 2,
+            },
+        )
+        self.assertIn("Review complete.", body)
+        self.assertIn("<!-- mep-bridge:output", body)
+        self.assertIn("bridge_id=br-metrics-1", body)
+        self.assertIn("action=reviewed", body)
+        self.assertIn("model=gpt-4o", body)
+        self.assertIn("tokens_in=1234", body)
+        self.assertIn("tokens_out=567", body)
+        self.assertIn("token_source=provider", body)
+        self.assertIn("tools_called=3", body)
+        self.assertIn("review_passes=2", body)
+        self.assertTrue(body.rstrip().endswith("-->"))
+
+    def test_render_github_writeback_body_omits_zero_or_missing_metrics(self):
+        body = self.service._render_github_writeback_body(
+            "br-minimal",
+            "approved",
+            "Looks good.",
+            review_metrics={
+                "model": "claude-3",
+                "tokens_in": 0,
+                "tokens_out": 0,
+                "token_source": "",
+                "tools_called": 0,
+                "review_passes": 0,
+            },
+        )
+        self.assertIn("model=claude-3", body)
+        self.assertNotIn("tokens_in=", body)
+        self.assertNotIn("tokens_out=", body)
+        self.assertNotIn("token_source=", body)
+        self.assertNotIn("tools_called=", body)
+        self.assertNotIn("review_passes=", body)
+
+    def test_render_github_writeback_body_works_without_review_metrics(self):
+        body = self.service._render_github_writeback_body(
+            "br-none",
+            "commented",
+            "Some comment.",
+        )
+        self.assertIn("Some comment.", body)
+        self.assertIn("<!-- mep-bridge:output bridge_id=br-none action=commented -->", body)
+        self.assertNotIn("model=", body)
+        self.assertNotIn("tokens_in=", body)
 
     def test_pending_registration_raises_clear_operator_error(self):
         client = DefaultMEPSubmissionClient(self.config)

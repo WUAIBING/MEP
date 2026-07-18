@@ -2050,6 +2050,63 @@ class TestRuntimeWebSocketLoop(unittest.TestCase):
             ["github_context", "workspace_read", "workspace_search", "workspace_git", "targeted_verify"],
         )
 
+    def test_process_task_reports_tools_called_from_runtime_tool_runs(self):
+        node = _runtime_node()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            os.makedirs(os.path.join(tmpdir, "bridge"), exist_ok=True)
+            with open(os.path.join(tmpdir, "bridge", "github_to_mep.py"), "w", encoding="utf-8") as handle:
+                handle.write("def live_sync_context():\n    return True\n")
+
+            task_data = TestRuntimeReviewPrompts._bridge_review_task_data()
+            payload = json.loads(task_data["payload"])
+            payload["task"]["inputs"]["github"].update(
+                {
+                    "repo_clone_url": "https://github.com/example/repo.git",
+                    "head_sha": "abc12345",
+                    "head_ref": "feature/test",
+                }
+            )
+            task_data["payload"] = json.dumps(payload)
+
+            node.adapter.last_review_metrics = {
+                "model": "test-model",
+                "tokens_in": 100,
+                "tokens_out": 50,
+                "tools_called": 0,
+                "review_passes": 2,
+                "token_source": "provider",
+            }
+
+            with (
+                patch.object(
+                    node,
+                    "_build_github_context",
+                    return_value=(
+                        "GitHub context:\n- Scope: `WUAIBING/MEP#246`",
+                        {"scope": "WUAIBING/MEP#246", "head_ref": "feature/test", "source": "task_inputs"},
+                    ),
+                ),
+                patch.object(node.workspace, "sync_pr_workspace", return_value=(True, tmpdir)),
+                patch.object(node.workspace, "build_review_context", return_value="Local workspace path: tmpdir"),
+                patch.object(node.workspace, "build_workspace_search_context", return_value="workspace_search hits from the checked-out workspace:\n\n### live_sync_context"),
+                patch.object(node.workspace, "build_workspace_git_context", return_value="workspace_git snapshot from the checked-out workspace:\n\n- HEAD commit: abc12345"),
+                patch.object(node.workspace, "build_verification_report", return_value=""),
+                patch.object(node.adapter, "generate_reply", return_value="reply"),
+                patch.object(node, "complete"),
+                patch.object(node, "_report_bridge_status") as report_mock,
+            ):
+                asyncio.run(node.process_task(task_data))
+
+        self.assertTrue(report_mock.called)
+        reported_metrics = report_mock.call_args.kwargs.get("review_metrics")
+        self.assertIsInstance(reported_metrics, dict)
+        # github_context, workspace_read, workspace_search, workspace_git succeeded;
+        # targeted_verify returned empty (no run recorded).
+        self.assertGreaterEqual(reported_metrics["tools_called"], 4)
+        self.assertEqual(reported_metrics["tokens_in"], 100)
+        # The adapter's own metrics dict must not be mutated.
+        self.assertEqual(node.adapter.last_review_metrics["tools_called"], 0)
+
     def test_build_github_context_prefers_api_fields_when_available(self):
         node = _runtime_node()
         github_inputs = {

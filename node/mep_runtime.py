@@ -16,7 +16,7 @@ import tempfile
 import time
 import urllib.parse
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Optional
 
 import requests
@@ -2794,22 +2794,28 @@ class AIAdapter:
     """Real AI adapter using Ollama for provider task processing."""
 
     model: str = "tinyllama"
+    last_review_metrics: dict[str, Any] = field(default_factory=dict)
 
     def generate_reply(self, payload: str, task_data: dict[str, Any]) -> str:
         import subprocess
 
         try:
             review_max = _review_max_chars()
+            self.last_review_metrics = {"model": self.model, "tokens_in": 0, "tokens_out": 0, "tools_called": 0, "review_passes": 0, "token_source": "estimated"}
             if _task_requires_repo_audit_prompt(task_data):
                 def _invoke(system_prompt: str, user_payload: str) -> str:
                     prompt = f"{system_prompt}\n\nTask: {user_payload}\n\nReply:"
+                    self.last_review_metrics["tokens_in"] += max(1, len(prompt) // 4)
                     result = subprocess.run(
                         ["ollama", "run", self.model, prompt],
                         capture_output=True,
                         text=True,
                         timeout=90,
                     )
-                    return (result.stdout or "").strip()
+                    reply = (result.stdout or "").strip()
+                    self.last_review_metrics["tokens_out"] += max(1, len(reply) // 4)
+                    self.last_review_metrics["review_passes"] += 1
+                    return reply
 
                 result = _run_two_pass_repo_audit(
                     task_data=task_data,
@@ -2823,13 +2829,17 @@ class AIAdapter:
             if _task_requires_review_prompt(task_data):
                 def _invoke(system_prompt: str, user_payload: str) -> str:
                     prompt = f"{system_prompt}\n\nTask: {user_payload}\n\nReply:"
+                    self.last_review_metrics["tokens_in"] += max(1, len(prompt) // 4)
                     result = subprocess.run(
                         ["ollama", "run", self.model, prompt],
                         capture_output=True,
                         text=True,
                         timeout=45,
                     )
-                    return (result.stdout or "").strip()
+                    reply = (result.stdout or "").strip()
+                    self.last_review_metrics["tokens_out"] += max(1, len(reply) // 4)
+                    self.last_review_metrics["review_passes"] += 1
+                    return reply
 
                 result = _run_two_pass_review(
                     task_data=task_data,
@@ -2866,9 +2876,11 @@ class DeepSeekAdapter:
 
     api_key: str = ""
     model: str = "deepseek-chat"
+    last_review_metrics: dict[str, Any] = field(default_factory=dict)
 
     def generate_reply(self, payload: str, task_data: dict[str, Any]) -> str:
         review_max = _review_max_chars()
+        self.last_review_metrics = {"model": self.model, "tokens_in": 0, "tokens_out": 0, "tools_called": 0, "review_passes": 0, "token_source": "provider"}
         try:
             def _invoke(system_prompt: str, user_payload: str) -> str:
                 resp = requests.post(
@@ -2890,10 +2902,15 @@ class DeepSeekAdapter:
                 )
                 if resp.status_code != 200:
                     return f"[DeepSeek] API error {resp.status_code}: {resp.text[:200]}"
-                message = resp.json()["choices"][0]["message"]
+                data = resp.json()
+                message = data["choices"][0]["message"]
                 reply = str(message.get("content") or "").strip()
                 if not reply:
                     reply = str(message.get("reasoning_content") or "").strip()
+                usage = data.get("usage") or {}
+                self.last_review_metrics["tokens_in"] += int(usage.get("prompt_tokens") or 0)
+                self.last_review_metrics["tokens_out"] += int(usage.get("completion_tokens") or 0)
+                self.last_review_metrics["review_passes"] += 1
                 return reply
 
             if _task_requires_repo_audit_prompt(task_data):
@@ -2941,12 +2958,14 @@ class OpenAICompatibleAdapter:
     model: str = "gpt-4o-mini"
     base_url: str = "https://api.openai.com/v1"
     provider_name: str = "openai-compatible"
+    last_review_metrics: dict[str, Any] = field(default_factory=dict)
 
     def _endpoint(self) -> str:
         return self.base_url.rstrip("/") + "/chat/completions"
 
     def generate_reply(self, payload: str, task_data: dict[str, Any]) -> str:
         review_max = _review_max_chars()
+        self.last_review_metrics = {"model": self.model, "tokens_in": 0, "tokens_out": 0, "tools_called": 0, "review_passes": 0, "token_source": "provider"}
         try:
             def _invoke(system_prompt: str, user_payload: str) -> str:
                 resp = requests.post(
@@ -2968,10 +2987,15 @@ class OpenAICompatibleAdapter:
                 )
                 if resp.status_code != 200:
                     return f"[{self.provider_name}] API error {resp.status_code}: {resp.text[:200]}"
-                message = resp.json()["choices"][0]["message"]
+                data = resp.json()
+                message = data["choices"][0]["message"]
                 reply = str(message.get("content") or "").strip()
                 if not reply:
                     reply = str(message.get("reasoning_content") or "").strip()
+                usage = data.get("usage") or {}
+                self.last_review_metrics["tokens_in"] += int(usage.get("prompt_tokens") or 0)
+                self.last_review_metrics["tokens_out"] += int(usage.get("completion_tokens") or 0)
+                self.last_review_metrics["review_passes"] += 1
                 return reply
 
             if _task_requires_repo_audit_prompt(task_data):
@@ -3904,6 +3928,7 @@ class RuntimeNode:
         task_id: str,
         status: str,
         detail: Optional[str],
+        review_metrics: Optional[dict[str, Any]] = None,
     ) -> None:
         bridge_metadata = self._bridge_metadata(interbot_message)
         if bridge_metadata is None:
@@ -3923,6 +3948,8 @@ class RuntimeNode:
             payload["action"] = action
         if detail:
             payload["detail"] = detail[:60000]
+        if review_metrics:
+            payload["review_metrics"] = review_metrics
         code, _body, raw = _safe_request(
             "POST",
             bridge_metadata["status_endpoint"],
@@ -4951,6 +4978,16 @@ class RuntimeNode:
             return
 
         result = self.adapter.generate_reply(instructions, adapter_task_data)
+        adapter_metrics = getattr(self.adapter, "last_review_metrics", None) or None
+        if adapter_metrics is not None and merged_runs:
+            # tools_called reflects the runtime tool runs that produced evidence
+            # for this task (workspace_read/search/git, targeted_verify,
+            # github_context), not adapter-internal calls.
+            adapter_metrics = dict(adapter_metrics)
+            adapter_metrics["tools_called"] = sum(
+                1 for run in merged_runs
+                if isinstance(run, dict) and str(run.get("status") or "").lower() == "success"
+            )
         # Fail-safe: a reviewer runtime must never let an adapter error (missing or
         # expired API key, HTTP error, timeout, empty completion) be written back as
         # a completed review/approval. Report a failed status with no review action so
@@ -4979,6 +5016,7 @@ class RuntimeNode:
                     task_id=task_id,
                     status="completed",
                     detail=result,
+                    review_metrics=adapter_metrics,
                 )
                 return
         dm_response = await self._submit_safe_structured_dm_reply(
@@ -4994,6 +5032,7 @@ class RuntimeNode:
                 task_id=task_id,
                 status="completed",
                 detail=result,
+                review_metrics=adapter_metrics,
             )
             return
         self.complete(task_id, result)
@@ -5003,6 +5042,7 @@ class RuntimeNode:
             task_id=task_id,
             status="completed",
             detail=result,
+            review_metrics=adapter_metrics,
         )
 
     def _ws_uri(self) -> str:
