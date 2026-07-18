@@ -3213,6 +3213,9 @@ class DeepSeekAdapter:
                     )
                     if agentic_result:
                         return agentic_result
+                    # Agentic loop exhausted without submit_review or returned empty;
+                    # fall back to baseline two-pass review.
+                    print("[mep agentic] loop exhausted, falling back to baseline two-pass review")
 
                 result = _run_two_pass_review(
                     task_data=task_data,
@@ -3366,6 +3369,9 @@ class OpenAICompatibleAdapter:
                     )
                     if agentic_result:
                         return agentic_result
+                    # Agentic loop exhausted without submit_review or returned empty;
+                    # fall back to baseline two-pass review.
+                    print("[mep agentic] loop exhausted, falling back to baseline two-pass review")
 
                 result = _run_two_pass_review(
                     task_data=task_data,
