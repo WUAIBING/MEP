@@ -1848,6 +1848,226 @@ def _run_two_pass_repo_audit(
     return final_reply[:review_max_chars].rstrip() or "[repo_audit runtime] review response was empty"
 
 
+def _agentic_review_tools() -> list[dict[str, Any]]:
+    """Return OpenAI-compatible function-calling tool definitions for V1.5 review."""
+    return [
+        {
+            "type": "function",
+            "function": {
+                "name": "workspace_read",
+                "description": "Read the contents of a specific file in the checked-out PR workspace. Use this to inspect exact code at call sites, helpers, or dependent files.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "file_path": {"type": "string", "description": "Relative path inside the workspace (e.g. bridge/github_to_mep.py)"},
+                    },
+                    "required": ["file_path"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "workspace_search",
+                "description": "Search the workspace for a text pattern (identifier, function name, config key). Returns matching files and line snippets.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "pattern": {"type": "string", "description": "Regex or literal pattern to search for"},
+                    },
+                    "required": ["pattern"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "workspace_git",
+                "description": "Get the git state of the workspace: current HEAD, tracked files, recent commits.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {},
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "targeted_verify",
+                "description": "Run allowlisted safety checks (ruff lint, pytest) on specific files in the workspace.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "file": {"type": "string", "description": "File to run checks on (e.g. bridge/github_to_mep.py)"},
+                    },
+                    "required": ["file"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "submit_review",
+                "description": "Submit the final review output when you have gathered enough evidence. Do NOT call this until you have investigated the changes thoroughly.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "summary": {"type": "string", "description": "Structured review summary with findings and evidence"},
+                        "approval": {"type": "boolean", "description": "True to approve, false to request changes or comment"},
+                    },
+                    "required": ["summary", "approval"],
+                },
+            },
+        },
+    ]
+
+
+def _execute_agentic_tool(
+    tool_name: str,
+    tool_args: dict[str, Any],
+    *,
+    workspace: Any,
+    workspace_path: str,
+    runtime_tool_runs: list[dict[str, Any]],
+) -> tuple[str, dict[str, Any]]:
+    """Execute a single agentic tool call and return (result_text, tool_run_record)."""
+    from dataclasses import asdict as _dc_asdict
+
+    run = RuntimeToolRun(
+        tool=tool_name,
+        purpose=f"agentic:{tool_name}",
+        status="success",
+        summary="",
+        scope="agentic_loop",
+    )
+    result = ""
+    if tool_name == "workspace_read":
+        file_path = str(tool_args.get("file_path", "")).strip().lstrip("/")
+        full_path = WorkspaceManager._resolve_repo_file(workspace_path, file_path)
+        if full_path is None:
+            run.status = "skipped"
+            run.summary = f"path_traversal_blocked:{file_path}"
+            result = f"[workspace_read] blocked: path '{file_path}' is outside workspace"
+        elif not os.path.isfile(full_path):
+            run.status = "skipped"
+            run.summary = f"not_found:{file_path}"
+            result = f"[workspace_read] file not found: {file_path}"
+        else:
+            try:
+                with open(full_path, encoding="utf-8", errors="replace") as fh:
+                    content = fh.read(60000)
+                run.summary = f"read {len(content)} chars from {file_path}"
+                run.evidence = [file_path]
+                result = f"[workspace_read] {file_path} ({len(content)} chars):\n\n{content}"
+            except OSError as exc:
+                run.status = "skipped"
+                run.summary = f"os_error:{exc}"
+                result = f"[workspace_read] error reading {file_path}: {exc}"
+    elif tool_name == "workspace_search":
+        pattern = str(tool_args.get("pattern", "")).strip()
+        if not pattern:
+            run.status = "skipped"
+            run.summary = "empty_pattern"
+            result = "[workspace_search] error: pattern is empty"
+        else:
+            result = workspace.build_workspace_search_context(
+                workspace_path, query=pattern, task_type="pr_review"
+            ) or "[workspace_search] no matches found"
+            run.summary = f"searched:{pattern}"
+    elif tool_name == "workspace_git":
+        result = workspace.build_workspace_git_context(workspace_path, task_type="pr_review") or "[workspace_git] no git data"
+        run.summary = "git_snapshot"
+    elif tool_name == "targeted_verify":
+        file_path = str(tool_args.get("file", "")).strip().lstrip("/")
+        full_path = WorkspaceManager._resolve_repo_file(workspace_path, file_path)
+        if full_path is None or not os.path.isfile(full_path):
+            run.status = "skipped"
+            run.summary = f"not_found:{file_path}"
+            result = f"[targeted_verify] file not found: {file_path}"
+        else:
+            # Use the existing verification pipeline for this file
+            result = workspace.build_verification_report(
+                workspace_path, changed_files=[file_path]
+            ) or "[targeted_verify] checks passed or produced no output"
+            run.summary = f"verified:{file_path}"
+    else:
+        run.status = "skipped"
+        run.summary = f"unknown_tool:{tool_name}"
+        result = f"[agentic] unknown tool: {tool_name}"
+    runtime_tool_runs.append(_dc_asdict(run) if hasattr(_dc_asdict, "__call__") else run.to_dict())
+    return result, run.to_dict()
+
+
+def _agentic_review_enabled() -> bool:
+    return os.environ.get("MEP_AGENTIC_REVIEW", "").strip() in ("1", "true", "yes")
+
+
+_MAX_AGENTIC_TOOL_CALLS = 6
+
+
+def _run_agentic_tool_loop(
+    *,
+    messages: list[dict[str, Any]],
+    tools: list[dict[str, Any]],
+    tools_aware_invoke: Any,
+    workspace: Any,
+    workspace_path: str,
+    runtime_tool_runs: list[dict[str, Any]],
+    max_tool_calls: int = 6,
+    review_max_chars: int = 4000,
+) -> str:
+    """Run the agentic review loop: LLM calls tools, we execute them, feed results back.
+
+    tools_aware_invoke(messages, *, tools) -> dict with keys: content, tool_calls, finish_reason
+    """
+    for _iteration in range(1, max_tool_calls + 2):
+        try:
+            response = tools_aware_invoke(messages, tools=tools)
+        except Exception:
+            return ""
+
+        if response is None or not isinstance(response, dict):
+            return ""
+
+        tool_calls = response.get("tool_calls")
+        if tool_calls and isinstance(tool_calls, list) and len(tool_calls) > 0:
+            assistant_msg: dict[str, Any] = {"role": "assistant", "content": response.get("content") or ""}
+            assistant_msg["tool_calls"] = [
+                {
+                    "id": tc.get("id", f"call_{_iteration}_{i}"),
+                    "type": "function",
+                    "function": {"name": tc["function"]["name"], "arguments": tc["function"]["arguments"]},
+                }
+                for i, tc in enumerate(tool_calls)
+                if isinstance(tc.get("function"), dict)
+            ]
+            messages.append(assistant_msg)
+            for tc in tool_calls:
+                fn = tc.get("function") if isinstance(tc.get("function"), dict) else {}
+                name = str(fn.get("name") or "").strip()
+                args_str = str(fn.get("arguments") or "{}")
+                try:
+                    args = json.loads(args_str) if args_str else {}
+                except (json.JSONDecodeError, TypeError):
+                    args = {}
+                if name == "submit_review":
+                    return str(args.get("summary", response.get("content", "")))[:review_max_chars]
+                result_text, _run_record = _execute_agentic_tool(
+                    name, args, workspace=workspace, workspace_path=workspace_path, runtime_tool_runs=runtime_tool_runs,
+                )
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": tc.get("id", f"call_{_iteration}_{len(runtime_tool_runs)}"),
+                    "content": result_text[:8000],
+                })
+            continue
+        content = str(response.get("content") or "").strip()
+        if content:
+            return content[:review_max_chars]
+        return ""
+    return ""
+
+
 _WEAK_REVIEW_PATTERNS = [
     r"\bmissing context\b",
     r"\bpatch excerpt\b",
@@ -2878,6 +3098,40 @@ class DeepSeekAdapter:
     model: str = "deepseek-chat"
     last_review_metrics: dict[str, Any] = field(default_factory=dict)
 
+    def _tools_aware_invoke(self, messages, *, tools):
+        """Make an API call with function-calling support. Returns dict with content, tool_calls, finish_reason."""
+        resp = requests.post(
+            "https://api.deepseek.com/v1/chat/completions",
+            headers={
+                "Authorization": f"Bearer {self.api_key}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": self.model,
+                "messages": messages,
+                "tools": tools,
+                "max_tokens": _env_positive_int("MEP_AI_MAX_TOKENS", 4000),
+                "temperature": 0.1,
+            },
+            timeout=_env_positive_int("MEP_AI_TIMEOUT_SECONDS", 120),
+        )
+        if resp.status_code != 200:
+            return {"content": f"[DeepSeek] API error {resp.status_code}: {resp.text[:200]}", "tool_calls": []}
+        choice = resp.json()["choices"][0]
+        msg = choice["message"]
+        content = str(msg.get("content") or "").strip()
+        if not content:
+            content = str(msg.get("reasoning_content") or "").strip()
+        raw_tool_calls = msg.get("tool_calls") or []
+        tool_calls = []
+        for tc in raw_tool_calls:
+            if isinstance(tc, dict) and tc.get("type") == "function":
+                tool_calls.append({
+                    "id": tc.get("id", ""),
+                    "function": tc.get("function", {}),
+                })
+        return {"content": content, "tool_calls": tool_calls, "finish_reason": choice.get("finish_reason", "")}
+
     def generate_reply(self, payload: str, task_data: dict[str, Any]) -> str:
         review_max = _review_max_chars()
         self.last_review_metrics = {"model": self.model, "tokens_in": 0, "tokens_out": 0, "tools_called": 0, "review_passes": 0, "token_source": "provider"}
@@ -2925,6 +3179,41 @@ class DeepSeekAdapter:
                 return "[DeepSeek] review response was empty"
 
             if _task_requires_review_prompt(task_data):
+                # V1.5 agentic review: when enabled and workspace is available,
+                # let the LLM investigate iteratively before producing output.
+                if (
+                    _agentic_review_enabled()
+                    and task_data.get("__workspace") is not None
+                    and task_data.get("__workspace_path")
+                ):
+                    tools = _agentic_review_tools()
+                    review_lenses = _review_lenses_for_task(task_data)
+                    lens_hint = ""
+                    if review_lenses:
+                        lens_hint = f"\n\nReview lenses to cover: {', '.join(review_lenses)}."
+                    system_prompt = (
+                        _candidate_system_prompt_for_task(task_data, review_max_chars=review_max)
+                        + f"\n\nYou are an investigative reviewer. Use the available tools to read files, search for call sites, check git history, and verify behavior BEFORE you call submit_review. "
+                        f"Investigate at least the changed files and one level of call sites. "
+                        f"Then call submit_review with your structured findings and approval decision.{lens_hint}"
+                    )
+                    messages: list[dict[str, Any]] = [
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": payload},
+                    ]
+                    agentic_result = _run_agentic_tool_loop(
+                        messages=messages,
+                        tools=tools,
+                        tools_aware_invoke=lambda msgs, **kw: self._tools_aware_invoke(msgs, tools=kw.get("tools", tools)),
+                        workspace=task_data["__workspace"],
+                        workspace_path=task_data["__workspace_path"],
+                        runtime_tool_runs=task_data.get("__runtime_tool_runs", []),
+                        max_tool_calls=_MAX_AGENTIC_TOOL_CALLS,
+                        review_max_chars=review_max,
+                    )
+                    if agentic_result:
+                        return agentic_result
+
                 result = _run_two_pass_review(
                     task_data=task_data,
                     payload=payload,
@@ -2962,6 +3251,40 @@ class OpenAICompatibleAdapter:
 
     def _endpoint(self) -> str:
         return self.base_url.rstrip("/") + "/chat/completions"
+
+    def _tools_aware_invoke(self, messages, *, tools):
+        """Make an API call with function-calling support. Returns dict with content, tool_calls, finish_reason."""
+        resp = requests.post(
+            self._endpoint(),
+            headers={
+                "Authorization": f"Bearer {self.api_key}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": self.model,
+                "messages": messages,
+                "tools": tools,
+                "max_tokens": _env_positive_int("MEP_AI_MAX_TOKENS", 4000),
+                "temperature": 0.1,
+            },
+            timeout=_env_positive_int("MEP_AI_TIMEOUT_SECONDS", 120),
+        )
+        if resp.status_code != 200:
+            return {"content": f"[{self.provider_name}] API error {resp.status_code}: {resp.text[:200]}", "tool_calls": []}
+        choice = resp.json()["choices"][0]
+        msg = choice["message"]
+        content = str(msg.get("content") or "").strip()
+        if not content:
+            content = str(msg.get("reasoning_content") or "").strip()
+        raw_tool_calls = msg.get("tool_calls") or []
+        tool_calls = []
+        for tc in raw_tool_calls:
+            if isinstance(tc, dict) and tc.get("type") == "function":
+                tool_calls.append({
+                    "id": tc.get("id", ""),
+                    "function": tc.get("function", {}),
+                })
+        return {"content": content, "tool_calls": tool_calls, "finish_reason": choice.get("finish_reason", "")}
 
     def generate_reply(self, payload: str, task_data: dict[str, Any]) -> str:
         review_max = _review_max_chars()
@@ -3010,6 +3333,40 @@ class OpenAICompatibleAdapter:
                 return f"[{self.provider_name}] review response was empty"
 
             if _task_requires_review_prompt(task_data):
+                # V1.5 agentic review: when enabled and workspace is available
+                if (
+                    _agentic_review_enabled()
+                    and task_data.get("__workspace") is not None
+                    and task_data.get("__workspace_path")
+                ):
+                    tools = _agentic_review_tools()
+                    review_lenses = _review_lenses_for_task(task_data)
+                    lens_hint = ""
+                    if review_lenses:
+                        lens_hint = f"\n\nReview lenses to cover: {', '.join(review_lenses)}."
+                    system_prompt = (
+                        _candidate_system_prompt_for_task(task_data, review_max_chars=review_max)
+                        + f"\n\nYou are an investigative reviewer. Use the available tools to read files, search for call sites, check git history, and verify behavior BEFORE you call submit_review. "
+                        f"Investigate at least the changed files and one level of call sites. "
+                        f"Then call submit_review with your structured findings and approval decision.{lens_hint}"
+                    )
+                    messages: list[dict[str, Any]] = [
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": payload},
+                    ]
+                    agentic_result = _run_agentic_tool_loop(
+                        messages=messages,
+                        tools=tools,
+                        tools_aware_invoke=lambda msgs, **kw: self._tools_aware_invoke(msgs, tools=kw.get("tools", tools)),
+                        workspace=task_data["__workspace"],
+                        workspace_path=task_data["__workspace_path"],
+                        runtime_tool_runs=task_data.get("__runtime_tool_runs", []),
+                        max_tool_calls=_MAX_AGENTIC_TOOL_CALLS,
+                        review_max_chars=review_max,
+                    )
+                    if agentic_result:
+                        return agentic_result
+
                 result = _run_two_pass_review(
                     task_data=task_data,
                     payload=payload,
@@ -4976,6 +5333,11 @@ class RuntimeNode:
             self.complete(task_id, rendered)
             print(f"[mep run] execution bridge task={task_id[:8]} result={rendered}")
             return
+
+        # Inject runtime workspace reference for agentic review loop
+        adapter_task_data["__workspace"] = self.workspace
+        adapter_task_data["__workspace_path"] = workspace_path
+        adapter_task_data["__runtime_tool_runs"] = runtime_tool_runs
 
         result = self.adapter.generate_reply(instructions, adapter_task_data)
         adapter_metrics = getattr(self.adapter, "last_review_metrics", None) or None
