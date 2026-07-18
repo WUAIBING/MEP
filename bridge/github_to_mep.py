@@ -3519,7 +3519,42 @@ class GitHubToMEPBridgeService:
                 marker_parts.append(f"review_passes={review_metrics['review_passes']}")
         marker_parts.append("-->")
         marker = " ".join(marker_parts)
+        footer = self._render_review_telemetry_footer(review_metrics)
+        if footer:
+            return f"{detail_text}\n\n{footer}\n\n{marker}"
         return f"{detail_text}\n\n{marker}"
+
+    @staticmethod
+    def _render_review_telemetry_footer(review_metrics: Optional[dict[str, Any]]) -> str:
+        """Render a single subtle footer line so developers can see review cost/effort."""
+        if not review_metrics:
+            return ""
+
+        def _as_int(value: Any) -> int:
+            try:
+                return int(value)
+            except (TypeError, ValueError):
+                return 0
+
+        parts: list[str] = []
+        model = str(review_metrics.get("model") or "").strip()
+        if model:
+            parts.append(f"model `{model}`")
+        tokens_in = _as_int(review_metrics.get("tokens_in"))
+        tokens_out = _as_int(review_metrics.get("tokens_out"))
+        if tokens_in or tokens_out:
+            token_source = str(review_metrics.get("token_source") or "").strip()
+            suffix = f" ({token_source})" if token_source else ""
+            parts.append(f"tokens {tokens_in} in / {tokens_out} out{suffix}")
+        tools_called = _as_int(review_metrics.get("tools_called"))
+        if tools_called:
+            parts.append(f"tools {tools_called}")
+        review_passes = _as_int(review_metrics.get("review_passes"))
+        if review_passes:
+            parts.append(f"passes {review_passes}")
+        if not parts:
+            return ""
+        return "*Review telemetry: " + " · ".join(parts) + "*"
 
     @staticmethod
     def _execution_github_inputs(execution: dict[str, Any]) -> dict[str, Any]:

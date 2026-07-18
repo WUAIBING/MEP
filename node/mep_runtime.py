@@ -3117,7 +3117,13 @@ class DeepSeekAdapter:
         )
         if resp.status_code != 200:
             return {"content": f"[DeepSeek] API error {resp.status_code}: {resp.text[:200]}", "tool_calls": []}
-        choice = resp.json()["choices"][0]
+        data = resp.json()
+        usage = data.get("usage") or {}
+        if self.last_review_metrics:
+            self.last_review_metrics["tokens_in"] += int(usage.get("prompt_tokens") or 0)
+            self.last_review_metrics["tokens_out"] += int(usage.get("completion_tokens") or 0)
+            self.last_review_metrics["review_passes"] += 1
+        choice = data["choices"][0]
         msg = choice["message"]
         content = str(msg.get("content") or "").strip()
         if not content:
@@ -3274,7 +3280,13 @@ class OpenAICompatibleAdapter:
         )
         if resp.status_code != 200:
             return {"content": f"[{self.provider_name}] API error {resp.status_code}: {resp.text[:200]}", "tool_calls": []}
-        choice = resp.json()["choices"][0]
+        data = resp.json()
+        usage = data.get("usage") or {}
+        if self.last_review_metrics:
+            self.last_review_metrics["tokens_in"] += int(usage.get("prompt_tokens") or 0)
+            self.last_review_metrics["tokens_out"] += int(usage.get("completion_tokens") or 0)
+            self.last_review_metrics["review_passes"] += 1
+        choice = data["choices"][0]
         msg = choice["message"]
         content = str(msg.get("content") or "").strip()
         if not content:
