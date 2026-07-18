@@ -1970,12 +1970,14 @@ def _execute_agentic_tool(
             run.summary = "empty_pattern"
             result = "[workspace_search] error: pattern is empty"
         else:
-            result = workspace.build_workspace_search_context(
-                workspace_path, query=pattern, task_type="pr_review"
-            ) or "[workspace_search] no matches found"
+            matches = workspace._workspace_search_matches(workspace_path, pattern, max_matches=8)
+            if matches:
+                result = f"[workspace_search] matches for '{pattern}':\n" + "\n".join(matches)
+            else:
+                result = "[workspace_search] no matches found"
             run.summary = f"searched:{pattern}"
     elif tool_name == "workspace_git":
-        result = workspace.build_workspace_git_context(workspace_path, task_type="pr_review") or "[workspace_git] no git data"
+        result = workspace.build_workspace_git_context(workspace_path) or "[workspace_git] no git data"
         run.summary = "git_snapshot"
     elif tool_name == "targeted_verify":
         file_path = str(tool_args.get("file", "")).strip().lstrip("/")
@@ -1986,8 +1988,9 @@ def _execute_agentic_tool(
             result = f"[targeted_verify] file not found: {file_path}"
         else:
             # Use the existing verification pipeline for this file
+            touched_tests = [file_path] if WorkspaceManager._is_test_path(file_path) else []
             result = workspace.build_verification_report(
-                workspace_path, changed_files=[file_path]
+                workspace_path, [file_path], touched_tests, enabled=True
             ) or "[targeted_verify] checks passed or produced no output"
             run.summary = f"verified:{file_path}"
     else:
@@ -2052,9 +2055,15 @@ def _run_agentic_tool_loop(
                     args = {}
                 if name == "submit_review":
                     return str(args.get("summary", response.get("content", "")))[:review_max_chars]
-                result_text, _run_record = _execute_agentic_tool(
-                    name, args, workspace=workspace, workspace_path=workspace_path, runtime_tool_runs=runtime_tool_runs,
-                )
+                try:
+                    result_text, _run_record = _execute_agentic_tool(
+                        name, args, workspace=workspace, workspace_path=workspace_path, runtime_tool_runs=runtime_tool_runs,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    # A broken tool must not kill the whole review; surface the
+                    # error to the model so it can adapt or submit without it.
+                    print(f"[mep agentic] tool {name} raised: {exc}")
+                    result_text = f"[agentic] tool {name} failed: {exc}"
                 messages.append({
                     "role": "tool",
                     "tool_call_id": tc.get("id", f"call_{_iteration}_{len(runtime_tool_runs)}"),
@@ -3117,7 +3126,16 @@ class DeepSeekAdapter:
         )
         if resp.status_code != 200:
             return {"content": f"[DeepSeek] API error {resp.status_code}: {resp.text[:200]}", "tool_calls": []}
-        choice = resp.json()["choices"][0]
+        data = resp.json()
+        usage = data.get("usage") or {}
+        if self.last_review_metrics:
+            self.last_review_metrics["tokens_in"] += int(usage.get("prompt_tokens") or 0)
+            self.last_review_metrics["tokens_out"] += int(usage.get("completion_tokens") or 0)
+            self.last_review_metrics["review_passes"] += 1
+            served_model = str(data.get("model") or "").strip()
+            if served_model:
+                self.last_review_metrics["model"] = served_model
+        choice = data["choices"][0]
         msg = choice["message"]
         content = str(msg.get("content") or "").strip()
         if not content:
@@ -3165,6 +3183,9 @@ class DeepSeekAdapter:
                 self.last_review_metrics["tokens_in"] += int(usage.get("prompt_tokens") or 0)
                 self.last_review_metrics["tokens_out"] += int(usage.get("completion_tokens") or 0)
                 self.last_review_metrics["review_passes"] += 1
+                served_model = str(data.get("model") or "").strip()
+                if served_model:
+                    self.last_review_metrics["model"] = served_model
                 return reply
 
             if _task_requires_repo_audit_prompt(task_data):
@@ -3274,7 +3295,16 @@ class OpenAICompatibleAdapter:
         )
         if resp.status_code != 200:
             return {"content": f"[{self.provider_name}] API error {resp.status_code}: {resp.text[:200]}", "tool_calls": []}
-        choice = resp.json()["choices"][0]
+        data = resp.json()
+        usage = data.get("usage") or {}
+        if self.last_review_metrics:
+            self.last_review_metrics["tokens_in"] += int(usage.get("prompt_tokens") or 0)
+            self.last_review_metrics["tokens_out"] += int(usage.get("completion_tokens") or 0)
+            self.last_review_metrics["review_passes"] += 1
+            served_model = str(data.get("model") or "").strip()
+            if served_model:
+                self.last_review_metrics["model"] = served_model
+        choice = data["choices"][0]
         msg = choice["message"]
         content = str(msg.get("content") or "").strip()
         if not content:
@@ -3322,6 +3352,9 @@ class OpenAICompatibleAdapter:
                 self.last_review_metrics["tokens_in"] += int(usage.get("prompt_tokens") or 0)
                 self.last_review_metrics["tokens_out"] += int(usage.get("completion_tokens") or 0)
                 self.last_review_metrics["review_passes"] += 1
+                served_model = str(data.get("model") or "").strip()
+                if served_model:
+                    self.last_review_metrics["model"] = served_model
                 return reply
 
             if _task_requires_repo_audit_prompt(task_data):
@@ -5045,6 +5078,14 @@ class RuntimeNode:
         if not task and isinstance(interbot_message, dict) and isinstance(interbot_message.get("task"), dict):
             task = copy.deepcopy(interbot_message.get("task"))
         inputs = task.get("inputs") if isinstance(task.get("inputs"), dict) else {}
+        # Fall back to interbot_message for inputs when the outer task envelope
+        # carries them inside the interbot payload (bridge originated tasks).
+        if not inputs and isinstance(interbot_message, dict) and isinstance(interbot_message.get("task"), dict):
+            interbot_task = interbot_message.get("task")
+            if isinstance(interbot_task, dict):
+                interbot_inputs = interbot_task.get("inputs")
+                if isinstance(interbot_inputs, dict):
+                    inputs = interbot_inputs
         github_inputs = dict(inputs.get("github") or {}) if isinstance(inputs.get("github"), dict) else {}
         repo_audit_inputs = dict(inputs.get("repo_audit") or {}) if isinstance(inputs.get("repo_audit"), dict) else {}
         repo_audit_required = _task_requires_repo_audit_contract(task_data)

@@ -4255,6 +4255,34 @@ class TestGitHubToMEPBridge(unittest.TestCase):
         self.assertIn("review_passes=2", body)
         self.assertTrue(body.rstrip().endswith("-->"))
 
+    def test_render_github_writeback_body_renders_visible_telemetry_footer(self):
+        body = self.service._render_github_writeback_body(
+            "br-metrics-2",
+            "reviewed",
+            "Review complete.",
+            review_metrics={
+                "model": "gpt-4o",
+                "tokens_in": 1234,
+                "tokens_out": 567,
+                "token_source": "provider",
+                "tools_called": 3,
+                "review_passes": 2,
+            },
+        )
+        self.assertIn(
+            "*Review telemetry: model `gpt-4o` · tokens 1234 in / 567 out (provider) · tools 3 · passes 2*",
+            body,
+        )
+        self.assertLess(body.index("Review telemetry"), body.index("<!-- mep-bridge:output"))
+
+    def test_render_github_writeback_body_no_footer_without_metrics(self):
+        body = self.service._render_github_writeback_body(
+            "br-none-footer",
+            "commented",
+            "Some comment.",
+        )
+        self.assertNotIn("Review telemetry", body)
+
     def test_render_github_writeback_body_omits_zero_or_missing_metrics(self):
         body = self.service._render_github_writeback_body(
             "br-minimal",
