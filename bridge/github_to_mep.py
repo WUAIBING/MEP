@@ -148,6 +148,9 @@ _SPECULATIVE_FINDING_PATTERNS = [
     r"\blikely\s+(?:drop|drops|filter|filters|skip|skips|alter|alters|misalign|misaligns)\b",
     r"\bmay\s+(?:silently\s+)?(?:drop|skip|alter|misalign|filter)\b",
     r"\bcould cause\b",
+    r"\bmay\s+cause\b",
+    r"\bcould\s+lead\s+to\b",
+    r"\btooling issues?\b",
 ]
 
 
@@ -388,6 +391,7 @@ class BridgeStatusUpdate(BaseModel):
     action: Optional[str] = None
     timestamp_ms: Optional[int] = None
     detail: Optional[str] = None
+    review_metrics: Optional[dict[str, Any]] = None
 
 
 class BridgeReviewFeedbackUpdate(BaseModel):
@@ -2980,6 +2984,9 @@ class GitHubToMEPBridgeService:
         expected_tests = snapshot.get("expected_tests") or []
         mentions_tests = bool(snapshot.get("mentions_tests"))
         lowered = str(snapshot.get("lowered") or "")
+        reviewability_bucket = str(
+            ((snapshot.get("reviewability") or {}).get("bucket") or "standard")
+        ).strip().lower()
 
         if anchored_paths:
             path_anchor_units = min(len(anchored_paths), 2) / 2
@@ -2999,8 +3006,18 @@ class GitHubToMEPBridgeService:
         elif changed_verified_identifiers:
             reasons.append("verified_changed_identifiers")
         if has_findings:
-            raw_score += _QUALITY_SCORE_WEIGHTS["review_substance"]
-            reasons.append("concrete_findings")
+            finding_substance_weight = _QUALITY_SCORE_WEIGHTS["review_substance"]
+            speculative_low_signal_finding = (
+                reviewability_bucket == "low_signal"
+                and changed_evidence_count < 2
+                and self._is_speculative_finding("\n".join(filter(None, [summary_text, observation_text, lowered])))
+            )
+            if speculative_low_signal_finding:
+                finding_substance_weight /= 2
+                reasons.append("speculative_low_signal_finding")
+            else:
+                reasons.append("concrete_findings")
+            raw_score += finding_substance_weight
         elif (summary_text or observation_text) and (changed_tokens or grounded_tokens or changed_verified_identifiers):
             raw_score += _QUALITY_SCORE_WEIGHTS["review_substance"] / 2
             reasons.append("grounded_summary_or_observation")
@@ -3033,11 +3050,13 @@ class GitHubToMEPBridgeService:
             return "approval_contains_findings"
         if not snapshot.get("anchored_paths"):
             return "approval_without_touched_path_anchor"
-        if not snapshot.get("changed_tokens"):
+        if not snapshot.get("changed_tokens") and not snapshot.get("changed_verified_identifiers"):
             return "approval_without_changed_code_evidence"
+        if not snapshot.get("changed_verified_identifiers"):
+            return "approval_without_verified_evidence"
         if snapshot.get("expected_tests") and not snapshot.get("mentions_tests"):
             return "approval_without_test_awareness"
-        if score < 6:
+        if score < 7:
             return "approval_below_quality_bar"
         return None
 
@@ -3049,6 +3068,39 @@ class GitHubToMEPBridgeService:
     @staticmethod
     def _suppression_reason_allows_retry(reason: Optional[str]) -> bool:
         return reason not in {"low_signal_no_finding"}
+
+    @classmethod
+    def _tune_quality_weights_from_feedback(cls, feedback_verdicts: list[str], current_weights: dict[str, float]) -> dict[str, float]:
+        """Adjust _QUALITY_SCORE_WEIGHTS based on human feedback verdicts.
+
+        - false_positive: decrease evidence weights (overly sensitive reviewer)
+        - missed_issue: increase evidence weights (not deep enough)
+        - useful: no change (balanced)
+
+        Returns a new weights dict (does not mutate the input).
+        """
+        weights = dict(current_weights)
+        if not feedback_verdicts:
+            return weights
+        false_positives = sum(1 for v in feedback_verdicts if v == "false_positive")
+        missed = sum(1 for v in feedback_verdicts if v == "missed_issue")
+        total = len(feedback_verdicts)
+        if total == 0:
+            return weights
+        # If >30% are false positives, slightly reduce evidence weights
+        if false_positives / total > 0.3:
+            for key in ("path_anchor", "changed_code_evidence", "review_substance"):
+                if key in weights:
+                    weights[key] = max(0.5, weights[key] - 0.2)
+        # If >20% are missed issues, increase evidence weights
+        if missed / total > 0.2:
+            for key in ("path_anchor", "changed_code_evidence", "risk_coverage"):
+                if key in weights:
+                    weights[key] = min(5.0, weights[key] + 0.2)
+        # Clamp all weights to [0.5, 5.0]
+        for key in weights:
+            weights[key] = max(0.5, min(5.0, weights[key]))
+        return weights
 
     @classmethod
     def _verify_review_findings_against_patch(
@@ -3446,11 +3498,27 @@ class GitHubToMEPBridgeService:
         detail: Optional[str],
         *,
         target_alias: Optional[str] = None,
+        review_metrics: Optional[dict[str, Any]] = None,
     ) -> str:
         detail_text = (detail or "").strip() or (
             f"{target_alias or self.config.target_alias} completed the requested action."
         )
-        marker = f"{BRIDGE_OUTPUT_MARKER} bridge_id={bridge_id} action={action} -->"
+        marker_parts = [f"{BRIDGE_OUTPUT_MARKER} bridge_id={bridge_id} action={action}"]
+        if review_metrics:
+            if review_metrics.get("model"):
+                marker_parts.append(f"model={review_metrics['model']}")
+            if review_metrics.get("tokens_in"):
+                marker_parts.append(f"tokens_in={review_metrics['tokens_in']}")
+            if review_metrics.get("tokens_out"):
+                marker_parts.append(f"tokens_out={review_metrics['tokens_out']}")
+            if review_metrics.get("token_source"):
+                marker_parts.append(f"token_source={review_metrics['token_source']}")
+            if review_metrics.get("tools_called"):
+                marker_parts.append(f"tools_called={review_metrics['tools_called']}")
+            if review_metrics.get("review_passes"):
+                marker_parts.append(f"review_passes={review_metrics['review_passes']}")
+        marker_parts.append("-->")
+        marker = " ".join(marker_parts)
         return f"{detail_text}\n\n{marker}"
 
     @staticmethod
@@ -3758,6 +3826,7 @@ class GitHubToMEPBridgeService:
             action,
             detail_to_publish,
             target_alias=str(execution.get("target_alias") or "").strip() or None,
+            review_metrics=update.review_metrics,
         )
         if review_action:
             inline_comments: list[dict[str, Any]] = []
@@ -4017,6 +4086,23 @@ class GitHubToMEPBridgeService:
         elif existing.get("notes"):
             feedback["notes"] = str(existing.get("notes"))
         self.store.update_execution(bridge_id, review_feedback=feedback)
+
+        # After every Nth feedback, tune quality score weights
+        if verdict and os.environ.get("MEP_FEEDBACK_TUNE_WEIGHTS", "").strip() in ("1", "true"):
+            recent = self.store.list_recent_review_trials(limit=50)
+            verdicts = [
+                str(t.get("review_feedback", {}).get("verdict") or "").strip().lower()
+                for t in recent
+                if t.get("review_feedback", {}).get("verdict")
+            ]
+            if len(verdicts) >= 5:
+                new_weights = self._tune_quality_weights_from_feedback(verdicts, _QUALITY_SCORE_WEIGHTS)
+                changed = {k: v for k, v in new_weights.items() if _QUALITY_SCORE_WEIGHTS.get(k) != v}
+                if changed:
+                    for k, v in new_weights.items():
+                        _QUALITY_SCORE_WEIGHTS[k] = v
+                    print(f"[mep feedback] tuned quality weights: {changed} (based on {len(verdicts)} verdicts)")
+
         return {"status": "ok", "bridge_id": bridge_id, "review_feedback": feedback}
 
     def label_review_trials_batch(self, update: BridgeReviewBatchLabelUpdate, token: str) -> dict[str, Any]:
@@ -4281,6 +4367,8 @@ class GitHubToMEPBridgeService:
             critique += "The code identifiers you mentioned are in the file context but NOT in the actual changed lines (+/-). Please focus your review on the actual changes."
         elif reason == "approval_without_changed_code_evidence":
             critique += "You attempted to approve the PR without citing changed-line code evidence. Reference concrete identifiers from the actual diff before approving."
+        elif reason == "approval_without_verified_evidence":
+            critique += "You attempted to approve the PR without listing explicit verified changed identifiers. Add a 'Changed identifiers verified:' section with concrete identifiers from the actual diff before approving."
         elif reason == "approval_without_test_awareness":
             critique += "You attempted to approve the PR without acknowledging the relevant changed tests. Re-check the diff and mention the test coverage you relied on."
         elif reason == "approval_below_quality_bar":
