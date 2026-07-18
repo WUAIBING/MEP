@@ -3352,7 +3352,14 @@ class GitHubToMEPBridgeService:
         action: str,
         suppression_reason: Optional[str],
     ) -> Optional[tuple[str, dict[str, Any], int, list[str]]]:
-        if action == "approved":
+        # Approvals may only be salvaged from cosmetic section-grounding
+        # failures (dropping the offending section); every other suppression
+        # reason keeps approvals fail-closed.
+        approval_salvageable_reasons = {
+            "checks_in_context_only",
+            "verified_identifiers_in_context_only",
+        }
+        if action == "approved" and suppression_reason not in approval_salvageable_reasons:
             return None
         if suppression_reason in {"summary_conflicts_with_patch"}:
             return None
@@ -3368,6 +3375,8 @@ class GitHubToMEPBridgeService:
         )
         score, reasons = self._score_review_quality(snapshot, action=action)
         if suppress:
+            if action == "approved":
+                return None
             reviewability = snapshot.get("reviewability") or {}
             reviewability_bucket = str(reviewability.get("bucket") or "standard").strip().lower()
             anchored_paths = snapshot.get("anchored_paths") or set()
@@ -3381,6 +3390,8 @@ class GitHubToMEPBridgeService:
                 and (checks_performed or risk_areas_checked)
             ):
                 return sanitized, snapshot, score, reasons
+            return None
+        if action == "approved" and self._approval_quality_failure(snapshot, score) is not None:
             return None
         return sanitized, snapshot, score, reasons
 
