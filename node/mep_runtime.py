@@ -1970,12 +1970,14 @@ def _execute_agentic_tool(
             run.summary = "empty_pattern"
             result = "[workspace_search] error: pattern is empty"
         else:
-            result = workspace.build_workspace_search_context(
-                workspace_path, query=pattern, task_type="pr_review"
-            ) or "[workspace_search] no matches found"
+            matches = workspace._workspace_search_matches(workspace_path, pattern, max_matches=8)
+            if matches:
+                result = f"[workspace_search] matches for '{pattern}':\n" + "\n".join(matches)
+            else:
+                result = "[workspace_search] no matches found"
             run.summary = f"searched:{pattern}"
     elif tool_name == "workspace_git":
-        result = workspace.build_workspace_git_context(workspace_path, task_type="pr_review") or "[workspace_git] no git data"
+        result = workspace.build_workspace_git_context(workspace_path) or "[workspace_git] no git data"
         run.summary = "git_snapshot"
     elif tool_name == "targeted_verify":
         file_path = str(tool_args.get("file", "")).strip().lstrip("/")
@@ -1986,8 +1988,9 @@ def _execute_agentic_tool(
             result = f"[targeted_verify] file not found: {file_path}"
         else:
             # Use the existing verification pipeline for this file
+            touched_tests = [file_path] if WorkspaceManager._is_test_path(file_path) else []
             result = workspace.build_verification_report(
-                workspace_path, changed_files=[file_path]
+                workspace_path, [file_path], touched_tests, enabled=True
             ) or "[targeted_verify] checks passed or produced no output"
             run.summary = f"verified:{file_path}"
     else:
@@ -2052,9 +2055,15 @@ def _run_agentic_tool_loop(
                     args = {}
                 if name == "submit_review":
                     return str(args.get("summary", response.get("content", "")))[:review_max_chars]
-                result_text, _run_record = _execute_agentic_tool(
-                    name, args, workspace=workspace, workspace_path=workspace_path, runtime_tool_runs=runtime_tool_runs,
-                )
+                try:
+                    result_text, _run_record = _execute_agentic_tool(
+                        name, args, workspace=workspace, workspace_path=workspace_path, runtime_tool_runs=runtime_tool_runs,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    # A broken tool must not kill the whole review; surface the
+                    # error to the model so it can adapt or submit without it.
+                    print(f"[mep agentic] tool {name} raised: {exc}")
+                    result_text = f"[agentic] tool {name} failed: {exc}"
                 messages.append({
                     "role": "tool",
                     "tool_call_id": tc.get("id", f"call_{_iteration}_{len(runtime_tool_runs)}"),
