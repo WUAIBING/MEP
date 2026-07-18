@@ -5045,6 +5045,14 @@ class RuntimeNode:
         if not task and isinstance(interbot_message, dict) and isinstance(interbot_message.get("task"), dict):
             task = copy.deepcopy(interbot_message.get("task"))
         inputs = task.get("inputs") if isinstance(task.get("inputs"), dict) else {}
+        # Fall back to interbot_message for inputs when the outer task envelope
+        # carries them inside the interbot payload (bridge originated tasks).
+        if not inputs and isinstance(interbot_message, dict) and isinstance(interbot_message.get("task"), dict):
+            interbot_task = interbot_message.get("task")
+            if isinstance(interbot_task, dict):
+                interbot_inputs = interbot_task.get("inputs")
+                if isinstance(interbot_inputs, dict):
+                    inputs = interbot_inputs
         github_inputs = dict(inputs.get("github") or {}) if isinstance(inputs.get("github"), dict) else {}
         repo_audit_inputs = dict(inputs.get("repo_audit") or {}) if isinstance(inputs.get("repo_audit"), dict) else {}
         repo_audit_required = _task_requires_repo_audit_contract(task_data)
