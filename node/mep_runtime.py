@@ -4979,6 +4979,15 @@ class RuntimeNode:
 
         result = self.adapter.generate_reply(instructions, adapter_task_data)
         adapter_metrics = getattr(self.adapter, "last_review_metrics", None) or None
+        if adapter_metrics is not None and merged_runs:
+            # tools_called reflects the runtime tool runs that produced evidence
+            # for this task (workspace_read/search/git, targeted_verify,
+            # github_context), not adapter-internal calls.
+            adapter_metrics = dict(adapter_metrics)
+            adapter_metrics["tools_called"] = sum(
+                1 for run in merged_runs
+                if isinstance(run, dict) and str(run.get("status") or "").lower() == "success"
+            )
         # Fail-safe: a reviewer runtime must never let an adapter error (missing or
         # expired API key, HTTP error, timeout, empty completion) be written back as
         # a completed review/approval. Report a failed status with no review action so
