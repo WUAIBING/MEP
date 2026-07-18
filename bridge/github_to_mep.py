@@ -148,6 +148,9 @@ _SPECULATIVE_FINDING_PATTERNS = [
     r"\blikely\s+(?:drop|drops|filter|filters|skip|skips|alter|alters|misalign|misaligns)\b",
     r"\bmay\s+(?:silently\s+)?(?:drop|skip|alter|misalign|filter)\b",
     r"\bcould cause\b",
+    r"\bmay\s+cause\b",
+    r"\bcould\s+lead\s+to\b",
+    r"\btooling issues?\b",
 ]
 
 
@@ -388,6 +391,7 @@ class BridgeStatusUpdate(BaseModel):
     action: Optional[str] = None
     timestamp_ms: Optional[int] = None
     detail: Optional[str] = None
+    review_metrics: Optional[dict[str, Any]] = None
 
 
 class BridgeReviewFeedbackUpdate(BaseModel):
@@ -2980,6 +2984,9 @@ class GitHubToMEPBridgeService:
         expected_tests = snapshot.get("expected_tests") or []
         mentions_tests = bool(snapshot.get("mentions_tests"))
         lowered = str(snapshot.get("lowered") or "")
+        reviewability_bucket = str(
+            ((snapshot.get("reviewability") or {}).get("bucket") or "standard")
+        ).strip().lower()
 
         if anchored_paths:
             path_anchor_units = min(len(anchored_paths), 2) / 2
@@ -2999,8 +3006,18 @@ class GitHubToMEPBridgeService:
         elif changed_verified_identifiers:
             reasons.append("verified_changed_identifiers")
         if has_findings:
-            raw_score += _QUALITY_SCORE_WEIGHTS["review_substance"]
-            reasons.append("concrete_findings")
+            finding_substance_weight = _QUALITY_SCORE_WEIGHTS["review_substance"]
+            speculative_low_signal_finding = (
+                reviewability_bucket == "low_signal"
+                and changed_evidence_count < 2
+                and self._is_speculative_finding("\n".join(filter(None, [summary_text, observation_text, lowered])))
+            )
+            if speculative_low_signal_finding:
+                finding_substance_weight /= 2
+                reasons.append("speculative_low_signal_finding")
+            else:
+                reasons.append("concrete_findings")
+            raw_score += finding_substance_weight
         elif (summary_text or observation_text) and (changed_tokens or grounded_tokens or changed_verified_identifiers):
             raw_score += _QUALITY_SCORE_WEIGHTS["review_substance"] / 2
             reasons.append("grounded_summary_or_observation")
@@ -3033,11 +3050,13 @@ class GitHubToMEPBridgeService:
             return "approval_contains_findings"
         if not snapshot.get("anchored_paths"):
             return "approval_without_touched_path_anchor"
-        if not snapshot.get("changed_tokens"):
+        if not snapshot.get("changed_tokens") and not snapshot.get("changed_verified_identifiers"):
             return "approval_without_changed_code_evidence"
+        if not snapshot.get("changed_verified_identifiers"):
+            return "approval_without_verified_evidence"
         if snapshot.get("expected_tests") and not snapshot.get("mentions_tests"):
             return "approval_without_test_awareness"
-        if score < 6:
+        if score < 7:
             return "approval_below_quality_bar"
         return None
 
@@ -3446,11 +3465,27 @@ class GitHubToMEPBridgeService:
         detail: Optional[str],
         *,
         target_alias: Optional[str] = None,
+        review_metrics: Optional[dict[str, Any]] = None,
     ) -> str:
         detail_text = (detail or "").strip() or (
             f"{target_alias or self.config.target_alias} completed the requested action."
         )
-        marker = f"{BRIDGE_OUTPUT_MARKER} bridge_id={bridge_id} action={action} -->"
+        marker_parts = [f"{BRIDGE_OUTPUT_MARKER} bridge_id={bridge_id} action={action}"]
+        if review_metrics:
+            if review_metrics.get("model"):
+                marker_parts.append(f"model={review_metrics['model']}")
+            if review_metrics.get("tokens_in"):
+                marker_parts.append(f"tokens_in={review_metrics['tokens_in']}")
+            if review_metrics.get("tokens_out"):
+                marker_parts.append(f"tokens_out={review_metrics['tokens_out']}")
+            if review_metrics.get("token_source"):
+                marker_parts.append(f"token_source={review_metrics['token_source']}")
+            if review_metrics.get("tools_called"):
+                marker_parts.append(f"tools_called={review_metrics['tools_called']}")
+            if review_metrics.get("review_passes"):
+                marker_parts.append(f"review_passes={review_metrics['review_passes']}")
+        marker_parts.append("-->")
+        marker = " ".join(marker_parts)
         return f"{detail_text}\n\n{marker}"
 
     @staticmethod
@@ -3758,6 +3793,7 @@ class GitHubToMEPBridgeService:
             action,
             detail_to_publish,
             target_alias=str(execution.get("target_alias") or "").strip() or None,
+            review_metrics=update.review_metrics,
         )
         if review_action:
             inline_comments: list[dict[str, Any]] = []
@@ -4281,6 +4317,8 @@ class GitHubToMEPBridgeService:
             critique += "The code identifiers you mentioned are in the file context but NOT in the actual changed lines (+/-). Please focus your review on the actual changes."
         elif reason == "approval_without_changed_code_evidence":
             critique += "You attempted to approve the PR without citing changed-line code evidence. Reference concrete identifiers from the actual diff before approving."
+        elif reason == "approval_without_verified_evidence":
+            critique += "You attempted to approve the PR without listing explicit verified changed identifiers. Add a 'Changed identifiers verified:' section with concrete identifiers from the actual diff before approving."
         elif reason == "approval_without_test_awareness":
             critique += "You attempted to approve the PR without acknowledging the relevant changed tests. Re-check the diff and mention the test coverage you relied on."
         elif reason == "approval_below_quality_bar":
