@@ -3132,6 +3132,9 @@ class DeepSeekAdapter:
             self.last_review_metrics["tokens_in"] += int(usage.get("prompt_tokens") or 0)
             self.last_review_metrics["tokens_out"] += int(usage.get("completion_tokens") or 0)
             self.last_review_metrics["review_passes"] += 1
+            served_model = str(data.get("model") or "").strip()
+            if served_model:
+                self.last_review_metrics["model"] = served_model
         choice = data["choices"][0]
         msg = choice["message"]
         content = str(msg.get("content") or "").strip()
@@ -3180,6 +3183,9 @@ class DeepSeekAdapter:
                 self.last_review_metrics["tokens_in"] += int(usage.get("prompt_tokens") or 0)
                 self.last_review_metrics["tokens_out"] += int(usage.get("completion_tokens") or 0)
                 self.last_review_metrics["review_passes"] += 1
+                served_model = str(data.get("model") or "").strip()
+                if served_model:
+                    self.last_review_metrics["model"] = served_model
                 return reply
 
             if _task_requires_repo_audit_prompt(task_data):
@@ -3295,6 +3301,9 @@ class OpenAICompatibleAdapter:
             self.last_review_metrics["tokens_in"] += int(usage.get("prompt_tokens") or 0)
             self.last_review_metrics["tokens_out"] += int(usage.get("completion_tokens") or 0)
             self.last_review_metrics["review_passes"] += 1
+            served_model = str(data.get("model") or "").strip()
+            if served_model:
+                self.last_review_metrics["model"] = served_model
         choice = data["choices"][0]
         msg = choice["message"]
         content = str(msg.get("content") or "").strip()
@@ -3343,6 +3352,9 @@ class OpenAICompatibleAdapter:
                 self.last_review_metrics["tokens_in"] += int(usage.get("prompt_tokens") or 0)
                 self.last_review_metrics["tokens_out"] += int(usage.get("completion_tokens") or 0)
                 self.last_review_metrics["review_passes"] += 1
+                served_model = str(data.get("model") or "").strip()
+                if served_model:
+                    self.last_review_metrics["model"] = served_model
                 return reply
 
             if _task_requires_repo_audit_prompt(task_data):
