@@ -2020,6 +2020,9 @@ def _run_agentic_tool_loop(
 
     tools_aware_invoke(messages, *, tools) -> dict with keys: content, tool_calls, finish_reason
     """
+    submit_review_failures = 0
+    max_submit_review_failures = 2  # Fail fast after 2 bad attempts
+    
     for _iteration in range(1, max_tool_calls + 2):
         try:
             response = tools_aware_invoke(messages, tools=tools)
@@ -2051,7 +2054,21 @@ def _run_agentic_tool_loop(
                 except (json.JSONDecodeError, TypeError):
                     args = {}
                 if name == "submit_review":
-                    return str(args.get("summary", response.get("content", "")))[:review_max_chars]
+                    # Only accept explicit summary argument, never fall back to raw content
+                    summary = args.get("summary")
+                    if summary is None or not isinstance(summary, str) or not summary.strip():
+                        # LLM called submit_review without proper summary
+                        submit_review_failures += 1
+                        if submit_review_failures >= max_submit_review_failures:
+                            # Anti-loop: fail fast after repeated failures
+                            return ""
+                        messages.append({
+                            "role": "tool",
+                            "tool_call_id": tc.get("id", f"call_{_iteration}_{len(runtime_tool_runs)}"),
+                            "content": f"[submit_review] error: summary argument is required and must be non-empty (attempt {submit_review_failures}/{max_submit_review_failures})",
+                        })
+                        continue
+                    return str(summary)[:review_max_chars]
                 result_text, _run_record = _execute_agentic_tool(
                     name, args, workspace=workspace, workspace_path=workspace_path, runtime_tool_runs=runtime_tool_runs,
                 )
@@ -2061,9 +2078,7 @@ def _run_agentic_tool_loop(
                     "content": result_text[:8000],
                 })
             continue
-        content = str(response.get("content") or "").strip()
-        if content:
-            return content[:review_max_chars]
+        # LLM finished without calling submit_review — return empty, never publish raw content
         return ""
     return ""
 

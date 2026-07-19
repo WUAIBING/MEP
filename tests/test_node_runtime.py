@@ -3456,5 +3456,153 @@ class TestWorkspaceReviewContext(unittest.TestCase):
         self.assertNotIn("tests/test_removed.py", flattened)
 
 
+class TestAgenticReviewLoopLeakGuard(unittest.TestCase):
+    """The agentic review loop must never publish raw model reasoning.
+
+    This test class validates the structural invariant enforced by
+    _run_agentic_tool_loop: only explicit submit_review.summary is published.
+    """
+
+    def _run(self, responses, *, review_max_chars=4000):
+        calls = {"i": 0}
+        sent_messages = {"last": None}
+
+        def _invoke(messages, *, tools):
+            sent_messages["last"] = list(messages)
+            idx = calls["i"]
+            calls["i"] += 1
+            return responses[min(idx, len(responses) - 1)]
+
+        result = mep_runtime._run_agentic_tool_loop(  # noqa: SLF001
+            messages=[{"role": "user", "content": "review this"}],
+            tools=mep_runtime._agentic_review_tools(),  # noqa: SLF001
+            tools_aware_invoke=_invoke,
+            workspace=None,
+            workspace_path="",
+            runtime_tool_runs=[],
+            max_tool_calls=6,
+            review_max_chars=review_max_chars,
+        )
+        return result, calls["i"], sent_messages["last"]
+
+    def test_free_text_reasoning_is_not_published(self):
+        """No-tool-call turns must never publish raw content."""
+        scratchpad = "Let me analyze this PR carefully. I need to check the caller."
+        # Every turn returns free-text reasoning and never calls submit_review.
+        result, invocations, _ = self._run([{"content": scratchpad, "tool_calls": []}])
+        self.assertEqual(result, "")
+        # First free-text turn returns "" immediately (no nudge in structural fix).
+        self.assertEqual(invocations, 1)
+
+    def test_submit_review_summary_is_published(self):
+        """Valid submit_review with summary must be published."""
+        summary = "## Review Summary\n\nChecked the changed handler and its call sites."
+        response = {
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "call_1",
+                    "function": {
+                        "name": "submit_review",
+                        "arguments": json.dumps({"summary": summary, "approval": True}),
+                    },
+                }
+            ],
+        }
+        result, _invocations, _ = self._run([response])
+        self.assertEqual(result, summary)
+
+    def test_submit_review_without_summary_does_not_leak_content(self):
+        """submit_review without summary must not fall back to raw content."""
+        response = {
+            "content": "Let me think about whether to approve. I need to verify the guard.",
+            "tool_calls": [
+                {
+                    "id": "call_1",
+                    "function": {
+                        "name": "submit_review",
+                        "arguments": json.dumps({"approval": True}),
+                    },
+                }
+            ],
+        }
+        result, invocations, _ = self._run([response])
+        # First attempt: error message sent, continue loop
+        # Second attempt: same response, fail fast
+        self.assertEqual(result, "")
+        self.assertEqual(invocations, 2)
+
+    def test_submit_review_empty_summary_does_not_leak_content(self):
+        """submit_review with empty summary must not publish."""
+        response = {
+            "content": "Some reasoning here.",
+            "tool_calls": [
+                {
+                    "id": "call_1",
+                    "function": {
+                        "name": "submit_review",
+                        "arguments": json.dumps({"summary": "", "approval": True}),
+                    },
+                }
+            ],
+        }
+        result, _invocations, _ = self._run([response])
+        self.assertEqual(result, "")
+
+    def test_submit_review_non_string_summary_does_not_leak_content(self):
+        """submit_review with non-string summary must not publish."""
+        response = {
+            "content": "Some reasoning here.",
+            "tool_calls": [
+                {
+                    "id": "call_1",
+                    "function": {
+                        "name": "submit_review",
+                        "arguments": json.dumps({"summary": 123, "approval": True}),
+                    },
+                }
+            ],
+        }
+        result, _invocations, _ = self._run([response])
+        self.assertEqual(result, "")
+
+    def test_submit_review_fails_after_two_bad_attempts(self):
+        """Anti-loop: must fail fast after 2 bad submit_review attempts."""
+        response = {
+            "content": "Reasoning",
+            "tool_calls": [
+                {
+                    "id": "call_1",
+                    "function": {
+                        "name": "submit_review",
+                        "arguments": json.dumps({"approval": True}),
+                    },
+                }
+            ],
+        }
+        result, invocations, _ = self._run([response])
+        self.assertEqual(result, "")
+        # Should fail after 2 attempts (anti-loop protection)
+        self.assertEqual(invocations, 2)
+
+    def test_submit_review_summary_truncated_to_max_chars(self):
+        """Summary must be truncated to review_max_chars."""
+        long_summary = "x" * 5000
+        response = {
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "call_1",
+                    "function": {
+                        "name": "submit_review",
+                        "arguments": json.dumps({"summary": long_summary, "approval": True}),
+                    },
+                }
+            ],
+        }
+        result, _invocations, _ = self._run([response], review_max_chars=1000)
+        self.assertEqual(len(result), 1000)
+
+
 if __name__ == "__main__":
     unittest.main()
