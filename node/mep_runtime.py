@@ -2019,7 +2019,13 @@ def _run_agentic_tool_loop(
     """Run the agentic review loop: LLM calls tools, we execute them, feed results back.
 
     tools_aware_invoke(messages, *, tools) -> dict with keys: content, tool_calls, finish_reason
+
+    A finished review MUST arrive through the submit_review tool. Raw assistant
+    content is treated as private reasoning/scratchpad and is never published;
+    when the model refuses to call submit_review we fail closed (return "") so
+    the caller falls back to the grounded baseline review.
     """
+    nudged = False
     for _iteration in range(1, max_tool_calls + 2):
         try:
             response = tools_aware_invoke(messages, tools=tools)
@@ -2051,7 +2057,12 @@ def _run_agentic_tool_loop(
                 except (json.JSONDecodeError, TypeError):
                     args = {}
                 if name == "submit_review":
-                    return str(args.get("summary", response.get("content", "")))[:review_max_chars]
+                    # Publish only the structured summary. Never fall back to raw
+                    # assistant content here: an empty summary means the model did
+                    # not produce a publishable review, so return "" and let the
+                    # caller drop to the grounded baseline path.
+                    summary = str(args.get("summary") or "").strip()
+                    return summary[:review_max_chars]
                 result_text, _run_record = _execute_agentic_tool(
                     name, args, workspace=workspace, workspace_path=workspace_path, runtime_tool_runs=runtime_tool_runs,
                 )
@@ -2061,11 +2072,54 @@ def _run_agentic_tool_loop(
                     "content": result_text[:8000],
                 })
             continue
-        content = str(response.get("content") or "").strip()
-        if content:
-            return content[:review_max_chars]
+        # No tool call this turn. The model answered in free text instead of
+        # calling submit_review; that text is chain-of-thought and must not be
+        # published. Nudge once toward the tool contract, then fail closed.
+        if not nudged:
+            nudged = True
+            messages.append({"role": "assistant", "content": str(response.get("content") or "")})
+            messages.append(
+                {
+                    "role": "user",
+                    "content": (
+                        "Do not reply in free text and do not expose your reasoning. "
+                        "Finish the review by calling the submit_review function with your "
+                        "final structured summary and approval decision now."
+                    ),
+                }
+            )
+            continue
         return ""
     return ""
+
+
+_AGENT_SCRATCHPAD_PATTERNS = [
+    r"^\s*let me\b",
+    r"\blet me (?:start|check|look|analyze|examine|verify|see|re-?read|trace|re-?examine)\b",
+    r"\bi need to (?:check|verify|look|see|examine|understand|confirm|re-?read|trace)\b",
+    r"\bi'll (?:check|start|look|examine|verify|analyze)\b",
+    r"\bi will (?:check|start|look|examine|verify|analyze)\b",
+    r"\bwait,?\s+let me\b",
+    r"\bactually,?\s+let me\b",
+    r"\bfrom (?:the )?workspace_search\b",
+    r"\bbut i need to\b",
+    r"\bi don'?t have the full\b",
+]
+
+
+def _looks_like_agent_scratchpad(text: str) -> bool:
+    """Detect leaked model reasoning/scratchpad that must never be published.
+
+    The agentic review loop is required to deliver its final answer through the
+    submit_review tool. If free-form investigative reasoning ("Let me...", "I
+    need to check...", "From workspace_search...") reaches the writeback, it is
+    chain-of-thought that escaped the tool contract, and the review must fall
+    back to the grounded baseline path instead of being published.
+    """
+    lowered = str(text or "").strip().lower()
+    if not lowered:
+        return False
+    return any(re.search(pattern, lowered) for pattern in _AGENT_SCRATCHPAD_PATTERNS)
 
 
 _WEAK_REVIEW_PATTERNS = [
@@ -3211,11 +3265,12 @@ class DeepSeekAdapter:
                         max_tool_calls=_MAX_AGENTIC_TOOL_CALLS,
                         review_max_chars=review_max,
                     )
-                    if agentic_result:
+                    if agentic_result and not _looks_like_agent_scratchpad(agentic_result):
                         return agentic_result
-                    # Agentic loop exhausted without submit_review or returned empty;
-                    # fall back to baseline two-pass review.
-                    print("[mep agentic] loop exhausted, falling back to baseline two-pass review")
+                    # Agentic loop exhausted, returned empty, or leaked raw model
+                    # reasoning; fall back to the grounded baseline two-pass review
+                    # rather than publishing chain-of-thought.
+                    print("[mep agentic] no publishable structured review from agentic loop, falling back to baseline two-pass review")
 
                 result = _run_two_pass_review(
                     task_data=task_data,
@@ -3367,11 +3422,12 @@ class OpenAICompatibleAdapter:
                         max_tool_calls=_MAX_AGENTIC_TOOL_CALLS,
                         review_max_chars=review_max,
                     )
-                    if agentic_result:
+                    if agentic_result and not _looks_like_agent_scratchpad(agentic_result):
                         return agentic_result
-                    # Agentic loop exhausted without submit_review or returned empty;
-                    # fall back to baseline two-pass review.
-                    print("[mep agentic] loop exhausted, falling back to baseline two-pass review")
+                    # Agentic loop exhausted, returned empty, or leaked raw model
+                    # reasoning; fall back to the grounded baseline two-pass review
+                    # rather than publishing chain-of-thought.
+                    print("[mep agentic] no publishable structured review from agentic loop, falling back to baseline two-pass review")
 
                 result = _run_two_pass_review(
                     task_data=task_data,

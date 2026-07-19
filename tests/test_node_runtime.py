@@ -3456,5 +3456,101 @@ class TestWorkspaceReviewContext(unittest.TestCase):
         self.assertNotIn("tests/test_removed.py", flattened)
 
 
+class TestAgenticReviewLoopLeakGuard(unittest.TestCase):
+    """The agentic review loop must never publish raw model reasoning."""
+
+    def _run(self, responses, *, review_max_chars=4000):
+        calls = {"i": 0}
+        sent_messages = {"last": None}
+
+        def _invoke(messages, *, tools):
+            sent_messages["last"] = list(messages)
+            idx = calls["i"]
+            calls["i"] += 1
+            return responses[min(idx, len(responses) - 1)]
+
+        result = mep_runtime._run_agentic_tool_loop(  # noqa: SLF001
+            messages=[{"role": "user", "content": "review this"}],
+            tools=mep_runtime._agentic_review_tools(),  # noqa: SLF001
+            tools_aware_invoke=_invoke,
+            workspace=None,
+            workspace_path="",
+            runtime_tool_runs=[],
+            max_tool_calls=6,
+            review_max_chars=review_max_chars,
+        )
+        return result, calls["i"], sent_messages["last"]
+
+    def test_free_text_reasoning_is_not_published(self):
+        scratchpad = "Let me analyze this PR carefully. I need to check the caller."
+        # Every turn returns free-text reasoning and never calls submit_review.
+        result, invocations, _ = self._run([{"content": scratchpad, "tool_calls": []}])
+        self.assertEqual(result, "")
+        # First free-text turn triggers a nudge, second gives up: two invocations.
+        self.assertEqual(invocations, 2)
+
+    def test_free_text_turn_nudges_toward_submit_review(self):
+        result, _invocations, last_messages = self._run(
+            [{"content": "Let me look at the diff first.", "tool_calls": []}]
+        )
+        self.assertEqual(result, "")
+        nudge = last_messages[-1]
+        self.assertEqual(nudge["role"], "user")
+        self.assertIn("submit_review", nudge["content"])
+
+    def test_submit_review_summary_is_published(self):
+        summary = "## Review Summary\n\nChecked the changed handler and its call sites."
+        response = {
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "call_1",
+                    "function": {
+                        "name": "submit_review",
+                        "arguments": json.dumps({"summary": summary, "approval": True}),
+                    },
+                }
+            ],
+        }
+        result, _invocations, _ = self._run([response])
+        self.assertEqual(result, summary)
+
+    def test_submit_review_without_summary_does_not_leak_content(self):
+        response = {
+            "content": "Let me think about whether to approve. I need to verify the guard.",
+            "tool_calls": [
+                {
+                    "id": "call_1",
+                    "function": {
+                        "name": "submit_review",
+                        "arguments": json.dumps({"approval": True}),
+                    },
+                }
+            ],
+        }
+        result, _invocations, _ = self._run([response])
+        self.assertEqual(result, "")
+
+    def test_scratchpad_detector_flags_reasoning(self):
+        self.assertTrue(
+            mep_runtime._looks_like_agent_scratchpad(  # noqa: SLF001
+                "Let me analyze this PR carefully. I need to check the caller."
+            )
+        )
+        self.assertTrue(
+            mep_runtime._looks_like_agent_scratchpad(  # noqa: SLF001
+                "From workspace_search I can see the call site at line 3533."
+            )
+        )
+
+    def test_scratchpad_detector_allows_grounded_review(self):
+        grounded = (
+            "## Review Summary\n\nReviewed the changed behavior around "
+            "`_render_review_telemetry_footer` and did not find a concrete issue "
+            "supported by the diff. Touched paths reviewed: `bridge/github_to_mep.py`."
+        )
+        self.assertFalse(mep_runtime._looks_like_agent_scratchpad(grounded))  # noqa: SLF001
+
+
 if __name__ == "__main__":
     unittest.main()
