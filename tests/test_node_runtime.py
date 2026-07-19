@@ -3491,8 +3491,10 @@ class TestAgenticReviewLoopLeakGuard(unittest.TestCase):
         # Every turn returns free-text reasoning and never calls submit_review.
         result, invocations, _ = self._run([{"content": scratchpad, "tool_calls": []}])
         self.assertEqual(result, "")
-        # First free-text turn returns "" immediately (no nudge in structural fix).
-        self.assertEqual(invocations, 1)
+        # Combined design: the first free-text turn nudges the model toward
+        # submit_review; when it still answers with raw reasoning, the second
+        # turn drops it and fails closed. Two invocations total.
+        self.assertEqual(invocations, 2)
 
     def test_submit_review_summary_is_published(self):
         """Valid submit_review with summary must be published."""

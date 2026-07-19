@@ -97,7 +97,7 @@ def _strict_adapter_mode() -> bool:
 
 
 def _review_max_chars() -> int:
-    return _env_positive_int("MEP_REVIEW_MAX_CHARS", 4000)
+    return _env_positive_int("MEP_REVIEW_MAX_CHARS", 12000)
 
 
 def _review_run_checks_enabled() -> bool:
@@ -1333,7 +1333,7 @@ def _system_prompt_for_task(
             "Do not rely on web knowledge, generic security checklists, or assumptions about unseen code. "
             "If you cannot verify a concrete finding from the supplied workspace material, keep `findings` empty and explain why in `why_no_finding`. "
             "Do not include chain-of-thought or any text outside the JSON object. "
-            f"Keep the response within {review_max_chars} characters.{workspace_hint}{inventory_hint}"
+            f"Be thorough and complete in your review.{workspace_hint}{inventory_hint}"
         )
     if _task_requires_review_prompt(task_data):
         github_inputs = _review_github_inputs(task_data)
@@ -1399,7 +1399,7 @@ def _system_prompt_for_task(
             "Do not speculate about unseen code, do not ask for more context, and do not include chain-of-thought or any text outside the JSON object. "
             "If the change looks good, keep findings empty, use summary to state the overall conclusion, list the risk areas and checks you covered, keep observation concrete, and set approval_recommendation to approve or comment. "
             "Diff restatement without risk coverage is not a sufficient review. Keep the "
-            f"response within {review_max_chars} characters.{review_mode_hint}{approval_hint}{deep_review_hint}{workspace_hint}"
+            f"Be thorough and complete.{review_mode_hint}{approval_hint}{deep_review_hint}{workspace_hint}"
         )
     return (
         "You are a helpful MEP (Miao Exchange Protocol) bot. "
@@ -1908,11 +1908,18 @@ def _agentic_review_tools() -> list[dict[str, Any]]:
             "type": "function",
             "function": {
                 "name": "submit_review",
-                "description": "Submit the final review output when you have gathered enough evidence. Do NOT call this until you have investigated the changes thoroughly.",
+                "description": (
+                    "Submit the final review output when you have gathered enough evidence. "
+                    "Do NOT call this until you have investigated the changes thoroughly. "
+                    "The summary must be the finished review ONLY \u2014 never include your "
+                    "private reasoning, planning, or investigative narration (no 'Let me...', "
+                    "'I need to check...', 'First I will...', 'From workspace_search...'). "
+                    "Start directly with the review content (e.g. '## Review Summary')."
+                ),
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "summary": {"type": "string", "description": "Structured review summary with findings and evidence"},
+                        "summary": {"type": "string", "description": "Finished structured review with findings and concrete code evidence. MUST contain only the review itself, with no reasoning preamble or narration; start directly with the review body (e.g. '## Review Summary')."},
                         "approval": {"type": "boolean", "description": "True to approve, false to request changes or comment"},
                     },
                     "required": ["summary", "approval"],
@@ -1970,12 +1977,16 @@ def _execute_agentic_tool(
             run.summary = "empty_pattern"
             result = "[workspace_search] error: pattern is empty"
         else:
-            result = workspace.build_workspace_search_context(
-                workspace_path, query=pattern, task_type="pr_review"
-            ) or "[workspace_search] no matches found"
+            matches = WorkspaceManager._workspace_search_matches(
+                workspace_path, pattern, max_matches=8
+            )
+            if matches:
+                result = f"[workspace_search] pattern '{pattern}' found {len(matches)} matches:\n\n```text\n" + "\n".join(matches) + "\n```"
+            else:
+                result = f"[workspace_search] no matches found for pattern '{pattern}'"
             run.summary = f"searched:{pattern}"
     elif tool_name == "workspace_git":
-        result = workspace.build_workspace_git_context(workspace_path, task_type="pr_review") or "[workspace_git] no git data"
+        result = workspace.build_workspace_git_context(workspace_path) or "[workspace_git] no git data"
         run.summary = "git_snapshot"
     elif tool_name == "targeted_verify":
         file_path = str(tool_args.get("file", "")).strip().lstrip("/")
@@ -2002,7 +2013,25 @@ def _agentic_review_enabled() -> bool:
     return os.environ.get("MEP_AGENTIC_REVIEW", "").strip() in ("1", "true", "yes")
 
 
-_MAX_AGENTIC_TOOL_CALLS = 6
+_MAX_AGENTIC_TOOL_CALLS = 10
+
+
+def _extract_tool_findings(messages: list[dict[str, Any]]) -> str:
+    """Extract tool-result content from the agentic loop's messages list.
+
+    When the model does not call submit_review, the investigation results
+    accumulated in messages are still valuable context for the baseline review.
+    """
+    findings: list[str] = []
+    for msg in messages:
+        if isinstance(msg, dict) and msg.get("role") == "tool":
+            content = str(msg.get("content") or "").strip()
+            if content:
+                findings.append(content)
+    if not findings:
+        return ""
+    # Keep last 3 tool results, cap at 6000 chars to limit context bloat
+    return "\n\n---\n\n".join(findings[-3:])[:6000]
 
 
 def _run_agentic_tool_loop(
@@ -2019,10 +2048,16 @@ def _run_agentic_tool_loop(
     """Run the agentic review loop: LLM calls tools, we execute them, feed results back.
 
     tools_aware_invoke(messages, *, tools) -> dict with keys: content, tool_calls, finish_reason
+
+    A finished review MUST arrive through the submit_review tool. Raw assistant
+    content is treated as private reasoning/scratchpad and is never published;
+    when the model refuses to call submit_review we fail closed (return "") so
+    the caller falls back to the grounded baseline review.
     """
     submit_review_failures = 0
     max_submit_review_failures = 2  # Fail fast after 2 bad attempts
-    
+    nudged = False
+    investigation_calls = 0
     for _iteration in range(1, max_tool_calls + 2):
         try:
             response = tools_aware_invoke(messages, tools=tools)
@@ -2054,13 +2089,14 @@ def _run_agentic_tool_loop(
                 except (json.JSONDecodeError, TypeError):
                     args = {}
                 if name == "submit_review":
-                    # Only accept explicit summary argument, never fall back to raw content
+                    # Only accept an explicit, non-empty string summary. Never
+                    # fall back to raw assistant content: an empty or invalid
+                    # summary means the model did not produce a publishable review.
                     summary = args.get("summary")
                     if summary is None or not isinstance(summary, str) or not summary.strip():
-                        # LLM called submit_review without proper summary
                         submit_review_failures += 1
                         if submit_review_failures >= max_submit_review_failures:
-                            # Anti-loop: fail fast after repeated failures
+                            # Anti-loop: fail fast after repeated bad attempts
                             return ""
                         messages.append({
                             "role": "tool",
@@ -2069,6 +2105,7 @@ def _run_agentic_tool_loop(
                         })
                         continue
                     return str(summary)[:review_max_chars]
+                investigation_calls += 1
                 result_text, _run_record = _execute_agentic_tool(
                     name, args, workspace=workspace, workspace_path=workspace_path, runtime_tool_runs=runtime_tool_runs,
                 )
@@ -2077,10 +2114,83 @@ def _run_agentic_tool_loop(
                     "tool_call_id": tc.get("id", f"call_{_iteration}_{len(runtime_tool_runs)}"),
                     "content": result_text[:8000],
                 })
+            # No early bail-out: let the model use all iterations.
+            # Qwen CAN call submit_review (proven in direct API test),
+            # it just needs more investigation room than other models.
+            if investigation_calls >= 10:
+                print("[mep agentic] bailing early after %d investigation calls without submit_review" % investigation_calls)
+                return ""
             continue
-        # LLM finished without calling submit_review — return empty, never publish raw content
+        # No tool call this turn. Nudge once toward the submit_review contract.
+        # If the model still answers in free text, publish that answer ONLY when
+        # it reads as a finished review; drop it when it looks like raw
+        # investigative reasoning, so we never leak chain-of-thought. Some models
+        # (notably deepseek) reliably return a clean structured review as free
+        # text instead of calling the tool, and those must still be published.
+        content = str(response.get("content") or "").strip()
+        if not nudged:
+            nudged = True
+            messages.append({"role": "assistant", "content": content})
+            messages.append(
+                {
+                    "role": "user",
+                    "content": (
+                        "You have NOT called submit_review yet. Your previous text response was discarded. "
+                        "You MUST call the submit_review tool now with your review summary and approval decision. "
+                        "Do NOT write any text — call the submit_review function. "
+                        "Start your summary with '## Review Summary'."
+                    ),
+                }
+            )
+            continue
+        if content and not _looks_like_agent_scratchpad(content):
+            print("[mep agentic] publishing free-text review (model did not call submit_review)")
+            return content[:review_max_chars]
+        print("[mep agentic] dropping non-structured free-text turn (looked like reasoning or empty)")
         return ""
     return ""
+
+
+# Verbs that, when they follow a first-person planning stem ("let me", "I'll",
+# "I need to", "I'm going to"), signal leaked investigative reasoning rather
+# than a finished review. An optional adverb/qualifier (e.g. "carefully",
+# "first", "now") may sit between the stem and the verb.
+_SCRATCHPAD_PLANNING_VERBS = (
+    r"start|check|look|analyze|analyse|examine|verify|see|read|re-?read|trace|"
+    r"re-?examine|walk|dig|dive|understand|confirm|investigate|review|inspect|"
+    r"find|figure|work|go|begin|assess|evaluate|scan|search|explore|map"
+)
+_SCRATCHPAD_ADVERB = r"(?:\w+[\s,]+){0,2}"
+_AGENT_SCRATCHPAD_PATTERNS = [
+    r"^\s*let me\b(?!\s+know\b)",
+    rf"\blet me {_SCRATCHPAD_ADVERB}(?:{_SCRATCHPAD_PLANNING_VERBS})\b",
+    rf"\bi need to {_SCRATCHPAD_ADVERB}(?:{_SCRATCHPAD_PLANNING_VERBS})\b",
+    rf"\bi'?ll {_SCRATCHPAD_ADVERB}(?:{_SCRATCHPAD_PLANNING_VERBS})\b",
+    rf"\bi will {_SCRATCHPAD_ADVERB}(?:{_SCRATCHPAD_PLANNING_VERBS})\b",
+    rf"\bi'?m going to {_SCRATCHPAD_ADVERB}(?:{_SCRATCHPAD_PLANNING_VERBS})\b",
+    rf"\bi should {_SCRATCHPAD_ADVERB}(?:{_SCRATCHPAD_PLANNING_VERBS})\b",
+    r"\bwait,?\s+let me\b",
+    r"\bactually,?\s+let me\b",
+    r"\b(?:first|now|next|then|okay|ok),?\s+let me\b",
+    r"\bfrom (?:the )?workspace_search\b",
+    r"\bbut i need to\b",
+    r"\bi don'?t have the full\b",
+]
+
+
+def _looks_like_agent_scratchpad(text: str) -> bool:
+    """Detect leaked model reasoning/scratchpad that must never be published.
+
+    The agentic review loop is required to deliver its final answer through the
+    submit_review tool. If free-form investigative reasoning ("Let me...", "I
+    need to check...", "From workspace_search...") reaches the writeback, it is
+    chain-of-thought that escaped the tool contract, and the review must fall
+    back to the grounded baseline path instead of being published.
+    """
+    lowered = str(text or "").strip().lower()
+    if not lowered:
+        return False
+    return any(re.search(pattern, lowered) for pattern in _AGENT_SCRATCHPAD_PATTERNS)
 
 
 _WEAK_REVIEW_PATTERNS = [
@@ -3132,7 +3242,8 @@ class DeepSeekAdapter:
         )
         if resp.status_code != 200:
             return {"content": f"[DeepSeek] API error {resp.status_code}: {resp.text[:200]}", "tool_calls": []}
-        choice = resp.json()["choices"][0]
+        data = resp.json()
+        choice = data["choices"][0]
         msg = choice["message"]
         content = str(msg.get("content") or "").strip()
         if not content:
@@ -3145,6 +3256,10 @@ class DeepSeekAdapter:
                     "id": tc.get("id", ""),
                     "function": tc.get("function", {}),
                 })
+        usage = data.get("usage") or {}
+        self.last_review_metrics["tokens_in"] += int(usage.get("prompt_tokens") or 0)
+        self.last_review_metrics["tokens_out"] += int(usage.get("completion_tokens") or 0)
+        self.last_review_metrics["review_passes"] += 1
         return {"content": content, "tool_calls": tool_calls, "finish_reason": choice.get("finish_reason", "")}
 
     def generate_reply(self, payload: str, task_data: dict[str, Any]) -> str:
@@ -3194,6 +3309,7 @@ class DeepSeekAdapter:
                 return "[DeepSeek] review response was empty"
 
             if _task_requires_review_prompt(task_data):
+                enriched_payload = payload  # default; may be enriched by agentic loop
                 # V1.5 agentic review: when enabled and workspace is available,
                 # let the LLM investigate iteratively before producing output.
                 if (
@@ -3208,9 +3324,13 @@ class DeepSeekAdapter:
                         lens_hint = f"\n\nReview lenses to cover: {', '.join(review_lenses)}."
                     system_prompt = (
                         _candidate_system_prompt_for_task(task_data, review_max_chars=review_max)
-                        + f"\n\nYou are an investigative reviewer. Use the available tools to read files, search for call sites, check git history, and verify behavior BEFORE you call submit_review. "
-                        f"Investigate at least the changed files and one level of call sites. "
-                        f"Then call submit_review with your structured findings and approval decision.{lens_hint}"
+                        + f"\n\nYou are an investigative code reviewer with a BUDGET of 5 tool calls. "
+                        f"Use workspace_read and workspace_search to investigate the changed files and call sites. "
+                        f"After at most 3-4 investigation calls, you MUST call submit_review with your final review. "
+                        f"CRITICAL: Your review will ONLY be published if you call the submit_review tool. "
+                        f"Any free-text response (without calling submit_review) will be DISCARDED. "
+                        f"The submit_review summary must start with '## Review Summary' and contain ONLY the finished review — "
+                        f"no planning, no narration, no 'Let me...', no 'I will check...'.{lens_hint}"
                     )
                     messages: list[dict[str, Any]] = [
                         {"role": "system", "content": system_prompt},
@@ -3226,15 +3346,21 @@ class DeepSeekAdapter:
                         max_tool_calls=_MAX_AGENTIC_TOOL_CALLS,
                         review_max_chars=review_max,
                     )
-                    if agentic_result:
+                    if agentic_result and not _looks_like_agent_scratchpad(agentic_result):
                         return agentic_result
-                    # Agentic loop exhausted without submit_review or returned empty;
-                    # fall back to baseline two-pass review.
-                    print("[mep agentic] loop exhausted, falling back to baseline two-pass review")
+                    # Agentic loop exhausted, returned empty, or leaked raw model
+                    # reasoning; fall back to the grounded baseline two-pass review
+                    # rather than publishing chain-of-thought.
+                    print("[mep agentic] no publishable structured review from agentic loop, falling back to baseline two-pass review")
+                    # Salvage tool findings from the agentic loop to enrich baseline
+                    tool_findings = _extract_tool_findings(messages)
+                    if tool_findings:
+                        enriched_payload = payload + "\n\n## Investigative Context (from agentic tools)\n" + tool_findings
+                        print("[mep agentic] salvaged %d chars of tool findings for baseline review" % len(tool_findings))
 
                 result = _run_two_pass_review(
                     task_data=task_data,
-                    payload=payload,
+                    payload=enriched_payload,
                     review_max_chars=review_max,
                     invoke_model=_invoke,
                 )
@@ -3270,9 +3396,24 @@ class OpenAICompatibleAdapter:
     def _endpoint(self) -> str:
         return self.base_url.rstrip("/") + "/chat/completions"
 
+    def _post_with_retry(self, url, **kwargs):
+        """Wrap requests.post with retry on SSL/connection errors."""
+        import time as _time
+        kwargs.setdefault("timeout", 120)
+        max_retries = 3
+        last_exc = None
+        for attempt in range(max_retries):
+            try:
+                return requests.post(url, **kwargs)
+            except (requests.exceptions.SSLError, requests.exceptions.ConnectionError) as exc:
+                last_exc = exc
+                print(f"[mep http] {self.provider_name} SSL/conn error on attempt {attempt+1}/{max_retries}: {exc}")
+                _time.sleep(2 * (attempt + 1))  # backoff: 2s, 4s, 6s
+        raise last_exc
+
     def _tools_aware_invoke(self, messages, *, tools):
         """Make an API call with function-calling support. Returns dict with content, tool_calls, finish_reason."""
-        resp = requests.post(
+        resp = self._post_with_retry(
             self._endpoint(),
             headers={
                 "Authorization": f"Bearer {self.api_key}",
@@ -3289,7 +3430,8 @@ class OpenAICompatibleAdapter:
         )
         if resp.status_code != 200:
             return {"content": f"[{self.provider_name}] API error {resp.status_code}: {resp.text[:200]}", "tool_calls": []}
-        choice = resp.json()["choices"][0]
+        data = resp.json()
+        choice = data["choices"][0]
         msg = choice["message"]
         content = str(msg.get("content") or "").strip()
         if not content:
@@ -3302,6 +3444,10 @@ class OpenAICompatibleAdapter:
                     "id": tc.get("id", ""),
                     "function": tc.get("function", {}),
                 })
+        usage = data.get("usage") or {}
+        self.last_review_metrics["tokens_in"] += int(usage.get("prompt_tokens") or 0)
+        self.last_review_metrics["tokens_out"] += int(usage.get("completion_tokens") or 0)
+        self.last_review_metrics["review_passes"] += 1
         return {"content": content, "tool_calls": tool_calls, "finish_reason": choice.get("finish_reason", "")}
 
     def generate_reply(self, payload: str, task_data: dict[str, Any]) -> str:
@@ -3309,7 +3455,7 @@ class OpenAICompatibleAdapter:
         self.last_review_metrics = {"model": self.model, "tokens_in": 0, "tokens_out": 0, "tools_called": 0, "review_passes": 0, "token_source": "provider"}
         try:
             def _invoke(system_prompt: str, user_payload: str) -> str:
-                resp = requests.post(
+                resp = self._post_with_retry(
                     self._endpoint(),
                     headers={
                         "Authorization": f"Bearer {self.api_key}",
@@ -3351,6 +3497,7 @@ class OpenAICompatibleAdapter:
                 return f"[{self.provider_name}] review response was empty"
 
             if _task_requires_review_prompt(task_data):
+                enriched_payload = payload  # default; may be enriched by agentic loop
                 # V1.5 agentic review: when enabled and workspace is available
                 if (
                     _agentic_review_enabled()
@@ -3364,9 +3511,13 @@ class OpenAICompatibleAdapter:
                         lens_hint = f"\n\nReview lenses to cover: {', '.join(review_lenses)}."
                     system_prompt = (
                         _candidate_system_prompt_for_task(task_data, review_max_chars=review_max)
-                        + f"\n\nYou are an investigative reviewer. Use the available tools to read files, search for call sites, check git history, and verify behavior BEFORE you call submit_review. "
-                        f"Investigate at least the changed files and one level of call sites. "
-                        f"Then call submit_review with your structured findings and approval decision.{lens_hint}"
+                        + f"\n\nYou are an investigative code reviewer with a BUDGET of 5 tool calls. "
+                        f"Use workspace_read and workspace_search to investigate the changed files and call sites. "
+                        f"After at most 3-4 investigation calls, you MUST call submit_review with your final review. "
+                        f"CRITICAL: Your review will ONLY be published if you call the submit_review tool. "
+                        f"Any free-text response (without calling submit_review) will be DISCARDED. "
+                        f"The submit_review summary must start with '## Review Summary' and contain ONLY the finished review — "
+                        f"no planning, no narration, no 'Let me...', no 'I will check...'.{lens_hint}"
                     )
                     messages: list[dict[str, Any]] = [
                         {"role": "system", "content": system_prompt},
@@ -3382,15 +3533,21 @@ class OpenAICompatibleAdapter:
                         max_tool_calls=_MAX_AGENTIC_TOOL_CALLS,
                         review_max_chars=review_max,
                     )
-                    if agentic_result:
+                    if agentic_result and not _looks_like_agent_scratchpad(agentic_result):
                         return agentic_result
-                    # Agentic loop exhausted without submit_review or returned empty;
-                    # fall back to baseline two-pass review.
-                    print("[mep agentic] loop exhausted, falling back to baseline two-pass review")
+                    # Agentic loop exhausted, returned empty, or leaked raw model
+                    # reasoning; fall back to the grounded baseline two-pass review
+                    # rather than publishing chain-of-thought.
+                    print("[mep agentic] no publishable structured review from agentic loop, falling back to baseline two-pass review")
+                    # Salvage tool findings from the agentic loop to enrich baseline
+                    tool_findings = _extract_tool_findings(messages)
+                    if tool_findings:
+                        enriched_payload = payload + "\n\n## Investigative Context (from agentic tools)\n" + tool_findings
+                        print("[mep agentic] salvaged %d chars of tool findings for baseline review" % len(tool_findings))
 
                 result = _run_two_pass_review(
                     task_data=task_data,
-                    payload=payload,
+                    payload=enriched_payload,
                     review_max_chars=review_max,
                     invoke_model=_invoke,
                 )
@@ -5057,10 +5214,11 @@ class RuntimeNode:
             instructions, interbot_message = MEPClient.extract_interbot_instructions(payload)
         workspace_path = ""
         task = task_data.get("task") if isinstance(task_data.get("task"), dict) else {}
-        if not task and isinstance(interbot_message, dict) and isinstance(interbot_message.get("task"), dict):
+        if (not task or not isinstance(task.get("inputs"), dict)) and isinstance(interbot_message, dict) and isinstance(interbot_message.get("task"), dict):
             task = copy.deepcopy(interbot_message.get("task"))
         inputs = task.get("inputs") if isinstance(task.get("inputs"), dict) else {}
         github_inputs = dict(inputs.get("github") or {}) if isinstance(inputs.get("github"), dict) else {}
+        print(f"[mep debug] task={task_id[:8]} github_inputs_keys={list(github_inputs.keys())[:8]} has_repo_clone_url={'repo_clone_url' in github_inputs} has_head_sha={'head_sha' in github_inputs} has_head_ref={'head_ref' in github_inputs}")
         repo_audit_inputs = dict(inputs.get("repo_audit") or {}) if isinstance(inputs.get("repo_audit"), dict) else {}
         repo_audit_required = _task_requires_repo_audit_contract(task_data)
         review_prompt_required = _task_requires_review_prompt(adapter_task_data)
