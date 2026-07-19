@@ -3498,6 +3498,20 @@ class TestAgenticReviewLoopLeakGuard(unittest.TestCase):
         self.assertEqual(nudge["role"], "user")
         self.assertIn("submit_review", nudge["content"])
 
+    def test_clean_free_text_review_is_published_after_nudge(self):
+        # deepseek and similar models often return a finished, structured review
+        # as free text instead of calling submit_review. That review must still
+        # be published (regression guard: the leak fix must not silence it).
+        clean = (
+            "## Review Summary\n\nReviewed `hub/db.py` get_pub_pem() and its call "
+            "sites. The pending_registrations guard is correct and connections are "
+            "released on the early-return path. No blocking issues. Approve."
+        )
+        result, invocations, _ = self._run([{"content": clean, "tool_calls": []}])
+        self.assertEqual(result, clean)
+        # First free-text turn nudges, second publishes the clean review.
+        self.assertEqual(invocations, 2)
+
     def test_submit_review_summary_is_published(self):
         summary = "## Review Summary\n\nChecked the changed handler and its call sites."
         response = {

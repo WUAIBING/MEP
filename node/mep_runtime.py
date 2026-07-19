@@ -2079,23 +2079,32 @@ def _run_agentic_tool_loop(
                     "content": result_text[:8000],
                 })
             continue
-        # No tool call this turn. The model answered in free text instead of
-        # calling submit_review; that text is chain-of-thought and must not be
-        # published. Nudge once toward the tool contract, then fail closed.
+        # No tool call this turn. Nudge once toward the submit_review contract.
+        # If the model still answers in free text, publish that answer ONLY when
+        # it reads as a finished review; drop it when it looks like raw
+        # investigative reasoning, so we never leak chain-of-thought. Some models
+        # (notably deepseek) reliably return a clean structured review as free
+        # text instead of calling the tool, and those must still be published.
+        content = str(response.get("content") or "").strip()
         if not nudged:
             nudged = True
-            messages.append({"role": "assistant", "content": str(response.get("content") or "")})
+            messages.append({"role": "assistant", "content": content})
             messages.append(
                 {
                     "role": "user",
                     "content": (
-                        "Do not reply in free text and do not expose your reasoning. "
-                        "Finish the review by calling the submit_review function with your "
-                        "final structured summary and approval decision now."
+                        "Do not expose your step-by-step reasoning. Finish the review by "
+                        "calling the submit_review function with your final structured summary "
+                        "and approval decision now. If you cannot call the tool, reply with "
+                        "only the finished review body (no planning or narration)."
                     ),
                 }
             )
             continue
+        if content and not _looks_like_agent_scratchpad(content):
+            print("[mep agentic] publishing free-text review (model did not call submit_review)")
+            return content[:review_max_chars]
+        print("[mep agentic] dropping non-structured free-text turn (looked like reasoning or empty)")
         return ""
     return ""
 
@@ -2124,8 +2133,6 @@ _AGENT_SCRATCHPAD_PATTERNS = [
     r"\bfrom (?:the )?workspace_search\b",
     r"\bbut i need to\b",
     r"\bi don'?t have the full\b",
-    r"\bthe highest-value\b",
-    r"\bpr description summary\b",
 ]
 
 
