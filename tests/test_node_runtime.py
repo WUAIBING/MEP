@@ -3542,6 +3542,19 @@ class TestAgenticReviewLoopLeakGuard(unittest.TestCase):
                 "From workspace_search I can see the call site at line 3533."
             )
         )
+        # Adverb between the planning stem and the verb must still be caught
+        # ("let me CAREFULLY analyze", "first, let me re-read", "I'm going to verify").
+        for leak in (
+            "Let me carefully analyze the PR diff and workspace context.",
+            "First, let me re-read the diff before deciding.",
+            "I'll now examine the changed lines.",
+            "I'm going to verify the behavior of the guard.",
+            "Now let me look at the callers.",
+        ):
+            self.assertTrue(
+                mep_runtime._looks_like_agent_scratchpad(leak),  # noqa: SLF001
+                msg=f"expected scratchpad: {leak!r}",
+            )
 
     def test_scratchpad_detector_allows_grounded_review(self):
         grounded = (
@@ -3550,6 +3563,12 @@ class TestAgenticReviewLoopLeakGuard(unittest.TestCase):
             "supported by the diff. Touched paths reviewed: `bridge/github_to_mep.py`."
         )
         self.assertFalse(mep_runtime._looks_like_agent_scratchpad(grounded))  # noqa: SLF001
+        # A closing sign-off that merely contains "let me know" is not scratchpad.
+        self.assertFalse(
+            mep_runtime._looks_like_agent_scratchpad(  # noqa: SLF001
+                "Let me know if you have any questions about this review."
+            )
+        )
 
 
 if __name__ == "__main__":

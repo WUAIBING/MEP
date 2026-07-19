@@ -1908,11 +1908,18 @@ def _agentic_review_tools() -> list[dict[str, Any]]:
             "type": "function",
             "function": {
                 "name": "submit_review",
-                "description": "Submit the final review output when you have gathered enough evidence. Do NOT call this until you have investigated the changes thoroughly.",
+                "description": (
+                    "Submit the final review output when you have gathered enough evidence. "
+                    "Do NOT call this until you have investigated the changes thoroughly. "
+                    "The summary must be the finished review ONLY \u2014 never include your "
+                    "private reasoning, planning, or investigative narration (no 'Let me...', "
+                    "'I need to check...', 'First I will...', 'From workspace_search...'). "
+                    "Start directly with the review content (e.g. '## Review Summary')."
+                ),
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "summary": {"type": "string", "description": "Structured review summary with findings and evidence"},
+                        "summary": {"type": "string", "description": "Finished structured review with findings and concrete code evidence. MUST contain only the review itself, with no reasoning preamble or narration; start directly with the review body (e.g. '## Review Summary')."},
                         "approval": {"type": "boolean", "description": "True to approve, false to request changes or comment"},
                     },
                     "required": ["summary", "approval"],
@@ -2093,17 +2100,32 @@ def _run_agentic_tool_loop(
     return ""
 
 
+# Verbs that, when they follow a first-person planning stem ("let me", "I'll",
+# "I need to", "I'm going to"), signal leaked investigative reasoning rather
+# than a finished review. An optional adverb/qualifier (e.g. "carefully",
+# "first", "now") may sit between the stem and the verb.
+_SCRATCHPAD_PLANNING_VERBS = (
+    r"start|check|look|analyze|analyse|examine|verify|see|read|re-?read|trace|"
+    r"re-?examine|walk|dig|dive|understand|confirm|investigate|review|inspect|"
+    r"find|figure|work|go|begin|assess|evaluate|scan|search|explore|map"
+)
+_SCRATCHPAD_ADVERB = r"(?:\w+[\s,]+){0,2}"
 _AGENT_SCRATCHPAD_PATTERNS = [
-    r"^\s*let me\b",
-    r"\blet me (?:start|check|look|analyze|examine|verify|see|re-?read|trace|re-?examine)\b",
-    r"\bi need to (?:check|verify|look|see|examine|understand|confirm|re-?read|trace)\b",
-    r"\bi'll (?:check|start|look|examine|verify|analyze)\b",
-    r"\bi will (?:check|start|look|examine|verify|analyze)\b",
+    r"^\s*let me\b(?!\s+know\b)",
+    rf"\blet me {_SCRATCHPAD_ADVERB}(?:{_SCRATCHPAD_PLANNING_VERBS})\b",
+    rf"\bi need to {_SCRATCHPAD_ADVERB}(?:{_SCRATCHPAD_PLANNING_VERBS})\b",
+    rf"\bi'?ll {_SCRATCHPAD_ADVERB}(?:{_SCRATCHPAD_PLANNING_VERBS})\b",
+    rf"\bi will {_SCRATCHPAD_ADVERB}(?:{_SCRATCHPAD_PLANNING_VERBS})\b",
+    rf"\bi'?m going to {_SCRATCHPAD_ADVERB}(?:{_SCRATCHPAD_PLANNING_VERBS})\b",
+    rf"\bi should {_SCRATCHPAD_ADVERB}(?:{_SCRATCHPAD_PLANNING_VERBS})\b",
     r"\bwait,?\s+let me\b",
     r"\bactually,?\s+let me\b",
+    r"\b(?:first|now|next|then|okay|ok),?\s+let me\b",
     r"\bfrom (?:the )?workspace_search\b",
     r"\bbut i need to\b",
     r"\bi don'?t have the full\b",
+    r"\bthe highest-value\b",
+    r"\bpr description summary\b",
 ]
 
 
@@ -3249,7 +3271,10 @@ class DeepSeekAdapter:
                         _candidate_system_prompt_for_task(task_data, review_max_chars=review_max)
                         + f"\n\nYou are an investigative reviewer. Use the available tools to read files, search for call sites, check git history, and verify behavior BEFORE you call submit_review. "
                         f"Investigate at least the changed files and one level of call sites. "
-                        f"Then call submit_review with your structured findings and approval decision.{lens_hint}"
+                        f"Then call submit_review with your structured findings and approval decision. "
+                        f"Keep all of your reasoning and investigation in tool calls: the submit_review summary must contain ONLY the finished review, "
+                        f"with no planning or narration (never write 'Let me...', 'I need to check...', 'First I will...', or 'From workspace_search...'). "
+                        f"Start the summary directly with the review body (e.g. '## Review Summary').{lens_hint}"
                     )
                     messages: list[dict[str, Any]] = [
                         {"role": "system", "content": system_prompt},
@@ -3406,7 +3431,10 @@ class OpenAICompatibleAdapter:
                         _candidate_system_prompt_for_task(task_data, review_max_chars=review_max)
                         + f"\n\nYou are an investigative reviewer. Use the available tools to read files, search for call sites, check git history, and verify behavior BEFORE you call submit_review. "
                         f"Investigate at least the changed files and one level of call sites. "
-                        f"Then call submit_review with your structured findings and approval decision.{lens_hint}"
+                        f"Then call submit_review with your structured findings and approval decision. "
+                        f"Keep all of your reasoning and investigation in tool calls: the submit_review summary must contain ONLY the finished review, "
+                        f"with no planning or narration (never write 'Let me...', 'I need to check...', 'First I will...', or 'From workspace_search...'). "
+                        f"Start the summary directly with the review body (e.g. '## Review Summary').{lens_hint}"
                     )
                     messages: list[dict[str, Any]] = [
                         {"role": "system", "content": system_prompt},
