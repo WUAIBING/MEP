@@ -3608,3 +3608,109 @@ class TestAgenticReviewLoopLeakGuard(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestAgenticSynthesisTurn(unittest.TestCase):
+    """The agentic loop must synthesize a finished review from gathered evidence
+    instead of discarding it when the model never calls submit_review itself."""
+
+    def _submit(self, summary, approval=True):
+        return {
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "call_final",
+                    "function": {
+                        "name": "submit_review",
+                        "arguments": json.dumps({"summary": summary, "approval": approval}),
+                    },
+                }
+            ],
+        }
+
+    def _search(self, n=1):
+        return {
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": f"call_s{i}",
+                    "function": {
+                        "name": "workspace_search",
+                        "arguments": json.dumps({"pattern": "def foo"}),
+                    },
+                }
+                for i in range(n)
+            ],
+        }
+
+    def test_budget_exhaustion_triggers_synthesis(self):
+        """When investigation budget is hit, a synthesis turn recovers the review."""
+        finished = "## Review Summary\n\nThe change is correct and safe. LGTM."
+        # One turn with 10 investigation calls -> budget reached -> synthesis turn.
+        responses = [self._search(10), self._submit(finished)]
+        calls = {"i": 0}
+
+        def _invoke(messages, *, tools):
+            idx = calls["i"]
+            calls["i"] += 1
+            return responses[min(idx, len(responses) - 1)]
+
+        result = mep_runtime._run_agentic_tool_loop(  # noqa: SLF001
+            messages=[{"role": "user", "content": "review this"}],
+            tools=mep_runtime._agentic_review_tools(),  # noqa: SLF001
+            tools_aware_invoke=_invoke,
+            workspace=None,
+            workspace_path="",
+            runtime_tool_runs=[],
+            max_tool_calls=10,
+            review_max_chars=4000,
+        )
+        self.assertEqual(result, finished)
+
+    def test_loop_exhaustion_triggers_synthesis(self):
+        """When the iteration range is exhausted, synthesis still recovers the review."""
+        finished = "## Review Summary\n\nFindings with file/line evidence. Approve."
+        # Each turn: one investigation call. Loop range exhausts, then synthesis fires.
+        responses = [self._search(1), self._search(1), self._search(1), self._submit(finished)]
+        calls = {"i": 0}
+
+        def _invoke(messages, *, tools):
+            idx = calls["i"]
+            calls["i"] += 1
+            return responses[min(idx, len(responses) - 1)]
+
+        result = mep_runtime._run_agentic_tool_loop(  # noqa: SLF001
+            messages=[{"role": "user", "content": "review this"}],
+            tools=mep_runtime._agentic_review_tools(),  # noqa: SLF001
+            tools_aware_invoke=_invoke,
+            workspace=None,
+            workspace_path="",
+            runtime_tool_runs=[],
+            max_tool_calls=2,
+            review_max_chars=4000,
+        )
+        self.assertEqual(result, finished)
+
+    def test_synthesis_scratchpad_is_not_published(self):
+        """If the synthesis turn only yields raw reasoning, fail closed to ""."""
+        scratchpad = "Let me analyze this more. I need to check the caller first."
+        responses = [self._search(10), {"content": scratchpad, "tool_calls": []}]
+        calls = {"i": 0}
+
+        def _invoke(messages, *, tools):
+            idx = calls["i"]
+            calls["i"] += 1
+            return responses[min(idx, len(responses) - 1)]
+
+        result = mep_runtime._run_agentic_tool_loop(  # noqa: SLF001
+            messages=[{"role": "user", "content": "review this"}],
+            tools=mep_runtime._agentic_review_tools(),  # noqa: SLF001
+            tools_aware_invoke=_invoke,
+            workspace=None,
+            workspace_path="",
+            runtime_tool_runs=[],
+            max_tool_calls=10,
+            review_max_chars=4000,
+        )
+        self.assertEqual(result, "")
+

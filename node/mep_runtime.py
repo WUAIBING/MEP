@@ -2034,6 +2034,62 @@ def _extract_tool_findings(messages: list[dict[str, Any]]) -> str:
     return "\n\n---\n\n".join(findings[-3:])[:6000]
 
 
+def _forced_synthesis_review(
+    messages: list[dict[str, Any]],
+    tools: list[dict[str, Any]],
+    tools_aware_invoke: Any,
+    review_max_chars: int,
+) -> str:
+    """Last-resort synthesis turn for the agentic review loop.
+
+    When the model has spent its investigation budget gathering evidence but has
+    not yet called submit_review, instead of discarding all that work we make ONE
+    final call that forces it to synthesize the finished review from the evidence
+    already in the conversation. This is the single biggest quality lever: strong
+    reasoning models investigate thoroughly and would otherwise bail out to the
+    weak grounded baseline review. Returns the finished review string, or "" if
+    synthesis fails (so the caller can still fall back to the baseline).
+    """
+    print("[mep agentic] forcing final synthesis turn (investigation done, no submit_review yet)")
+    messages.append({
+        "role": "user",
+        "content": (
+            "STOP investigating. You have gathered enough evidence above. "
+            "Now write your FINAL review based ONLY on the evidence already collected. "
+            "Call the submit_review tool right now with your finished review. "
+            "The summary MUST start with '## Review Summary' and contain ONLY the finished "
+            "review: concrete findings with file/line evidence, an assessment of correctness "
+            "and safety, and a clear verdict. No planning, no narration, no 'Let me...', "
+            "no 'I will check...'. Set approval=true only if the change is correct and safe; "
+            "otherwise set approval=false. Call submit_review now."
+        ),
+    })
+    try:
+        response = tools_aware_invoke(messages, tools=tools)
+    except Exception:
+        return ""
+    if not isinstance(response, dict):
+        return ""
+    for tc in (response.get("tool_calls") or []):
+        fn = tc.get("function") if isinstance(tc.get("function"), dict) else {}
+        if str(fn.get("name") or "").strip() == "submit_review":
+            try:
+                args = json.loads(str(fn.get("arguments") or "{}"))
+            except (json.JSONDecodeError, TypeError):
+                args = {}
+            summary = args.get("summary")
+            if isinstance(summary, str) and summary.strip():
+                approval = args.get("approval")
+                print("[mep agentic] synthesis turn produced submit_review (approval=%r)" % (approval,))
+                return str(summary)[:review_max_chars]
+    content = str(response.get("content") or "").strip()
+    if content and not _looks_like_agent_scratchpad(content):
+        print("[mep agentic] synthesis turn produced free-text review")
+        return content[:review_max_chars]
+    print("[mep agentic] synthesis turn did not yield a publishable review")
+    return ""
+
+
 def _run_agentic_tool_loop(
     *,
     messages: list[dict[str, Any]],
@@ -2118,8 +2174,8 @@ def _run_agentic_tool_loop(
             # Qwen CAN call submit_review (proven in direct API test),
             # it just needs more investigation room than other models.
             if investigation_calls >= 10:
-                print("[mep agentic] bailing early after %d investigation calls without submit_review" % investigation_calls)
-                return ""
+                print("[mep agentic] investigation budget reached (%d calls) without submit_review" % investigation_calls)
+                return _forced_synthesis_review(messages, tools, tools_aware_invoke, review_max_chars)
             continue
         # No tool call this turn. Nudge once toward the submit_review contract.
         # If the model still answers in free text, publish that answer ONLY when
@@ -2148,7 +2204,9 @@ def _run_agentic_tool_loop(
             return content[:review_max_chars]
         print("[mep agentic] dropping non-structured free-text turn (looked like reasoning or empty)")
         return ""
-    return ""
+    # Loop exhausted its iterations without a submit_review: force one final
+    # synthesis turn so the gathered evidence is not thrown away.
+    return _forced_synthesis_review(messages, tools, tools_aware_invoke, review_max_chars)
 
 
 # Verbs that, when they follow a first-person planning stem ("let me", "I'll",
