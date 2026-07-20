@@ -3714,3 +3714,29 @@ class TestAgenticSynthesisTurn(unittest.TestCase):
         )
         self.assertEqual(result, "")
 
+    def test_budget_warning_fires_at_7_calls(self):
+        """At 7 investigation calls, a budget warning is injected and the model can still submit."""
+        finished = "## Review Summary\n\nBudget warning works. Model submitted after warning."
+        responses = [self._search(7), self._submit(finished)]
+        captured_messages = []
+        calls = {"i": 0}
+        def _invoke(messages, *, tools):
+            idx = calls["i"]
+            calls["i"] += 1
+            if idx == 1:
+                captured_messages.extend(list(messages))
+            return responses[min(idx, len(responses) - 1)]
+        result = mep_runtime._run_agentic_tool_loop(
+            messages=[{"role": "user", "content": "review this"}],
+            tools=mep_runtime._agentic_review_tools(),
+            tools_aware_invoke=_invoke,
+            workspace=None, workspace_path="", runtime_tool_runs=[],
+            max_tool_calls=10, review_max_chars=4000,
+        )
+        self.assertEqual(result, finished)
+        warning_found = any(
+            "BUDGET WARNING" in str(m.get("content", ""))
+            for m in captured_messages if m.get("role") == "user"
+        )
+        self.assertTrue(warning_found, "Budget warning should be in messages after 7 investigation calls")
+

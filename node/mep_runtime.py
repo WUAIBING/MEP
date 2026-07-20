@@ -2114,6 +2114,7 @@ def _run_agentic_tool_loop(
     max_submit_review_failures = 2  # Fail fast after 2 bad attempts
     nudged = False
     investigation_calls = 0
+    budget_warned = False
     for _iteration in range(1, max_tool_calls + 2):
         try:
             response = tools_aware_invoke(messages, tools=tools)
@@ -2173,6 +2174,17 @@ def _run_agentic_tool_loop(
             # No early bail-out: let the model use all iterations.
             # Qwen CAN call submit_review (proven in direct API test),
             # it just needs more investigation room than other models.
+            if not budget_warned and investigation_calls >= 7:
+                budget_warned = True
+                print("[mep agentic] budget warning: %d/10 calls used — nudging model to wrap up" % investigation_calls)
+                messages.append({
+                    "role": "user",
+                    "content": (
+                        "BUDGET WARNING: You have used %d of 10 investigation calls. "
+                        "You have only a few calls remaining. Stop investigating and wrap up — "
+                        "identify the most important findings and call submit_review within the next 1-2 calls."
+                    ) % investigation_calls,
+                })
             if investigation_calls >= 10:
                 print("[mep agentic] investigation budget reached (%d calls) without submit_review" % investigation_calls)
                 return _forced_synthesis_review(messages, tools, tools_aware_invoke, review_max_chars)
