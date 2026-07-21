@@ -2899,8 +2899,7 @@ class GitHubToMEPBridgeService:
             "changes": "\n".join(patches_by_path.get(path, {}).get("changes", "") for path in anchored_paths),
         }
         _HAS_FINDINGS_PROXY_RE = re.compile(
-            r"(?im)^[\s\S]*?(?:^|\n)\s*"
-            r"(?:\d+\.|###?\s*\d+\.?|[-*]\s+)"
+            r"(?im)^\s*(?:\d+\.|###?\s*\d+\.?|[-*]\s+)"
             r".{0,200}?(?:request changes|severity|high risk|medium risk|low risk|"
             r"recommend(?:ation|ed)?|invariant|finding|issue|concern|gap|"
             r"should be|must be|broken|incorrect|unsafe|missing)",

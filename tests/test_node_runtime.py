@@ -3748,7 +3748,8 @@ class TestAgenticSynthesisTurn(unittest.TestCase):
         calls = {"i": 0}
 
         def _invoke(messages, *, tools):
-            idx = calls["i"]; calls["i"] += 1
+            idx = calls["i"]
+            calls["i"] += 1
             return responses[min(idx, len(responses) - 1)]
 
         result = mep_runtime._run_agentic_tool_loop(  # noqa: SLF001
@@ -3773,7 +3774,8 @@ class TestAgenticSynthesisTurn(unittest.TestCase):
         calls = {"i": 0}
 
         def _invoke(messages, *, tools):
-            idx = calls["i"]; calls["i"] += 1
+            idx = calls["i"]
+            calls["i"] += 1
             return responses[min(idx, len(responses) - 1)]
 
         # A task_data that signals approval-mode via _review_intent_type() ->
@@ -3805,7 +3807,8 @@ class TestAgenticSynthesisTurn(unittest.TestCase):
         calls = {"i": 0}
 
         def _invoke(messages, *, tools):
-            idx = calls["i"]; calls["i"] += 1
+            idx = calls["i"]
+            calls["i"] += 1
             return responses[min(idx, len(responses) - 1)]
 
         result = mep_runtime._run_agentic_tool_loop(  # noqa: SLF001

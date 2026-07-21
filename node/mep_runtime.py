@@ -2327,6 +2327,11 @@ def _run_agentic_tool_loop(
                 })
             if investigation_calls >= 10:
                 print("[mep agentic] investigation budget reached (%d calls) without submit_review" % investigation_calls)
+                # NOTE: _forced_synthesis_review runs the D3 approval-safety
+                # guard synchronously BEFORE return. By the time this value
+                # reaches the bridge, any approval=True has already been
+                # downgraded to COMMENT-only if there were no prior
+                # evidence-gathering tool calls in `messages`.
                 return _forced_synthesis_review(messages, tools, tools_aware_invoke, review_max_chars, task_data=task_data)
             continue
         # No tool call this turn. Nudge once toward the submit_review contract.
@@ -2358,6 +2363,10 @@ def _run_agentic_tool_loop(
         return ""
     # Loop exhausted its iterations without a submit_review: force one final
     # synthesis turn so the gathered evidence is not thrown away.
+    # NOTE: _forced_synthesis_review runs the D3 approval-safety guard
+    # synchronously BEFORE return (see call site at the budget branch above).
+    # The bridge only sees a publish-time approval flag that already reflects
+    # the downgrade for no-evidence submissions.
     return _forced_synthesis_review(messages, tools, tools_aware_invoke, review_max_chars, task_data=task_data)
 
 
