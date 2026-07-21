@@ -2035,6 +2035,24 @@ def _extract_tool_findings(messages: list[dict[str, Any]]) -> str:
     return "\n\n---\n\n".join(findings[-3:])[:6000]
 
 
+
+def _apply_d3_verdict_rewrite(text: str) -> str:
+    """Rewrite Verdict: APPROVE to REQUEST_CHANGES with D3 guard note.
+
+    Used by _forced_synthesis_review to ensure no-evidence synthesis
+    cannot produce an APPROVE verdict in the published text.
+    """
+    try:
+        return re.sub(
+            r"(?im)^\s*Verdict\s*:\s*APPROVE\b.*$",
+            "Verdict: REQUEST_CHANGES (no prior evidence tool calls; "
+            "synthesis-turn approval downgraded by D3 guard)",
+            str(text),
+        )
+    except Exception:
+        return text
+
+
 def _forced_synthesis_review(
     messages: list[dict[str, Any]],
     tools: list[dict[str, Any]],
@@ -2156,30 +2174,10 @@ def _forced_synthesis_review(
                     )
                     approval = False
                     args["approval"] = False
-                    # Also rewrite the verdict line in the summary text so the
+                    # Rewrite the verdict line in the summary text so the
                     # published review does not carry a contradictory "Verdict:
                     # APPROVE" while the publish-time approval flag is False.
-                    try:
-                        summary = re.sub(
-                            r"(?im)^\s*Verdict\s*:\s*APPROVE\b.*$",
-                            "Verdict: REQUEST_CHANGES (no prior evidence tool calls; "
-                            "synthesis-turn approval downgraded by D3 guard)",
-                            str(summary),
-                        )
-                    except Exception:
-                        pass
-                    # Also rewrite the verdict line in the summary text so the
-                    # published review does not carry a contradictory "Verdict:
-                    # APPROVE" while the publish-time approval flag is False.
-                    try:
-                        summary = re.sub(
-                            r"(?im)^\s*Verdict\s*:\s*APPROVE\b.*$",
-                            "Verdict: REQUEST_CHANGES (no prior evidence tool calls; "
-                            "synthesis-turn approval downgraded by D3 guard)",
-                            str(summary),
-                        )
-                    except Exception:
-                        pass
+                    summary = _apply_d3_verdict_rewrite(summary)
                 # Defense D1: drop adapter-error sentinels verbatim --
                 # otherwise a partial API outage could publish as a
                 # reviewer summary.
@@ -2224,6 +2222,12 @@ def _forced_synthesis_review(
             print("[mep agentic] synthesis turn produced free-text review (post-sanitize)")
             return sanitized
         print("[mep agentic] synthesis turn produced free-text review")
+        # Defense D3: apply no-evidence verdict guard to free-text
+        # output so a model that skips submit_review and returns
+        # plain text with "Verdict: APPROVE" but without evidence is
+        # downgraded.
+        if evidence_tool_calls < 1 and content:
+            content = _apply_d3_verdict_rewrite(content)
         return content[:review_max_chars]
     print("[mep agentic] synthesis turn did not yield a publishable review")
     return ""
