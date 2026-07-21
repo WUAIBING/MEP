@@ -3932,18 +3932,24 @@ class GitHubToMEPBridgeService:
             review_metrics=update.review_metrics,
         )
         if review_action:
-            inline_comments: list[dict[str, Any]] = []
-            if action != "approved":
-                inline_comments = self._inline_review_comments(detail_to_publish, snapshot.get("review_package") or {})
-            self._submit_github_review(
-                repo_full_name,
-                number,
-                review_events[action],
-                body,
-                github_token,
-                comments=inline_comments,
-            )
-            self._record_github_writeback_publish(action, review_action=True)
+            retry_count = int(execution.get("retry_count") or 0)
+            if retry_count > 0:
+                # Retry pass: first pass already published to GitHub.
+                # Record internally only to avoid duplicate review posts.
+                self._record_github_writeback_publish(action, review_action=True)
+            else:
+                inline_comments: list[dict[str, Any]] = []
+                if action != "approved":
+                    inline_comments = self._inline_review_comments(detail_to_publish, snapshot.get("review_package") or {})
+                self._submit_github_review(
+                    repo_full_name,
+                    number,
+                    review_events[action],
+                    body,
+                    github_token,
+                    comments=inline_comments,
+                )
+                self._record_github_writeback_publish(action, review_action=True)
             review_result = self._build_review_trial_result(
                 execution,
                 update,
@@ -3958,8 +3964,12 @@ class GitHubToMEPBridgeService:
             if str(update.action or "").strip().lower() == "approved" and action == "reviewed" and downgrade_reason:
                 review_result["downgrade_reason"] = downgrade_reason
             return action, None, review_result
-        self._post_github_comment(repo_full_name, number, body, github_token)
-        self._record_github_writeback_publish("commented", review_action=False)
+        retry_count = int(execution.get("retry_count") or 0)
+        if retry_count > 0:
+            self._record_github_writeback_publish("commented", review_action=False)
+        else:
+            self._post_github_comment(repo_full_name, number, body, github_token)
+            self._record_github_writeback_publish("commented", review_action=False)
         return "commented", None, None
 
     async def handle_status_callback(self, update: BridgeStatusUpdate, token: str) -> dict[str, Any]:
