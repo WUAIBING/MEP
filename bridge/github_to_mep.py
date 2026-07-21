@@ -2898,11 +2898,46 @@ class GitHubToMEPBridgeService:
             "full": "\n".join(patches_by_path.get(path, {}).get("full", "") for path in anchored_paths),
             "changes": "\n".join(patches_by_path.get(path, {}).get("changes", "") for path in anchored_paths),
         }
-        has_findings = "## review findings" in lowered or bool(self._extract_review_finding_entries(detail or ""))
+        _HAS_FINDINGS_PROXY_RE = re.compile(
+            r"(?im)^[\s\S]*?(?:^|\n)\s*"
+            r"(?:\d+\.|###?\s*\d+\.?|[-*]\s+)"
+            r".{0,200}?(?:request changes|severity|high risk|medium risk|low risk|"
+            r"recommend(?:ation|ed)?|invariant|finding|issue|concern|gap|"
+            r"should be|must be|broken|incorrect|unsafe|missing)",
+        )
+        has_findings_proxy = bool(_HAS_FINDINGS_PROXY_RE.search(detail or ""))
+        has_findings = (
+            "## review findings" in lowered
+            or bool(self._extract_review_finding_entries(detail or ""))
+            or has_findings_proxy
+        )
         summary_text = self._extract_summary_text(detail or "")
         observation_text = self._extract_observation_text(detail or "")
-        risk_areas_checked = self._extract_review_section_list(detail or "", "Risk areas checked")
-        checks_performed = self._extract_review_section_list(detail or "", "Checks performed")
+        _RISK_AREA_ALIASES = (
+            "Risk areas checked",
+            "Risk areas covered",
+            "Lenses inspected",
+            "Lenses audited",
+            "Areas checked",
+            "Areas audited",
+            "Audited lenses",
+        )
+        _CHECKS_ALIASES = (
+            "Checks performed",
+            "Checks run",
+            "Checks executed",
+            "Checks completed",
+            "Verifications",
+            "Verification steps",
+        )
+        _raw_risk: list[str] = []
+        for _label in _RISK_AREA_ALIASES:
+            _raw_risk.extend(self._extract_review_section_list(detail or "", _label))
+        _raw_checks: list[str] = []
+        for _label in _CHECKS_ALIASES:
+            _raw_checks.extend(self._extract_review_section_list(detail or "", _label))
+        risk_areas_checked = list(dict.fromkeys(_raw_risk))
+        checks_performed = list(dict.fromkeys(_raw_checks))
         verified_identifiers = self._extract_review_section_list(detail or "", "Changed identifiers verified")
         why_no_finding = self._extract_review_section_text(detail or "", "Why no finding")
         has_structured_sections = any(
@@ -3196,6 +3231,18 @@ class GitHubToMEPBridgeService:
         grounded_tokens = snapshot.get("grounded_tokens") or set()
         changed_tokens = snapshot.get("changed_tokens") or set()
         summary_tokens = snapshot.get("summary_tokens") or set()
+        # PR #335: when the review has strong positive grounding signals,
+        # downgrading summary_in_context_only to a non-suppression
+        # observation (instead of suppressing) lets the grounded body of
+        # the review (observation, paths, tests, checks, identifiers)
+        # still publish while the unsupported summary is stripped.
+        positive_grounding_signals = sum((
+            1 if anchored_paths else 0,
+            1 if len(changed_tokens) >= 2 else 0,
+            1 if verified_identifiers else 0,
+            1 if len(grounded_tokens) >= 2 else 0,
+        ))
+        allow_summary_grounding_relax = positive_grounding_signals >= 3
         summary_changed_tokens = snapshot.get("summary_changed_tokens") or set()
         observation_tokens = snapshot.get("observation_tokens") or set()
         observation_changed_tokens = snapshot.get("observation_changed_tokens") or set()
@@ -3251,6 +3298,8 @@ class GitHubToMEPBridgeService:
             if observation_text and self._is_speculative_finding(observation_text) and len(observation_changed_tokens) < 2:
                 return True, "observation_in_context_only"
             if summary_text and self._is_speculative_finding(summary_text) and len(summary_changed_tokens) < 2:
+                if allow_summary_grounding_relax:
+                    return False, "summary_in_context_only_relaxed"
                 return True, "summary_in_context_only"
             if summary_text and anchored_paths and review_package:
                 if self._finding_conflicts_with_patch(summary_text, anchored_patch_info["full"]) or self._finding_conflicts_with_patch(detail or "", anchored_patch_info["full"]):
@@ -3262,14 +3311,20 @@ class GitHubToMEPBridgeService:
                     token for token in (summary_tokens - summary_changed_tokens) if token not in anchored_patch_full
                 }
                 if hallucinated_summary_tokens:
+                    if allow_summary_grounding_relax:
+                        return False, "summary_in_context_only_relaxed"
                     return True, "summary_in_context_only"
                 if self._list_entries_with_unsupported_code_snippets(
                     [summary_text],
                     anchored_patch_info,
                     allowed_snippets=allowed_snippets,
                 ):
+                    if allow_summary_grounding_relax:
+                        return False, "summary_in_context_only_relaxed"
                     return True, "summary_in_context_only"
                 if not summary_changed_tokens and not changed_tokens and not verified_identifiers:
+                    if allow_summary_grounding_relax:
+                        return False, "summary_in_context_only_relaxed"
                     return True, "summary_in_context_only"
             if observation_tokens:
                 hallucinated_observation_tokens = {
@@ -3333,7 +3388,7 @@ class GitHubToMEPBridgeService:
             sanitized = re.sub(r"(?im)^\s*Changed identifiers verified:\s*.+(?:\n|$)", "", sanitized)
         elif reason == "checks_in_context_only":
             sanitized = re.sub(r"(?im)^\s*Checks performed:\s*.+(?:\n|$)", "", sanitized)
-        elif reason in {"summary_conflicts_with_patch", "summary_in_context_only"}:
+        elif reason in {"summary_conflicts_with_patch", "summary_in_context_only", "summary_in_context_only_relaxed"}:
             sanitized = re.sub(
                 r"(?ims)^##\s*Review Summary\s*.*?(?=\n\s*Observation:|\n\s*Touched paths reviewed:|\n\s*Tests reviewed:|\n\s*Risk areas checked:|\n\s*Checks performed:|\n\s*Changed identifiers verified:|$)",
                 "## Review Summary\n\n",

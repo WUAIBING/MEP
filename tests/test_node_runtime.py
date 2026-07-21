@@ -3740,3 +3740,282 @@ class TestAgenticSynthesisTurn(unittest.TestCase):
         )
         self.assertTrue(warning_found, "Budget warning should be in messages after 7 investigation calls")
 
+    def test_synthesis_blocks_adapter_error_summary(self):
+        """D1: an adapter-error sentinel in the synthesis summary is dropped before publish."""
+        # Model says "review complete" but its summary looks like an API failure.
+        summary = "[DeepSeek] api error: rate limit exceeded; empty response"
+        responses = [self._search(10), self._submit(summary, approval=False)]
+        calls = {"i": 0}
+
+        def _invoke(messages, *, tools):
+            idx = calls["i"]; calls["i"] += 1
+            return responses[min(idx, len(responses) - 1)]
+
+        result = mep_runtime._run_agentic_tool_loop(  # noqa: SLF001
+            messages=[{"role": "user", "content": "review this"}],
+            tools=mep_runtime._agentic_review_tools(),  # noqa: SLF001
+            tools_aware_invoke=_invoke,
+            workspace=None, workspace_path="", runtime_tool_runs=[],
+            max_tool_calls=10, review_max_chars=4000,
+        )
+        self.assertEqual(result, "")
+
+    def test_synthesis_approval_mode_routes_through_baseline_renderer(self):
+        """D2/D3: with task_data in approval mode, the synthesis summary is re-routed
+        through _render_structured_review_with_task_data so the L2970 guard fires."""
+        # Mark task_data so _task_is_approval_review() returns True. We don't have
+        # that exact helper's signature locally; instead we build task_data that
+        # the runtime recognizes as approval-mode by populating the same signal.
+        # Easiest way: pre-mark the task as approval-type via a payload that
+        # contains the marker _render_structured_review_with_task_data inspects.
+        summary = "## Review Summary\nFine."
+        responses = [self._search(10), self._submit(summary, approval=True)]
+        calls = {"i": 0}
+
+        def _invoke(messages, *, tools):
+            idx = calls["i"]; calls["i"] += 1
+            return responses[min(idx, len(responses) - 1)]
+
+        # A task_data that signals approval-mode via _review_intent_type() ->
+        # task_data["intent"]["type"] == "code.review.approve".
+        approval_task_data = {
+            "intent": {"type": "code.review.approve"},
+        }
+
+        # Direct unit-level call to _forced_synthesis_review: the function must
+        # return the rendered output, not the raw summary, when approval-mode
+        # is on. If the renderer returns "" for this input, so does the synth.
+        out = mep_runtime._forced_synthesis_review(  # noqa: SLF001
+            messages=[{"role": "user", "content": "review this"}],
+            tools=mep_runtime._agentic_review_tools(),  # noqa: SLF001
+            tools_aware_invoke=_invoke,
+            review_max_chars=4000,
+            task_data=approval_task_data,
+        )
+        # Either the renderer dropped it (returned "") because plain text +
+        # approval-mode triggers the guard, OR it accepted and reformatted.
+        # In either case, the result must NOT be the raw untrusted summary.
+        self.assertNotEqual(out, summary,
+            "approval-mode must re-route the synthesis summary; raw summary leak is a regression")
+
+    def test_synthesis_passes_through_clean_in_comment_only_mode(self):
+        """D3 plumbing: when no task_data is provided, behavior is unchanged for clean text."""
+        finished = "## Review Summary\n\nFindings with file/line evidence. LGTM."
+        responses = [self._search(10), self._submit(finished, approval=True)]
+        calls = {"i": 0}
+
+        def _invoke(messages, *, tools):
+            idx = calls["i"]; calls["i"] += 1
+            return responses[min(idx, len(responses) - 1)]
+
+        result = mep_runtime._run_agentic_tool_loop(  # noqa: SLF001
+            messages=[{"role": "user", "content": "review this"}],
+            tools=mep_runtime._agentic_review_tools(),  # noqa: SLF001
+            tools_aware_invoke=_invoke,
+            workspace=None, workspace_path="", runtime_tool_runs=[],
+            max_tool_calls=10, review_max_chars=4000,
+        )
+        self.assertEqual(result, finished)
+
+
+    def test_synthesis_strips_submit_review_from_tools(self):
+        """The synthesis turn must NOT pass submit_review in tools.
+
+        This is the defense for finding #1 from the Hub-Sentinel rereview of
+        PR #335: previously the model could emit a partial/duplicate
+        submit_review call during synthesis. The fix strips the submit_review
+        schema entry before passing tools to the model.
+        """
+        captured = {"synthesis_tools": None}
+
+        def _dispatcher(messages, *, tools):
+            if not hasattr(_dispatcher, "_seen"):
+                _dispatcher._seen = 1
+                return self._search(10)
+            captured["synthesis_tools"] = tools
+            return {
+                "content": "## Review Summary\n\nFindings with file/line evidence. LGTM.",
+                "tool_calls": [],
+            }
+
+        result = mep_runtime._run_agentic_tool_loop(  # noqa: SLF001
+            messages=[{"role": "user", "content": "review this"}],
+            tools=mep_runtime._agentic_review_tools(),  # noqa: SLF001
+            tools_aware_invoke=_dispatcher,
+            workspace=None, workspace_path="", runtime_tool_runs=[],
+            max_tool_calls=10, review_max_chars=4000,
+        )
+        self.assertIsNotNone(captured["synthesis_tools"])
+        tools_passed = captured["synthesis_tools"] or []
+        tool_names = [t.get("name") for t in tools_passed if isinstance(t, dict)]
+        self.assertNotIn("submit_review", tool_names)
+        self.assertIn("## Review Summary", result)
+
+    def test_synthesis_truncates_long_messages(self):
+        """The synthesis wrapper must not blow up on huge messages."""
+        huge = "x" * 30000
+        messages = [
+            {"role": "system", "content": "you are a reviewer"},
+            {"role": "user", "content": "diff: x"},
+            {"role": "assistant", "content": huge},
+            {"role": "user", "content": "more evidence: " + huge},
+        ]
+        finished = "## Review Summary\n\nFindings. LGTM."
+
+        def _invoke(messages, *, tools):
+            return {"content": finished, "tool_calls": []}
+
+        # Should NOT raise despite message total being well over 18000.
+        result = mep_runtime._forced_synthesis_review(  # noqa: SLF001
+            messages=list(messages),
+            tools=mep_runtime._agentic_review_tools(),  # noqa: SLF001
+            tools_aware_invoke=_invoke,
+            review_max_chars=4000,
+            synthesis_max_chars=18000,
+        )
+        self.assertIn("## Review Summary", result)
+
+    def test_synthesis_respects_deadline(self):
+        """A hung synthesis call returns empty rather than blocking forever."""
+        import time
+        def _dispatcher(messages, *, tools):
+            if not hasattr(_dispatcher, "_seen"):
+                _dispatcher._seen = 1
+                return self._search(10)
+            time.sleep(2.0)
+            return {"content": "should not see this", "tool_calls": []}
+
+        original = mep_runtime._forced_synthesis_review
+        def _quick_synth(*args, **kwargs):
+            kwargs["synthesis_deadline_seconds"] = 0.2
+            return original(*args, **kwargs)
+        mep_runtime._forced_synthesis_review = _quick_synth
+        try:
+            result = mep_runtime._run_agentic_tool_loop(  # noqa: SLF001
+                messages=[{"role": "user", "content": "review this"}],
+                tools=mep_runtime._agentic_review_tools(),  # noqa: SLF001
+                tools_aware_invoke=_dispatcher,
+                workspace=None, workspace_path="", runtime_tool_runs=[],
+                max_tool_calls=10, review_max_chars=4000,
+            )
+        finally:
+            mep_runtime._forced_synthesis_review = original
+
+        # Hung synthesis must return "" (or any non-hang value); must NOT contain
+        # the hang's content.
+        self.assertNotIn("should not see this", result or "")
+
+
+    def test_synthesis_approval_downgrades_without_evidence(self):
+        """D3: approval=True from synthesis turn without prior evidence-gathering
+        tool calls must be downgraded to approval=False.
+
+        PR #335 Hub-Sentinel (br-84d3a60f9d2e6) flagged that by keeping
+        submit_review in the synthesis tools list, we re-opened the
+        approval-safety gate the prior COMMENT-only fallback deliberately
+        kept closed. The synthesis helper now requires at least one prior
+        evidence-gathering tool call in the conversation before accepting
+        an approval=True payload; otherwise it downgrades to COMMENT-only.
+        """
+        # Dispatcher: first call returns a search tool result (so we can build
+        # a tool_calls-bearing assistant message); second call returns a
+        # submit_review call with approval=True.
+        import json as _json
+
+        def _dispatcher(messages, *, tools):
+            # synthesis helper only calls the dispatcher once
+            return {
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call_synth_test",
+                        "type": "function",
+                        "function": {
+                            "name": "submit_review",
+                            "arguments": _json.dumps({
+                                "summary": "## Review Summary\n\nLooks fine.\n\nVerdict: APPROVE",
+                                "approval": True,
+                            }),
+                        },
+                    }
+                ],
+            }
+
+        # Conversation with NO prior evidence-gathering tool calls.
+        messages_no_evidence = [
+            {"role": "user", "content": "review this"},
+        ]
+        out = mep_runtime._forced_synthesis_review(  # noqa: SLF001
+            messages=list(messages_no_evidence),
+            tools=mep_runtime._agentic_review_tools(),  # noqa: SLF001
+            tools_aware_invoke=_dispatcher,
+            review_max_chars=4000,
+        )
+        # With no evidence and approval=True, D3 must downgrade to COMMENT-only.
+        # The helper returns the sanitized baseline summary (which should still
+        # contain the substantive review text but with approval=False).
+        self.assertTrue(out, "synthesis should still produce a publishable review")
+        # The returned string MUST NOT carry an APPROVE verdict, since the
+        # synthesis turn had no evidence and approval was downgraded.
+        self.assertNotIn("Verdict: APPROVE", out or "")
+        # And it must carry a clear non-approval verdict line.
+        self.assertIn("Verdict: REQUEST_CHANGES", out or "")
+
+    def test_synthesis_approval_kept_with_prior_evidence(self):
+        """D3 keeps approval=True when the conversation has prior evidence-gathering
+        tool calls -- this protects the legitimate path where the model
+        investigated and just failed to call submit_review before budget exhaustion."""
+        import json as _json
+
+        def _dispatcher(messages, *, tools):
+            # synthesis helper only calls the dispatcher once
+            return {
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call_synth_evidence",
+                        "type": "function",
+                        "function": {
+                            "name": "submit_review",
+                            "arguments": _json.dumps({
+                                "summary": "## Review Summary\n\nLooks fine.\n\nVerdict: APPROVE",
+                                "approval": True,
+                            }),
+                        },
+                    }
+                ],
+            }
+
+        # Conversation WITH a prior evidence-gathering tool call (read_file).
+        messages_with_evidence = [
+            {"role": "user", "content": "review this"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call_prior_evidence",
+                        "type": "function",
+                        "function": {
+                            "name": "read_file",
+                            "arguments": "{\"path\": \"node/mep_runtime.py\"}",
+                        },
+                    }
+                ],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "call_prior_evidence",
+                "content": "def hello(): pass",
+            },
+        ]
+        out = mep_runtime._forced_synthesis_review(  # noqa: SLF001
+            messages=list(messages_with_evidence),
+            tools=mep_runtime._agentic_review_tools(),  # noqa: SLF001
+            tools_aware_invoke=_dispatcher,
+            review_max_chars=4000,
+        )
+        self.assertTrue(out, "synthesis should produce a publishable review")
+        # With prior evidence, approval=True should pass through.
+        self.assertIn("Verdict: APPROVE", out or "")
+

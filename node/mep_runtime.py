@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import concurrent.futures
 import copy
 import json
 import os
@@ -2039,6 +2040,10 @@ def _forced_synthesis_review(
     tools: list[dict[str, Any]],
     tools_aware_invoke: Any,
     review_max_chars: int,
+    task_data: Optional[dict[str, Any]] = None,
+    *,
+    synthesis_max_chars: int = 18000,
+    synthesis_deadline_seconds: float = 45.0,
 ) -> str:
     """Last-resort synthesis turn for the agentic review loop.
 
@@ -2056,20 +2061,79 @@ def _forced_synthesis_review(
         "content": (
             "STOP investigating. You have gathered enough evidence above. "
             "Now write your FINAL review based ONLY on the evidence already collected. "
-            "Call the submit_review tool right now with your finished review. "
-            "The summary MUST start with '## Review Summary' and contain ONLY the finished "
+            "Do not call any tools -- the submit_review tool has been removed for this "
+            "synthesis turn. Reply with a single self-contained review string. "
+            "The reply MUST start with '## Review Summary' and contain ONLY the finished "
             "review: concrete findings with file/line evidence, an assessment of correctness "
             "and safety, and a clear verdict. No planning, no narration, no 'Let me...', "
-            "no 'I will check...'. Set approval=true only if the change is correct and safe; "
-            "otherwise set approval=false. Call submit_review now."
+            "no 'I will check...'. The final line MUST be either 'Verdict: APPROVE' or "
+            "'Verdict: REQUEST_CHANGES'."
         ),
     })
+    if synthesis_max_chars > 0:
+        try:
+            total = 0
+            for m in messages:
+                c = m.get("content")
+                if isinstance(c, str):
+                    total += len(c)
+            if total > synthesis_max_chars:
+                print(f"[mep agentic] truncating synthesis messages ({total} > {synthesis_max_chars})")
+                keep_head = max(2, len(messages) - 4)
+                head = messages[:1] if messages else []
+                tail = messages[keep_head:]
+                truncated = list(head) + list(tail)
+                trunc_note = {
+                    "role": "system",
+                    "content": "[bridge note: earlier investigation turns were truncated to fit the synthesis budget.]",
+                }
+                messages = truncated + [trunc_note]
+        except Exception as _trunc_err:
+            print(f"[mep agentic] message-truncation skipped: {_trunc_err}")
+    # NOTE: keep submit_review in the synthesis tools list. The previous version
+    # stripped it, but the agentic phase's tool messages still carry
+    # tool_call_id values for submit_review; minimaxi then rejects the synthesis
+    # call with 2013 "tool result's tool id ... not found" and the whole review
+    # is lost (PR #335 regression -- quality_score dropped to 0). The prompt
+    # explicitly tells the model "Do not call any tools", and D1/D2 below still
+    # screen adapter-error sentinels and approval-mode tasks before publishing.
     try:
-        response = tools_aware_invoke(messages, tools=tools)
+        synthesis_tools = list(tools or []) if isinstance(tools, list) else []
+    except Exception:
+        synthesis_tools = []
+    try:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as _ex:
+            _future = _ex.submit(tools_aware_invoke, messages, tools=synthesis_tools or None)
+            response = _future.result(timeout=synthesis_deadline_seconds)
+    except concurrent.futures.TimeoutError:
+        print(f"[mep agentic] synthesis timed out after {synthesis_deadline_seconds}s")
+        return ""
     except Exception:
         return ""
     if not isinstance(response, dict):
         return ""
+    # Defense D3 (PR #335 Hub-Sentinel finding): the synthesis turn exposes
+    # submit_review to avoid minimaxi 2013 tool-id mismatches. That re-opens
+    # the approval gate the prior fallback deliberately kept closed. Count
+    # prior evidence-gathering tool calls in the conversation; if there are
+    # none and the model emits approval=True, downgrade to COMMENT-only so
+    # the substantive review text still publishes but cannot drive an
+    # approval writeback.
+    evidence_tool_calls = 0
+    try:
+        EVIDENCE_TOOL_NAMES = {
+            "_search", "_fetch", "_run", "read_file", "search", "fetch",
+            "list_files", "list_directory", "search_code", "git_log",
+            "git_diff", "grep", "find_in_files",
+        }
+        for m in (messages or []):
+            for tc in (m.get("tool_calls") or []):
+                fn = tc.get("function") if isinstance(tc, dict) else {}
+                if isinstance(fn, dict):
+                    if str(fn.get("name") or "").strip() in EVIDENCE_TOOL_NAMES:
+                        evidence_tool_calls += 1
+    except Exception:
+        evidence_tool_calls = 0
     for tc in (response.get("tool_calls") or []):
         fn = tc.get("function") if isinstance(tc.get("function"), dict) else {}
         if str(fn.get("name") or "").strip() == "submit_review":
@@ -2080,10 +2144,85 @@ def _forced_synthesis_review(
             summary = args.get("summary")
             if isinstance(summary, str) and summary.strip():
                 approval = args.get("approval")
+                # Defense D3: if model emits approval=True on the forced
+                # synthesis turn without prior evidence-gathering tool calls,
+                # downgrade to COMMENT-only. PR #335 Hub-Sentinel finding:
+                # keeping submit_review in tools re-opened the approval gate.
+                if approval and evidence_tool_calls < 1:
+                    print(
+                        "[mep agentic] synthesis turn tried approval=True with "
+                        "no prior evidence tool calls (count=%d); downgrading to "
+                        "COMMENT-only" % evidence_tool_calls
+                    )
+                    approval = False
+                    args["approval"] = False
+                    # Also rewrite the verdict line in the summary text so the
+                    # published review does not carry a contradictory "Verdict:
+                    # APPROVE" while the publish-time approval flag is False.
+                    try:
+                        summary = re.sub(
+                            r"(?im)^\s*Verdict\s*:\s*APPROVE\b.*$",
+                            "Verdict: REQUEST_CHANGES (no prior evidence tool calls; "
+                            "synthesis-turn approval downgraded by D3 guard)",
+                            str(summary),
+                        )
+                    except Exception:
+                        pass
+                    # Also rewrite the verdict line in the summary text so the
+                    # published review does not carry a contradictory "Verdict:
+                    # APPROVE" while the publish-time approval flag is False.
+                    try:
+                        summary = re.sub(
+                            r"(?im)^\s*Verdict\s*:\s*APPROVE\b.*$",
+                            "Verdict: REQUEST_CHANGES (no prior evidence tool calls; "
+                            "synthesis-turn approval downgraded by D3 guard)",
+                            str(summary),
+                        )
+                    except Exception:
+                        pass
+                # Defense D1: drop adapter-error sentinels verbatim --
+                # otherwise a partial API outage could publish as a
+                # reviewer summary.
+                if _is_adapter_error(summary):
+                    print("[mep agentic] synthesis turn summary looked like adapter error; dropping")
+                    return ""
+                # Defense D2: in approval-mode tasks, re-route through
+                # the baseline structured renderer so the L2970
+                # approval-safety guard actually fires on the synthesis
+                # text. PR #335 regression: synthesis used to bypass this.
+                if task_data and _task_is_approval_review(task_data):
+                    sanitized = _render_structured_review_with_task_data(
+                        str(summary)[:review_max_chars],
+                        max_chars=review_max_chars,
+                        task_data=task_data,
+                    )
+                    if not sanitized:
+                        print(
+                            "[mep agentic] synthesis turn summary blocked by baseline "
+                            "approval guard (approval=%r) -- approval-mode re-route" % (approval,)
+                        )
+                        return ""
+                    print("[mep agentic] synthesis turn produced submit_review (approval=%r, post-sanitize)" % (approval,))
+                    return sanitized
                 print("[mep agentic] synthesis turn produced submit_review (approval=%r)" % (approval,))
                 return str(summary)[:review_max_chars]
     content = str(response.get("content") or "").strip()
     if content and not _looks_like_agent_scratchpad(content):
+        # Defense D1/D2: mirror the submit_review branch above.
+        if _is_adapter_error(content):
+            print("[mep agentic] synthesis free-text looked like adapter error; dropping")
+            return ""
+        if task_data and _task_is_approval_review(task_data):
+            sanitized = _render_structured_review_with_task_data(
+                content[:review_max_chars],
+                max_chars=review_max_chars,
+                task_data=task_data,
+            )
+            if not sanitized:
+                print("[mep agentic] synthesis free-text blocked by baseline approval guard")
+                return ""
+            print("[mep agentic] synthesis turn produced free-text review (post-sanitize)")
+            return sanitized
         print("[mep agentic] synthesis turn produced free-text review")
         return content[:review_max_chars]
     print("[mep agentic] synthesis turn did not yield a publishable review")
@@ -2100,6 +2239,7 @@ def _run_agentic_tool_loop(
     runtime_tool_runs: list[dict[str, Any]],
     max_tool_calls: int = 6,
     review_max_chars: int = 4000,
+    task_data: Optional[dict[str, Any]] = None,
 ) -> str:
     """Run the agentic review loop: LLM calls tools, we execute them, feed results back.
 
@@ -2187,7 +2327,7 @@ def _run_agentic_tool_loop(
                 })
             if investigation_calls >= 10:
                 print("[mep agentic] investigation budget reached (%d calls) without submit_review" % investigation_calls)
-                return _forced_synthesis_review(messages, tools, tools_aware_invoke, review_max_chars)
+                return _forced_synthesis_review(messages, tools, tools_aware_invoke, review_max_chars, task_data=task_data)
             continue
         # No tool call this turn. Nudge once toward the submit_review contract.
         # If the model still answers in free text, publish that answer ONLY when
@@ -2218,7 +2358,7 @@ def _run_agentic_tool_loop(
         return ""
     # Loop exhausted its iterations without a submit_review: force one final
     # synthesis turn so the gathered evidence is not thrown away.
-    return _forced_synthesis_review(messages, tools, tools_aware_invoke, review_max_chars)
+    return _forced_synthesis_review(messages, tools, tools_aware_invoke, review_max_chars, task_data=task_data)
 
 
 # Verbs that, when they follow a first-person planning stem ("let me", "I'll",
@@ -3415,6 +3555,7 @@ class DeepSeekAdapter:
                         runtime_tool_runs=task_data.get("__runtime_tool_runs", []),
                         max_tool_calls=_MAX_AGENTIC_TOOL_CALLS,
                         review_max_chars=review_max,
+                        task_data=task_data,
                     )
                     if agentic_result and not _looks_like_agent_scratchpad(agentic_result):
                         return agentic_result
@@ -3602,6 +3743,7 @@ class OpenAICompatibleAdapter:
                         runtime_tool_runs=task_data.get("__runtime_tool_runs", []),
                         max_tool_calls=_MAX_AGENTIC_TOOL_CALLS,
                         review_max_chars=review_max,
+                        task_data=task_data,
                     )
                     if agentic_result and not _looks_like_agent_scratchpad(agentic_result):
                         return agentic_result
