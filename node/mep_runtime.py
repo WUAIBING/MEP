@@ -513,6 +513,8 @@ def _interbot_routing_contract_error(
     target = interbot_message.get("target")
     inner_target = str(target.get("node_id") or "").strip() if isinstance(target, dict) else ""
     outer_target = str(task_data.get("target_node") or "").strip()
+    if outer_target and outer_target != local_node_id:
+        return "task target_node does not match the receiving runtime"
     if inner_target and outer_target and inner_target != outer_target:
         return "target.node_id does not match task target_node"
     if inner_target and inner_target != local_node_id:
