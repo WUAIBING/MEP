@@ -51,6 +51,36 @@ class TestIdentityPaths(unittest.TestCase):
             self.assertEqual(runtime_identity.enc_key_path, modern_path)
             self.assertFalse(os.path.exists(legacy_path))
 
+    def test_both_identity_classes_warn_and_select_legacy_when_sidecars_conflict(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            key_path = os.path.join(tmpdir, "conflicting-sidecars-bot.pem")
+            legacy_identity = MEPIdentity(key_path)
+            modern_source_path = os.path.join(tmpdir, "modern-source.pem")
+            MEPIdentity(modern_source_path)
+            modern_path = f"{key_path}.x25519.pem"
+            os.replace(
+                modern_source_path.replace(".pem", "_enc.pem"),
+                modern_path,
+            )
+
+            with self.assertWarnsRegex(RuntimeWarning, "Both legacy and modern X25519 sidecars exist"):
+                shared_identity = MEPIdentity(key_path)
+            with self.assertWarnsRegex(RuntimeWarning, "Both legacy and modern X25519 sidecars exist"):
+                runtime_identity = RuntimeMEPIdentity(key_path)
+
+            self.assertEqual(
+                shared_identity.x25519_public_key,
+                legacy_identity.x25519_public_key,
+            )
+            self.assertEqual(
+                runtime_identity.x25519_public_key,
+                legacy_identity.x25519_public_key,
+            )
+            self.assertEqual(
+                runtime_identity.enc_key_path,
+                key_path.replace(".pem", "_enc.pem"),
+            )
+
     def test_default_key_dir_uses_shared_home_resolver(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             with patch.dict(os.environ, {}, clear=True):

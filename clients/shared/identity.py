@@ -60,6 +60,13 @@ class MEPIdentity:
     def _load_or_create_x25519_key(self, key_path: str) -> x25519.X25519PrivateKey:
         legacy_path = key_path.replace(".pem", "_enc.pem")
         modern_path = f"{key_path}.x25519.pem"
+        if os.path.exists(legacy_path) and os.path.exists(modern_path):
+            warnings.warn(
+                "Both legacy and modern X25519 sidecars exist; selecting the legacy _enc.pem key. "
+                "Remove the stale sidecar only after confirming the Hub registration and peer encryption key.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
         if os.path.exists(legacy_path):
             x25519_path = legacy_path
         elif os.path.exists(modern_path):
