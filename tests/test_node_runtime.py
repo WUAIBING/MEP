@@ -3,6 +3,7 @@ import asyncio
 import json
 import os
 import tempfile
+import threading
 import unittest
 from typing import Any, Optional
 from unittest.mock import AsyncMock, patch
@@ -2221,7 +2222,10 @@ class TestRuntimeWebSocketLoop(unittest.TestCase):
                 patch.object(node, "complete") as complete_mock,
             ):
                 task = asyncio.create_task(node.process_task(task_data))
-                await asyncio.sleep(0)
+                for _ in range(100):
+                    if node._ws.sent:
+                        break
+                    await asyncio.sleep(0.01)
                 invite = json.loads(node._ws.sent[0])
                 self.assertEqual(invite["event"], "call.invite")
                 self.assertEqual(invite["context_id"], "ctx-bridge")
@@ -2279,7 +2283,10 @@ class TestRuntimeWebSocketLoop(unittest.TestCase):
                 patch.object(node, "complete") as complete_mock,
             ):
                 task = asyncio.create_task(node.process_task(task_data))
-                await asyncio.sleep(0)
+                for _ in range(100):
+                    if node._ws.sent:
+                        break
+                    await asyncio.sleep(0.01)
                 await node.handle_ws_event({"event": "call.accepted", "context_id": "ctx-bridge-frame-fail"})
                 await task
 
@@ -2439,6 +2446,121 @@ class TestRuntimeWebSocketLoop(unittest.TestCase):
         asyncio.run(node.handle_ws_event({"event": "call.incoming", "context_id": "ctx-auto", "caller": "node_peer"}))
 
         self.assertEqual([json.loads(payload)["event"] for payload in node._ws.sent], ["call.accept"])
+
+    def test_runtime_answers_incoming_live_text_frame_with_ai_off_event_loop(self):
+        node = _runtime_node()
+        node.live_call_enabled = True
+        node.call_auto_accept = True
+        node._ws = _FakeWebSocket([])
+        adapter_started = threading.Event()
+        release_adapter = threading.Event()
+
+        def _generate_reply(prompt, task_data):
+            adapter_started.set()
+            release_adapter.wait(timeout=2)
+            self.assertIn("Caller: Hello, can you hear me?", prompt)
+            self.assertEqual(task_data["conversation"]["context_id"], "ctx-ai")
+            return "Yes, I can hear you."
+
+        async def _run() -> None:
+            with patch.object(node.adapter, "generate_reply", side_effect=_generate_reply):
+                await node.handle_ws_event(
+                    {"event": "call.incoming", "context_id": "ctx-ai", "caller": "node_peer"}
+                )
+                await node.handle_ws_event(
+                    {
+                        "event": "call.frame",
+                        "context_id": "ctx-ai",
+                        "sender": "node_peer",
+                        "seq": 1,
+                        "content_type": "text/plain",
+                        "payload": "Hello, can you hear me?",
+                    }
+                )
+                for _ in range(100):
+                    if adapter_started.is_set():
+                        break
+                    await asyncio.sleep(0.01)
+                self.assertTrue(adapter_started.is_set())
+
+                # The model is still blocked in a worker thread, but call liveness
+                # must continue to be served by the asyncio/WebSocket loop.
+                await node.handle_ws_event({"event": "call.ping", "context_id": "ctx-ai"})
+                release_adapter.set()
+                await asyncio.gather(*list(node._background_tasks))
+
+        asyncio.run(_run())
+
+        frames = [json.loads(payload) for payload in node._ws.sent]
+        self.assertEqual(frames[0]["event"], "call.accept")
+        self.assertEqual(frames[1]["content_type"], "application/vnd.mep.call-status+json")
+        self.assertEqual(json.loads(frames[1]["payload"])["event"], "reply.started")
+        self.assertEqual(frames[2], {"event": "call.pong", "context_id": "ctx-ai"})
+        self.assertEqual(frames[3]["payload"], "Yes, I can hear you.")
+        self.assertEqual(json.loads(frames[4]["payload"])["event"], "reply.completed")
+        self.assertEqual([frames[index]["seq"] for index in (1, 3, 4)], [1, 2, 3])
+
+    def test_runtime_does_not_answer_call_status_frames(self):
+        node = _runtime_node()
+        node.live_call_enabled = True
+        node.call_auto_accept = True
+        node._ws = _FakeWebSocket([])
+
+        async def _run() -> None:
+            with patch.object(node.adapter, "generate_reply") as generate_mock:
+                await node.handle_ws_event(
+                    {"event": "call.incoming", "context_id": "ctx-status", "caller": "node_peer"}
+                )
+                await node.handle_ws_event(
+                    {
+                        "event": "call.frame",
+                        "context_id": "ctx-status",
+                        "sender": "node_peer",
+                        "seq": 1,
+                        "content_type": "application/vnd.mep.call-status+json",
+                        "payload": json.dumps({"event": "reply.started"}),
+                    }
+                )
+                await asyncio.sleep(0)
+                generate_mock.assert_not_called()
+
+        asyncio.run(_run())
+        self.assertEqual([json.loads(payload)["event"] for payload in node._ws.sent], ["call.accept"])
+
+    def test_runtime_live_call_history_carries_across_turns(self):
+        node = _runtime_node()
+        node.live_call_enabled = True
+        node.call_auto_accept = True
+        node._ws = _FakeWebSocket([])
+        prompts = []
+
+        def _generate_reply(prompt, _task_data):
+            prompts.append(prompt)
+            return "First answer" if len(prompts) == 1 else "Second answer"
+
+        async def _run() -> None:
+            with patch.object(node.adapter, "generate_reply", side_effect=_generate_reply):
+                await node.handle_ws_event(
+                    {"event": "call.incoming", "context_id": "ctx-history", "caller": "node_peer"}
+                )
+                for seq, text in ((1, "First question"), (2, "Follow-up question")):
+                    await node.handle_ws_event(
+                        {
+                            "event": "call.frame",
+                            "context_id": "ctx-history",
+                            "sender": "node_peer",
+                            "seq": seq,
+                            "content_type": "text/plain",
+                            "payload": text,
+                        }
+                    )
+                    await asyncio.gather(*list(node._background_tasks))
+
+        asyncio.run(_run())
+        self.assertEqual(len(prompts), 2)
+        self.assertIn("Caller: First question", prompts[1])
+        self.assertIn("You: First answer", prompts[1])
+        self.assertIn("Caller: Follow-up question", prompts[1])
 
 
 class TestRuntimeKeyDirResolution(unittest.TestCase):
