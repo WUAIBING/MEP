@@ -129,7 +129,8 @@ class TestCodexCLIAdapter(unittest.TestCase):
             with open(native, "wb") as handle:
                 handle.write(b"")
 
-            adapter = mep_runtime.CodexCLIAdapter(command=launcher, workspace=tmpdir)
+            with patch("node.mep_runtime.os.name", "nt"):
+                adapter = mep_runtime.CodexCLIAdapter(command=launcher, workspace=tmpdir)
 
         self.assertEqual(adapter.command, native)
 
