@@ -2,6 +2,7 @@ import os
 import time
 import base64
 import hashlib
+import warnings
 from cryptography.hazmat.primitives.asymmetric import ed25519, x25519
 from cryptography.hazmat.primitives import serialization, hashes
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
@@ -10,11 +11,26 @@ from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 class MEPIdentity:
     def __init__(self, key_path="private.pem"):
         self.key_path = key_path
-        self.enc_key_path = key_path.replace(".pem", "_enc.pem")
+        legacy_enc_key_path = key_path.replace(".pem", "_enc.pem")
+        modern_enc_key_path = f"{key_path}.x25519.pem"
+        if os.path.exists(legacy_enc_key_path) and os.path.exists(modern_enc_key_path):
+            warnings.warn(
+                "Both legacy and modern X25519 sidecars exist; selecting the legacy _enc.pem key. "
+                "Remove the stale sidecar only after confirming the Hub registration and peer encryption key.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+        if os.path.exists(legacy_enc_key_path):
+            self.enc_key_path = legacy_enc_key_path
+        elif os.path.exists(modern_enc_key_path):
+            self.enc_key_path = modern_enc_key_path
+        else:
+            self.enc_key_path = legacy_enc_key_path
         self.generated_new_key = False
         self._load_or_generate()
         
     def _load_or_generate(self):
+        os.makedirs(os.path.dirname(os.path.abspath(self.key_path)), exist_ok=True)
         # 1. Signing Key (Ed25519)
         if os.path.exists(self.key_path):
             with open(self.key_path, "rb") as f:

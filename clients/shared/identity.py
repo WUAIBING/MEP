@@ -58,7 +58,24 @@ class MEPIdentity:
         return key
 
     def _load_or_create_x25519_key(self, key_path: str) -> x25519.X25519PrivateKey:
-        x25519_path = f"{key_path}.x25519.pem"
+        legacy_path = key_path.replace(".pem", "_enc.pem")
+        modern_path = f"{key_path}.x25519.pem"
+        if os.path.exists(legacy_path) and os.path.exists(modern_path):
+            warnings.warn(
+                "Both legacy and modern X25519 sidecars exist; selecting the legacy _enc.pem key. "
+                "Remove the stale sidecar only after confirming the Hub registration and peer encryption key.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+        if os.path.exists(legacy_path):
+            x25519_path = legacy_path
+        elif os.path.exists(modern_path):
+            x25519_path = modern_path
+        else:
+            # The node runtime has historically used `_enc.pem`. Creating the
+            # same sidecar here keeps one signing identity paired with one
+            # encryption identity across the runtime and shared client.
+            x25519_path = legacy_path
         os.makedirs(os.path.dirname(os.path.abspath(x25519_path)), exist_ok=True)
         if os.path.exists(x25519_path):
             with open(x25519_path, "rb") as f:

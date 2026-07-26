@@ -85,8 +85,10 @@ class _FakeRuntime:
 
 
 class _FakeCompletedProcess:
-    def __init__(self, stdout=""):
+    def __init__(self, stdout="", stderr="", returncode=0):
         self.stdout = stdout
+        self.stderr = stderr
+        self.returncode = returncode
 
 
 class TestMockAdapter(unittest.TestCase):
@@ -102,6 +104,189 @@ class TestMockAdapter(unittest.TestCase):
         self.assertIn("DM received", chat)
         self.assertIn("market=data", data)
         self.assertIn("Data purchase acknowledged", data)
+
+
+class TestCodexCLIAdapter(unittest.TestCase):
+    def test_windows_cmd_launcher_resolves_to_native_codex_binary(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            launcher = os.path.join(tmpdir, "codex.cmd")
+            native = os.path.join(
+                tmpdir,
+                "node_modules",
+                "@openai",
+                "codex",
+                "node_modules",
+                "@openai",
+                "codex-win32-x64",
+                "vendor",
+                "x86_64-pc-windows-msvc",
+                "bin",
+                "codex.exe",
+            )
+            os.makedirs(os.path.dirname(native))
+            with open(launcher, "w", encoding="utf-8") as handle:
+                handle.write("@echo off")
+            with open(native, "wb") as handle:
+                handle.write(b"")
+
+            with patch("node.mep_runtime.os.name", "nt"):
+                adapter = mep_runtime.CodexCLIAdapter(command=launcher, workspace=tmpdir)
+
+        self.assertEqual(adapter.command, native)
+
+    def test_readiness_fails_fast_when_cli_is_not_logged_in(self):
+        adapter = mep_runtime.CodexCLIAdapter(command="codex", workspace=os.getcwd())
+
+        class _NotLoggedInProcess:
+            returncode = 1
+
+            def __init__(self, command, **_kwargs):
+                self.command = command
+
+            def communicate(self, timeout):
+                self.timeout = timeout
+                return "", "Not logged in"
+
+        with patch("node.mep_runtime.subprocess.Popen", side_effect=_NotLoggedInProcess) as popen_mock:
+            error = adapter.readiness_error()
+
+        self.assertEqual(error, "codex_not_logged_in")
+        self.assertEqual(popen_mock.call_args.args[0], ["codex", "login", "status"])
+
+    def test_readiness_refuses_write_enabled_sandbox_for_untrusted_dm_lane(self):
+        adapter = mep_runtime.CodexCLIAdapter(
+            command="codex",
+            workspace=os.getcwd(),
+            sandbox="workspace-write",
+        )
+
+        with patch("node.mep_runtime.subprocess.Popen") as popen_mock:
+            error = adapter.readiness_error()
+
+        self.assertEqual(error, "codex_unsafe_dm_sandbox_refused:workspace-write")
+        popen_mock.assert_not_called()
+
+    def test_readiness_uses_explicit_codex_home_for_service_identity(self):
+        with tempfile.TemporaryDirectory() as codex_home:
+            adapter = mep_runtime.CodexCLIAdapter(
+                command="codex",
+                workspace=os.getcwd(),
+                codex_home=codex_home,
+            )
+
+            class _LoggedInProcess:
+                returncode = 0
+
+                def __init__(self, _command, **kwargs):
+                    self.env = kwargs["env"]
+
+                def communicate(self, timeout):
+                    return "", "Logged in using ChatGPT"
+
+            with patch("node.mep_runtime.subprocess.Popen", side_effect=_LoggedInProcess) as popen_mock:
+                error = adapter.readiness_error()
+
+        self.assertEqual(error, "")
+        self.assertEqual(popen_mock.call_args.kwargs["env"]["CODEX_HOME"], codex_home)
+
+    def test_readiness_timeout_terminates_login_process_tree(self):
+        adapter = mep_runtime.CodexCLIAdapter(command="codex", workspace=os.getcwd())
+
+        class _TimedOutLoginProcess:
+            returncode = None
+            pid = 789
+
+            def __init__(self, _command, **_kwargs):
+                pass
+
+            def communicate(self, timeout):
+                raise mep_runtime.subprocess.TimeoutExpired("codex login status", timeout)
+
+        with (
+            patch("node.mep_runtime.subprocess.Popen", side_effect=_TimedOutLoginProcess),
+            patch.object(mep_runtime.CodexCLIAdapter, "_terminate_process_tree") as terminate_mock,
+        ):
+            error = adapter.readiness_error()
+
+        self.assertEqual(error, "codex_login_status_timeout")
+        terminate_mock.assert_called_once()
+
+    def test_generate_reply_invokes_ephemeral_read_only_codex_via_stdin(self):
+        adapter = mep_runtime.CodexCLIAdapter(
+            command="codex",
+            workspace=os.getcwd(),
+            timeout_seconds=30,
+        )
+        observed = {}
+
+        class _FakeCodexProcess:
+            returncode = 0
+            pid = 123
+
+            def __init__(self, command, **kwargs):
+                observed["command"] = command
+                observed["encoding"] = kwargs.get("encoding")
+                observed["errors"] = kwargs.get("errors")
+                self.output_path = command[command.index("--output-last-message") + 1]
+
+            def communicate(self, prompt, timeout):
+                observed["prompt"] = prompt
+                observed["timeout"] = timeout
+                with open(self.output_path, "w", encoding="utf-8") as handle:
+                    handle.write("Codex node answer")
+                return "", ""
+
+        with patch("node.mep_runtime.subprocess.Popen", side_effect=_FakeCodexProcess):
+            reply = adapter.generate_reply("Hello from MEP", {"id": "task-dm", "bounty": 0.0})
+
+        self.assertEqual(reply, "Codex node answer")
+        self.assertIn("exec", observed["command"])
+        self.assertIn("--ephemeral", observed["command"])
+        self.assertIn("--ignore-user-config", observed["command"])
+        self.assertIn("read-only", observed["command"])
+        self.assertIn("gpt-5.4-mini", observed["command"])
+        self.assertIn("model_reasoning_effort=low", observed["command"])
+        self.assertIn("model_verbosity=low", observed["command"])
+        self.assertIn('model_provider="mep_chatgpt_http"', observed["command"])
+        self.assertIn(
+            'model_providers.mep_chatgpt_http.base_url="https://chatgpt.com/backend-api/codex"',
+            observed["command"],
+        )
+        self.assertIn("model_providers.mep_chatgpt_http.supports_websockets=false", observed["command"])
+        self.assertEqual(observed["command"][-1], "-")
+        self.assertIn("Hello from MEP", observed["prompt"])
+        self.assertIn("untrusted conversation input", observed["prompt"])
+        self.assertEqual(observed["timeout"], 30)
+        self.assertEqual(observed["encoding"], "utf-8")
+        self.assertEqual(observed["errors"], "strict")
+        self.assertEqual(adapter.last_review_metrics["transport"], "https")
+        self.assertIn("latency_seconds", adapter.last_review_metrics)
+
+    def test_timeout_terminates_entire_codex_process_tree(self):
+        adapter = mep_runtime.CodexCLIAdapter(
+            command="codex",
+            workspace=os.getcwd(),
+            timeout_seconds=1,
+        )
+
+        class _TimedOutCodexProcess:
+            returncode = None
+            pid = 456
+
+            def __init__(self, _command, **_kwargs):
+                pass
+
+            def communicate(self, _prompt, timeout):
+                raise mep_runtime.subprocess.TimeoutExpired("codex", timeout)
+
+        with (
+            patch("node.mep_runtime.subprocess.Popen", side_effect=_TimedOutCodexProcess),
+            patch.object(mep_runtime.CodexCLIAdapter, "_terminate_process_tree") as terminate_mock,
+        ):
+            reply = adapter.generate_reply("slow message", {"id": "task-dm", "bounty": 0.0})
+
+        self.assertIn("timed out after 1s", reply)
+        terminate_mock.assert_called_once()
 
 
 class TestRuntimeUx(unittest.TestCase):
@@ -190,6 +375,36 @@ class TestRuntimeUx(unittest.TestCase):
         self.assertEqual(request_mock.call_args.kwargs["json_body"]["alias"], "node_runtime")
         write_alias_mock.assert_called_once_with(args.key_path, "node_runtime")
 
+    def test_init_reports_pending_approval_without_claiming_success(self):
+        args = argparse.Namespace(
+            hub_url="http://hub",
+            ws_url="ws://hub",
+            key_path="C:/tmp/test_key.pem",
+            adapter="mock",
+            alias="pending-node",
+        )
+        fake_identity = _FakeIdentity()
+        fake_identity.generated_new_key = False
+        fake_identity.key_path = args.key_path
+        with (
+            patch("node.mep_runtime._ensure_key_parent"),
+            patch("node.mep_runtime.MEPIdentity", return_value=fake_identity),
+            patch(
+                "node.mep_runtime._safe_request",
+                return_value=(
+                    200,
+                    {"status": "pending", "node_id": fake_identity.node_id, "balance": 0.0},
+                    "",
+                ),
+            ),
+            patch("node.mep_runtime._write_alias_sidecar") as write_alias_mock,
+            patch("node.mep_runtime.cmd_status") as status_mock,
+        ):
+            code = mep_runtime.cmd_init(args)
+        self.assertEqual(code, 2)
+        write_alias_mock.assert_called_once_with(args.key_path, "pending-node")
+        status_mock.assert_not_called()
+
     def test_up_runs_even_if_doctor_fails(self):
         args = argparse.Namespace(
             hub_url="http://hub",
@@ -219,6 +434,20 @@ class TestRuntimeUx(unittest.TestCase):
             {"pubkey": "pub", "alias": "runtime-alias", "x25519_public_key": "encpub"},
         )
 
+    def test_runtime_register_refuses_pending_approval(self):
+        node = _runtime_node()
+        with patch(
+            "node.mep_runtime._safe_request",
+            return_value=(
+                200,
+                {"status": "pending", "node_id": node.node_id, "balance": 0.0},
+                "",
+            ),
+        ):
+            ok, message = node.register("runtime-alias")
+        self.assertFalse(ok)
+        self.assertIn("registration pending approval", message)
+
     def test_run_reads_persisted_alias_when_cli_alias_missing(self):
         args = argparse.Namespace(
             hub_url="http://hub",
@@ -246,10 +475,65 @@ class TestRuntimeUx(unittest.TestCase):
         deepseek_args = parser.parse_args(["--adapter", "deepseek", "run"])
         ollama_args = parser.parse_args(["--adapter", "ollama", "status"])
         openai_args = parser.parse_args(["--adapter", "openai", "run"])
+        codex_args = parser.parse_args(["--adapter", "codex", "run"])
 
         self.assertEqual(deepseek_args.adapter, "deepseek")
         self.assertEqual(ollama_args.adapter, "ollama")
         self.assertEqual(openai_args.adapter, "openai")
+        self.assertEqual(codex_args.adapter, "codex")
+
+    def test_run_with_unavailable_codex_cli_fails_closed(self):
+        args = argparse.Namespace(
+            hub_url="http://hub",
+            ws_url="ws://hub",
+            key_path="C:/tmp/test_key.pem",
+            adapter="codex",
+            alias="Codex CLI Bot",
+        )
+        with (
+            patch.dict("os.environ", {"MEP_CODEX_COMMAND": "codex"}, clear=True),
+            patch("node.mep_runtime._ensure_key_parent"),
+            patch.object(mep_runtime.CodexCLIAdapter, "readiness_error", return_value="codex_not_logged_in"),
+            patch("node.mep_runtime.RuntimeNode") as runtime_cls,
+        ):
+            code = mep_runtime.cmd_run(args)
+
+        self.assertEqual(code, 2)
+        runtime_cls.assert_not_called()
+
+    def test_run_with_ready_codex_cli_uses_codex_adapter(self):
+        args = argparse.Namespace(
+            hub_url="http://hub",
+            ws_url="ws://hub",
+            key_path="C:/tmp/test_key.pem",
+            adapter="codex",
+            alias="Codex CLI Bot",
+        )
+        fake_runtime = _FakeRuntime()
+        with (
+            patch.dict(
+                "os.environ",
+                {
+                    "MEP_CODEX_COMMAND": "codex",
+                    "MEP_CODEX_MODEL": "test-model",
+                    "MEP_CODEX_WORKSPACE": "C:/repo",
+                },
+                clear=True,
+            ),
+            patch("node.mep_runtime._ensure_key_parent"),
+            patch.object(mep_runtime.CodexCLIAdapter, "readiness_error", return_value=""),
+            patch("node.mep_runtime.MEPIdentity", return_value=_FakeIdentity()),
+            patch("node.mep_runtime._resolve_runtime_alias", return_value="Codex CLI Bot"),
+            patch("node.mep_runtime.RuntimeNode", return_value=fake_runtime) as runtime_cls,
+            patch("node.mep_runtime.asyncio.run", side_effect=lambda coro: (coro.close(), 0)[1]),
+        ):
+            code = mep_runtime.cmd_run(args)
+
+        self.assertEqual(code, 0)
+        adapter = runtime_cls.call_args.kwargs["adapter"]
+        self.assertIsInstance(adapter, mep_runtime.CodexCLIAdapter)
+        self.assertEqual(adapter.model, "test-model")
+        self.assertFalse(adapter.use_websockets)
 
     def test_run_with_deepseek_without_api_key_falls_back_to_mock_adapter(self):
         args = argparse.Namespace(
@@ -528,6 +812,23 @@ class TestRuntimeReviewPrompts(unittest.TestCase):
                 {"id": "task_generic", "bounty": 0.0, "payload": "hello"}
             )
         )
+
+    def test_inner_interbot_intent_wins_over_conflicting_outer_intent(self):
+        task_data = {
+            "intent": {"type": "analysis.request"},
+            "payload": json.dumps(
+                {
+                    "spec_version": "mep.interbot.v1",
+                    "source": {"node_id": "node_peer"},
+                    "target": {"node_id": "node_runtime"},
+                    "intent": {"type": "chat.request"},
+                    "task": {"instructions": "This is ordinary chat."},
+                }
+            ),
+        }
+
+        self.assertEqual(mep_runtime._review_intent_type(task_data), "chat.request")  # noqa: SLF001
+        self.assertFalse(mep_runtime._task_requires_review_prompt(task_data))  # noqa: SLF001
 
     def test_ai_adapter_uses_reviewer_prompt_for_bridge_review_tasks(self):
         adapter = mep_runtime.AIAdapter(model="tinyllama")
@@ -2396,6 +2697,125 @@ class TestRuntimeWebSocketLoop(unittest.TestCase):
 
         asyncio.run(_run())
 
+    def test_process_task_uses_inner_chat_intent_before_review_routing(self):
+        node = _runtime_node()
+        task_data = {
+            "id": "task_chat_intent",
+            "bounty": 0.0,
+            "intent": {"type": "analysis.request"},
+            "payload": json.dumps(
+                {
+                    "spec_version": "mep.interbot.v1",
+                    "message_id": "msg-chat-intent",
+                    "trace_id": "trace-chat-intent",
+                    "source": {"node_id": "node_peer"},
+                    "target": {"node_id": node.node_id},
+                    "conversation": {"context_id": "ctx-chat-intent", "turn_type": "chat_turn"},
+                    "intent": {"type": "chat.request", "priority": "normal"},
+                    "task": {"instructions": "Have a normal conversation."},
+                    "economics": {"bounty_seconds": 0.0, "currency": "SECONDS"},
+                    "delivery": {"reply_mode": "new_dm", "settlement_mode": "task_result"},
+                }
+            ),
+        }
+
+        def _reply(_prompt, adapter_task_data):
+            self.assertEqual(adapter_task_data["intent"]["type"], "chat.request")
+            return "Normal chat reply"
+
+        with (
+            patch.object(node, "_build_github_context") as github_context_mock,
+            patch.object(node.adapter, "generate_reply", side_effect=_reply),
+            patch.object(node, "complete") as complete_mock,
+        ):
+            asyncio.run(node.process_task(task_data))
+
+        github_context_mock.assert_not_called()
+        complete_mock.assert_called_once_with("task_chat_intent", "Normal chat reply")
+
+    def test_process_task_rejects_mismatched_inner_interbot_target(self):
+        node = _runtime_node()
+        task_data = {
+            "id": "task_wrong_target",
+            "bounty": 0.0,
+            "consumer_id": "node_peer",
+            "target_node": node.node_id,
+            "intent": {"type": "analysis.request"},
+            "payload": json.dumps(
+                {
+                    "spec_version": "mep.interbot.v1",
+                    "message_id": "msg-wrong-target",
+                    "source": {"node_id": "node_peer"},
+                    "target": {"node_id": "node_other"},
+                    "intent": {"type": "code.review.approve"},
+                    "task": {"instructions": "Route this through the review lane."},
+                }
+            ),
+        }
+
+        with (
+            patch.object(node.adapter, "generate_reply") as generate_mock,
+            patch.object(node, "complete") as complete_mock,
+        ):
+            asyncio.run(node.process_task(task_data))
+
+        generate_mock.assert_not_called()
+        complete_mock.assert_called_once_with(
+            "task_wrong_target",
+            "[interbot] routing contract rejected: target.node_id does not match task target_node",
+        )
+
+    def test_process_task_rejects_mismatched_outer_target_when_inner_target_is_missing(self):
+        node = _runtime_node()
+        task_data = {
+            "id": "task_wrong_outer_target",
+            "bounty": 0.0,
+            "consumer_id": "node_peer",
+            "target_node": "node_other",
+            "payload": json.dumps(
+                {
+                    "spec_version": "mep.interbot.v1",
+                    "message_id": "msg-wrong-outer-target",
+                    "source": {"node_id": "node_peer"},
+                    "intent": {"type": "code.review.approve"},
+                    "task": {"instructions": "Route this through the review lane."},
+                }
+            ),
+        }
+
+        with (
+            patch.object(node.adapter, "generate_reply") as generate_mock,
+            patch.object(node, "complete") as complete_mock,
+        ):
+            asyncio.run(node.process_task(task_data))
+
+        generate_mock.assert_not_called()
+        complete_mock.assert_called_once_with(
+            "task_wrong_outer_target",
+            "[interbot] routing contract rejected: task target_node does not match the receiving runtime",
+        )
+
+    def test_structured_reply_preserves_inner_intent_in_outer_task(self):
+        node = _runtime_node()
+        envelope = {
+            "spec_version": "mep.interbot.v1",
+            "message_id": "msg-reply-intent",
+            "source": {"node_id": node.node_id},
+            "target": {"node_id": "node_peer"},
+            "conversation": {"context_id": "ctx-reply-intent", "turn_type": "chat_turn"},
+            "intent": {"type": "chat.response", "priority": "low"},
+            "task": {"instructions": "Hello back."},
+        }
+        with patch(
+            "node.mep_runtime._safe_request",
+            return_value=(200, {"task_id": "task_reply_intent"}, ""),
+        ) as request_mock:
+            ok, _body, _raw = node._submit_structured_interbot_message(envelope)
+
+        self.assertTrue(ok)
+        outer = json.loads(request_mock.call_args.kwargs["data_body"])
+        self.assertEqual(outer["intent"], {"type": "chat.response", "priority": "low"})
+
     def test_process_task_stops_bounded_structured_dm_reply_when_session_limit_is_exceeded(self):
         node = _runtime_node()
         task_data = {
@@ -2523,6 +2943,39 @@ class TestRuntimeWebSocketLoop(unittest.TestCase):
 
         asyncio.run(_run())
         self.assertEqual([json.loads(payload)["event"] for payload in node._ws.sent], ["call.accept"])
+
+    def test_runtime_reports_adapter_failure_instead_of_speaking_error_text(self):
+        node = _runtime_node()
+        node.live_call_enabled = True
+        node.call_auto_accept = True
+        node._ws = _FakeWebSocket([])
+
+        async def _run() -> None:
+            with patch.object(
+                node.adapter,
+                "generate_reply",
+                return_value="[codex-cli] inference failed: invalid UTF-8",
+            ):
+                await node.handle_ws_event(
+                    {"event": "call.incoming", "context_id": "ctx-error", "caller": "node_peer"}
+                )
+                await node.handle_ws_event(
+                    {
+                        "event": "call.frame",
+                        "context_id": "ctx-error",
+                        "sender": "node_peer",
+                        "seq": 1,
+                        "content_type": "text/plain",
+                        "payload": "Can you hear me?",
+                    }
+                )
+                await asyncio.gather(*list(node._background_tasks))
+
+        asyncio.run(_run())
+        frames = [json.loads(payload) for payload in node._ws.sent]
+        self.assertEqual(json.loads(frames[1]["payload"])["event"], "reply.started")
+        self.assertEqual(json.loads(frames[2]["payload"]), {"event": "reply.failed", "reason": "adapter_error"})
+        self.assertNotIn("inference failed", json.dumps(frames))
 
     def test_runtime_live_call_history_carries_across_turns(self):
         node = _runtime_node()
@@ -2662,7 +3115,8 @@ class TestRuntimeKeyDirResolution(unittest.TestCase):
 
     def test_create_new_local_identity_uses_node_id_canonical_path(self):
         with tempfile.TemporaryDirectory() as tmpdir:
-            key_path = mep_runtime._create_new_local_identity(tmpdir)  # noqa: SLF001
+            with patch.dict(os.environ, {"MEP_KEY_DIR": tmpdir}, clear=False):
+                key_path = mep_runtime._create_new_local_identity(tmpdir)  # noqa: SLF001
             identity = MEPIdentity(key_path)
             self.assertEqual(os.path.basename(key_path), f"{identity.node_id}.pem")
             self.assertTrue(os.path.exists(key_path))
@@ -2734,11 +3188,18 @@ class TestAdapterErrorDetection(unittest.TestCase):
         self.assertTrue(mep_runtime._is_adapter_error("[DeepSeek] error: connection reset"))  # noqa: SLF001
         self.assertTrue(mep_runtime._is_adapter_error("[AI adapter] tinyllama timed out"))  # noqa: SLF001
         self.assertTrue(mep_runtime._is_adapter_error("[AI adapter] empty response from tinyllama"))  # noqa: SLF001
+        self.assertTrue(mep_runtime._is_adapter_error("[codex-cli] inference failed: invalid UTF-8"))  # noqa: SLF001
+        self.assertTrue(mep_runtime._is_adapter_error("[codex-cli] inference timed out after 60s"))  # noqa: SLF001
         self.assertTrue(mep_runtime._is_adapter_error(""))  # noqa: SLF001
 
     def test_is_adapter_error_allows_real_reviews(self):
         self.assertFalse(  # noqa: SLF001
             mep_runtime._is_adapter_error("## Review Summary\n\nThe change is scoped and tested.")
+        )
+        self.assertFalse(  # noqa: SLF001
+            mep_runtime._is_adapter_error(
+                "[codex-cli] The old request timed out, but the retry succeeded and the failed test is fixed."
+            )
         )
 
 

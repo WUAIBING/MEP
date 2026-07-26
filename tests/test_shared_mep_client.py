@@ -199,6 +199,7 @@ class TestSharedMEPClient(unittest.TestCase):
 
         submit_body = json.loads(session.post.call_args.kwargs["data"])
         self.assertEqual(submit_body["routing"], {"target_node_id": "node_reviewer"})
+        self.assertEqual(submit_body["intent"], {"type": "review.request", "priority": "normal"})
         body = json.loads(submit_body["task"]["instructions"])
         self.assertEqual(body["spec_version"], "mep.interbot.v1")
         self.assertEqual(body["target"]["node_id"], "node_reviewer")
@@ -213,6 +214,20 @@ class TestSharedMEPClient(unittest.TestCase):
         self.assertEqual(response["context_id"], "pr154-review")
         self.assertTrue(response["message_id"])
         self.assertTrue(response["trace_id"])
+
+    def test_submit_dm_preserves_chat_intent_in_outer_task(self):
+        with (
+            patch("clients.shared.mep_client.MEPIdentity", return_value=_FakeIdentity()),
+            patch("clients.shared.mep_client.requests.Session") as session_cls,
+        ):
+            session = session_cls.return_value
+            session.post.return_value = _FakeResponse()
+            client = MEPClient("unused.pem")
+
+            asyncio.run(client.submit_dm("Hello", "node_peer", priority="low"))
+
+        submit_body = json.loads(session.post.call_args.kwargs["data"])
+        self.assertEqual(submit_body["intent"], {"type": "chat.request", "priority": "low"})
 
     def test_submit_dm_can_attach_session_safety_metadata(self):
         with (

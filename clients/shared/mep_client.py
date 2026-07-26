@@ -398,6 +398,28 @@ class MEPClient:
             envelope["human_note"] = human_note
         return envelope
 
+    async def _submit_interbot_envelope(self, envelope: dict[str, Any]) -> dict:
+        target = envelope.get("target") if isinstance(envelope.get("target"), dict) else {}
+        target_node = target.get("node_id")
+        if not isinstance(target_node, str) or not target_node:
+            raise ValueError("inter-bot envelope is missing target.node_id")
+
+        intent = envelope.get("intent") if isinstance(envelope.get("intent"), dict) else {}
+        intent_type = intent.get("type")
+        if not isinstance(intent_type, str) or not intent_type.strip():
+            intent_type = "chat.request"
+        intent_priority = intent.get("priority")
+        if not isinstance(intent_priority, str) or not intent_priority.strip():
+            intent_priority = None
+
+        return await self.submit_task(
+            json.dumps(envelope),
+            0.0,
+            target_node=target_node,
+            intent_type=intent_type,
+            intent_priority=intent_priority,
+        )
+
     async def submit_dm(
         self,
         message: str,
@@ -444,7 +466,7 @@ class MEPClient:
             governance=governance,
             turn_index=turn_index,
         )
-        response = await self.submit_task(json.dumps(envelope), 0.0, None, target_node)
+        response = await self._submit_interbot_envelope(envelope)
         response["message_id"] = envelope["message_id"]
         response["trace_id"] = envelope["trace_id"]
         response["context_id"] = envelope["conversation"]["context_id"]
@@ -515,7 +537,7 @@ class MEPClient:
         target_node = target.get("node_id")
         if not isinstance(target_node, str) or not target_node:
             raise ValueError("reply envelope is missing target.node_id")
-        response = await self.submit_task(json.dumps(envelope), 0.0, None, target_node)
+        response = await self._submit_interbot_envelope(envelope)
         response["message_id"] = envelope["message_id"]
         response["trace_id"] = envelope["trace_id"]
         response["context_id"] = envelope["conversation"]["context_id"]
@@ -615,7 +637,7 @@ class MEPClient:
             governance=governance,
             turn_index=turn_index,
         )
-        response = await self.submit_task(json.dumps(envelope), 0.0, None, target_node)
+        response = await self._submit_interbot_envelope(envelope)
         response["message_id"] = envelope["message_id"]
         response["trace_id"] = envelope["trace_id"]
         response["context_id"] = envelope["conversation"]["context_id"]
@@ -748,7 +770,7 @@ class MEPClient:
             session_safety=session_safety,
             turn_index=turn_index,
         )
-        response = await self.submit_task(json.dumps(envelope), 0.0, None, target_node)
+        response = await self._submit_interbot_envelope(envelope)
         response["message_id"] = envelope["message_id"]
         response["trace_id"] = envelope["trace_id"]
         response["context_id"] = envelope["conversation"]["context_id"]
@@ -847,7 +869,7 @@ class MEPClient:
             human_note=human_note,
             turn_index=turn_index,
         )
-        response = await self.submit_task(json.dumps(envelope), 0.0, None, target_node)
+        response = await self._submit_interbot_envelope(envelope)
         response["message_id"] = envelope["message_id"]
         response["trace_id"] = envelope["trace_id"]
         response["context_id"] = envelope["conversation"]["context_id"]
@@ -965,7 +987,7 @@ class MEPClient:
             human_note=human_note,
             turn_index=turn_index,
         )
-        response = await self.submit_task(json.dumps(envelope), 0.0, None, target_node)
+        response = await self._submit_interbot_envelope(envelope)
         response["message_id"] = envelope["message_id"]
         response["trace_id"] = envelope["trace_id"]
         response["context_id"] = envelope["conversation"]["context_id"]
