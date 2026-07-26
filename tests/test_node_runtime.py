@@ -52,6 +52,7 @@ class _FakeWebSocket:
         self.messages = list(messages)
         self.pings = 0
         self.sent = []
+        self.sent_event = asyncio.Event()
 
     async def recv(self):
         item = self.messages.pop(0)
@@ -64,6 +65,7 @@ class _FakeWebSocket:
 
     async def send(self, payload):
         self.sent.append(payload)
+        self.sent_event.set()
 
 
 class _FakeConnectContext:
@@ -2222,10 +2224,7 @@ class TestRuntimeWebSocketLoop(unittest.TestCase):
                 patch.object(node, "complete") as complete_mock,
             ):
                 task = asyncio.create_task(node.process_task(task_data))
-                for _ in range(100):
-                    if node._ws.sent:
-                        break
-                    await asyncio.sleep(0.01)
+                await asyncio.wait_for(node._ws.sent_event.wait(), timeout=1)
                 invite = json.loads(node._ws.sent[0])
                 self.assertEqual(invite["event"], "call.invite")
                 self.assertEqual(invite["context_id"], "ctx-bridge")
@@ -2283,10 +2282,7 @@ class TestRuntimeWebSocketLoop(unittest.TestCase):
                 patch.object(node, "complete") as complete_mock,
             ):
                 task = asyncio.create_task(node.process_task(task_data))
-                for _ in range(100):
-                    if node._ws.sent:
-                        break
-                    await asyncio.sleep(0.01)
+                await asyncio.wait_for(node._ws.sent_event.wait(), timeout=1)
                 await node.handle_ws_event({"event": "call.accepted", "context_id": "ctx-bridge-frame-fail"})
                 await task
 
