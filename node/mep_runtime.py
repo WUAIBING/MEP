@@ -5237,6 +5237,16 @@ class RuntimeNode:
             f"Conversation so far:\n{transcript}\nYou:"
         )
 
+    @staticmethod
+    def _sanitize_live_call_reply(reply: str) -> str:
+        """Remove provider-private reasoning before a reply is sent to a caller."""
+        return re.sub(
+            r"<think\b[^>]*>.*?</think\s*>",
+            "",
+            str(reply or ""),
+            flags=re.IGNORECASE | re.DOTALL,
+        ).strip()
+
     async def _answer_live_call_frame(self, *, context_id: str, sender: str, text: str) -> None:
         lock = self._live_call_locks.setdefault(context_id, asyncio.Lock())
         async with lock:
@@ -5275,7 +5285,7 @@ class RuntimeNode:
                     content_type="application/vnd.mep.call-status+json",
                 )
                 return
-            reply = str(reply or "").strip()
+            reply = self._sanitize_live_call_reply(reply)
             if not reply:
                 await self._send_live_call_frame(
                     context_id,

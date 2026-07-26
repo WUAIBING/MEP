@@ -2456,7 +2456,7 @@ class TestRuntimeWebSocketLoop(unittest.TestCase):
             release_adapter.wait(timeout=2)
             self.assertIn("Caller: Hello, can you hear me?", prompt)
             self.assertEqual(task_data["conversation"]["context_id"], "ctx-ai")
-            return "Yes, I can hear you."
+            return "<think>This must remain private.</think>\nYes, I can hear you."
 
         async def _run() -> None:
             with patch.object(node.adapter, "generate_reply", side_effect=_generate_reply):
@@ -2493,6 +2493,7 @@ class TestRuntimeWebSocketLoop(unittest.TestCase):
         self.assertEqual(json.loads(frames[1]["payload"])["event"], "reply.started")
         self.assertEqual(frames[2], {"event": "call.pong", "context_id": "ctx-ai"})
         self.assertEqual(frames[3]["payload"], "Yes, I can hear you.")
+        self.assertNotIn("<think>", frames[3]["payload"])
         self.assertEqual(json.loads(frames[4]["payload"])["event"], "reply.completed")
         self.assertEqual([frames[index]["seq"] for index in (1, 3, 4)], [1, 2, 3])
 
