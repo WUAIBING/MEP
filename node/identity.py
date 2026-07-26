@@ -10,7 +10,14 @@ from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 class MEPIdentity:
     def __init__(self, key_path="private.pem"):
         self.key_path = key_path
-        self.enc_key_path = key_path.replace(".pem", "_enc.pem")
+        legacy_enc_key_path = key_path.replace(".pem", "_enc.pem")
+        modern_enc_key_path = f"{key_path}.x25519.pem"
+        if os.path.exists(legacy_enc_key_path):
+            self.enc_key_path = legacy_enc_key_path
+        elif os.path.exists(modern_enc_key_path):
+            self.enc_key_path = modern_enc_key_path
+        else:
+            self.enc_key_path = legacy_enc_key_path
         self.generated_new_key = False
         self._load_or_generate()
         

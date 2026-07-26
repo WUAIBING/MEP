@@ -812,6 +812,23 @@ class TestRuntimeReviewPrompts(unittest.TestCase):
             )
         )
 
+    def test_inner_interbot_intent_wins_over_conflicting_outer_intent(self):
+        task_data = {
+            "intent": {"type": "analysis.request"},
+            "payload": json.dumps(
+                {
+                    "spec_version": "mep.interbot.v1",
+                    "source": {"node_id": "node_peer"},
+                    "target": {"node_id": "node_runtime"},
+                    "intent": {"type": "chat.request"},
+                    "task": {"instructions": "This is ordinary chat."},
+                }
+            ),
+        }
+
+        self.assertEqual(mep_runtime._review_intent_type(task_data), "chat.request")  # noqa: SLF001
+        self.assertFalse(mep_runtime._task_requires_review_prompt(task_data))  # noqa: SLF001
+
     def test_ai_adapter_uses_reviewer_prompt_for_bridge_review_tasks(self):
         adapter = mep_runtime.AIAdapter(model="tinyllama")
         task_data = self._bridge_review_task_data()
@@ -3115,6 +3132,11 @@ class TestAdapterErrorDetection(unittest.TestCase):
     def test_is_adapter_error_allows_real_reviews(self):
         self.assertFalse(  # noqa: SLF001
             mep_runtime._is_adapter_error("## Review Summary\n\nThe change is scoped and tested.")
+        )
+        self.assertFalse(  # noqa: SLF001
+            mep_runtime._is_adapter_error(
+                "[codex-cli] The old request timed out, but the retry succeeded and the failed test is fixed."
+            )
         )
 
 

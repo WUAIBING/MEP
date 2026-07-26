@@ -34,6 +34,23 @@ class TestIdentityPaths(unittest.TestCase):
             self.assertTrue(os.path.exists(key_path.replace(".pem", "_enc.pem")))
             self.assertFalse(os.path.exists(f"{key_path}.x25519.pem"))
 
+    def test_runtime_identity_reuses_existing_modern_x25519_sidecar(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            key_path = os.path.join(tmpdir, "modern-sidecar-bot.pem")
+            shared_identity = MEPIdentity(key_path)
+            legacy_path = key_path.replace(".pem", "_enc.pem")
+            modern_path = f"{key_path}.x25519.pem"
+            os.replace(legacy_path, modern_path)
+
+            runtime_identity = RuntimeMEPIdentity(key_path)
+
+            self.assertEqual(
+                runtime_identity.x25519_public_key,
+                shared_identity.x25519_public_key,
+            )
+            self.assertEqual(runtime_identity.enc_key_path, modern_path)
+            self.assertFalse(os.path.exists(legacy_path))
+
     def test_default_key_dir_uses_shared_home_resolver(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             with patch.dict(os.environ, {}, clear=True):

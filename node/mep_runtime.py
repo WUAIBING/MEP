@@ -131,8 +131,12 @@ def _is_adapter_error(text: str) -> bool:
         return True
     if cleaned.startswith("[AI adapter]") and ("error" in lowered or "empty" in lowered or "timed out" in lowered):
         return True
-    if cleaned.startswith("[codex-cli]") and (
-        "failed" in lowered or "timed out" in lowered or "no final message" in lowered
+    if lowered.startswith(
+        (
+            "[codex-cli] inference failed:",
+            "[codex-cli] inference timed out ",
+            "[codex-cli] inference returned no final message",
+        )
     ):
         return True
     return False
@@ -504,9 +508,8 @@ def _task_requires_review_prompt(task_data: dict[str, Any]) -> bool:
     if isinstance(bridge_metadata, dict) and str(bridge_metadata.get("bridge_id") or "").strip():
         return True
 
-    intent: Any = task_data.get("intent")
-    if not isinstance(intent, dict) and isinstance(interbot_message, dict):
-        intent = interbot_message.get("intent")
+    inner_intent = interbot_message.get("intent") if isinstance(interbot_message, dict) else None
+    intent: Any = inner_intent if isinstance(inner_intent, dict) else task_data.get("intent")
     intent_type = str(intent.get("type") or "").strip() if isinstance(intent, dict) else ""
     return intent_type in {
         "code.review.request",
@@ -677,9 +680,8 @@ def _filter_review_identifiers_to_allowed(values: list[str], allowed_identifiers
 
 def _review_intent_type(task_data: dict[str, Any]) -> str:
     interbot_message = _interbot_message_from_task_data(task_data)
-    intent: Any = task_data.get("intent")
-    if not isinstance(intent, dict) and isinstance(interbot_message, dict):
-        intent = interbot_message.get("intent")
+    inner_intent = interbot_message.get("intent") if isinstance(interbot_message, dict) else None
+    intent: Any = inner_intent if isinstance(inner_intent, dict) else task_data.get("intent")
     return str(intent.get("type") or "").strip().lower() if isinstance(intent, dict) else ""
 
 
