@@ -2558,6 +2558,76 @@ class TestRuntimeWebSocketLoop(unittest.TestCase):
         self.assertIn("You: First answer", prompts[1])
         self.assertIn("Caller: Follow-up question", prompts[1])
 
+    def test_runtime_serializes_concurrent_frames_for_same_call(self):
+        node = _runtime_node()
+        node.live_call_enabled = True
+        node.call_auto_accept = True
+        node._ws = _FakeWebSocket([])
+        first_started = threading.Event()
+        release_first = threading.Event()
+        prompts = []
+
+        def _generate_reply(prompt, _task_data):
+            prompts.append(prompt)
+            if len(prompts) == 1:
+                first_started.set()
+                release_first.wait(timeout=2)
+                return "First answer"
+            return "Second answer"
+
+        async def _run() -> None:
+            with patch.object(node.adapter, "generate_reply", side_effect=_generate_reply):
+                await node.handle_ws_event(
+                    {"event": "call.incoming", "context_id": "ctx-concurrent", "caller": "node_peer"}
+                )
+                for seq, text in ((1, "First question"), (2, "Second question")):
+                    await node.handle_ws_event(
+                        {
+                            "event": "call.frame",
+                            "context_id": "ctx-concurrent",
+                            "sender": "node_peer",
+                            "seq": seq,
+                            "content_type": "text/plain",
+                            "payload": text,
+                        }
+                    )
+                self.assertTrue(await asyncio.to_thread(first_started.wait, 2))
+                self.assertEqual(len(prompts), 1)
+                release_first.set()
+                await asyncio.gather(*list(node._background_tasks))
+
+        asyncio.run(_run())
+        self.assertEqual(len(prompts), 2)
+        self.assertIn("You: First answer", prompts[1])
+        self.assertIn("Caller: Second question", prompts[1])
+        frames = [
+            json.loads(payload)
+            for payload in node._ws.sent
+            if json.loads(payload).get("event") == "call.frame"
+        ]
+        self.assertEqual([frame["seq"] for frame in frames], [1, 2, 3, 4, 5, 6])
+
+    def test_runtime_forgets_all_live_call_state_on_hangup(self):
+        node = _runtime_node()
+        node.live_call_enabled = True
+        node.call_auto_accept = True
+        node._ws = _FakeWebSocket([])
+
+        async def _run() -> None:
+            await node.handle_ws_event(
+                {"event": "call.incoming", "context_id": "ctx-cleanup", "caller": "node_peer"}
+            )
+            node._live_call_history["ctx-cleanup"] = [{"role": "user", "content": "hello"}]
+            node._live_call_locks["ctx-cleanup"] = asyncio.Lock()
+            node._live_call_outbound_seq["ctx-cleanup"] = 3
+            await node.handle_ws_event({"event": "call.hangup", "context_id": "ctx-cleanup"})
+
+        asyncio.run(_run())
+        self.assertEqual(node._live_call_peers, {})
+        self.assertEqual(node._live_call_history, {})
+        self.assertEqual(node._live_call_locks, {})
+        self.assertEqual(node._live_call_outbound_seq, {})
+
 
 class TestRuntimeKeyDirResolution(unittest.TestCase):
     def test_find_git_root_detects_worktree_dot_git_file(self):

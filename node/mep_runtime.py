@@ -5217,6 +5217,12 @@ class RuntimeNode:
         self._live_call_locks.pop(context_id, None)
         self._live_call_outbound_seq.pop(context_id, None)
 
+    def _forget_all_live_calls(self) -> None:
+        self._live_call_peers.clear()
+        self._live_call_history.clear()
+        self._live_call_locks.clear()
+        self._live_call_outbound_seq.clear()
+
     @staticmethod
     def _render_live_call_prompt(history: list[dict[str, str]]) -> str:
         transcript = "\n".join(
@@ -5279,6 +5285,9 @@ class RuntimeNode:
                 return
             history.append({"role": "assistant", "content": reply[:6000]})
             del history[:-12]
+            # Keep state after reply.completed because the call remains active
+            # and subsequent frames need conversational continuity. Teardown is
+            # driven by call.hangup or transport disconnect.
             chunk_size = max(200, _env_positive_int("MEP_CALL_FRAME_CHARS", 800))
             for offset in range(0, len(reply), chunk_size):
                 if self._live_call_peers.get(context_id) != sender:
@@ -6070,6 +6079,7 @@ class RuntimeNode:
             finally:
                 self._ws = None
                 self._cancel_pending_call_bridges("socket_closed")
+                self._forget_all_live_calls()
                 for task in list(self._background_tasks):
                     task.cancel()
                 if self._background_tasks:
