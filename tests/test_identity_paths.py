@@ -6,9 +6,34 @@ from unittest.mock import patch
 
 from clients.shared.identity import MEPIdentity
 from clients.shared import identity_paths
+from node.identity import MEPIdentity as RuntimeMEPIdentity
 
 
 class TestIdentityPaths(unittest.TestCase):
+    def test_shared_identity_reuses_runtime_x25519_sidecar(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            key_path = os.path.join(tmpdir, "persistent-bot.pem")
+            runtime_identity = RuntimeMEPIdentity(key_path)
+
+            shared_identity = MEPIdentity(key_path)
+
+            self.assertEqual(shared_identity.node_id, runtime_identity.node_id)
+            self.assertEqual(
+                shared_identity.x25519_public_key,
+                runtime_identity.x25519_public_key,
+            )
+            self.assertTrue(os.path.exists(key_path.replace(".pem", "_enc.pem")))
+            self.assertFalse(os.path.exists(f"{key_path}.x25519.pem"))
+
+    def test_shared_identity_creates_runtime_compatible_x25519_sidecar(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            key_path = os.path.join(tmpdir, "new-shared-bot.pem")
+
+            MEPIdentity(key_path)
+
+            self.assertTrue(os.path.exists(key_path.replace(".pem", "_enc.pem")))
+            self.assertFalse(os.path.exists(f"{key_path}.x25519.pem"))
+
     def test_default_key_dir_uses_shared_home_resolver(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             with patch.dict(os.environ, {}, clear=True):
