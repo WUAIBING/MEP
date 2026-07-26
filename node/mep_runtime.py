@@ -4665,6 +4665,11 @@ class RuntimeNode:
         self._ws: Any = None
         self._background_tasks: set[asyncio.Task[Any]] = set()
         self._pending_call_bridges: dict[str, asyncio.Future[dict[str, Any]]] = {}
+        self._live_call_peers: dict[str, str] = {}
+        self._live_call_history: dict[str, list[dict[str, str]]] = {}
+        self._live_call_locks: dict[str, asyncio.Lock] = {}
+        self._live_call_outbound_seq: dict[str, int] = {}
+        self._task_adapter_lock = asyncio.Lock()
         
         # Phase 4: Autonomous Workspace Management
         workspace_dir = os.getenv("MEP_WORKSPACE_DIR")
@@ -5128,6 +5133,7 @@ class RuntimeNode:
             if self.live_call_enabled and self.call_auto_accept:
                 sent = await self._send_ws_event({"event": "call.accept", "context_id": context_id})
                 if sent:
+                    self._live_call_peers[context_id] = caller
                     print(f"[mep run] auto-accepted live call context={context_id} caller={caller}")
                 else:
                     print(f"[mep run] auto-accept failed context={context_id} caller={caller}")
@@ -5155,11 +5161,155 @@ class RuntimeNode:
             return
         if event == "call.frame":
             sender = data.get("sender") if isinstance(data.get("sender"), str) else "unknown"
+            content_type = str(data.get("content_type") or "text/plain").lower()
             snippet = str(data.get("payload") or "").strip().replace("\n", " ")[:160]
             print(f"[mep run] live frame context={context_id} sender={sender} payload={snippet}")
+            if (
+                self.live_call_enabled
+                and context_id
+                and sender != "unknown"
+                and content_type == "text/plain"
+                and snippet
+            ):
+                self._live_call_peers[context_id] = sender
+                self._schedule_background_task(
+                    self._answer_live_call_frame(
+                        context_id=context_id,
+                        sender=sender,
+                        text=str(data.get("payload") or "").strip(),
+                    ),
+                    label=f"live_call_answer:{context_id}",
+                )
             return
-        if event in {"call.hangup", "call.suspended", "call.resumed"}:
+        if event == "call.hangup":
+            if context_id:
+                self._forget_live_call(context_id)
             print(f"[mep run] {event} context={context_id} detail={data}")
+            return
+        if event in {"call.suspended", "call.resumed"}:
+            print(f"[mep run] {event} context={context_id} detail={data}")
+
+    def _next_live_call_sequence(self, context_id: str) -> int:
+        sequence = self._live_call_outbound_seq.get(context_id, 0) + 1
+        self._live_call_outbound_seq[context_id] = sequence
+        return sequence
+
+    async def _send_live_call_frame(
+        self,
+        context_id: str,
+        payload: str,
+        *,
+        content_type: str = "text/plain",
+    ) -> bool:
+        return await self._send_ws_event(
+            {
+                "event": "call.frame",
+                "context_id": context_id,
+                "seq": self._next_live_call_sequence(context_id),
+                "content_type": content_type,
+                "payload": payload,
+            }
+        )
+
+    def _forget_live_call(self, context_id: str) -> None:
+        self._live_call_peers.pop(context_id, None)
+        self._live_call_history.pop(context_id, None)
+        self._live_call_locks.pop(context_id, None)
+        self._live_call_outbound_seq.pop(context_id, None)
+
+    def _forget_all_live_calls(self) -> None:
+        self._live_call_peers.clear()
+        self._live_call_history.clear()
+        self._live_call_locks.clear()
+        self._live_call_outbound_seq.clear()
+
+    @staticmethod
+    def _render_live_call_prompt(history: list[dict[str, str]]) -> str:
+        transcript = "\n".join(
+            f"{'Caller' if turn.get('role') == 'user' else 'You'}: {turn.get('content', '')}"
+            for turn in history[-12:]
+        )
+        return (
+            "You are answering a live MEP bot-to-bot phone call. "
+            "Respond naturally, directly, and briefly. Preserve conversational continuity. "
+            "Do not narrate hidden reasoning or repeat the transcript. If the caller asks for "
+            "work that cannot be completed during this call, state the next concrete step.\n\n"
+            f"Conversation so far:\n{transcript}\nYou:"
+        )
+
+    @staticmethod
+    def _sanitize_live_call_reply(reply: str) -> str:
+        """Remove provider-private reasoning before a reply is sent to a caller."""
+        return re.sub(
+            r"<think\b[^>]*>.*?</think\s*>",
+            "",
+            str(reply or ""),
+            flags=re.IGNORECASE | re.DOTALL,
+        ).strip()
+
+    async def _answer_live_call_frame(self, *, context_id: str, sender: str, text: str) -> None:
+        lock = self._live_call_locks.setdefault(context_id, asyncio.Lock())
+        async with lock:
+            if self._live_call_peers.get(context_id) != sender:
+                return
+            history = self._live_call_history.setdefault(context_id, [])
+            history.append({"role": "user", "content": text[:6000]})
+            del history[:-12]
+            started = await self._send_live_call_frame(
+                context_id,
+                json.dumps({"event": "reply.started"}),
+                content_type="application/vnd.mep.call-status+json",
+            )
+            if not started:
+                return
+            prompt = self._render_live_call_prompt(history)
+            task_data = {
+                "id": f"call:{context_id}",
+                "bounty": 0.0,
+                "consumer_id": sender,
+                "intent": {"type": "chat.request"},
+                "conversation": {"context_id": context_id},
+            }
+            try:
+                # Most adapters retain per-request metrics on the instance.
+                # Isolate live-call state from concurrent review/task inference.
+                call_adapter = copy.copy(self.adapter)
+                reply = await asyncio.to_thread(call_adapter.generate_reply, prompt, task_data)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001
+                print(f"[mep run] live call AI failed context={context_id} detail={exc}")
+                await self._send_live_call_frame(
+                    context_id,
+                    json.dumps({"event": "reply.failed", "reason": "adapter_error"}),
+                    content_type="application/vnd.mep.call-status+json",
+                )
+                return
+            reply = self._sanitize_live_call_reply(reply)
+            if not reply:
+                await self._send_live_call_frame(
+                    context_id,
+                    json.dumps({"event": "reply.failed", "reason": "empty_response"}),
+                    content_type="application/vnd.mep.call-status+json",
+                )
+                return
+            history.append({"role": "assistant", "content": reply[:6000]})
+            del history[:-12]
+            # Keep state after reply.completed because the call remains active
+            # and subsequent frames need conversational continuity. Teardown is
+            # driven by call.hangup or transport disconnect.
+            chunk_size = max(200, _env_positive_int("MEP_CALL_FRAME_CHARS", 800))
+            for offset in range(0, len(reply), chunk_size):
+                if self._live_call_peers.get(context_id) != sender:
+                    return
+                sent = await self._send_live_call_frame(context_id, reply[offset : offset + chunk_size])
+                if not sent:
+                    return
+            await self._send_live_call_frame(
+                context_id,
+                json.dumps({"event": "reply.completed"}),
+                content_type="application/vnd.mep.call-status+json",
+            )
 
     @staticmethod
     def _interbot_reply_mode(interbot_message: dict[str, Any]) -> Optional[str]:
@@ -5810,7 +5960,11 @@ class RuntimeNode:
             for finding in _secret_findings:
                 print(f"  {finding}")
 
-        result = self.adapter.generate_reply(instructions, adapter_task_data)
+        # Provider adapters are currently synchronous. Run inference away from the
+        # WebSocket event loop so pings, call frames, and new task delivery remain
+        # responsive during long model requests.
+        async with self._task_adapter_lock:
+            result = await asyncio.to_thread(self.adapter.generate_reply, instructions, adapter_task_data)
         adapter_metrics = getattr(self.adapter, "last_review_metrics", None) or None
         if adapter_metrics is not None and merged_runs:
             # tools_called reflects the runtime tool runs that produced evidence
@@ -5935,6 +6089,7 @@ class RuntimeNode:
             finally:
                 self._ws = None
                 self._cancel_pending_call_bridges("socket_closed")
+                self._forget_all_live_calls()
                 for task in list(self._background_tasks):
                     task.cancel()
                 if self._background_tasks:
