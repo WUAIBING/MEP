@@ -34,6 +34,15 @@ class TestIdentityPaths(unittest.TestCase):
             self.assertTrue(os.path.exists(key_path.replace(".pem", "_enc.pem")))
             self.assertFalse(os.path.exists(f"{key_path}.x25519.pem"))
 
+    def test_runtime_identity_creates_missing_key_directory(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            key_path = os.path.join(tmpdir, "nested", "bot", "runtime.pem")
+
+            identity = RuntimeMEPIdentity(key_path)
+
+            self.assertTrue(os.path.exists(key_path))
+            self.assertTrue(os.path.exists(identity.enc_key_path))
+
     def test_runtime_identity_reuses_existing_modern_x25519_sidecar(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             key_path = os.path.join(tmpdir, "modern-sidecar-bot.pem")

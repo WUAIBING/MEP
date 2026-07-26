@@ -30,6 +30,7 @@ class MEPIdentity:
         self._load_or_generate()
         
     def _load_or_generate(self):
+        os.makedirs(os.path.dirname(os.path.abspath(self.key_path)), exist_ok=True)
         # 1. Signing Key (Ed25519)
         if os.path.exists(self.key_path):
             with open(self.key_path, "rb") as f:

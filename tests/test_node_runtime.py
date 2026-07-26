@@ -2733,6 +2733,38 @@ class TestRuntimeWebSocketLoop(unittest.TestCase):
         github_context_mock.assert_not_called()
         complete_mock.assert_called_once_with("task_chat_intent", "Normal chat reply")
 
+    def test_process_task_rejects_mismatched_inner_interbot_target(self):
+        node = _runtime_node()
+        task_data = {
+            "id": "task_wrong_target",
+            "bounty": 0.0,
+            "consumer_id": "node_peer",
+            "target_node": node.node_id,
+            "intent": {"type": "analysis.request"},
+            "payload": json.dumps(
+                {
+                    "spec_version": "mep.interbot.v1",
+                    "message_id": "msg-wrong-target",
+                    "source": {"node_id": "node_peer"},
+                    "target": {"node_id": "node_other"},
+                    "intent": {"type": "code.review.approve"},
+                    "task": {"instructions": "Route this through the review lane."},
+                }
+            ),
+        }
+
+        with (
+            patch.object(node.adapter, "generate_reply") as generate_mock,
+            patch.object(node, "complete") as complete_mock,
+        ):
+            asyncio.run(node.process_task(task_data))
+
+        generate_mock.assert_not_called()
+        complete_mock.assert_called_once_with(
+            "task_wrong_target",
+            "[interbot] routing contract rejected: target.node_id does not match task target_node",
+        )
+
     def test_structured_reply_preserves_inner_intent_in_outer_task(self):
         node = _runtime_node()
         envelope = {

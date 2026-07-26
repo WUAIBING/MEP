@@ -498,6 +498,28 @@ def _interbot_message_from_task_data(task_data: dict[str, Any]) -> Optional[dict
     return None
 
 
+def _interbot_routing_contract_error(
+    task_data: dict[str, Any],
+    interbot_message: dict[str, Any],
+    *,
+    local_node_id: str,
+) -> str:
+    source = interbot_message.get("source")
+    inner_source = str(source.get("node_id") or "").strip() if isinstance(source, dict) else ""
+    outer_source = str(task_data.get("consumer_id") or "").strip()
+    if inner_source and outer_source and inner_source != outer_source:
+        return "source.node_id does not match task consumer_id"
+
+    target = interbot_message.get("target")
+    inner_target = str(target.get("node_id") or "").strip() if isinstance(target, dict) else ""
+    outer_target = str(task_data.get("target_node") or "").strip()
+    if inner_target and outer_target and inner_target != outer_target:
+        return "target.node_id does not match task target_node"
+    if inner_target and inner_target != local_node_id:
+        return "target.node_id does not match the receiving runtime"
+    return ""
+
+
 def _task_requires_review_prompt(task_data: dict[str, Any]) -> bool:
     interbot_message = _interbot_message_from_task_data(task_data)
     task: Any = task_data.get("task")
@@ -5826,6 +5848,16 @@ class RuntimeNode:
         if MEPClient is not None:
             instructions, interbot_message = MEPClient.extract_interbot_instructions(payload)
         if isinstance(interbot_message, dict):
+            contract_error = _interbot_routing_contract_error(
+                task_data,
+                interbot_message,
+                local_node_id=self.node_id,
+            )
+            if contract_error:
+                detail = f"[interbot] routing contract rejected: {contract_error}"
+                print(f"[mep run] rejecting task={task_id[:8]} reason={contract_error}")
+                self.complete(task_id, detail)
+                return
             inner_intent = interbot_message.get("intent")
             if isinstance(inner_intent, dict):
                 adapter_task_data["intent"] = copy.deepcopy(inner_intent)
