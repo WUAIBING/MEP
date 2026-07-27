@@ -1817,6 +1817,19 @@ def _run_two_pass_review(
     rendered = _render_structured_review_with_task_data(final_reply, max_chars=review_max_chars, task_data=task_data)
     if rendered:
         return rendered
+    if _task_is_approval_review(task_data) and not _is_adapter_error(final_reply):
+        # Approval reviews intentionally reject unstructured model output. Do
+        # not undo that fail-closed boundary by publishing the raw response.
+        # Re-render an empty structured packet so authoritative runtime tool
+        # evidence can produce a grounded deterministic decision, while weak
+        # evidence remains an explicit non-approval comment.
+        grounded = _render_structured_review_with_task_data(
+            "{}",
+            max_chars=review_max_chars,
+            task_data=task_data,
+        )
+        if grounded:
+            return grounded
     finalized = _finalize_model_reply(final_reply, max_chars=review_max_chars)
     if finalized:
         return finalized
@@ -3411,8 +3424,16 @@ def _render_structured_review_with_task_data(
 ) -> str:
     if _task_requires_repo_audit_prompt(task_data or {}):
         return _render_structured_repo_audit_with_task_data(text, max_chars=max_chars, task_data=task_data)
-    parsed = _extract_first_json_object(text)
     approval_mode = _task_is_approval_review(task_data or {})
+    if _looks_like_agent_scratchpad(text):
+        # Treat leaked planning/reasoning as absent model output. Discovery
+        # reviews can still use the deterministic, task-grounded renderer;
+        # approval reviews fail closed here and are normalized by the
+        # two-pass caller using the runtime evidence bundle.
+        if approval_mode:
+            return ""
+        return _render_default_structured_review(task_data=task_data, max_chars=max_chars)
+    parsed = _extract_first_json_object(text)
     if not isinstance(parsed, dict):
         if _is_adapter_error(text) or approval_mode:
             return ""

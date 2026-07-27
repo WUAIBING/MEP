@@ -1089,6 +1089,80 @@ class TestRuntimeReviewPrompts(unittest.TestCase):
         self.assertIn("always anchor the output to the actual diff", prompt)
         self.assertIn("Review mode is `discovery_review`.", prompt)
 
+    def test_structured_discovery_review_replaces_scratchpad_with_grounded_default(self):
+        scratchpad = "Let me carefully analyze this PR. I need to inspect the actual code changes."
+
+        rendered = mep_runtime._render_structured_review_with_task_data(  # noqa: SLF001
+            scratchpad,
+            max_chars=1200,
+            task_data=self._bridge_review_task_data(),
+        )
+
+        self.assertIn("## Review Summary", rendered)
+        self.assertIn("Touched paths reviewed: `bridge/github_to_mep.py`", rendered)
+        self.assertNotIn("Let me carefully analyze", rendered)
+        self.assertNotIn("I need to inspect", rendered)
+
+    def test_two_pass_approval_review_normalizes_scratchpad_with_runtime_evidence(self):
+        replies = iter(
+            [
+                '{"risk_candidates":[]}',
+                "Let me carefully analyze this PR. I need to inspect the actual code changes.",
+            ]
+        )
+
+        rendered = mep_runtime._run_two_pass_review(  # noqa: SLF001
+            task_data=self._bridge_review_task_data(intent_type="code.review.approve"),
+            payload="Review this PR and approve only if the exact-head evidence is sufficient.",
+            review_max_chars=1400,
+            invoke_model=lambda _system, _payload: next(replies),
+        )
+
+        self.assertIn("## Review Summary", rendered)
+        self.assertIn("Touched paths reviewed: `bridge/github_to_mep.py`", rendered)
+        self.assertIn("Changed identifiers verified:", rendered)
+        self.assertNotIn("Let me carefully analyze", rendered)
+        self.assertNotIn("I need to inspect", rendered)
+
+    def test_two_pass_approval_review_downgrades_scratchpad_when_runtime_evidence_is_weak(self):
+        replies = iter(
+            [
+                '{"risk_candidates":[]}',
+                "Let me carefully analyze this PR. I need to inspect the actual code changes.",
+            ]
+        )
+        task_data = self._bridge_review_task_data(
+            intent_type="code.review.approve",
+            runtime_tool_bundle={
+                "contract_version": "mep.runtime_tools.v1",
+                "task_mode": "review",
+                "runs": [
+                    {
+                        "tool": "workspace_read",
+                        "status": "success",
+                        "summary": "assembled local context",
+                        "evidence": ["bridge/github_to_mep.py"],
+                    }
+                ],
+            },
+        )
+
+        rendered = mep_runtime._run_two_pass_review(  # noqa: SLF001
+            task_data=task_data,
+            payload="Review this PR and approve only if the exact-head evidence is sufficient.",
+            review_max_chars=1400,
+            invoke_model=lambda _system, _payload: next(replies),
+        )
+
+        self.assertIn("did not yet clear the approval bar", rendered)
+        self.assertNotIn("Let me carefully analyze", rendered)
+        action = mep_runtime.RuntimeNode._bridge_status_action(  # noqa: SLF001
+            mep_runtime._interbot_message_from_task_data(task_data),  # noqa: SLF001
+            detail=rendered,
+            task_data=task_data,
+        )
+        self.assertEqual(action, "reviewed")
+
     def test_approval_review_prompt_requires_verified_identifiers_and_test_awareness(self):
         task_data = self._bridge_review_task_data(intent_type="code.review.approve")
         prompt = mep_runtime._system_prompt_for_task(  # noqa: SLF001
