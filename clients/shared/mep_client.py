@@ -136,16 +136,19 @@ class MEPClient:
     async def _resume_live_calls(self, ws) -> None:
         self._prune_live_calls()
         attempted: set[str] = set()
-        while unattempted := self._live_call_contexts - attempted:
+        while (
+            len(attempted) < self.call_context_max
+            and (unattempted := self._live_call_contexts - attempted)
+        ):
             context_id = min(unattempted)
             attempted.add(context_id)
-            self._mark_resume_pending(context_id)
             try:
                 await ws.send(json.dumps({"event": "call.resume", "context_id": context_id}))
             except Exception:
-                # Keep trying the remaining calls. This context is retried by the
-                # next connection unless its unacknowledged deadline expires first.
+                # A failed send was never acknowledged, so retain the context for
+                # the next connection without starting its ACK-eviction deadline.
                 continue
+            self._mark_resume_pending(context_id)
 
     async def register(self) -> dict:
         body = {

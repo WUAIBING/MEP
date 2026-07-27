@@ -249,7 +249,30 @@ class TestSharedMEPClient(unittest.TestCase):
                 )
                 self.assertEqual(
                     set(client._call_resume_pending),
-                    {"ctx-a", "ctx-b", "ctx-c"},
+                    {"ctx-a", "ctx-c"},
+                )
+                client.stop()
+                await asyncio.sleep(0)
+
+        asyncio.run(_run())
+
+    def test_failed_resume_send_survives_ack_timeout_for_next_connection(self):
+        async def _run():
+            with patch("clients.shared.mep_client.MEPIdentity", return_value=_FakeIdentity()):
+                client = MEPClient("unused.pem")
+                client.call_resume_ack_timeout_seconds = 0.01
+                client._remember_live_call("ctx-retry")
+
+                await client._resume_live_calls(_SelectivelyFailingWebSocket({"ctx-retry"}))
+                await asyncio.sleep(0.03)
+
+                self.assertEqual(client._live_call_contexts, {"ctx-retry"})
+                self.assertEqual(client._call_resume_pending, {})
+                retry_ws = _FakeWebSocket()
+                await client._resume_live_calls(retry_ws)
+                self.assertEqual(
+                    json.loads(retry_ws.sent[0]),
+                    {"event": "call.resume", "context_id": "ctx-retry"},
                 )
                 client.stop()
                 await asyncio.sleep(0)
@@ -275,6 +298,28 @@ class TestSharedMEPClient(unittest.TestCase):
                     [json.loads(payload)["context_id"] for payload in ws.sent],
                     ["ctx-a", "ctx-b"],
                 )
+                client.stop()
+                await asyncio.sleep(0)
+
+        asyncio.run(_run())
+
+    def test_resume_drain_is_bounded_when_calls_keep_arriving(self):
+        async def _run():
+            with patch("clients.shared.mep_client.MEPIdentity", return_value=_FakeIdentity()):
+                client = MEPClient("unused.pem")
+                client.call_context_max = 3
+                client.call_resume_ack_timeout_seconds = 60
+                client._remember_live_call("ctx-0")
+
+                class _ContinuouslyAddingWebSocket(_FakeWebSocket):
+                    async def send(self, payload: str) -> None:
+                        await super().send(payload)
+                        client._remember_live_call(f"ctx-{len(self.sent)}")
+
+                ws = _ContinuouslyAddingWebSocket()
+                await client._resume_live_calls(ws)
+
+                self.assertEqual(len(ws.sent), client.call_context_max)
                 client.stop()
                 await asyncio.sleep(0)
 
