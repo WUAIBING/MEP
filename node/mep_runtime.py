@@ -118,6 +118,17 @@ def _review_allow_external_checks() -> bool:
     return _env_truthy("MEP_REVIEW_ALLOW_EXTERNAL_CHECKS", "0")
 
 
+def _verification_report_has_failures(report: str) -> bool:
+    """Return whether an allowlisted verification command failed.
+
+    The report is also prompt context, but its presence alone must not count as
+    successful approval evidence. Keep this parser tied to the status labels
+    emitted by ``build_verification_report`` so failed commands stay
+    fail-closed in the runtime tool bundle.
+    """
+    return bool(re.search(r"^\$ .+: failed \(exit -?\d+\)", str(report or ""), re.MULTILINE))
+
+
 def _is_adapter_error(text: str) -> bool:
     """Detect adapter failures that must never be published as a real review.
 
@@ -1087,6 +1098,13 @@ def _runtime_tool_successful_runs(task_data: Optional[dict[str, Any]]) -> list[d
 
 
 def _runtime_tool_evidence_satisfies_approval(task_data: Optional[dict[str, Any]]) -> bool:
+    runs = _runtime_tool_run_entries(task_data)
+    if any(
+        str(item.get("tool") or "").strip().lower() == "targeted_verify"
+        and str(item.get("status") or "").strip().lower() == "failed"
+        for item in runs
+    ):
+        return False
     successful_runs = _runtime_tool_successful_runs(task_data)
     successful_tools = {
         str(item.get("tool") or "").strip().lower()
@@ -5515,6 +5533,24 @@ class WorkspaceManager:
             "VIRTUAL_ENV",
         }
         env = {key: value for key, value in os.environ.items() if key in allowed_passthrough and value}
+        # HOME/USERPROFILE are intentionally replaced below, which also hides
+        # Python's per-user site-packages directory on Windows. Preserve only
+        # the already-installed package search roots so allowlisted tools such
+        # as ``python -m pytest`` remain available without forwarding provider
+        # credentials or other deployment environment variables.
+        import site
+
+        python_paths = [item for item in env.get("PYTHONPATH", "").split(os.pathsep) if item]
+        try:
+            site_paths = [*site.getsitepackages(), site.getusersitepackages()]
+        except (AttributeError, OSError):
+            site_paths = []
+        for path in site_paths:
+            normalized = str(path or "").strip()
+            if normalized and os.path.isdir(normalized) and normalized not in python_paths:
+                python_paths.append(normalized)
+        if python_paths:
+            env["PYTHONPATH"] = os.pathsep.join(python_paths)
         env["HOME"] = temp_home
         env["USERPROFILE"] = temp_home
         env["TMPDIR"] = temp_home
@@ -7220,11 +7256,16 @@ class RuntimeNode:
                         )
                         if verification_report:
                             instructions = f"{instructions}\n\n{verification_report}"
+                            verification_failed = _verification_report_has_failures(verification_report)
                             _record_runtime_tool_run(
                                 "targeted_verify",
                                 purpose="Run allowlisted verification against the checked-out PR head",
-                                status="success",
-                                summary="ran targeted verification on the synced PR workspace",
+                                status="failed" if verification_failed else "success",
+                                summary=(
+                                    "targeted verification reported a failed command on the synced PR workspace"
+                                    if verification_failed
+                                    else "ran targeted verification on the synced PR workspace"
+                                ),
                                 scope="pr_review",
                                 evidence=[str(path) for path in touched_tests[:2] or touched_paths[:2]],
                             )
