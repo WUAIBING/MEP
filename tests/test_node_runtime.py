@@ -1988,6 +1988,106 @@ class TestRuntimeWebSocketLoop(unittest.TestCase):
         self.assertEqual(handle_mock.await_args_list[0].args[0], {"event": "new_task", "data": {"id": "task_one"}})
         self.assertEqual(handle_mock.await_args_list[1].args[0], {"event": "new_task", "data": {"id": "task_two"}})
 
+    def test_action_event_fanout_is_retained_once_in_sequence_order(self):
+        node = _runtime_node()
+        later = {
+            "spec_version": "mep.action.v1",
+            "context_id": "action-context-123",
+            "event_id": "evt-later",
+            "seq": 2,
+            "producer_id": "node_peer_b",
+            "action_id": "review-b",
+            "event_type": "action.progress",
+        }
+        earlier = {
+            "spec_version": "mep.action.v1",
+            "context_id": "action-context-123",
+            "event_id": "evt-earlier",
+            "seq": 1,
+            "producer_id": "node_peer_a",
+            "action_id": "review-a",
+            "event_type": "action.started",
+        }
+
+        asyncio.run(node.handle_ws_event({"event": "action_event", "data": later}))
+        asyncio.run(node.handle_ws_event({"event": "action_event", "data": earlier}))
+        asyncio.run(node.handle_ws_event({"event": "action_event", "data": earlier}))
+
+        history = node._action_event_history["action-context-123"]  # noqa: SLF001
+        self.assertEqual([event["seq"] for event in history], [1, 2])
+        self.assertEqual([event["event_id"] for event in history], ["evt-earlier", "evt-later"])
+
+    def test_process_task_publishes_started_inference_and_terminal_action_events(self):
+        node = _runtime_node()
+        task_data = {
+            "id": "task_action_progress",
+            "bounty": 0.0,
+            "payload": "Analyze this change.",
+            "task": {
+                "inputs": {
+                    "action_context": {
+                        "spec_version": "mep.action.v1",
+                        "context_id": "action-context-123",
+                        "action_id": "review-runtime",
+                    }
+                }
+            },
+        }
+        published = []
+
+        def capture(metadata, event_type, **kwargs):
+            published.append((metadata, event_type, kwargs))
+            return True
+
+        async def run():
+            with (
+                patch.object(node.adapter, "generate_reply", return_value="Analysis completed."),
+                patch.object(node, "_post_action_event_sync", side_effect=capture),
+                patch("node.mep_runtime._safe_request", return_value=(200, {"status": "completed"}, "")),
+            ):
+                await node.process_task(task_data)
+                if node._background_tasks:  # noqa: SLF001
+                    await asyncio.gather(*list(node._background_tasks))  # noqa: SLF001
+
+        asyncio.run(run())
+
+        self.assertEqual(
+            [event_type for _metadata, event_type, _kwargs in published],
+            ["action.started", "action.progress", "action.completed"],
+        )
+        self.assertEqual(published[1][2]["phase"], "inference")
+        self.assertEqual(published[2][2]["progress"], 100)
+        self.assertNotIn("task_action_progress", node._task_action_contexts)  # noqa: SLF001
+
+    def test_process_task_failure_boundary_publishes_terminal_failure(self):
+        node = _runtime_node()
+        task_data = {
+            "id": "task_action_failure",
+            "task": {
+                "inputs": {
+                    "action_context": {
+                        "spec_version": "mep.action.v1",
+                        "context_id": "action-context-123",
+                        "action_id": "review-failure",
+                    }
+                }
+            },
+        }
+
+        async def run():
+            with (
+                patch.object(node, "process_task", new=AsyncMock(side_effect=RuntimeError("boom"))),
+                patch.object(node, "_emit_action_event", new=AsyncMock(return_value=True)) as emit_mock,
+            ):
+                with self.assertRaisesRegex(RuntimeError, "boom"):
+                    await node._process_task_with_failure_boundary(task_data)  # noqa: SLF001
+                return emit_mock
+
+        emit_mock = asyncio.run(run())
+        emit_mock.assert_awaited_once()
+        self.assertEqual(emit_mock.await_args.args[1], "action.failed")
+        self.assertEqual(emit_mock.await_args.kwargs["phase"], "runtime")
+
     def test_run_forever_recovers_pending_tasks_after_connect(self):
         node = _runtime_node()
 

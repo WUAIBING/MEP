@@ -583,11 +583,329 @@ def init_db():
         CREATE INDEX IF NOT EXISTS idx_pending_dms_target_created
         ON pending_dms (target_node, created_at)
     ''')
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS action_contexts (
+            context_id TEXT PRIMARY KEY,
+            owner_id TEXT NOT NULL,
+            participants_json TEXT NOT NULL,
+            topic TEXT,
+            status TEXT NOT NULL,
+            max_events INTEGER NOT NULL,
+            next_seq INTEGER NOT NULL,
+            created_at REAL NOT NULL,
+            updated_at REAL NOT NULL
+        )
+    ''')
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS action_events (
+            context_id TEXT NOT NULL,
+            seq INTEGER NOT NULL,
+            event_id TEXT NOT NULL,
+            producer_id TEXT NOT NULL,
+            action_id TEXT NOT NULL,
+            parent_action_id TEXT,
+            event_type TEXT NOT NULL,
+            visibility TEXT NOT NULL,
+            audience_json TEXT NOT NULL,
+            phase TEXT,
+            message TEXT,
+            progress INTEGER,
+            artifacts_json TEXT NOT NULL,
+            created_at REAL NOT NULL,
+            PRIMARY KEY (context_id, seq),
+            UNIQUE (context_id, event_id)
+        )
+    ''')
+    cursor.execute('''
+        CREATE INDEX IF NOT EXISTS idx_action_events_context_action
+        ON action_events (context_id, action_id, seq)
+    ''')
     conn.commit()
     _release_conn(conn)
     global FINANCIAL_NS_BACKFILL_REPORT
     FINANCIAL_NS_BACKFILL_REPORT = backfill_financial_ns_columns()
     FINANCIAL_NS_BACKFILL_REPORT.extend(validate_financial_ns_storage())
+
+
+def _decode_action_context_row(row) -> Optional[dict]:
+    if row is None:
+        return None
+    participants = json.loads(row[2]) if row[2] else []
+    return {
+        "context_id": row[0],
+        "owner_id": row[1],
+        "participants": participants if isinstance(participants, list) else [],
+        "topic": row[3] or "",
+        "status": row[4],
+        "max_events": int(row[5]),
+        "next_seq": int(row[6]),
+        "created_at": float(row[7]),
+        "updated_at": float(row[8]),
+    }
+
+
+def create_action_context(
+    context_id: str,
+    owner_id: str,
+    participants: list[str],
+    topic: str,
+    max_events: int,
+    created_at: float,
+) -> bool:
+    conn = _get_conn()
+    cursor = conn.cursor()
+    values = (
+        context_id,
+        owner_id,
+        json.dumps(participants, separators=(",", ":")),
+        topic,
+        "active",
+        max_events,
+        1,
+        created_at,
+        created_at,
+    )
+    if _is_postgres():
+        cursor.execute(
+            """
+            INSERT INTO action_contexts (
+                context_id, owner_id, participants_json, topic, status,
+                max_events, next_seq, created_at, updated_at
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT (context_id) DO NOTHING
+            """,
+            values,
+        )
+    else:
+        cursor.execute(
+            """
+            INSERT OR IGNORE INTO action_contexts (
+                context_id, owner_id, participants_json, topic, status,
+                max_events, next_seq, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            values,
+        )
+    created = int(cursor.rowcount or 0) == 1
+    conn.commit()
+    _release_conn(conn)
+    return created
+
+
+def get_action_context(context_id: str) -> Optional[dict]:
+    conn = _get_conn()
+    cursor = conn.cursor()
+    placeholder = _sql_placeholder()
+    cursor.execute(
+        f"""
+        SELECT context_id, owner_id, participants_json, topic, status,
+               max_events, next_seq, created_at, updated_at
+        FROM action_contexts
+        WHERE context_id = {placeholder}
+        """,
+        (context_id,),
+    )
+    result = _decode_action_context_row(cursor.fetchone())
+    _release_conn(conn)
+    return result
+
+
+def append_action_event(
+    *,
+    context_id: str,
+    event_id: str,
+    producer_id: str,
+    action_id: str,
+    parent_action_id: Optional[str],
+    event_type: str,
+    visibility: str,
+    audience: list[str],
+    phase: Optional[str],
+    message: Optional[str],
+    progress: Optional[int],
+    artifacts: list[dict],
+    created_at: float,
+) -> dict:
+    conn = _get_conn()
+    cursor = conn.cursor()
+    placeholder = _sql_placeholder()
+    if not _is_postgres():
+        cursor.execute("BEGIN IMMEDIATE")
+    lock_clause = " FOR UPDATE" if _is_postgres() else ""
+    cursor.execute(
+        f"""
+        SELECT context_id, owner_id, participants_json, topic, status,
+               max_events, next_seq, created_at, updated_at
+        FROM action_contexts
+        WHERE context_id = {placeholder}
+        {lock_clause}
+        """,
+        (context_id,),
+    )
+    context = _decode_action_context_row(cursor.fetchone())
+    if context is None:
+        conn.rollback()
+        _release_conn(conn)
+        return {"status": "missing_context"}
+
+    cursor.execute(
+        f"""
+        SELECT seq FROM action_events
+        WHERE context_id = {placeholder} AND event_id = {placeholder}
+        """,
+        (context_id, event_id),
+    )
+    duplicate = cursor.fetchone()
+    if duplicate:
+        conn.rollback()
+        _release_conn(conn)
+        return {"status": "duplicate", "seq": int(duplicate[0]), "context": context}
+
+    cursor.execute(
+        f"""
+        SELECT event_type FROM action_events
+        WHERE context_id = {placeholder} AND action_id = {placeholder}
+        ORDER BY seq DESC
+        LIMIT 1
+        """,
+        (context_id, action_id),
+    )
+    last_event = cursor.fetchone()
+    if last_event and last_event[0] in {"action.completed", "action.failed", "action.cancelled"}:
+        conn.rollback()
+        _release_conn(conn)
+        return {"status": "terminal", "terminal_event": last_event[0], "context": context}
+
+    seq = int(context["next_seq"])
+    if seq > int(context["max_events"]):
+        conn.rollback()
+        _release_conn(conn)
+        return {"status": "full", "context": context}
+
+    values = (
+        context_id,
+        seq,
+        event_id,
+        producer_id,
+        action_id,
+        parent_action_id,
+        event_type,
+        visibility,
+        json.dumps(audience, separators=(",", ":")),
+        phase,
+        message,
+        progress,
+        json.dumps(artifacts, separators=(",", ":")),
+        created_at,
+    )
+    if _is_postgres():
+        cursor.execute(
+            """
+            INSERT INTO action_events (
+                context_id, seq, event_id, producer_id, action_id,
+                parent_action_id, event_type, visibility, audience_json,
+                phase, message, progress, artifacts_json, created_at
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            """,
+            values,
+        )
+        cursor.execute(
+            """
+            UPDATE action_contexts
+            SET next_seq = %s, updated_at = %s
+            WHERE context_id = %s
+            """,
+            (seq + 1, created_at, context_id),
+        )
+    else:
+        cursor.execute(
+            """
+            INSERT INTO action_events (
+                context_id, seq, event_id, producer_id, action_id,
+                parent_action_id, event_type, visibility, audience_json,
+                phase, message, progress, artifacts_json, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            values,
+        )
+        cursor.execute(
+            """
+            UPDATE action_contexts
+            SET next_seq = ?, updated_at = ?
+            WHERE context_id = ?
+            """,
+            (seq + 1, created_at, context_id),
+        )
+    conn.commit()
+    context["next_seq"] = seq + 1
+    context["updated_at"] = created_at
+    _release_conn(conn)
+    return {
+        "status": "created",
+        "seq": seq,
+        "context": context,
+        "event": {
+            "spec_version": "mep.action.v1",
+            "context_id": context_id,
+            "seq": seq,
+            "event_id": event_id,
+            "producer_id": producer_id,
+            "action_id": action_id,
+            "parent_action_id": parent_action_id,
+            "event_type": event_type,
+            "visibility": visibility,
+            "audience": audience,
+            "phase": phase,
+            "message": message,
+            "progress": progress,
+            "artifacts": artifacts,
+            "created_at": created_at,
+        },
+    }
+
+
+def list_action_events(context_id: str, *, after_seq: int = 0, limit: int = 100) -> list[dict]:
+    conn = _get_conn()
+    cursor = conn.cursor()
+    placeholder = _sql_placeholder()
+    cursor.execute(
+        f"""
+        SELECT context_id, seq, event_id, producer_id, action_id,
+               parent_action_id, event_type, visibility, audience_json,
+               phase, message, progress, artifacts_json, created_at
+        FROM action_events
+        WHERE context_id = {placeholder} AND seq > {placeholder}
+        ORDER BY seq ASC
+        LIMIT {placeholder}
+        """,
+        (context_id, after_seq, limit),
+    )
+    events: list[dict] = []
+    for row in cursor.fetchall():
+        audience = json.loads(row[8]) if row[8] else []
+        artifacts = json.loads(row[12]) if row[12] else []
+        events.append(
+            {
+                "spec_version": "mep.action.v1",
+                "context_id": row[0],
+                "seq": int(row[1]),
+                "event_id": row[2],
+                "producer_id": row[3],
+                "action_id": row[4],
+                "parent_action_id": row[5],
+                "event_type": row[6],
+                "visibility": row[7],
+                "audience": audience if isinstance(audience, list) else [],
+                "phase": row[9],
+                "message": row[10],
+                "progress": row[11],
+                "artifacts": artifacts if isinstance(artifacts, list) else [],
+                "created_at": float(row[13]),
+            }
+        )
+    _release_conn(conn)
+    return events
+
 
 def register_node(node_id: str, pub_pem: str) -> dict:
     conn = _get_conn()

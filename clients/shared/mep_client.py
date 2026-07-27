@@ -390,6 +390,110 @@ class MEPClient:
         )
         return {"status_code": response.status_code, "json": response.json()}
 
+    async def create_action_context(
+        self,
+        participants: list[str],
+        *,
+        topic: Optional[str] = None,
+        context_id: Optional[str] = None,
+        max_events: int = 500,
+    ) -> dict:
+        body: dict[str, Any] = {
+            "owner_id": self.node_id,
+            "participants": participants,
+            "max_events": max_events,
+        }
+        if topic:
+            body["topic"] = topic
+        if context_id:
+            body["context_id"] = context_id
+        payload_str = json.dumps(body)
+        headers = self._auth_headers(payload_str)
+        response = await asyncio.to_thread(
+            self.session.post,
+            f"{self.hub_url}/actions/contexts",
+            data=payload_str,
+            headers=headers,
+            timeout=20,
+        )
+        return {"status_code": response.status_code, "json": response.json()}
+
+    @staticmethod
+    def build_action_context_metadata(
+        context_id: str,
+        action_id: str,
+        *,
+        parent_action_id: Optional[str] = None,
+    ) -> dict[str, str]:
+        metadata = {
+            "spec_version": "mep.action.v1",
+            "context_id": context_id,
+            "action_id": action_id,
+        }
+        if parent_action_id:
+            metadata["parent_action_id"] = parent_action_id
+        return metadata
+
+    async def post_action_event(
+        self,
+        context_id: str,
+        action_id: str,
+        event_type: str,
+        *,
+        event_id: Optional[str] = None,
+        parent_action_id: Optional[str] = None,
+        visibility: str = "participants",
+        audience: Optional[list[str]] = None,
+        phase: Optional[str] = None,
+        message: Optional[str] = None,
+        progress: Optional[int] = None,
+        artifacts: Optional[list[dict[str, Any]]] = None,
+    ) -> dict:
+        body: dict[str, Any] = {
+            "context_id": context_id,
+            "action_id": action_id,
+            "event_type": event_type,
+            "event_id": event_id or f"evt-{uuid.uuid4()}",
+            "visibility": visibility,
+        }
+        optional = {
+            "parent_action_id": parent_action_id,
+            "audience": audience,
+            "phase": phase,
+            "message": message,
+            "progress": progress,
+            "artifacts": artifacts,
+        }
+        body.update({key: value for key, value in optional.items() if value is not None})
+        payload_str = json.dumps(body)
+        headers = self._auth_headers(payload_str)
+        response = await asyncio.to_thread(
+            self.session.post,
+            f"{self.hub_url}/actions/events",
+            data=payload_str,
+            headers=headers,
+            timeout=20,
+        )
+        return {"status_code": response.status_code, "json": response.json()}
+
+    async def get_action_context(
+        self,
+        context_id: str,
+        *,
+        after_seq: int = 0,
+        limit: int = 100,
+    ) -> dict:
+        payload_str = ""
+        headers = self._auth_headers(payload_str)
+        response = await asyncio.to_thread(
+            self.session.get,
+            f"{self.hub_url}/actions/contexts/{context_id}",
+            params={"after_seq": after_seq, "limit": limit},
+            headers=headers,
+            timeout=20,
+        )
+        return {"status_code": response.status_code, "json": response.json()}
+
     def build_interbot_message(
         self,
         message: str,

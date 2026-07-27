@@ -3301,6 +3301,170 @@ class TestBrainstormSessions(unittest.TestCase):
 
 
 
+class TestActionProgressV1(unittest.TestCase):
+    def setUp(self):
+        conn = db._get_conn()
+        conn.execute("DELETE FROM action_events")
+        conn.execute("DELETE FROM action_contexts")
+        conn.commit()
+        db._release_conn(conn)
+        main.connected_nodes.clear()
+        main.rate_limits.clear()
+
+    def tearDown(self):
+        main.connected_nodes.clear()
+        main.rate_limits.clear()
+
+    @staticmethod
+    def _create_context(owner, participants, *, context_id="action-test-context"):
+        owner_priv, _owner_pub, owner_id = owner
+        payload = json.dumps(
+            {
+                "owner_id": owner_id,
+                "participants": [identity[2] for identity in participants],
+                "context_id": context_id,
+                "topic": "Parallel review",
+            }
+        )
+        return client.post(
+            "/actions/contexts",
+            content=payload,
+            headers=_auth_headers(owner_priv, owner_id, payload),
+        )
+
+    @staticmethod
+    def _post_event(identity, body):
+        private_key, _pub_pem, node_id = identity
+        payload = json.dumps(body)
+        return client.post(
+            "/actions/events",
+            content=payload,
+            headers=_auth_headers(private_key, node_id, payload),
+        )
+
+    def test_persistent_lifecycle_replay_visibility_and_idempotency(self):
+        owner = _make_identity()
+        worker_a = _make_identity()
+        worker_b = _make_identity()
+        outsider = _make_identity()
+        for _private_key, pub_pem, _node_id in (owner, worker_a, worker_b, outsider):
+            _register(pub_pem)
+
+        create_resp = self._create_context(owner, [worker_a, worker_b])
+        self.assertEqual(create_resp.status_code, 200, create_resp.text)
+        context_id = create_resp.json()["context_id"]
+
+        started = {
+            "context_id": context_id,
+            "action_id": "review-runtime",
+            "event_id": "evt-started-0001",
+            "event_type": "action.started",
+            "visibility": "participants",
+            "phase": "accepted",
+            "progress": 5,
+        }
+        started_resp = self._post_event(worker_a, started)
+        self.assertEqual(started_resp.status_code, 200, started_resp.text)
+        self.assertEqual(started_resp.json()["seq"], 1)
+
+        duplicate_resp = self._post_event(worker_a, started)
+        self.assertEqual(duplicate_resp.status_code, 200, duplicate_resp.text)
+        self.assertEqual(duplicate_resp.json()["status"], "duplicate")
+        self.assertEqual(duplicate_resp.json()["seq"], 1)
+
+        private_resp = self._post_event(
+            worker_b,
+            {
+                "context_id": context_id,
+                "action_id": "private-diagnostic",
+                "event_id": "evt-private-0002",
+                "event_type": "action.progress",
+                "visibility": "private",
+                "message": "Local diagnostic checkpoint.",
+            },
+        )
+        self.assertEqual(private_resp.status_code, 200, private_resp.text)
+
+        completed = {
+            "context_id": context_id,
+            "action_id": "review-runtime",
+            "event_id": "evt-complete-0003",
+            "event_type": "action.completed",
+            "visibility": "participants",
+            "phase": "complete",
+            "progress": 100,
+        }
+        completed_resp = self._post_event(worker_a, completed)
+        self.assertEqual(completed_resp.status_code, 200, completed_resp.text)
+        self.assertEqual(completed_resp.json()["seq"], 3)
+
+        post_terminal = dict(completed, event_id="evt-after-terminal", event_type="action.progress")
+        terminal_resp = self._post_event(worker_a, post_terminal)
+        self.assertEqual(terminal_resp.status_code, 409)
+
+        replay_resp = client.get(
+            f"/actions/contexts/{context_id}?after_seq=0&limit=20",
+            headers=_auth_headers(owner[0], owner[2], ""),
+        )
+        self.assertEqual(replay_resp.status_code, 200, replay_resp.text)
+        replay = replay_resp.json()
+        self.assertEqual(replay["latest_seq"], 3)
+        self.assertEqual([event["seq"] for event in replay["events"]], [1, 3])
+
+        worker_b_replay = client.get(
+            f"/actions/contexts/{context_id}?after_seq=1&limit=20",
+            headers=_auth_headers(worker_b[0], worker_b[2], ""),
+        )
+        self.assertEqual([event["seq"] for event in worker_b_replay.json()["events"]], [2, 3])
+
+        outsider_resp = client.get(
+            f"/actions/contexts/{context_id}",
+            headers=_auth_headers(outsider[0], outsider[2], ""),
+        )
+        self.assertEqual(outsider_resp.status_code, 403)
+
+    def test_three_workers_publish_in_parallel_and_all_receive_progress(self):
+        owner = _make_identity()
+        workers = [_make_identity() for _ in range(3)]
+        for _private_key, pub_pem, _node_id in (owner, *workers):
+            _register(pub_pem)
+
+        create_resp = self._create_context(owner, workers, context_id="action-three-workers")
+        self.assertEqual(create_resp.status_code, 200, create_resp.text)
+        context_id = create_resp.json()["context_id"]
+
+        sockets = {}
+        for _private_key, _pub_pem, node_id in workers:
+            sockets[node_id] = _FakeWebSocket()
+            main.connected_nodes[node_id] = sockets[node_id]
+
+        def publish(index):
+            return self._post_event(
+                workers[index],
+                {
+                    "context_id": context_id,
+                    "action_id": f"parallel-worker-{index}",
+                    "event_id": f"evt-parallel-{index:04d}",
+                    "event_type": "action.started",
+                    "visibility": "participants",
+                    "phase": "accepted",
+                    "progress": 5,
+                },
+            )
+
+        with ThreadPoolExecutor(max_workers=3) as executor:
+            responses = list(executor.map(publish, range(3)))
+
+        self.assertTrue(all(response.status_code == 200 for response in responses))
+        self.assertEqual(sorted(response.json()["seq"] for response in responses), [1, 2, 3])
+        for socket in sockets.values():
+            self.assertEqual(len(socket.sent), 3)
+            self.assertEqual(
+                sorted(message["data"]["seq"] for message in socket.sent),
+                [1, 2, 3],
+            )
+
+
 def tearDownModule():
 
     """Clean up test database."""

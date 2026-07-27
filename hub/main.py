@@ -39,6 +39,8 @@ from models import (
     MeshAssembleRequest,
     BrainstormSessionCreate,
     BrainstormSessionPost,
+    ActionContextCreate,
+    ActionEventPost,
 )
 
 from v2_models import (
@@ -234,6 +236,18 @@ ANTI_LOOP_WINDOW_SECONDS = float(os.getenv("MEP_ANTI_LOOP_WINDOW_SECONDS", "90")
 ANTI_LOOP_MAX_MESSAGES = int(os.getenv("MEP_ANTI_LOOP_MAX_MESSAGES", "6"))
 ANTI_LOOP_COOLDOWN_SECONDS = int(os.getenv("MEP_ANTI_LOOP_COOLDOWN_SECONDS", "60"))
 ANTI_LOOP_TERMINATION_TOKENS = ("[end]", "[no_relay]", "[ack_only]")
+ACTION_SPEC_VERSION = "mep.action.v1"
+ACTION_EVENT_TYPES = {
+    "action.proposed",
+    "action.started",
+    "action.progress",
+    "action.needs_approval",
+    "action.completed",
+    "action.failed",
+    "action.cancelled",
+}
+ACTION_TERMINAL_EVENTS = {"action.completed", "action.failed", "action.cancelled"}
+ACTION_VISIBILITIES = {"private", "owner", "participants", "scoped"}
 PRIVACY_MODE_PLAINTEXT_ONLY = "plaintext_only"
 PRIVACY_MODE_PREFER_ENCRYPTED = "prefer_encrypted"
 PRIVACY_MODE_REQUIRE_ENCRYPTED = "require_encrypted"
@@ -1348,6 +1362,56 @@ def _normalize_brainstorm_participants(owner_id: str, participants: list[str]) -
     return cleaned
 
 
+def _action_event_recipients(
+    *,
+    owner_id: str,
+    participants: list[str],
+    producer_id: str,
+    visibility: str,
+    audience: Optional[list[str]],
+) -> list[str]:
+    if visibility not in ACTION_VISIBILITIES:
+        allowed = ", ".join(sorted(ACTION_VISIBILITIES))
+        raise HTTPException(status_code=400, detail=f"Invalid action visibility. Allowed values: {allowed}")
+    if visibility != "scoped" and audience:
+        raise HTTPException(status_code=400, detail="action audience is only valid with scoped visibility")
+    if visibility == "private":
+        candidates = [producer_id]
+    elif visibility == "owner":
+        candidates = [owner_id, producer_id]
+    elif visibility == "participants":
+        candidates = participants
+    else:
+        if not audience:
+            raise HTTPException(status_code=400, detail="scoped action visibility requires an audience")
+        invalid = [node_id for node_id in audience if node_id not in participants]
+        if invalid:
+            raise HTTPException(status_code=400, detail="action audience must contain participants only")
+        candidates = [*audience, producer_id]
+    recipients: list[str] = []
+    seen: set[str] = set()
+    for node_id in candidates:
+        if node_id in participants and node_id not in seen:
+            recipients.append(node_id)
+            seen.add(node_id)
+    return recipients
+
+
+def _normalize_action_artifacts(artifacts: Optional[list[dict[str, Any]]]) -> list[dict[str, str]]:
+    normalized: list[dict[str, str]] = []
+    for raw in artifacts or []:
+        if not isinstance(raw, dict):
+            continue
+        item: dict[str, str] = {}
+        for key, max_chars in (("type", 40), ("uri", 1000), ("label", 200), ("digest", 160)):
+            value = raw.get(key)
+            if isinstance(value, str) and value.strip():
+                item[key] = value.strip()[:max_chars]
+        if item:
+            normalized.append(item)
+    return normalized[:20]
+
+
 def _normalize_mesh_trigger(value: str) -> str:
     normalized = (value or "").strip().lower()
     if normalized not in MESH_ALLOWED_TRIGGERS:
@@ -2435,6 +2499,197 @@ async def brainstorm_list_sessions(authenticated_node: str = Depends(verify_requ
         ]
     sessions.sort(key=lambda item: float(item.get("updated_at") or now), reverse=True)
     return {"count": len(sessions), "sessions": sessions}
+
+@app.post("/actions/contexts")
+async def action_context_create(
+    payload: ActionContextCreate,
+    authenticated_node: str = Depends(verify_request),
+):
+    if authenticated_node != payload.owner_id:
+        raise HTTPException(status_code=403, detail="Cannot create an action context for another node")
+    participants = _normalize_brainstorm_participants(payload.owner_id, payload.participants)
+    if len(participants) < 2:
+        raise HTTPException(status_code=400, detail="Action context requires at least 2 participants")
+    context_id = (payload.context_id or f"action-{uuid.uuid4()}").strip()
+    topic = (payload.topic or "").strip()
+    max_events = int(payload.max_events or 500)
+    created_at = time.time()
+    created = await asyncio.to_thread(
+        db.create_action_context,
+        context_id,
+        payload.owner_id,
+        participants,
+        topic,
+        max_events,
+        created_at,
+    )
+    context = await asyncio.to_thread(db.get_action_context, context_id)
+    if not created:
+        if (
+            context is None
+            or context.get("owner_id") != payload.owner_id
+            or context.get("participants") != participants
+        ):
+            raise HTTPException(status_code=409, detail="Action context ID already exists with different membership")
+        status = "existing"
+    else:
+        status = "created"
+        log_event(
+            "action_context_created",
+            f"Action context {context_id[:12]} created by {payload.owner_id}",
+            context_id=context_id,
+            owner_id=payload.owner_id,
+            participant_count=len(participants),
+        )
+    return {
+        "status": status,
+        "spec_version": ACTION_SPEC_VERSION,
+        **(context or {}),
+    }
+
+
+@app.post("/actions/events")
+async def action_event_post(
+    payload: ActionEventPost,
+    authenticated_node: str = Depends(verify_request),
+):
+    if payload.event_type not in ACTION_EVENT_TYPES:
+        allowed = ", ".join(sorted(ACTION_EVENT_TYPES))
+        raise HTTPException(status_code=400, detail=f"Invalid action event type. Allowed values: {allowed}")
+    context = await asyncio.to_thread(db.get_action_context, payload.context_id)
+    if context is None or context.get("status") != "active":
+        raise HTTPException(status_code=404, detail="Action context not found or inactive")
+    participants = list(context.get("participants") or [])
+    if authenticated_node not in participants:
+        raise HTTPException(status_code=403, detail="Node is not a participant of this action context")
+    recipients = _action_event_recipients(
+        owner_id=str(context["owner_id"]),
+        participants=participants,
+        producer_id=authenticated_node,
+        visibility=payload.visibility,
+        audience=payload.audience,
+    )
+    if payload.event_type == "action.progress" and payload.message is None and payload.progress is None:
+        raise HTTPException(status_code=400, detail="action.progress requires a message or progress value")
+    result = await asyncio.to_thread(
+        db.append_action_event,
+        context_id=payload.context_id,
+        event_id=(payload.event_id or f"evt-{uuid.uuid4()}").strip(),
+        producer_id=authenticated_node,
+        action_id=payload.action_id.strip(),
+        parent_action_id=(payload.parent_action_id or "").strip() or None,
+        event_type=payload.event_type,
+        visibility=payload.visibility,
+        audience=recipients,
+        phase=(payload.phase or "").strip() or None,
+        message=(payload.message or "").strip() or None,
+        progress=payload.progress,
+        artifacts=_normalize_action_artifacts(payload.artifacts),
+        created_at=time.time(),
+    )
+
+    if result["status"] == "duplicate":
+        return {
+            "status": "duplicate",
+            "spec_version": ACTION_SPEC_VERSION,
+            "context_id": payload.context_id,
+            "seq": result["seq"],
+            "delivered_to": [],
+        }
+    if result["status"] == "terminal":
+        raise HTTPException(
+            status_code=409,
+            detail=f"Action is already terminal: {result.get('terminal_event')}",
+        )
+    if result["status"] == "full":
+        raise HTTPException(status_code=409, detail="Action context reached max_events")
+    if result["status"] != "created":
+        raise HTTPException(status_code=404, detail="Action context not found")
+
+    event = result["event"]
+    fanout_payload = {"event": "action_event", "data": event}
+    async with node_lock:
+        recipient_sockets = [(node_id, connected_nodes.get(node_id)) for node_id in recipients]
+
+    async def deliver(node_id: str, ws: Optional[WebSocket]) -> Optional[str]:
+        if ws is None:
+            return None
+        try:
+            await ws.send_json(fanout_payload)
+            return node_id
+        except Exception as exc:
+            log_event(
+                "action_fanout_failed",
+                f"Failed action fanout for context {payload.context_id[:12]} to {node_id}: {exc}",
+                context_id=payload.context_id,
+                action_id=payload.action_id,
+                node_id=node_id,
+            )
+            async with node_lock:
+                if connected_nodes.get(node_id) is ws:
+                    del connected_nodes[node_id]
+            return None
+
+    delivery_results = await asyncio.gather(
+        *(deliver(node_id, ws) for node_id, ws in recipient_sockets)
+    )
+    delivered_to = [node_id for node_id in delivery_results if node_id is not None]
+    log_event(
+        "action_event",
+        f"{payload.event_type} action={payload.action_id[:24]} context={payload.context_id[:12]}",
+        context_id=payload.context_id,
+        action_id=payload.action_id,
+        producer_id=authenticated_node,
+        seq=result["seq"],
+        delivered_count=len(delivered_to),
+    )
+    return {
+        "status": "created",
+        "spec_version": ACTION_SPEC_VERSION,
+        "context_id": payload.context_id,
+        "seq": result["seq"],
+        "event": event,
+        "delivered_to": delivered_to,
+    }
+
+
+@app.get("/actions/contexts/{context_id}")
+async def action_context_get(
+    context_id: str,
+    after_seq: int = 0,
+    limit: int = 100,
+    authenticated_node: str = Depends(verify_request),
+):
+    safe_after_seq = max(0, int(after_seq))
+    safe_limit = max(1, min(int(limit), 500))
+    context = await asyncio.to_thread(db.get_action_context, context_id)
+    if context is None:
+        raise HTTPException(status_code=404, detail="Action context not found")
+    participants = list(context.get("participants") or [])
+    if authenticated_node not in participants:
+        raise HTTPException(status_code=403, detail="Node is not a participant of this action context")
+    events = await asyncio.to_thread(
+        db.list_action_events,
+        context_id,
+        after_seq=safe_after_seq,
+        limit=safe_limit,
+    )
+    visible_events = [
+        event
+        for event in events
+        if authenticated_node in (event.get("audience") or [])
+    ]
+    latest_seq = max(0, int(context.get("next_seq") or 1) - 1)
+    scanned_through_seq = int(events[-1]["seq"]) if events else safe_after_seq
+    return {
+        "spec_version": ACTION_SPEC_VERSION,
+        **context,
+        "latest_seq": latest_seq,
+        "scanned_through_seq": scanned_through_seq,
+        "has_more": scanned_through_seq < latest_seq,
+        "events": visible_events,
+    }
+
 
 @app.get("/federation/peers")
 async def get_federation_peers():

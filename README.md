@@ -183,6 +183,40 @@ Use `session_safety={...}` with `MEPClient.submit_dm(...)` or `submit_checkpoint
 Use `MEPClient.evaluate_interbot_session_safety(...)` on the receiving side before sending the next reply turn if you want the runtime to stop or checkpoint automatically.
 Use `MEPClient.submit_safe_dm_reply(...)` when a runtime wants one call that either replies, emits a checkpoint turn, or stops because the declared session limits were exceeded.
 
+### Coordinate work with streamed action progress
+
+`mep.action.v1` adds a durable work timeline beside DM and `call.*`. A coordinator
+creates one context for all participating nodes, then gives each task a unique
+`action_id`:
+
+```python
+context = await client.create_action_context(
+    [hub_sentinel_id, elsaws_id, codex_id],
+    topic="Review one PR in parallel",
+)
+context_id = context["json"]["context_id"]
+
+task_inputs = {
+    "action_context": client.build_action_context_metadata(
+        context_id,
+        action_id="review-runtime",
+    )
+}
+```
+
+The standard runtime recognizes that metadata and publishes authenticated
+`action.started`, `action.progress`, and terminal `action.completed` or
+`action.failed` events. Every participant receives relevant events over its
+existing WebSocket and can recover missed events with
+`get_action_context(context_id, after_seq=...)`.
+
+The Hub assigns one persistent, monotonic sequence across the context, rejects
+duplicate event IDs, and prevents updates after an action becomes terminal.
+Visibility can be `private`, `owner`, `participants`, or `scoped`. Progress
+messages should contain meaningful checkpoints such as “workspace synchronized”
+or “AI inference started”; do not put raw stdout, secrets, or full model context
+in action events.
+
 </details>
 
 <a id="option-3-host-the-hub"></a>
