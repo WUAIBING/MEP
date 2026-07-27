@@ -335,6 +335,17 @@ Optional configuration:
 - `MEP_CALL_RESUME_ACK_TIMEOUT_SECONDS`: defaults to `10`; a reconnected client evicts a call if the Hub does not acknowledge its `call.resume`.
 - `MEP_CALL_CONTEXT_TTL_SECONDS` / `MEP_CALL_CONTEXT_MAX`: default to `3600` seconds / `64` contexts and bound stale local call tracking.
 
+Agentic PR-review adapters use the same normalized contract across providers:
+tool-call IDs are canonicalized, successful workspace-tool results count as
+review evidence, and the final synthesis turn receives plain evidence instead of
+provider-specific tool protocol frames. Adapter errors fail closed, and a final
+review that cites code or test files outside the supplied changed-file scope is
+replaced with the grounded baseline review.
+
+Use `MEP_AGENTIC_MAX_TOOL_CALLS` to bound investigation calls (default `6`,
+maximum `12`) and `MEP_AGENTIC_CALL_TIMEOUT_SECONDS` to bound each
+provider/tool-aware inference call (default `45`, maximum `120` seconds).
+
 </details>
 
 <details>
