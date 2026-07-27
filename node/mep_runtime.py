@@ -130,10 +130,27 @@ def _is_adapter_error(text: str) -> bool:
     if not cleaned:
         return True
     lowered = cleaned.lower()
-    if cleaned.startswith("[DeepSeek]") and ("api error" in lowered or "error:" in lowered or "empty" in lowered):
+    provider_sentinel = re.match(r"^\[[^\]\r\n]{1,80}\]", cleaned)
+    provider_error_prefixes = (
+        "api error",
+        "error:",
+        "timed out",
+        "timeout",
+        "reply was empty",
+        "review response was empty",
+        "empty response",
+        "invalid params",
+    )
+    if cleaned.startswith("[AI adapter]") and any(
+        marker in lowered for marker in ("error", "empty", "timed out", "timeout")
+    ):
         return True
-    if cleaned.startswith("[AI adapter]") and ("error" in lowered or "empty" in lowered or "timed out" in lowered):
-        return True
+    if provider_sentinel:
+        detail = cleaned[provider_sentinel.end() :].strip().lower()
+        if detail.startswith(provider_error_prefixes):
+            return True
+        if "tool result's tool id" in detail or "tool result id" in detail:
+            return True
     if lowered.startswith(
         (
             "[codex-cli] app-server inference failed:",
@@ -2049,7 +2066,257 @@ def _agentic_review_enabled() -> bool:
     return os.environ.get("MEP_AGENTIC_REVIEW", "").strip() in ("1", "true", "yes")
 
 
-_MAX_AGENTIC_TOOL_CALLS = 10
+_MAX_AGENTIC_TOOL_CALLS = 6
+_AGENTIC_EVIDENCE_TOOL_NAMES = {
+    "workspace_read",
+    "workspace_search",
+    "workspace_git",
+    "targeted_verify",
+    "_search",
+    "_fetch",
+    "_run",
+    "read_file",
+    "search",
+    "fetch",
+    "list_files",
+    "list_directory",
+    "search_code",
+    "git_log",
+    "git_diff",
+    "grep",
+    "find_in_files",
+}
+
+
+def _agentic_call_timeout_seconds() -> int:
+    return min(_env_positive_int("MEP_AGENTIC_CALL_TIMEOUT_SECONDS", 45), 120)
+
+
+def _agentic_max_tool_calls() -> int:
+    return min(_env_positive_int("MEP_AGENTIC_MAX_TOOL_CALLS", _MAX_AGENTIC_TOOL_CALLS), 12)
+
+
+def _canonical_tool_call_id(
+    value: Any,
+    *,
+    iteration: int,
+    index: int,
+    used_ids: set[str],
+) -> str:
+    """Return a provider-neutral, unique tool call ID for conversation replay."""
+    cleaned = re.sub(r"[^A-Za-z0-9_-]+", "_", str(value or "").strip())
+    cleaned = cleaned.strip("_")[:56]
+    if not cleaned:
+        cleaned = f"call_{iteration}_{index}"
+    if not cleaned.startswith("call_"):
+        cleaned = f"call_{cleaned}"
+    candidate = cleaned[:64]
+    suffix = 1
+    while candidate in used_ids:
+        tail = f"_{suffix}"
+        candidate = f"{cleaned[: max(1, 64 - len(tail))]}{tail}"
+        suffix += 1
+    used_ids.add(candidate)
+    return candidate
+
+
+def _agentic_evidence_tool_count(messages: list[dict[str, Any]]) -> int:
+    """Count evidence calls that have a matching, non-error tool result."""
+    issued: dict[str, str] = {}
+    for message in messages or []:
+        if not isinstance(message, dict) or message.get("role") != "assistant":
+            continue
+        for tool_call in message.get("tool_calls") or []:
+            if not isinstance(tool_call, dict):
+                continue
+            function = tool_call.get("function")
+            if not isinstance(function, dict):
+                continue
+            call_id = str(tool_call.get("id") or "").strip()
+            name = str(function.get("name") or "").strip()
+            if call_id and name in _AGENTIC_EVIDENCE_TOOL_NAMES:
+                issued[call_id] = name
+    successful: set[str] = set()
+    for message in messages or []:
+        if not isinstance(message, dict) or message.get("role") != "tool":
+            continue
+        call_id = str(message.get("tool_call_id") or "").strip()
+        if call_id not in issued:
+            continue
+        content = str(message.get("content") or "").strip()
+        lowered = content.lower()
+        if (
+            content
+            and not _is_adapter_error(content)
+            and " error:" not in lowered
+            and not lowered.startswith(("[agentic] unknown tool", "[workspace_read] blocked"))
+        ):
+            successful.add(call_id)
+    return len(successful)
+
+
+def _review_scope_lines(task_data: Optional[dict[str, Any]]) -> list[str]:
+    github_inputs = _review_github_inputs(task_data or {})
+    paths = _clean_review_list(github_inputs.get("touched_paths"), max_items=8, max_chars=120)
+    tests = _clean_review_list(github_inputs.get("touched_tests"), max_items=6, max_chars=120)
+    risk_pack = github_inputs.get("risk_pack")
+    identifiers = (
+        _clean_review_identifier_list(
+            risk_pack.get("changed_identifiers"),
+            max_items=12,
+            max_chars=80,
+        )
+        if isinstance(risk_pack, dict)
+        else []
+    )
+    lines: list[str] = []
+    if paths:
+        lines.append("Allowed changed paths: " + ", ".join(paths))
+    if tests:
+        lines.append("Allowed changed tests: " + ", ".join(tests))
+    if identifiers:
+        lines.append("Allowed changed identifiers: " + ", ".join(identifiers))
+    return lines
+
+
+def _provider_neutral_synthesis_messages(
+    messages: list[dict[str, Any]],
+    *,
+    task_data: Optional[dict[str, Any]],
+    max_chars: int,
+) -> list[dict[str, str]]:
+    """Flatten tool history into plain evidence so every provider sees valid input.
+
+    OpenAI-compatible providers disagree about how tool-call IDs must be retained
+    after history truncation. A synthesis turn does not need tools, so carrying
+    assistant/tool protocol frames only creates avoidable provider coupling.
+    """
+    task_text = ""
+    evidence: list[str] = []
+    issued_names: dict[str, str] = {}
+    for message in messages or []:
+        if not isinstance(message, dict):
+            continue
+        role = message.get("role")
+        if role == "user" and not task_text:
+            candidate = str(message.get("content") or "").strip()
+            if candidate and "BUDGET WARNING" not in candidate:
+                task_text = candidate
+        if role == "assistant":
+            for tool_call in message.get("tool_calls") or []:
+                if not isinstance(tool_call, dict):
+                    continue
+                function = tool_call.get("function")
+                if not isinstance(function, dict):
+                    continue
+                call_id = str(tool_call.get("id") or "").strip()
+                name = str(function.get("name") or "").strip()
+                if call_id and name:
+                    issued_names[call_id] = name
+        if role == "tool":
+            content = str(message.get("content") or "").strip()
+            if not content:
+                continue
+            call_id = str(message.get("tool_call_id") or "").strip()
+            name = issued_names.get(call_id, "workspace_evidence")
+            evidence.append(f"[{name}]\n{content}")
+
+    scope = "\n".join(_review_scope_lines(task_data))
+    final_instruction = (
+        "Write the final review using only the task scope and evidence below. "
+        "Do not call tools. Do not mention files, tests, identifiers, or defects "
+        "outside the allowed scope. If evidence does not prove a concrete defect, "
+        "say so instead of inventing one. Start with '## Review Summary', include "
+        "a concise evidence-grounded assessment, and end with exactly "
+        "'Verdict: APPROVE' or 'Verdict: REQUEST_CHANGES'."
+    )
+    budget = max(2000, max_chars)
+    task_budget = min(6000, max(1000, budget // 3))
+    evidence_budget = max(1000, budget - task_budget - 1600)
+    task_excerpt = task_text[:task_budget]
+    selected_evidence: list[str] = []
+    remaining = evidence_budget
+    for item in reversed(evidence):
+        if remaining <= 0:
+            break
+        excerpt = item[:remaining]
+        selected_evidence.append(excerpt)
+        remaining -= len(excerpt)
+    selected_evidence.reverse()
+    user_parts = [final_instruction]
+    if scope:
+        user_parts.append(scope)
+    if task_excerpt:
+        user_parts.append("Original task:\n" + task_excerpt)
+    if selected_evidence:
+        user_parts.append("Verified tool evidence:\n" + "\n\n---\n\n".join(selected_evidence))
+    else:
+        user_parts.append("Verified tool evidence: none.")
+    return [
+        {
+            "role": "system",
+            "content": (
+                "You are MEP's provider-neutral final-answer normalizer. "
+                "Return only the finished review; never expose private reasoning."
+            ),
+        },
+        {"role": "user", "content": "\n\n".join(user_parts)},
+    ]
+
+
+def _review_output_has_scope_violation(
+    text: str,
+    *,
+    task_data: Optional[dict[str, Any]],
+) -> bool:
+    github_inputs = _review_github_inputs(task_data or {})
+    allowed_paths = _clean_review_list(
+        github_inputs.get("touched_paths"),
+        max_items=12,
+        max_chars=160,
+    )
+    allowed_tests = _clean_review_list(
+        github_inputs.get("touched_tests"),
+        max_items=8,
+        max_chars=160,
+    )
+    allowed = {item.replace("\\", "/").lower() for item in allowed_paths + allowed_tests}
+    allowed_basenames = {os.path.basename(item).lower() for item in allowed}
+    allowed.update(allowed_basenames)
+    if not allowed:
+        return False
+    referenced_paths = {
+        match.replace("\\", "/").strip("`'\".,:;()[]{}").lower()
+        for match in re.findall(
+            r"(?:(?:[A-Za-z0-9_.-]+[\\/])*)[A-Za-z0-9_.-]+\.(?:py|sh|yml|yaml|json|toml|md)",
+            str(text or ""),
+        )
+    }
+    return any(path not in allowed for path in referenced_paths)
+
+
+def _normalize_agentic_review_output(
+    text: str,
+    *,
+    task_data: Optional[dict[str, Any]],
+    review_max_chars: int,
+) -> str:
+    cleaned = str(text or "").strip()
+    if _is_adapter_error(cleaned) or _looks_like_agent_scratchpad(cleaned):
+        return ""
+    if _review_output_has_scope_violation(cleaned, task_data=task_data):
+        print("[mep normalize] off-scope agentic review withheld; using grounded default")
+        return _render_default_structured_review(
+            task_data=task_data,
+            max_chars=review_max_chars,
+        )
+    if _extract_first_json_object(cleaned) is not None:
+        return _render_structured_review_with_task_data(
+            cleaned,
+            max_chars=review_max_chars,
+            task_data=task_data,
+        )
+    return _finalize_model_reply(cleaned, max_chars=review_max_chars)[:review_max_chars]
 
 
 def _extract_tool_findings(messages: list[dict[str, Any]]) -> str:
@@ -2109,84 +2376,30 @@ def _forced_synthesis_review(
     synthesis fails (so the caller can still fall back to the baseline).
     """
     print("[mep agentic] forcing final synthesis turn (investigation done, no submit_review yet)")
-    messages.append({
-        "role": "user",
-        "content": (
-            "STOP investigating. You have gathered enough evidence above. "
-            "Now write your FINAL review based ONLY on the evidence already collected. "
-            "Do not call any tools -- the submit_review tool has been removed for this "
-            "synthesis turn. Reply with a single self-contained review string. "
-            "The reply MUST start with '## Review Summary' and contain ONLY the finished "
-            "review: concrete findings with file/line evidence, an assessment of correctness "
-            "and safety, and a clear verdict. No planning, no narration, no 'Let me...', "
-            "no 'I will check...'. The final line MUST be either 'Verdict: APPROVE' or "
-            "'Verdict: REQUEST_CHANGES'."
-        ),
-    })
-    if synthesis_max_chars > 0:
-        try:
-            total = 0
-            for m in messages:
-                c = m.get("content")
-                if isinstance(c, str):
-                    total += len(c)
-            if total > synthesis_max_chars:
-                print(f"[mep agentic] truncating synthesis messages ({total} > {synthesis_max_chars})")
-                keep_head = max(2, len(messages) - 4)
-                head = messages[:1] if messages else []
-                tail = messages[keep_head:]
-                truncated = list(head) + list(tail)
-                trunc_note = {
-                    "role": "system",
-                    "content": "[bridge note: earlier investigation turns were truncated to fit the synthesis budget.]",
-                }
-                messages = truncated + [trunc_note]
-        except Exception as _trunc_err:
-            print(f"[mep agentic] message-truncation skipped: {_trunc_err}")
-    # NOTE: keep submit_review in the synthesis tools list. The previous version
-    # stripped it, but the agentic phase's tool messages still carry
-    # tool_call_id values for submit_review; minimaxi then rejects the synthesis
-    # call with 2013 "tool result's tool id ... not found" and the whole review
-    # is lost (PR #335 regression -- quality_score dropped to 0). The prompt
-    # explicitly tells the model "Do not call any tools", and D1/D2 below still
-    # screen adapter-error sentinels and approval-mode tasks before publishing.
+    evidence_tool_calls = _agentic_evidence_tool_count(messages)
+    synthesis_messages = _provider_neutral_synthesis_messages(
+        messages,
+        task_data=task_data,
+        max_chars=synthesis_max_chars,
+    )
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    future: Optional[concurrent.futures.Future[Any]] = None
     try:
-        synthesis_tools = list(tools or []) if isinstance(tools, list) else []
-    except Exception:
-        synthesis_tools = []
-    try:
-        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as _ex:
-            _future = _ex.submit(tools_aware_invoke, messages, tools=synthesis_tools or None)
-            response = _future.result(timeout=synthesis_deadline_seconds)
+        future = executor.submit(tools_aware_invoke, synthesis_messages, tools=None)
+        response = future.result(timeout=synthesis_deadline_seconds)
     except concurrent.futures.TimeoutError:
         print(f"[mep agentic] synthesis timed out after {synthesis_deadline_seconds}s")
+        if future is not None:
+            future.cancel()
         return ""
     except Exception:
         return ""
+    finally:
+        executor.shutdown(wait=False, cancel_futures=True)
     if not isinstance(response, dict):
         return ""
-    # Defense D3 (PR #335 Hub-Sentinel finding): the synthesis turn exposes
-    # submit_review to avoid minimaxi 2013 tool-id mismatches. That re-opens
-    # the approval gate the prior fallback deliberately kept closed. Count
-    # prior evidence-gathering tool calls in the conversation; if there are
-    # none and the model emits approval=True, downgrade to COMMENT-only so
-    # the substantive review text still publishes but cannot drive an
-    # approval writeback.
-    evidence_tool_calls = 0
-    try:
-        EVIDENCE_TOOL_NAMES = {
-            "_search", "_fetch", "_run", "read_file", "search", "fetch",
-            "list_files", "list_directory", "search_code", "git_log",
-            "git_diff", "grep", "find_in_files",
-        }
-        for m in (messages or []):
-            for tc in (m.get("tool_calls") or []):
-                fn = tc.get("function") if isinstance(tc, dict) else {}
-                if isinstance(fn, dict):
-                    if str(fn.get("name") or "").strip() in EVIDENCE_TOOL_NAMES:
-                        evidence_tool_calls += 1
-    except Exception:
-        evidence_tool_calls = 0
+    # Defense D3: only successful, matched evidence tool results count. The
+    # provider-neutral synthesis turn itself never receives tool schemas.
     for tc in (response.get("tool_calls") or []):
         fn = tc.get("function") if isinstance(tc.get("function"), dict) else {}
         if str(fn.get("name") or "").strip() == "submit_review":
@@ -2237,8 +2450,16 @@ def _forced_synthesis_review(
                         return ""
                     print("[mep agentic] synthesis turn produced submit_review (approval=%r, post-sanitize)" % (approval,))
                     return sanitized
-                print("[mep agentic] synthesis turn produced submit_review (approval=%r)" % (approval,))
-                return str(summary)[:review_max_chars]
+                normalized = _normalize_agentic_review_output(
+                    str(summary),
+                    task_data=task_data,
+                    review_max_chars=review_max_chars,
+                )
+                if not normalized:
+                    print("[mep agentic] synthesis submit_review failed normalization")
+                    return ""
+                print("[mep agentic] synthesis turn produced submit_review (approval=%r, normalized)" % (approval,))
+                return normalized
     content = str(response.get("content") or "").strip()
     if content and not _looks_like_agent_scratchpad(content):
         # Defense D1/D2: mirror the submit_review branch above.
@@ -2263,7 +2484,11 @@ def _forced_synthesis_review(
         # downgraded.
         if evidence_tool_calls < 1 and content:
             content = _apply_d3_verdict_rewrite(content)
-        return content[:review_max_chars]
+        return _normalize_agentic_review_output(
+            content,
+            task_data=task_data,
+            review_max_chars=review_max_chars,
+        )
     print("[mep agentic] synthesis turn did not yield a publishable review")
     return ""
 
@@ -2294,7 +2519,10 @@ def _run_agentic_tool_loop(
     nudged = False
     investigation_calls = 0
     budget_warned = False
-    for _iteration in range(1, max_tool_calls + 2):
+    investigation_limit = max(1, int(max_tool_calls))
+    warning_threshold = max(1, investigation_limit - 3)
+    used_tool_call_ids: set[str] = set()
+    for _iteration in range(1, investigation_limit + 2):
         try:
             response = tools_aware_invoke(messages, tools=tools)
         except Exception:
@@ -2305,19 +2533,35 @@ def _run_agentic_tool_loop(
 
         tool_calls = response.get("tool_calls")
         if tool_calls and isinstance(tool_calls, list) and len(tool_calls) > 0:
+            normalized_tool_calls: list[dict[str, Any]] = []
+            for index, tool_call in enumerate(tool_calls):
+                if not isinstance(tool_call, dict):
+                    continue
+                function = tool_call.get("function")
+                if not isinstance(function, dict):
+                    continue
+                normalized_tool_calls.append(
+                    {
+                        "id": _canonical_tool_call_id(
+                            tool_call.get("id"),
+                            iteration=_iteration,
+                            index=index,
+                            used_ids=used_tool_call_ids,
+                        ),
+                        "type": "function",
+                        "function": {
+                            "name": str(function.get("name") or "").strip(),
+                            "arguments": str(function.get("arguments") or "{}"),
+                        },
+                    }
+                )
+            if not normalized_tool_calls:
+                return ""
             assistant_msg: dict[str, Any] = {"role": "assistant", "content": response.get("content") or ""}
-            assistant_msg["tool_calls"] = [
-                {
-                    "id": tc.get("id", f"call_{_iteration}_{i}"),
-                    "type": "function",
-                    "function": {"name": tc["function"]["name"], "arguments": tc["function"]["arguments"]},
-                }
-                for i, tc in enumerate(tool_calls)
-                if isinstance(tc.get("function"), dict)
-            ]
+            assistant_msg["tool_calls"] = normalized_tool_calls
             messages.append(assistant_msg)
-            for tc in tool_calls:
-                fn = tc.get("function") if isinstance(tc.get("function"), dict) else {}
+            for tc in normalized_tool_calls:
+                fn = tc["function"]
                 name = str(fn.get("name") or "").strip()
                 args_str = str(fn.get("arguments") or "{}")
                 try:
@@ -2336,35 +2580,42 @@ def _run_agentic_tool_loop(
                             return ""
                         messages.append({
                             "role": "tool",
-                            "tool_call_id": tc.get("id", f"call_{_iteration}_{len(runtime_tool_runs)}"),
+                            "tool_call_id": tc["id"],
                             "content": f"[submit_review] error: summary argument is required and must be non-empty (attempt {submit_review_failures}/{max_submit_review_failures})",
                         })
                         continue
-                    return str(summary)[:review_max_chars]
+                    return _normalize_agentic_review_output(
+                        str(summary),
+                        task_data=task_data,
+                        review_max_chars=review_max_chars,
+                    )
                 investigation_calls += 1
                 result_text, _run_record = _execute_agentic_tool(
                     name, args, workspace=workspace, workspace_path=workspace_path, runtime_tool_runs=runtime_tool_runs,
                 )
                 messages.append({
                     "role": "tool",
-                    "tool_call_id": tc.get("id", f"call_{_iteration}_{len(runtime_tool_runs)}"),
+                    "tool_call_id": tc["id"],
                     "content": result_text[:8000],
                 })
             # No early bail-out: let the model use all iterations.
             # Qwen CAN call submit_review (proven in direct API test),
             # it just needs more investigation room than other models.
-            if not budget_warned and investigation_calls >= 7:
+            if not budget_warned and investigation_calls >= warning_threshold:
                 budget_warned = True
-                print("[mep agentic] budget warning: %d/10 calls used — nudging model to wrap up" % investigation_calls)
+                print(
+                    "[mep agentic] budget warning: %d/%d calls used; nudging model to wrap up"
+                    % (investigation_calls, investigation_limit)
+                )
                 messages.append({
                     "role": "user",
                     "content": (
-                        "BUDGET WARNING: You have used %d of 10 investigation calls. "
+                        "BUDGET WARNING: You have used %d of %d investigation calls. "
                         "You have only a few calls remaining. Stop investigating and wrap up — "
                         "identify the most important findings and call submit_review within the next 1-2 calls."
-                    ) % investigation_calls,
+                    ) % (investigation_calls, investigation_limit),
                 })
-            if investigation_calls >= 10:
+            if investigation_calls >= investigation_limit:
                 print("[mep agentic] investigation budget reached (%d calls) without submit_review" % investigation_calls)
                 # NOTE: _forced_synthesis_review runs the D3 approval-safety
                 # guard synchronously BEFORE return. By the time this value
@@ -2380,6 +2631,9 @@ def _run_agentic_tool_loop(
         # (notably deepseek) reliably return a clean structured review as free
         # text instead of calling the tool, and those must still be published.
         content = str(response.get("content") or "").strip()
+        if _is_adapter_error(content):
+            print("[mep agentic] provider/tool protocol error; falling back to grounded baseline")
+            return ""
         if not nudged:
             nudged = True
             messages.append({"role": "assistant", "content": content})
@@ -2397,7 +2651,11 @@ def _run_agentic_tool_loop(
             continue
         if content and not _looks_like_agent_scratchpad(content):
             print("[mep agentic] publishing free-text review (model did not call submit_review)")
-            return content[:review_max_chars]
+            return _normalize_agentic_review_output(
+                content,
+                task_data=task_data,
+                review_max_chars=review_max_chars,
+            )
         print("[mep agentic] dropping non-structured free-text turn (looked like reasoning or empty)")
         return ""
     # Loop exhausted its iterations without a submit_review: force one final
@@ -4114,20 +4372,22 @@ class DeepSeekAdapter:
 
     def _tools_aware_invoke(self, messages, *, tools):
         """Make an API call with function-calling support. Returns dict with content, tool_calls, finish_reason."""
+        request_json: dict[str, Any] = {
+            "model": self.model,
+            "messages": messages,
+            "max_tokens": _env_positive_int("MEP_AI_MAX_TOKENS", 4000),
+            "temperature": 0.1,
+        }
+        if tools:
+            request_json["tools"] = tools
         resp = requests.post(
             "https://api.deepseek.com/v1/chat/completions",
             headers={
                 "Authorization": f"Bearer {self.api_key}",
                 "Content-Type": "application/json",
             },
-            json={
-                "model": self.model,
-                "messages": messages,
-                "tools": tools,
-                "max_tokens": _env_positive_int("MEP_AI_MAX_TOKENS", 4000),
-                "temperature": 0.1,
-            },
-            timeout=_env_positive_int("MEP_AI_TIMEOUT_SECONDS", 120),
+            json=request_json,
+            timeout=_agentic_call_timeout_seconds(),
         )
         if resp.status_code != 200:
             return {"content": f"[DeepSeek] API error {resp.status_code}: {resp.text[:200]}", "tool_calls": []}
@@ -4232,7 +4492,7 @@ class DeepSeekAdapter:
                         workspace=task_data["__workspace"],
                         workspace_path=task_data["__workspace_path"],
                         runtime_tool_runs=task_data.get("__runtime_tool_runs", []),
-                        max_tool_calls=_MAX_AGENTIC_TOOL_CALLS,
+                        max_tool_calls=_agentic_max_tool_calls(),
                         review_max_chars=review_max,
                         task_data=task_data,
                     )
@@ -4303,20 +4563,22 @@ class OpenAICompatibleAdapter:
 
     def _tools_aware_invoke(self, messages, *, tools):
         """Make an API call with function-calling support. Returns dict with content, tool_calls, finish_reason."""
+        request_json: dict[str, Any] = {
+            "model": self.model,
+            "messages": messages,
+            "max_tokens": _env_positive_int("MEP_AI_MAX_TOKENS", 4000),
+            "temperature": 0.1,
+        }
+        if tools:
+            request_json["tools"] = tools
         resp = self._post_with_retry(
             self._endpoint(),
             headers={
                 "Authorization": f"Bearer {self.api_key}",
                 "Content-Type": "application/json",
             },
-            json={
-                "model": self.model,
-                "messages": messages,
-                "tools": tools,
-                "max_tokens": _env_positive_int("MEP_AI_MAX_TOKENS", 4000),
-                "temperature": 0.1,
-            },
-            timeout=_env_positive_int("MEP_AI_TIMEOUT_SECONDS", 120),
+            json=request_json,
+            timeout=_agentic_call_timeout_seconds(),
         )
         if resp.status_code != 200:
             return {"content": f"[{self.provider_name}] API error {resp.status_code}: {resp.text[:200]}", "tool_calls": []}
@@ -4420,7 +4682,7 @@ class OpenAICompatibleAdapter:
                         workspace=task_data["__workspace"],
                         workspace_path=task_data["__workspace_path"],
                         runtime_tool_runs=task_data.get("__runtime_tool_runs", []),
-                        max_tool_calls=_MAX_AGENTIC_TOOL_CALLS,
+                        max_tool_calls=_agentic_max_tool_calls(),
                         review_max_chars=review_max,
                         task_data=task_data,
                     )

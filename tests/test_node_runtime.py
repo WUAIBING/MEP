@@ -3677,6 +3677,11 @@ class TestAdapterErrorDetection(unittest.TestCase):
         self.assertTrue(mep_runtime._is_adapter_error("[DeepSeek] error: connection reset"))  # noqa: SLF001
         self.assertTrue(mep_runtime._is_adapter_error("[AI adapter] tinyllama timed out"))  # noqa: SLF001
         self.assertTrue(mep_runtime._is_adapter_error("[AI adapter] empty response from tinyllama"))  # noqa: SLF001
+        self.assertTrue(  # noqa: SLF001
+            mep_runtime._is_adapter_error(
+                "[minimaxi] API error 400: invalid params, tool result's tool id(call_1) not found"
+            )
+        )
         self.assertTrue(mep_runtime._is_adapter_error("[codex-cli] inference failed: invalid UTF-8"))  # noqa: SLF001
         self.assertTrue(mep_runtime._is_adapter_error("[codex-cli] inference timed out after 60s"))  # noqa: SLF001
         self.assertTrue(mep_runtime._is_adapter_error(""))  # noqa: SLF001
@@ -3690,6 +3695,156 @@ class TestAdapterErrorDetection(unittest.TestCase):
                 "[codex-cli] The old request timed out, but the retry succeeded and the failed test is fixed."
             )
         )
+
+
+class TestProviderNormalization(unittest.TestCase):
+    def test_openai_compatible_synthesis_omits_empty_tools_field(self):
+        adapter = mep_runtime.OpenAICompatibleAdapter(
+            api_key="test-key",
+            model="test-model",
+            base_url="https://provider.example/v1",
+            provider_name="test-provider",
+        )
+        adapter.last_review_metrics = {
+            "tokens_in": 0,
+            "tokens_out": 0,
+            "review_passes": 0,
+        }
+        response = _FakeResponse(
+            json_data={
+                "choices": [
+                    {
+                        "message": {"content": "finished review"},
+                        "finish_reason": "stop",
+                    }
+                ],
+                "usage": {},
+            }
+        )
+        with patch.object(adapter, "_post_with_retry", return_value=response) as post:
+            result = adapter._tools_aware_invoke(  # noqa: SLF001
+                [{"role": "user", "content": "synthesize"}],
+                tools=None,
+            )
+
+        self.assertEqual(result["content"], "finished review")
+        self.assertNotIn("tools", post.call_args.kwargs["json"])
+
+    def test_tool_call_ids_are_canonical_and_unique(self):
+        used: set[str] = set()
+        first = mep_runtime._canonical_tool_call_id(  # noqa: SLF001
+            "bad provider id",
+            iteration=1,
+            index=0,
+            used_ids=used,
+        )
+        second = mep_runtime._canonical_tool_call_id(  # noqa: SLF001
+            "bad provider id",
+            iteration=1,
+            index=1,
+            used_ids=used,
+        )
+        self.assertRegex(first, r"^call_[A-Za-z0-9_-]+$")
+        self.assertNotEqual(first, second)
+        self.assertLessEqual(len(second), 64)
+
+    def test_provider_neutral_synthesis_removes_tool_protocol_frames(self):
+        messages = [
+            {"role": "system", "content": "review"},
+            {"role": "user", "content": "inspect the changed runtime"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call_read",
+                        "type": "function",
+                        "function": {
+                            "name": "workspace_read",
+                            "arguments": '{"file_path":"node/mep_runtime.py"}',
+                        },
+                    }
+                ],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "call_read",
+                "content": "verified changed helper",
+            },
+        ]
+        normalized = mep_runtime._provider_neutral_synthesis_messages(  # noqa: SLF001
+            messages,
+            task_data={
+                "task": {
+                    "inputs": {
+                        "github": {
+                            "touched_paths": ["node/mep_runtime.py"],
+                            "touched_tests": ["tests/test_node_runtime.py"],
+                        }
+                    }
+                }
+            },
+            max_chars=4000,
+        )
+        self.assertTrue(all(message["role"] in {"system", "user"} for message in normalized))
+        rendered = "\n".join(message["content"] for message in normalized)
+        self.assertIn("[workspace_read]", rendered)
+        self.assertNotIn("tool_call_id", rendered)
+
+    def test_workspace_tools_count_as_successful_evidence(self):
+        messages = [
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call_read",
+                        "type": "function",
+                        "function": {
+                            "name": "workspace_read",
+                            "arguments": "{}",
+                        },
+                    }
+                ],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "call_read",
+                "content": "authoritative file evidence",
+            },
+        ]
+        self.assertEqual(  # noqa: SLF001
+            mep_runtime._agentic_evidence_tool_count(messages),
+            1,
+        )
+
+    def test_off_scope_agentic_finding_is_replaced_by_grounded_default(self):
+        task_data = {
+            "task": {
+                "inputs": {
+                    "github": {
+                        "touched_paths": [
+                            "node/mep_runtime.py",
+                            "scripts/deploy_hub_release.sh",
+                        ],
+                        "touched_tests": ["tests/test_node_runtime.py"],
+                    }
+                }
+            }
+        }
+        output = mep_runtime._normalize_agentic_review_output(  # noqa: SLF001
+            (
+                "## Review Summary\n\n"
+                "Found a malformed `run_id` bug in `mep_review.py`.\n\n"
+                "Verdict: REQUEST_CHANGES"
+            ),
+            task_data=task_data,
+            review_max_chars=4000,
+        )
+        self.assertIn("## Review Summary", output)
+        self.assertIn("node/mep_runtime.py", output)
+        self.assertNotIn("mep_review.py", output)
+        self.assertNotIn("run_id", output)
 
 
 class TestWorkspaceReviewContext(unittest.TestCase):
@@ -4810,7 +4965,7 @@ class TestAgenticSynthesisTurn(unittest.TestCase):
         """When the iteration range is exhausted, synthesis still recovers the review."""
         finished = "## Review Summary\n\nFindings with file/line evidence. Approve."
         # Each turn: one investigation call. Loop range exhausts, then synthesis fires.
-        responses = [self._search(1), self._search(1), self._search(1), self._submit(finished)]
+        responses = [self._search(1), self._search(1), self._submit(finished)]
         calls = {"i": 0}
 
         def _invoke(messages, *, tools):
@@ -4968,13 +5123,14 @@ class TestAgenticSynthesisTurn(unittest.TestCase):
         submit_review call during synthesis. The fix strips the submit_review
         schema entry before passing tools to the model.
         """
-        captured = {"synthesis_tools": None}
+        captured = {"synthesis_tools": "not-called", "messages": None}
 
         def _dispatcher(messages, *, tools):
             if not hasattr(_dispatcher, "_seen"):
                 _dispatcher._seen = 1
                 return self._search(10)
             captured["synthesis_tools"] = tools
+            captured["messages"] = list(messages)
             return {
                 "content": "## Review Summary\n\nFindings with file/line evidence. LGTM.",
                 "tool_calls": [],
@@ -4987,10 +5143,12 @@ class TestAgenticSynthesisTurn(unittest.TestCase):
             workspace=None, workspace_path="", runtime_tool_runs=[],
             max_tool_calls=10, review_max_chars=4000,
         )
-        self.assertIsNotNone(captured["synthesis_tools"])
-        tools_passed = captured["synthesis_tools"] or []
-        tool_names = [t.get("name") for t in tools_passed if isinstance(t, dict)]
-        self.assertNotIn("submit_review", tool_names)
+        self.assertIsNone(captured["synthesis_tools"])
+        synthesis_messages = captured["messages"] or []
+        self.assertTrue(synthesis_messages)
+        self.assertTrue(
+            all(message.get("role") in {"system", "user"} for message in synthesis_messages)
+        )
         self.assertIn("## Review Summary", result)
 
     def test_synthesis_truncates_long_messages(self):
