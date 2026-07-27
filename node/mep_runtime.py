@@ -131,25 +131,20 @@ def _is_adapter_error(text: str) -> bool:
         return True
     lowered = cleaned.lower()
     provider_sentinel = re.match(r"^\[[^\]\r\n]{1,80}\]", cleaned)
-    provider_error_prefixes = (
-        "api error",
-        "error:",
-        "timed out",
-        "timeout",
-        "reply was empty",
-        "review response was empty",
-        "empty response",
-        "invalid params",
-    )
     if cleaned.startswith("[AI adapter]") and any(
         marker in lowered for marker in ("error", "empty", "timed out", "timeout")
     ):
         return True
     if provider_sentinel:
         detail = cleaned[provider_sentinel.end() :].strip().lower()
-        if detail.startswith(provider_error_prefixes):
+        if re.match(r"^api error(?:\s+[1-5]\d{2}(?:\s|:|$)|:)", detail):
             return True
-        if "tool result's tool id" in detail or "tool result id" in detail:
+        if detail.startswith(("error:", "reply was empty", "review response was empty", "empty response")):
+            return True
+        if re.match(
+            r"^(?:(?:inference|request|review)\s+)?(?:timed out|timeout)(?:\s+after\b|:|$)",
+            detail,
+        ):
             return True
     if lowered.startswith(
         (

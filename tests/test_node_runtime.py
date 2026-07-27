@@ -3695,6 +3695,16 @@ class TestAdapterErrorDetection(unittest.TestCase):
                 "[codex-cli] The old request timed out, but the retry succeeded and the failed test is fixed."
             )
         )
+        self.assertFalse(  # noqa: SLF001
+            mep_runtime._is_adapter_error(
+                "[openai] API error handling middleware looks well structured here."
+            )
+        )
+        self.assertFalse(  # noqa: SLF001
+            mep_runtime._is_adapter_error(
+                "[deepseek] The review discusses a tool result id without reporting an adapter failure."
+            )
+        )
 
 
 class TestProviderNormalization(unittest.TestCase):
