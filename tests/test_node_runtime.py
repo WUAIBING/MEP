@@ -3682,6 +3682,11 @@ class TestAdapterErrorDetection(unittest.TestCase):
                 "[minimaxi] API error 400: invalid params, tool result's tool id(call_1) not found"
             )
         )
+        self.assertTrue(  # noqa: SLF001
+            mep_runtime._is_adapter_error(
+                "[deepseek] inference context error: timeout occurred"
+            )
+        )
         self.assertTrue(mep_runtime._is_adapter_error("[codex-cli] inference failed: invalid UTF-8"))  # noqa: SLF001
         self.assertTrue(mep_runtime._is_adapter_error("[codex-cli] inference timed out after 60s"))  # noqa: SLF001
         self.assertTrue(mep_runtime._is_adapter_error(""))  # noqa: SLF001
@@ -3703,6 +3708,11 @@ class TestAdapterErrorDetection(unittest.TestCase):
         self.assertFalse(  # noqa: SLF001
             mep_runtime._is_adapter_error(
                 "[deepseek] The review discusses a tool result id without reporting an adapter failure."
+            )
+        )
+        self.assertFalse(  # noqa: SLF001
+            mep_runtime._is_adapter_error(
+                "[openai] The code's error: handling branch is covered by tests."
             )
         )
 

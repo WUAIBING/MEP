@@ -141,6 +141,12 @@ def _is_adapter_error(text: str) -> bool:
             return True
         if detail.startswith(("error:", "reply was empty", "review response was empty", "empty response")):
             return True
+        if re.search(
+            r"\berror:\s*.{0,160}\b(?:timed out|timeout|empty response|invalid params|"
+            r"rate limit|connection(?: reset| refused)?|server overloaded|failed|failure)\b",
+            detail,
+        ):
+            return True
         if re.match(
             r"^(?:(?:inference|request|review)\s+)?(?:timed out|timeout)(?:\s+after\b|:|$)",
             detail,
