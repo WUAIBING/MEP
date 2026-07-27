@@ -5337,6 +5337,9 @@ class RuntimeNode:
         self._live_call_locks: dict[str, asyncio.Lock] = {}
         self._live_call_outbound_seq: dict[str, int] = {}
         self._task_adapter_lock = asyncio.Lock()
+        self._task_action_contexts: dict[str, dict[str, str]] = {}
+        self._action_event_history: dict[str, list[dict[str, Any]]] = {}
+        self._action_history_limit = _env_positive_int("MEP_ACTION_HISTORY_LIMIT", 128)
         
         # Phase 4: Autonomous Workspace Management
         workspace_dir = os.getenv("MEP_WORKSPACE_DIR")
@@ -5350,6 +5353,174 @@ class RuntimeNode:
         headers = self.identity.get_auth_headers(payload)
         headers["Content-Type"] = "application/json"
         return headers
+
+    @staticmethod
+    def _action_context_metadata(
+        task_data: dict[str, Any],
+        interbot_message: Optional[dict[str, Any]],
+    ) -> Optional[dict[str, str]]:
+        candidates: list[Any] = []
+        for container in (interbot_message, task_data):
+            if not isinstance(container, dict):
+                continue
+            task = container.get("task")
+            if not isinstance(task, dict):
+                continue
+            inputs = task.get("inputs")
+            if isinstance(inputs, dict):
+                candidates.append(inputs.get("action_context"))
+        for raw in candidates:
+            if not isinstance(raw, dict) or raw.get("spec_version") != "mep.action.v1":
+                continue
+            context_id = str(raw.get("context_id") or "").strip()
+            action_id = str(raw.get("action_id") or "").strip()
+            parent_action_id = str(raw.get("parent_action_id") or "").strip()
+            if not context_id or not action_id:
+                continue
+            metadata = {
+                "spec_version": "mep.action.v1",
+                "context_id": context_id[:160],
+                "action_id": action_id[:160],
+            }
+            if parent_action_id:
+                metadata["parent_action_id"] = parent_action_id[:160]
+            return metadata
+        return None
+
+    def _remember_action_event(self, event: Any) -> None:
+        if not isinstance(event, dict) or event.get("spec_version") != "mep.action.v1":
+            return
+        context_id = str(event.get("context_id") or "").strip()
+        event_id = str(event.get("event_id") or "").strip()
+        if not context_id or not event_id:
+            return
+        history = self._action_event_history.setdefault(context_id, [])
+        if any(item.get("event_id") == event_id for item in history):
+            return
+        history.append(copy.deepcopy(event))
+        history.sort(key=lambda item: int(item.get("seq") or 0))
+        if len(history) > self._action_history_limit:
+            del history[:-self._action_history_limit]
+        print(
+            f"[mep action] context={context_id[:12]} seq={event.get('seq')} "
+            f"producer={str(event.get('producer_id') or '')[:18]} "
+            f"type={event.get('event_type')} phase={event.get('phase') or '-'}"
+        )
+
+    def _post_action_event_sync(
+        self,
+        metadata: dict[str, str],
+        event_type: str,
+        *,
+        phase: Optional[str] = None,
+        message: Optional[str] = None,
+        progress: Optional[int] = None,
+        artifacts: Optional[list[dict[str, str]]] = None,
+    ) -> bool:
+        body: dict[str, Any] = {
+            "context_id": metadata["context_id"],
+            "action_id": metadata["action_id"],
+            "event_type": event_type,
+            "event_id": f"evt-{uuid.uuid4()}",
+            "visibility": "participants",
+        }
+        for key in ("parent_action_id",):
+            if metadata.get(key):
+                body[key] = metadata[key]
+        optional: dict[str, Any] = {
+            "phase": phase,
+            "message": message,
+            "progress": progress,
+            "artifacts": artifacts,
+        }
+        body.update({key: value for key, value in optional.items() if value is not None})
+        payload = json.dumps(body)
+        code, response, raw = _safe_request(
+            "POST",
+            f"{self.hub_url}/actions/events",
+            data_body=payload,
+            headers=self._auth_headers(payload),
+            timeout=20.0,
+        )
+        if code == 200 and isinstance(response, dict):
+            event = response.get("event")
+            if isinstance(event, dict):
+                self._remember_action_event(event)
+            return True
+        print(
+            f"[mep action] publish failed context={metadata['context_id'][:12]} "
+            f"action={metadata['action_id'][:18]} type={event_type} "
+            f"status={code} detail={raw[:300]}"
+        )
+        return False
+
+    async def _emit_action_event(
+        self,
+        metadata: dict[str, str],
+        event_type: str,
+        *,
+        phase: Optional[str] = None,
+        message: Optional[str] = None,
+        progress: Optional[int] = None,
+        artifacts: Optional[list[dict[str, str]]] = None,
+    ) -> bool:
+        return await asyncio.to_thread(
+            self._post_action_event_sync,
+            metadata,
+            event_type,
+            phase=phase,
+            message=message,
+            progress=progress,
+            artifacts=artifacts,
+        )
+
+    def _schedule_action_event(
+        self,
+        metadata: Optional[dict[str, str]],
+        event_type: str,
+        *,
+        phase: Optional[str] = None,
+        message: Optional[str] = None,
+        progress: Optional[int] = None,
+        artifacts: Optional[list[dict[str, str]]] = None,
+    ) -> None:
+        if metadata is None:
+            return
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            self._post_action_event_sync(
+                metadata,
+                event_type,
+                phase=phase,
+                message=message,
+                progress=progress,
+                artifacts=artifacts,
+            )
+            return
+        self._schedule_background_task(
+            self._emit_action_event(
+                metadata,
+                event_type,
+                phase=phase,
+                message=message,
+                progress=progress,
+                artifacts=artifacts,
+            ),
+            label=f"{event_type}:{metadata['action_id'][:18]}",
+        )
+
+    @staticmethod
+    def _action_result_failed(result_payload: str) -> bool:
+        normalized = str(result_payload or "").strip().lower()
+        failure_markers = (
+            "[interbot] routing contract rejected",
+            "[review runtime]",
+            "[repo audit]",
+            "error:",
+            "failed:",
+        )
+        return _is_adapter_error(result_payload) or normalized.startswith(failure_markers)
 
     @staticmethod
     def _bridge_metadata(interbot_message: Optional[dict[str, Any]]) -> Optional[dict[str, Any]]:
@@ -5610,6 +5781,7 @@ class RuntimeNode:
         return False
 
     def complete(self, task_id: str, result_payload: str) -> None:
+        action_metadata = self._task_action_contexts.pop(task_id, None)
         payload = json.dumps(
             {
                 "task_id": task_id,
@@ -5626,8 +5798,26 @@ class RuntimeNode:
         )
         if code == 200:
             print(f"[mep run] completed task={task_id[:8]}")
+            failed = self._action_result_failed(result_payload)
+            self._schedule_action_event(
+                action_metadata,
+                "action.failed" if failed else "action.completed",
+                phase="complete",
+                message=(
+                    "Task failed; diagnostic result was submitted."
+                    if failed
+                    else "Task completed and its result was submitted."
+                ),
+                progress=100,
+            )
         else:
             print(f"[mep run] complete failed task={task_id[:8]} status={code} detail={raw}")
+            self._schedule_action_event(
+                action_metadata,
+                "action.failed",
+                phase="settlement",
+                message="Task result could not be submitted to the Hub.",
+            )
 
     def _schedule_background_task(self, coroutine: Any, *, label: str) -> None:
         task = asyncio.create_task(coroutine)
@@ -6348,6 +6538,25 @@ class RuntimeNode:
             f"origin_task={task_id[:8]}"
         )
 
+    async def _process_task_with_failure_boundary(self, task_data: dict[str, Any]) -> None:
+        task_id = str(task_data.get("id") or "")
+        try:
+            await self.process_task(task_data)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            action_metadata = self._task_action_contexts.pop(task_id, None)
+            if action_metadata is None:
+                action_metadata = self._action_context_metadata(task_data, None)
+            if action_metadata is not None:
+                await self._emit_action_event(
+                    action_metadata,
+                    "action.failed",
+                    phase="runtime",
+                    message="The runtime stopped unexpectedly while processing the task.",
+                )
+            raise
+
     async def process_task(self, task_data: dict[str, Any]) -> None:
         task_id = str(task_data.get("id") or "")
         payload = str(task_data.get("payload") or "")
@@ -6364,6 +6573,16 @@ class RuntimeNode:
         interbot_message: Optional[dict[str, Any]] = None
         if MEPClient is not None:
             instructions, interbot_message = MEPClient.extract_interbot_instructions(payload)
+        action_metadata = self._action_context_metadata(task_data, interbot_message)
+        if task_id and action_metadata is not None:
+            self._task_action_contexts[task_id] = action_metadata
+            await self._emit_action_event(
+                action_metadata,
+                "action.started",
+                phase="accepted",
+                message="Accepted the structured work task.",
+                progress=5,
+            )
         if isinstance(interbot_message, dict):
             contract_error = _interbot_routing_contract_error(
                 task_data,
@@ -6418,6 +6637,13 @@ class RuntimeNode:
                 f"[mep tools] task={task_id[:8]} "
                 f"tool={entry.get('tool')} status={entry.get('status')} "
                 f"summary={entry.get('summary')}"
+            )
+            self._schedule_action_event(
+                action_metadata,
+                "action.progress",
+                phase=str(entry.get("tool") or "tool")[:80],
+                message=str(entry.get("summary") or "Runtime tool checkpoint.")[:2000],
+                progress=min(80, 10 + len(runtime_tool_runs) * 10),
             )
 
         if repo_audit_required:
@@ -6723,6 +6949,14 @@ class RuntimeNode:
             and is_execution_request is not None
             and is_execution_request(interbot_message)
         ):
+            if action_metadata is not None:
+                await self._emit_action_event(
+                    action_metadata,
+                    "action.progress",
+                    phase="execution",
+                    message="Starting the authorized execution bridge.",
+                    progress=85,
+                )
             bridge_request = build_execution_bridge_request(
                 interbot_message,
                 consumer_id=str(task_data.get("consumer_id") or ""),
@@ -6757,6 +6991,14 @@ class RuntimeNode:
         # Provider adapters are currently synchronous. Run inference away from the
         # WebSocket event loop so pings, call frames, and new task delivery remain
         # responsive during long model requests.
+        if action_metadata is not None:
+            await self._emit_action_event(
+                action_metadata,
+                "action.progress",
+                phase="inference",
+                message="Prepared scoped context and started AI inference.",
+                progress=85,
+            )
         async with self._task_adapter_lock:
             result = await asyncio.to_thread(self.adapter.generate_reply, instructions, adapter_task_data)
         adapter_metrics = getattr(self.adapter, "last_review_metrics", None) or None
@@ -6839,7 +7081,12 @@ class RuntimeNode:
             if task_id and self.should_bid(task):
                 self.bid(task_id)
         elif event == "new_task":
-            self._schedule_background_task(self.process_task(data.get("data", {})), label="process_task")
+            self._schedule_background_task(
+                self._process_task_with_failure_boundary(data.get("data", {})),
+                label="process_task",
+            )
+        elif event == "action_event":
+            self._remember_action_event(data.get("data"))
         elif isinstance(event, str) and event.startswith("call."):
             await self._handle_call_event(data)
 

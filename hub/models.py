@@ -106,3 +106,25 @@ class BrainstormSessionPost(BaseModel):
     session_id: str
     message: str = Field(..., min_length=1, max_length=5000)
     reply_to_message_id: Optional[str] = None
+
+
+class ActionContextCreate(BaseModel):
+    owner_id: str
+    participants: List[str] = Field(..., min_length=1, max_length=128)
+    context_id: Optional[str] = Field(default=None, min_length=8, max_length=160)
+    topic: Optional[str] = Field(default=None, max_length=500)
+    max_events: Optional[int] = Field(default=500, ge=10, le=5000)
+
+
+class ActionEventPost(BaseModel):
+    context_id: str = Field(..., min_length=8, max_length=160)
+    action_id: str = Field(..., min_length=1, max_length=160)
+    event_type: str = Field(..., min_length=1, max_length=40)
+    event_id: Optional[str] = Field(default=None, min_length=8, max_length=160)
+    parent_action_id: Optional[str] = Field(default=None, max_length=160)
+    visibility: str = Field(default="participants", max_length=20)
+    audience: Optional[List[str]] = Field(default=None, max_length=128)
+    phase: Optional[str] = Field(default=None, max_length=80)
+    message: Optional[str] = Field(default=None, max_length=2000)
+    progress: Optional[int] = Field(default=None, ge=0, le=100)
+    artifacts: Optional[List[Dict[str, Any]]] = Field(default=None, max_length=20)

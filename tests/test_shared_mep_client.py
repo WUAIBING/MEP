@@ -98,6 +98,73 @@ class TestSharedMEPClient(unittest.TestCase):
         )
         self.assertEqual(body["routing"], {"target_node_id": "node_provider", "target_capability": "text"})
 
+    def test_action_context_helpers_use_signed_persistent_endpoints(self):
+        with (
+            patch("clients.shared.mep_client.MEPIdentity", return_value=_FakeIdentity()),
+            patch("clients.shared.mep_client.requests.Session") as session_cls,
+        ):
+            session = session_cls.return_value
+            session.post.return_value = _FakeResponse(json_data={"status": "created"})
+            session.get.return_value = _FakeResponse(json_data={"events": []})
+            client = MEPClient("unused.pem")
+
+            created = asyncio.run(
+                client.create_action_context(
+                    ["node_hub", "node_elsaws"],
+                    topic="Parallel review",
+                    context_id="action-context-123",
+                    max_events=250,
+                )
+            )
+            posted = asyncio.run(
+                client.post_action_event(
+                    "action-context-123",
+                    "review-client",
+                    "action.progress",
+                    event_id="evt-progress-123",
+                    phase="workspace_read",
+                    message="Read the changed files.",
+                    progress=40,
+                )
+            )
+            replay = asyncio.run(
+                client.get_action_context(
+                    "action-context-123",
+                    after_seq=7,
+                    limit=25,
+                )
+            )
+
+        self.assertEqual(created["status_code"], 200)
+        self.assertEqual(posted["status_code"], 200)
+        self.assertEqual(replay["status_code"], 200)
+        create_body = json.loads(session.post.call_args_list[0].kwargs["data"])
+        self.assertEqual(create_body["owner_id"], "node_consumer")
+        self.assertEqual(create_body["participants"], ["node_hub", "node_elsaws"])
+        self.assertEqual(create_body["context_id"], "action-context-123")
+        event_body = json.loads(session.post.call_args_list[1].kwargs["data"])
+        self.assertEqual(event_body["event_type"], "action.progress")
+        self.assertEqual(event_body["progress"], 40)
+        self.assertEqual(
+            session.get.call_args.kwargs["params"],
+            {"after_seq": 7, "limit": 25},
+        )
+
+        metadata = MEPClient.build_action_context_metadata(
+            "action-context-123",
+            "review-client",
+            parent_action_id="review-parent",
+        )
+        self.assertEqual(
+            metadata,
+            {
+                "spec_version": "mep.action.v1",
+                "context_id": "action-context-123",
+                "action_id": "review-client",
+                "parent_action_id": "review-parent",
+            },
+        )
+
     def test_send_ws_event_uses_active_socket_when_present(self):
         with patch("clients.shared.mep_client.MEPIdentity", return_value=_FakeIdentity()):
             client = MEPClient("unused.pem")
