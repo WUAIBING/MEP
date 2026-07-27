@@ -13,6 +13,9 @@ class _FakeIdentity:
     def get_auth_headers(self, payload: str) -> dict:
         return {"X-MEP-NodeID": self.node_id, "X-MEP-Signature": "sig"}
 
+    def sign(self, node_id: str, timestamp: str) -> str:
+        return f"sig:{node_id}:{timestamp}"
+
 
 class _FakeResponse:
     def __init__(self, status_code=200, json_data=None):
@@ -29,6 +32,35 @@ class _FakeWebSocket:
 
     async def send(self, payload: str) -> None:
         self.sent.append(payload)
+
+
+class _ScriptedWebSocket(_FakeWebSocket):
+    def __init__(self, messages):
+        super().__init__()
+        self.messages = list(messages)
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, traceback):
+        return False
+
+    async def recv(self):
+        return json.dumps(self.messages.pop(0))
+
+
+class _SelectivelyFailingWebSocket(_FakeWebSocket):
+    def __init__(self, failing_contexts):
+        super().__init__()
+        self.failing_contexts = set(failing_contexts)
+        self.attempted = []
+
+    async def send(self, payload: str) -> None:
+        context_id = json.loads(payload)["context_id"]
+        self.attempted.append(context_id)
+        if context_id in self.failing_contexts:
+            raise ConnectionError(f"send failed for {context_id}")
+        await super().send(payload)
 
 
 class TestSharedMEPClient(unittest.TestCase):
@@ -76,6 +108,7 @@ class TestSharedMEPClient(unittest.TestCase):
 
         self.assertTrue(sent)
         self.assertEqual(json.loads(ws.sent[0]), {"event": "call.accept", "context_id": "ctx-1"})
+        self.assertEqual(client._live_call_contexts, {"ctx-1"})
 
     def test_send_ws_event_returns_false_without_active_socket(self):
         with patch("clients.shared.mep_client.MEPIdentity", return_value=_FakeIdentity()):
@@ -84,6 +117,229 @@ class TestSharedMEPClient(unittest.TestCase):
             sent = asyncio.run(client.send_ws_event({"event": "call.accept", "context_id": "ctx-1"}))
 
         self.assertFalse(sent)
+
+    def test_listener_automatically_pongs_live_call_health_checks(self):
+        ws = _ScriptedWebSocket(
+            [{"event": "call.ping", "context_id": "ctx-ping"}]
+        )
+        observed = []
+
+        async def _run():
+            with (
+                patch("clients.shared.mep_client.MEPIdentity", return_value=_FakeIdentity()),
+                patch("clients.shared.mep_client.ws_connect", return_value=ws),
+            ):
+                client = MEPClient("unused.pem")
+                client.heartbeat_seconds = 0
+
+                async def on_result(_data):
+                    return None
+
+                async def on_event(data):
+                    observed.append(data)
+                    client.stop()
+
+                await client.listen_results(on_result, on_event)
+
+        asyncio.run(_run())
+        self.assertEqual(
+            json.loads(ws.sent[0]),
+            {"event": "call.pong", "context_id": "ctx-ping"},
+        )
+        self.assertEqual(observed[0]["event"], "call.ping")
+
+    def test_listener_resumes_active_calls_after_websocket_reconnect(self):
+        ws = _ScriptedWebSocket(
+            [{"event": "call.hangup", "context_id": "ctx-resume"}]
+        )
+
+        async def _run():
+            with (
+                patch("clients.shared.mep_client.MEPIdentity", return_value=_FakeIdentity()),
+                patch("clients.shared.mep_client.ws_connect", return_value=ws),
+            ):
+                client = MEPClient("unused.pem")
+                client.heartbeat_seconds = 0
+                client._live_call_contexts.add("ctx-resume")
+
+                async def on_result(_data):
+                    return None
+
+                async def on_event(_data):
+                    client.stop()
+
+                await client.listen_results(on_result, on_event)
+                self.assertEqual(client._live_call_contexts, set())
+
+        asyncio.run(_run())
+        self.assertEqual(
+            json.loads(ws.sent[0]),
+            {"event": "call.resume", "context_id": "ctx-resume"},
+        )
+
+    def test_listener_reconnect_cycle_resumes_only_the_active_call(self):
+        first_ws = _ScriptedWebSocket(
+            [{"event": "call.accepted", "context_id": "ctx-cycle"}]
+        )
+        second_ws = _ScriptedWebSocket(
+            [{"event": "call.resumed", "context_id": "ctx-cycle"}]
+        )
+        observed = []
+
+        async def _run():
+            with (
+                patch("clients.shared.mep_client.MEPIdentity", return_value=_FakeIdentity()),
+                patch(
+                    "clients.shared.mep_client.ws_connect",
+                    side_effect=[first_ws, second_ws],
+                ),
+            ):
+                client = MEPClient("unused.pem")
+                client.heartbeat_seconds = 0
+
+                async def on_result(_data):
+                    return None
+
+                async def on_event(data):
+                    observed.append(data["event"])
+                    if data["event"] == "call.resumed":
+                        client.stop()
+
+                await client.listen_results(on_result, on_event)
+                self.assertEqual(client._live_call_contexts, {"ctx-cycle"})
+
+        asyncio.run(_run())
+        self.assertEqual(observed, ["call.accepted", "call.resumed"])
+        self.assertEqual(
+            json.loads(second_ws.sent[0]),
+            {"event": "call.resume", "context_id": "ctx-cycle"},
+        )
+
+    def test_unacknowledged_resume_is_evicted(self):
+        async def _run():
+            with patch("clients.shared.mep_client.MEPIdentity", return_value=_FakeIdentity()):
+                client = MEPClient("unused.pem")
+                client.call_resume_ack_timeout_seconds = 0.01
+                client._remember_live_call("ctx-stale")
+                ws = _FakeWebSocket()
+
+                await client._resume_live_calls(ws)
+                await asyncio.sleep(0.03)
+
+                self.assertEqual(client._live_call_contexts, set())
+                self.assertEqual(client._call_resume_pending, {})
+
+        asyncio.run(_run())
+
+    def test_resume_send_failure_does_not_skip_remaining_calls(self):
+        async def _run():
+            with patch("clients.shared.mep_client.MEPIdentity", return_value=_FakeIdentity()):
+                client = MEPClient("unused.pem")
+                client.call_resume_ack_timeout_seconds = 60
+                for context_id in ("ctx-a", "ctx-b", "ctx-c"):
+                    client._remember_live_call(context_id)
+                ws = _SelectivelyFailingWebSocket({"ctx-b"})
+
+                await client._resume_live_calls(ws)
+
+                self.assertEqual(ws.attempted, ["ctx-a", "ctx-b", "ctx-c"])
+                self.assertEqual(
+                    [json.loads(payload)["context_id"] for payload in ws.sent],
+                    ["ctx-a", "ctx-c"],
+                )
+                self.assertEqual(
+                    set(client._call_resume_pending),
+                    {"ctx-a", "ctx-c"},
+                )
+                client.stop()
+                await asyncio.sleep(0)
+
+        asyncio.run(_run())
+
+    def test_failed_resume_send_survives_ack_timeout_for_next_connection(self):
+        async def _run():
+            with patch("clients.shared.mep_client.MEPIdentity", return_value=_FakeIdentity()):
+                client = MEPClient("unused.pem")
+                client.call_resume_ack_timeout_seconds = 0.01
+                client._remember_live_call("ctx-retry")
+
+                await client._resume_live_calls(_SelectivelyFailingWebSocket({"ctx-retry"}))
+                await asyncio.sleep(0.03)
+
+                self.assertEqual(client._live_call_contexts, {"ctx-retry"})
+                self.assertEqual(client._call_resume_pending, {})
+                retry_ws = _FakeWebSocket()
+                await client._resume_live_calls(retry_ws)
+                self.assertEqual(
+                    json.loads(retry_ws.sent[0]),
+                    {"event": "call.resume", "context_id": "ctx-retry"},
+                )
+                client.stop()
+                await asyncio.sleep(0)
+
+        asyncio.run(_run())
+
+    def test_resume_includes_call_added_while_sends_are_in_progress(self):
+        async def _run():
+            with patch("clients.shared.mep_client.MEPIdentity", return_value=_FakeIdentity()):
+                client = MEPClient("unused.pem")
+                client.call_resume_ack_timeout_seconds = 60
+                client._remember_live_call("ctx-a")
+
+                class _AddingWebSocket(_FakeWebSocket):
+                    async def send(self, payload: str) -> None:
+                        await super().send(payload)
+                        client._remember_live_call("ctx-b")
+
+                ws = _AddingWebSocket()
+                await client._resume_live_calls(ws)
+
+                self.assertEqual(
+                    [json.loads(payload)["context_id"] for payload in ws.sent],
+                    ["ctx-a", "ctx-b"],
+                )
+                client.stop()
+                await asyncio.sleep(0)
+
+        asyncio.run(_run())
+
+    def test_resume_drain_is_bounded_when_calls_keep_arriving(self):
+        async def _run():
+            with patch("clients.shared.mep_client.MEPIdentity", return_value=_FakeIdentity()):
+                client = MEPClient("unused.pem")
+                client.call_context_max = 3
+                client.call_resume_ack_timeout_seconds = 60
+                client._remember_live_call("ctx-0")
+
+                class _ContinuouslyAddingWebSocket(_FakeWebSocket):
+                    async def send(self, payload: str) -> None:
+                        await super().send(payload)
+                        client._remember_live_call(f"ctx-{len(self.sent)}")
+
+                ws = _ContinuouslyAddingWebSocket()
+                await client._resume_live_calls(ws)
+
+                self.assertEqual(len(ws.sent), client.call_context_max)
+                client.stop()
+                await asyncio.sleep(0)
+
+        asyncio.run(_run())
+
+    def test_live_call_tracking_is_ttl_and_size_bounded(self):
+        with patch("clients.shared.mep_client.MEPIdentity", return_value=_FakeIdentity()):
+            client = MEPClient("unused.pem")
+            client.call_context_max = 2
+            client.call_context_ttl_seconds = 10
+            client._live_call_contexts.update({"ctx-old", "ctx-mid", "ctx-new"})
+            client._live_call_last_seen.update(
+                {"ctx-old": 1.0, "ctx-mid": 5.0, "ctx-new": 9.0}
+            )
+
+            client._prune_live_calls(now=10.0)
+            self.assertEqual(client._live_call_contexts, {"ctx-mid", "ctx-new"})
+
+            client._prune_live_calls(now=20.0)
+            self.assertEqual(client._live_call_contexts, set())
 
     def test_submit_task_can_send_secret_data_offer(self):
         with (

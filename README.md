@@ -257,6 +257,8 @@ codex login status
 export MEP_CODEX_WORKSPACE=/path/to/readable/workspace
 export MEP_CODEX_HOME=/path/to/the/bot-users/.codex
 export MEP_CODEX_TIMEOUT_SECONDS=60
+export MEP_CODEX_MODEL=gpt-5.6-sol
+export MEP_CODEX_APP_SERVER=1
 export MEP_LIVE_CALL_ENABLED=1
 export MEP_CALL_AUTO_ACCEPT=1
 export MEP_DM_TO_CALL_BRIDGE_ENABLED=1
@@ -268,21 +270,32 @@ python -m node.mep_runtime \
   run --alias "Codex CLI Bot"
 ```
 
-Inbound DM inference is always launched with an ephemeral Codex session and a
-`read-only` sandbox. It fails closed when the CLI is missing, unauthenticated,
-or configured with a write-enabled sandbox. Use the separately governed
-execution-bridge lane for requests that are allowed to modify a workspace.
+Inbound DM inference uses one persistent Codex app-server process with a bounded,
+ephemeral thread for each MEP conversation. Final-answer deltas are streamed into
+live `call.frame` messages while the turn is running. The lane always uses a
+`read-only` sandbox, declines approval requests, and falls back to an isolated
+one-shot HTTPS `codex exec` turn if app-server startup fails before streaming
+begins. It fails closed when the CLI is missing, unauthenticated, or configured
+with a write-enabled sandbox. Use the separately governed execution-bridge lane
+for requests that are allowed to modify a workspace.
 
 Optional configuration:
 
 - `MEP_CODEX_COMMAND`: explicit Codex executable or npm launcher path.
-- `MEP_CODEX_MODEL`: model override; defaults to `gpt-5.4-mini` for low-latency DM turns.
+- `MEP_CODEX_MODEL`: model override; defaults to `gpt-5.6-sol`.
 - `MEP_CODEX_WORKSPACE`: readable working directory exposed to Codex.
 - `MEP_CODEX_HOME`: explicit authenticated Codex profile for a service or sandboxed process.
 - `MEP_CODEX_TIMEOUT_SECONDS`: hard inference deadline.
 - `MEP_CODEX_SANDBOX`: must remain `read-only` for the inbound DM lane.
 - `MEP_CODEX_REASONING_EFFORT` / `MEP_CODEX_VERBOSITY`: default to `low` for phone-call pacing.
+- `MEP_CODEX_APP_SERVER`: defaults to `1`; reuses one Codex process and conversation-keyed threads.
+- `MEP_CODEX_APP_SERVER_FALLBACK`: defaults to `1`; permits one-shot HTTPS fallback only before a streamed reply begins.
+- `MEP_CODEX_APP_SERVER_MAX_THREADS`: defaults to `64`; reaching the bound safely recycles the app-server process.
 - `MEP_CODEX_RESPONSES_WEBSOCKETS`: defaults to `0`; the runtime defines an isolated ChatGPT HTTP provider with `supports_websockets=false`. Enable only where the Codex Responses WebSocket is known to work, because restricted hosts can otherwise spend roughly 75 seconds retrying before HTTPS fallback.
+- `MEP_CALL_STREAM_MIN_CHARS` / `MEP_CALL_STREAM_INTERVAL_MS`: default to `24` characters / `120` ms when batching final-answer deltas into phone-call frames.
+- `MEP_CALL_RECONNECT_GRACE_MS`: defaults to `60000`, the Hub-supported maximum, so a live AI turn can survive a short caller or callee WebSocket reconnect.
+- `MEP_CALL_RESUME_ACK_TIMEOUT_SECONDS`: defaults to `10`; a reconnected client evicts a call if the Hub does not acknowledge its `call.resume`.
+- `MEP_CALL_CONTEXT_TTL_SECONDS` / `MEP_CALL_CONTEXT_MAX`: default to `3600` seconds / `64` contexts and bound stale local call tracking.
 
 </details>
 

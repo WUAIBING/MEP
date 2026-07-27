@@ -1,5 +1,6 @@
 import argparse
 import asyncio
+import copy
 import json
 import os
 import tempfile
@@ -216,6 +217,7 @@ class TestCodexCLIAdapter(unittest.TestCase):
             command="codex",
             workspace=os.getcwd(),
             timeout_seconds=30,
+            use_app_server=False,
         )
         observed = {}
 
@@ -244,7 +246,7 @@ class TestCodexCLIAdapter(unittest.TestCase):
         self.assertIn("--ephemeral", observed["command"])
         self.assertIn("--ignore-user-config", observed["command"])
         self.assertIn("read-only", observed["command"])
-        self.assertIn("gpt-5.4-mini", observed["command"])
+        self.assertIn("gpt-5.6-sol", observed["command"])
         self.assertIn("model_reasoning_effort=low", observed["command"])
         self.assertIn("model_verbosity=low", observed["command"])
         self.assertIn('model_provider="mep_chatgpt_http"', observed["command"])
@@ -267,6 +269,7 @@ class TestCodexCLIAdapter(unittest.TestCase):
             command="codex",
             workspace=os.getcwd(),
             timeout_seconds=1,
+            use_app_server=False,
         )
 
         class _TimedOutCodexProcess:
@@ -287,6 +290,204 @@ class TestCodexCLIAdapter(unittest.TestCase):
 
         self.assertIn("timed out after 1s", reply)
         terminate_mock.assert_called_once()
+
+    def test_app_server_streams_final_deltas_and_records_warm_thread_metrics(self):
+        adapter = mep_runtime.CodexCLIAdapter(command="codex", workspace=os.getcwd())
+        observed = {}
+
+        class _FakeSession:
+            def invoke(self, prompt, task_data, on_delta):
+                observed["prompt"] = prompt
+                observed["task_data"] = task_data
+                on_delta("Codex ")
+                on_delta("streamed answer")
+                return "Codex streamed answer", {
+                    "transport": "app_server",
+                    "thread_reused": True,
+                    "first_delta_seconds": 0.4,
+                    "latency_seconds": 0.8,
+                }
+
+            def close(self):
+                return None
+
+        adapter._app_server_session = _FakeSession()  # type: ignore[assignment]  # noqa: SLF001
+        deltas = []
+        task_data = {
+            "id": "task-live",
+            "consumer_id": "node_peer",
+            "conversation": {"context_id": "ctx-live"},
+            "bounty": 0.0,
+        }
+
+        reply = adapter.generate_reply_stream("Hello", task_data, deltas.append)
+
+        self.assertEqual(reply, "Codex streamed answer")
+        self.assertEqual(deltas, ["Codex ", "streamed answer"])
+        self.assertIn("untrusted conversation input", observed["prompt"])
+        self.assertEqual(observed["task_data"], task_data)
+        self.assertEqual(adapter.last_review_metrics["transport"], "app_server")
+        self.assertTrue(adapter.last_review_metrics["thread_reused"])
+        self.assertEqual(adapter.last_review_metrics["first_delta_seconds"], 0.4)
+
+    def test_app_server_failure_falls_back_to_isolated_https_before_streaming(self):
+        adapter = mep_runtime.CodexCLIAdapter(command="codex", workspace=os.getcwd())
+
+        class _BrokenSession:
+            def invoke(self, _prompt, _task_data, _on_delta):
+                raise mep_runtime._CodexAppServerError("process_exited")  # noqa: SLF001
+
+            def close(self):
+                return None
+
+        adapter._app_server_session = _BrokenSession()  # type: ignore[assignment]  # noqa: SLF001
+        with patch.object(adapter, "_invoke_exec", return_value="HTTPS fallback") as exec_mock:
+            reply = adapter.generate_reply("Hello", {"id": "task-fallback", "bounty": 0.0})
+
+        self.assertEqual(reply, "HTTPS fallback")
+        exec_mock.assert_called_once()
+        self.assertEqual(adapter.last_review_metrics["transport"], "https_fallback")
+        self.assertEqual(adapter.last_review_metrics["app_server_error"], "process_exited")
+
+    def test_app_server_failure_does_not_duplicate_a_partially_streamed_reply(self):
+        adapter = mep_runtime.CodexCLIAdapter(command="codex", workspace=os.getcwd())
+
+        class _InterruptedSession:
+            def invoke(self, _prompt, _task_data, on_delta):
+                on_delta("Partial answer")
+                raise mep_runtime._CodexAppServerError("process_exited")  # noqa: SLF001
+
+            def close(self):
+                return None
+
+        adapter._app_server_session = _InterruptedSession()  # type: ignore[assignment]  # noqa: SLF001
+        with patch.object(adapter, "_invoke_exec") as exec_mock:
+            reply = adapter.generate_reply_stream(
+                "Hello",
+                {"id": "task-interrupted", "bounty": 0.0},
+                lambda _delta: None,
+            )
+
+        self.assertEqual(reply, "[codex-cli] app-server inference failed: process_exited")
+        exec_mock.assert_not_called()
+        self.assertTrue(mep_runtime._is_adapter_error(reply))  # noqa: SLF001
+
+    def test_copied_adapter_shares_app_server_but_not_request_metrics(self):
+        adapter = mep_runtime.CodexCLIAdapter(command="codex", workspace=os.getcwd())
+        adapter.last_review_metrics = {"request": "original"}
+
+        cloned = copy.copy(adapter)
+
+        self.assertIs(cloned._app_server_session, adapter._app_server_session)  # noqa: SLF001
+        self.assertEqual(cloned.last_review_metrics, {})
+        self.assertIsNot(cloned.last_review_metrics, adapter.last_review_metrics)
+
+    def test_app_server_thread_key_reuses_only_the_same_peer_conversation(self):
+        session = mep_runtime._CodexAppServerSession(  # noqa: SLF001
+            command="codex",
+            model="gpt-5.6-sol",
+            workspace=os.getcwd(),
+            env={},
+            timeout_seconds=30,
+            sandbox="read-only",
+            reasoning_effort="low",
+            verbosity="low",
+            use_websockets=False,
+            max_threads=4,
+        )
+        request_result = {"thread": {"id": "thread-1"}}
+        task = {
+            "id": "task-1",
+            "consumer_id": "node_peer",
+            "conversation": {"context_id": "ctx-1"},
+        }
+
+        with patch.object(session, "_request_locked", return_value=request_result) as request_mock:
+            first = session._thread_for_task_locked(task)  # noqa: SLF001
+            second = session._thread_for_task_locked(task)  # noqa: SLF001
+
+        self.assertEqual(first, ("thread-1", False))
+        self.assertEqual(second, ("thread-1", True))
+        request_mock.assert_called_once()
+        params = request_mock.call_args.args[1]
+        self.assertEqual(params["model"], "gpt-5.6-sol")
+        self.assertEqual(params["sandbox"], "read-only")
+        self.assertEqual(params["approvalPolicy"], "never")
+        self.assertTrue(params["ephemeral"])
+
+    def test_app_server_declines_server_initiated_approval_requests(self):
+        session = mep_runtime._CodexAppServerSession(  # noqa: SLF001
+            command="codex",
+            model="gpt-5.6-sol",
+            workspace=os.getcwd(),
+            env={},
+            timeout_seconds=30,
+            sandbox="read-only",
+            reasoning_effort="low",
+            verbosity="low",
+            use_websockets=False,
+            max_threads=4,
+        )
+        sent = []
+
+        with patch.object(session, "_send_locked", side_effect=sent.append):
+            session._respond_to_server_request_locked(  # noqa: SLF001
+                {"id": 91, "method": "item/commandExecution/requestApproval", "params": {}}
+            )
+
+        self.assertEqual(sent, [{"id": 91, "result": {"decision": "decline"}}])
+
+    def test_app_server_broken_pipe_tears_down_process_and_threads(self):
+        session = mep_runtime._CodexAppServerSession(  # noqa: SLF001
+            command="codex",
+            model="gpt-5.6-sol",
+            workspace=os.getcwd(),
+            env={},
+            timeout_seconds=30,
+            sandbox="read-only",
+            reasoning_effort="low",
+            verbosity="low",
+            use_websockets=False,
+            max_threads=4,
+        )
+
+        class _BrokenStdin:
+            def write(self, _payload):
+                raise BrokenPipeError
+
+            def flush(self):
+                return None
+
+            def close(self):
+                return None
+
+        class _BrokenProcess:
+            pid = 42
+            stdin = _BrokenStdin()
+            stdout = None
+            stderr = None
+
+            def poll(self):
+                return None
+
+        process = _BrokenProcess()
+        session._process = process  # type: ignore[assignment]  # noqa: SLF001
+        session._threads["node_peer:ctx-broken"] = "thread-broken"  # noqa: SLF001
+        task_data = {
+            "id": "task-broken",
+            "consumer_id": "node_peer",
+            "conversation": {"context_id": "ctx-broken"},
+        }
+
+        with (
+            patch.object(session, "_terminate_process_tree") as terminate_mock,
+            self.assertRaisesRegex(mep_runtime._CodexAppServerError, "process_write_failed"),  # noqa: SLF001
+        ):
+            session.invoke("Hello", task_data)
+
+        terminate_mock.assert_called_once_with(process)
+        self.assertIsNone(session._process)  # noqa: SLF001
+        self.assertEqual(session._threads, {})  # noqa: SLF001
 
 
 class TestRuntimeUx(unittest.TestCase):
@@ -1838,6 +2039,7 @@ class TestRuntimeWebSocketLoop(unittest.TestCase):
         self.assertEqual(adapter_task_data["payload"], task_data["payload"])
         self.assertEqual(adapter_task_data["task"]["instructions"], "Use only this instruction text.")
         self.assertEqual(adapter_task_data["intent"]["type"], "chat.request")
+        self.assertEqual(adapter_task_data["conversation"]["context_id"], "ctx-1")
         complete_mock.assert_called_once_with("task_interbot", "reply")
 
     def test_process_task_downgrades_plaintext_approval_to_reviewed_bridge_status(self):
@@ -2863,6 +3065,43 @@ class TestRuntimeWebSocketLoop(unittest.TestCase):
 
         self.assertEqual([json.loads(payload)["event"] for payload in node._ws.sent], ["call.accept"])
 
+    def test_runtime_waits_for_websocket_reconnect_before_sending_live_frame(self):
+        node = _runtime_node()
+        node.call_reconnect_grace_ms = 1000
+        node._ws = None
+        reconnected = _FakeWebSocket([])
+
+        async def _run() -> None:
+            send_task = asyncio.create_task(
+                node._send_ws_event(
+                    {"event": "call.frame", "context_id": "ctx-reconnect", "payload": "continued"}
+                )
+            )
+            await asyncio.sleep(0)
+            self.assertFalse(send_task.done())
+            node._ws = reconnected
+            node._ws_ready.set()
+            self.assertTrue(await send_task)
+
+        asyncio.run(_run())
+        self.assertEqual(
+            json.loads(reconnected.sent[0]),
+            {"event": "call.frame", "context_id": "ctx-reconnect", "payload": "continued"},
+        )
+
+    def test_runtime_recovers_pending_tasks_off_the_event_loop(self):
+        node = _runtime_node()
+
+        async def _run() -> None:
+            with (
+                patch.object(node, "_fetch_pending_tasks") as fetch_mock,
+                patch("node.mep_runtime.asyncio.to_thread", new=AsyncMock(return_value=[])) as to_thread_mock,
+            ):
+                await node._recover_pending_tasks()
+            to_thread_mock.assert_awaited_once_with(fetch_mock)
+
+        asyncio.run(_run())
+
     def test_runtime_answers_incoming_live_text_frame_with_ai_off_event_loop(self):
         node = _runtime_node()
         node.live_call_enabled = True
@@ -2916,6 +3155,72 @@ class TestRuntimeWebSocketLoop(unittest.TestCase):
         self.assertNotIn("<think>", frames[3]["payload"])
         self.assertEqual(json.loads(frames[4]["payload"])["event"], "reply.completed")
         self.assertEqual([frames[index]["seq"] for index in (1, 3, 4)], [1, 2, 3])
+
+    def test_runtime_streams_codex_final_answer_deltas_before_generation_completes(self):
+        node = _runtime_node()
+        node.live_call_enabled = True
+        node.call_auto_accept = True
+        node._ws = _FakeWebSocket([])
+        first_delta_emitted = threading.Event()
+        release_generation = threading.Event()
+
+        class _StreamingAdapter:
+            def generate_reply_stream(self, _prompt, _task_data, on_delta):
+                on_delta("Hello ")
+                first_delta_emitted.set()
+                release_generation.wait(timeout=2)
+                on_delta("from Codex")
+                return "Hello from Codex"
+
+        node.adapter = _StreamingAdapter()
+
+        async def _run() -> None:
+            with patch.dict(
+                os.environ,
+                {"MEP_CALL_STREAM_MIN_CHARS": "1", "MEP_CALL_STREAM_INTERVAL_MS": "20"},
+                clear=False,
+            ):
+                await node.handle_ws_event(
+                    {"event": "call.incoming", "context_id": "ctx-stream", "caller": "node_peer"}
+                )
+                await node.handle_ws_event(
+                    {
+                        "event": "call.frame",
+                        "context_id": "ctx-stream",
+                        "sender": "node_peer",
+                        "seq": 1,
+                        "content_type": "text/plain",
+                        "payload": "Say hello",
+                    }
+                )
+                self.assertTrue(await asyncio.to_thread(first_delta_emitted.wait, 2))
+                for _ in range(100):
+                    frames = [json.loads(payload) for payload in node._ws.sent]
+                    if any(frame.get("payload") == "Hello " for frame in frames):
+                        break
+                    await asyncio.sleep(0.01)
+                self.assertTrue(
+                    any(json.loads(payload).get("payload") == "Hello " for payload in node._ws.sent)
+                )
+                self.assertFalse(
+                    any(
+                        json.loads(frame.get("payload", "{}")).get("event") == "reply.completed"
+                        for frame in (json.loads(payload) for payload in node._ws.sent)
+                        if frame.get("content_type") == "application/vnd.mep.call-status+json"
+                    )
+                )
+                release_generation.set()
+                await asyncio.gather(*list(node._background_tasks))
+
+        asyncio.run(_run())
+        frames = [json.loads(payload) for payload in node._ws.sent]
+        text_frames = [
+            frame["payload"]
+            for frame in frames
+            if frame.get("content_type") == "text/plain" and frame.get("event") == "call.frame"
+        ]
+        self.assertEqual("".join(text_frames), "Hello from Codex")
+        self.assertEqual(json.loads(frames[-1]["payload"])["event"], "reply.completed")
 
     def test_runtime_does_not_answer_call_status_frames(self):
         node = _runtime_node()
