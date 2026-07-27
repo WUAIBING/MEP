@@ -1089,6 +1089,80 @@ class TestRuntimeReviewPrompts(unittest.TestCase):
         self.assertIn("always anchor the output to the actual diff", prompt)
         self.assertIn("Review mode is `discovery_review`.", prompt)
 
+    def test_structured_discovery_review_replaces_scratchpad_with_grounded_default(self):
+        scratchpad = "Let me carefully analyze this PR. I need to inspect the actual code changes."
+
+        rendered = mep_runtime._render_structured_review_with_task_data(  # noqa: SLF001
+            scratchpad,
+            max_chars=1200,
+            task_data=self._bridge_review_task_data(),
+        )
+
+        self.assertIn("## Review Summary", rendered)
+        self.assertIn("Touched paths reviewed: `bridge/github_to_mep.py`", rendered)
+        self.assertNotIn("Let me carefully analyze", rendered)
+        self.assertNotIn("I need to inspect", rendered)
+
+    def test_two_pass_approval_review_normalizes_scratchpad_with_runtime_evidence(self):
+        replies = iter(
+            [
+                '{"risk_candidates":[]}',
+                "Let me carefully analyze this PR. I need to inspect the actual code changes.",
+            ]
+        )
+
+        rendered = mep_runtime._run_two_pass_review(  # noqa: SLF001
+            task_data=self._bridge_review_task_data(intent_type="code.review.approve"),
+            payload="Review this PR and approve only if the exact-head evidence is sufficient.",
+            review_max_chars=1400,
+            invoke_model=lambda _system, _payload: next(replies),
+        )
+
+        self.assertIn("## Review Summary", rendered)
+        self.assertIn("Touched paths reviewed: `bridge/github_to_mep.py`", rendered)
+        self.assertIn("Changed identifiers verified:", rendered)
+        self.assertNotIn("Let me carefully analyze", rendered)
+        self.assertNotIn("I need to inspect", rendered)
+
+    def test_two_pass_approval_review_downgrades_scratchpad_when_runtime_evidence_is_weak(self):
+        replies = iter(
+            [
+                '{"risk_candidates":[]}',
+                "Let me carefully analyze this PR. I need to inspect the actual code changes.",
+            ]
+        )
+        task_data = self._bridge_review_task_data(
+            intent_type="code.review.approve",
+            runtime_tool_bundle={
+                "contract_version": "mep.runtime_tools.v1",
+                "task_mode": "review",
+                "runs": [
+                    {
+                        "tool": "workspace_read",
+                        "status": "success",
+                        "summary": "assembled local context",
+                        "evidence": ["bridge/github_to_mep.py"],
+                    }
+                ],
+            },
+        )
+
+        rendered = mep_runtime._run_two_pass_review(  # noqa: SLF001
+            task_data=task_data,
+            payload="Review this PR and approve only if the exact-head evidence is sufficient.",
+            review_max_chars=1400,
+            invoke_model=lambda _system, _payload: next(replies),
+        )
+
+        self.assertIn("did not yet clear the approval bar", rendered)
+        self.assertNotIn("Let me carefully analyze", rendered)
+        action = mep_runtime.RuntimeNode._bridge_status_action(  # noqa: SLF001
+            mep_runtime._interbot_message_from_task_data(task_data),  # noqa: SLF001
+            detail=rendered,
+            task_data=task_data,
+        )
+        self.assertEqual(action, "reviewed")
+
     def test_approval_review_prompt_requires_verified_identifiers_and_test_awareness(self):
         task_data = self._bridge_review_task_data(intent_type="code.review.approve")
         prompt = mep_runtime._system_prompt_for_task(  # noqa: SLF001
@@ -2882,6 +2956,57 @@ class TestRuntimeWebSocketLoop(unittest.TestCase):
             ["github_context", "workspace_read", "workspace_search", "workspace_git", "targeted_verify"],
         )
 
+    def test_process_task_marks_failed_targeted_verification_as_failed_evidence(self):
+        node = _runtime_node()
+        captured = {}
+        with tempfile.TemporaryDirectory() as tmpdir:
+            os.makedirs(os.path.join(tmpdir, "bridge"), exist_ok=True)
+            with open(os.path.join(tmpdir, "bridge", "github_to_mep.py"), "w", encoding="utf-8") as handle:
+                handle.write("def live_sync_context():\n    return True\n")
+
+            task_data = TestRuntimeReviewPrompts._bridge_review_task_data()
+            payload = json.loads(task_data["payload"])
+            payload["task"]["inputs"]["github"].update(
+                {
+                    "repo_clone_url": "https://github.com/example/repo.git",
+                    "head_sha": "abc12345",
+                    "head_ref": "feature/test",
+                }
+            )
+            task_data["payload"] = json.dumps(payload)
+
+            def _reply(_instructions, adapter_task_data):
+                captured.update(adapter_task_data["task"]["inputs"]["runtime_tool_bundle"])
+                return "reply"
+
+            failed_report = (
+                "Automated verification run on the checked-out PR head (authoritative; "
+                "use these results in your review):\n\n"
+                "$ pytest (changed tests): failed (exit 1)\n1 failed"
+            )
+            with (
+                patch.object(
+                    node,
+                    "_build_github_context",
+                    return_value=("GitHub context", {"scope": "WUAIBING/MEP#246"}),
+                ),
+                patch.object(node.workspace, "sync_pr_workspace", return_value=(True, tmpdir)),
+                patch.object(node.workspace, "build_review_context", return_value="Local workspace path: tmpdir"),
+                patch.object(node.workspace, "build_workspace_search_context", return_value="workspace search"),
+                patch.object(node.workspace, "build_workspace_git_context", return_value="workspace git"),
+                patch.object(node.workspace, "build_verification_report", return_value=failed_report),
+                patch.object(node.adapter, "generate_reply", side_effect=_reply),
+                patch.object(node, "complete"),
+            ):
+                asyncio.run(node.process_task(task_data))
+
+        targeted_verify = next(item for item in captured["runs"] if item["tool"] == "targeted_verify")
+        self.assertEqual(targeted_verify["status"], "failed")
+        self.assertIn("failed command", targeted_verify["summary"])
+        self.assertFalse(mep_runtime._runtime_tool_evidence_satisfies_approval(  # noqa: SLF001
+            {"task": {"inputs": {"runtime_tool_bundle": captured}}}
+        ))
+
     def test_process_task_reports_tools_called_from_runtime_tool_runs(self):
         node = _runtime_node()
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -4017,7 +4142,10 @@ class TestProviderNormalization(unittest.TestCase):
 class TestWorkspaceReviewContext(unittest.TestCase):
     def test_exact_clean_workspace_requires_matching_remote_head_and_clean_status(self):
         with tempfile.TemporaryDirectory() as tmp:
-            os.makedirs(os.path.join(tmp, ".git"))
+            # Linked Git worktrees (including Codex worktrees) use a .git file
+            # pointing at the primary repository rather than a .git directory.
+            with open(os.path.join(tmp, ".git"), "w", encoding="utf-8") as handle:
+                handle.write("gitdir: C:/repo/.git/worktrees/review\n")
             wm = mep_runtime.WorkspaceManager(os.path.join(tmp, "managed"))
             head = "a" * 40
             with patch.object(
@@ -4914,16 +5042,20 @@ class TestWorkspaceReviewContext(unittest.TestCase):
         self.assertIn('"candidate_coverage"', second_user_payload)
 
     def test_clean_check_env_uses_allowlist_and_throwaway_home(self):
-        with patch.dict(
-            os.environ,
-            {
-                "MEP_REVIEW_RUN_CHECKS": "true",
-                "MEP_AI_MAX_TOKENS": "4000",
-                "DEEPSEEK_API_KEY": "super-secret",
-                "R2_SECRET_ACCESS_KEY": "hidden",
-                "PATH": os.environ.get("PATH", ""),
-                "PYTHONPATH": "repo",
-            },
+        with (
+            patch.dict(
+                os.environ,
+                {
+                    "MEP_REVIEW_RUN_CHECKS": "true",
+                    "MEP_AI_MAX_TOKENS": "4000",
+                    "DEEPSEEK_API_KEY": "super-secret",
+                    "R2_SECRET_ACCESS_KEY": "hidden",
+                    "PATH": os.environ.get("PATH", ""),
+                    "PYTHONPATH": "repo",
+                },
+            ),
+            patch("site.getuserbase", return_value="C:/user/python"),
+            patch("os.path.isdir", return_value=True),
         ):
             env = mep_runtime.WorkspaceManager._clean_check_env("C:/tmp/mep-review-home")  # noqa: SLF001
         self.assertNotIn("MEP_REVIEW_RUN_CHECKS", env)
@@ -4934,6 +5066,7 @@ class TestWorkspaceReviewContext(unittest.TestCase):
         self.assertEqual(env["HOME"], "C:/tmp/mep-review-home")
         self.assertEqual(env["USERPROFILE"], "C:/tmp/mep-review-home")
         self.assertEqual(env["PYTHONPATH"], "repo")
+        self.assertEqual(env["PYTHONUSERBASE"], "C:/user/python")
 
     def test_build_verification_report_runs_pytest_when_enabled(self):
         with tempfile.TemporaryDirectory() as tmp:

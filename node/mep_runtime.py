@@ -118,6 +118,17 @@ def _review_allow_external_checks() -> bool:
     return _env_truthy("MEP_REVIEW_ALLOW_EXTERNAL_CHECKS", "0")
 
 
+def _verification_report_has_failures(report: str) -> bool:
+    """Return whether an allowlisted verification command failed.
+
+    The report is also prompt context, but its presence alone must not count as
+    successful approval evidence. Keep this parser tied to the status labels
+    emitted by ``build_verification_report`` so failed commands stay
+    fail-closed in the runtime tool bundle.
+    """
+    return bool(re.search(r"^\$ .+: failed \(exit -?\d+\)", str(report or ""), re.MULTILINE))
+
+
 def _is_adapter_error(text: str) -> bool:
     """Detect adapter failures that must never be published as a real review.
 
@@ -1087,6 +1098,13 @@ def _runtime_tool_successful_runs(task_data: Optional[dict[str, Any]]) -> list[d
 
 
 def _runtime_tool_evidence_satisfies_approval(task_data: Optional[dict[str, Any]]) -> bool:
+    runs = _runtime_tool_run_entries(task_data)
+    if any(
+        str(item.get("tool") or "").strip().lower() == "targeted_verify"
+        and str(item.get("status") or "").strip().lower() == "failed"
+        for item in runs
+    ):
+        return False
     successful_runs = _runtime_tool_successful_runs(task_data)
     successful_tools = {
         str(item.get("tool") or "").strip().lower()
@@ -1817,6 +1835,19 @@ def _run_two_pass_review(
     rendered = _render_structured_review_with_task_data(final_reply, max_chars=review_max_chars, task_data=task_data)
     if rendered:
         return rendered
+    if _task_is_approval_review(task_data) and not _is_adapter_error(final_reply):
+        # Approval reviews intentionally reject unstructured model output. Do
+        # not undo that fail-closed boundary by publishing the raw response.
+        # Re-render an empty structured packet so authoritative runtime tool
+        # evidence can produce a grounded deterministic decision, while weak
+        # evidence remains an explicit non-approval comment.
+        grounded = _render_structured_review_with_task_data(
+            "{}",
+            max_chars=review_max_chars,
+            task_data=task_data,
+        )
+        if grounded:
+            return grounded
     finalized = _finalize_model_reply(final_reply, max_chars=review_max_chars)
     if finalized:
         return finalized
@@ -3411,8 +3442,16 @@ def _render_structured_review_with_task_data(
 ) -> str:
     if _task_requires_repo_audit_prompt(task_data or {}):
         return _render_structured_repo_audit_with_task_data(text, max_chars=max_chars, task_data=task_data)
-    parsed = _extract_first_json_object(text)
     approval_mode = _task_is_approval_review(task_data or {})
+    if _looks_like_agent_scratchpad(text):
+        # Treat leaked planning/reasoning as absent model output. Discovery
+        # reviews can still use the deterministic, task-grounded renderer;
+        # approval reviews fail closed here and are normalized by the
+        # two-pass caller using the runtime evidence bundle.
+        if approval_mode:
+            return ""
+        return _render_default_structured_review(task_data=task_data, max_chars=max_chars)
+    parsed = _extract_first_json_object(text)
     if not isinstance(parsed, dict):
         if _is_adapter_error(text) or approval_mode:
             return ""
@@ -4726,7 +4765,14 @@ class WorkspaceManager:
         self.base_dir = os.path.abspath(base_dir)
         os.makedirs(self.base_dir, exist_ok=True)
 
-    def _run_git(self, cwd: str, args: list[str], *, timeout_seconds: int = 60) -> tuple[int, str]:
+    def _run_git(
+        self,
+        cwd: str,
+        args: list[str],
+        *,
+        timeout_seconds: int = 60,
+        include_stderr: bool = True,
+    ) -> tuple[int, str]:
         try:
             # Sanitize environment for git subprocesses to prevent
             # hostile repo hooks/config from leaking secrets or executing
@@ -4753,7 +4799,8 @@ class WorkspaceManager:
                 timeout=timeout_seconds,
                 env=safe_env,
             )
-            return result.returncode, (result.stdout + result.stderr).strip()
+            output = result.stdout + result.stderr if include_stderr else result.stdout
+            return result.returncode, output.strip()
         except Exception as exc:  # noqa: BLE001
             return -1, str(exc)
 
@@ -4792,13 +4839,21 @@ class WorkspaceManager:
             not candidate
             or not expected_repo
             or not re.fullmatch(r"[0-9a-f]{40}", expected_head)
-            or not os.path.isdir(os.path.join(candidate, ".git"))
+            or not os.path.exists(os.path.join(candidate, ".git"))
         ):
             return False
-        head_code, actual_head = self._run_git(candidate, ["rev-parse", "HEAD"])
+        head_code, actual_head = self._run_git(
+            candidate,
+            ["rev-parse", "HEAD"],
+            include_stderr=False,
+        )
         if head_code != 0 or actual_head.strip().lower() != expected_head:
             return False
-        remote_code, actual_remote = self._run_git(candidate, ["remote", "get-url", "origin"])
+        remote_code, actual_remote = self._run_git(
+            candidate,
+            ["remote", "get-url", "origin"],
+            include_stderr=False,
+        )
         if (
             remote_code != 0
             or self._canonical_repo_identity(actual_remote) != expected_repo
@@ -4807,6 +4862,7 @@ class WorkspaceManager:
         status_code, status = self._run_git(
             candidate,
             ["status", "--porcelain", "--untracked-files=all"],
+            include_stderr=False,
         )
         return status_code == 0 and not status.strip()
 
@@ -5477,6 +5533,21 @@ class WorkspaceManager:
             "VIRTUAL_ENV",
         }
         env = {key: value for key, value in os.environ.items() if key in allowed_passthrough and value}
+        # HOME/USERPROFILE are intentionally replaced below, which also hides
+        # Python's per-user site-packages directory on Windows. Preserve the
+        # original Python user base so allowlisted tools such as
+        # ``python -m pytest`` remain available at normal site-package
+        # precedence. Using PYTHONPATH here would put user packages before the
+        # standard library and can let stale backports (for example typing.py)
+        # shadow the interpreter's own modules.
+        import site
+
+        try:
+            user_base = str(site.getuserbase() or "").strip()
+        except (AttributeError, OSError):
+            user_base = ""
+        if user_base and os.path.isdir(user_base):
+            env["PYTHONUSERBASE"] = user_base
         env["HOME"] = temp_home
         env["USERPROFILE"] = temp_home
         env["TMPDIR"] = temp_home
@@ -7182,11 +7253,16 @@ class RuntimeNode:
                         )
                         if verification_report:
                             instructions = f"{instructions}\n\n{verification_report}"
+                            verification_failed = _verification_report_has_failures(verification_report)
                             _record_runtime_tool_run(
                                 "targeted_verify",
                                 purpose="Run allowlisted verification against the checked-out PR head",
-                                status="success",
-                                summary="ran targeted verification on the synced PR workspace",
+                                status="failed" if verification_failed else "success",
+                                summary=(
+                                    "targeted verification reported a failed command on the synced PR workspace"
+                                    if verification_failed
+                                    else "ran targeted verification on the synced PR workspace"
+                                ),
                                 scope="pr_review",
                                 evidence=[str(path) for path in touched_tests[:2] or touched_paths[:2]],
                             )
