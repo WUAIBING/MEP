@@ -47,6 +47,7 @@ class MEPClient:
         self._stop = asyncio.Event()
         self._active_ws = None
         self._heartbeat_task: asyncio.Task | None = None
+        self._live_call_contexts: set[str] = set()
         manifest = load_manifest()
         self._manifest = manifest
         self.hub_url = (
@@ -1386,9 +1387,20 @@ class MEPClient:
                     if self.heartbeat_seconds > 0:
                         heartbeat_task = asyncio.create_task(self._heartbeat_loop(ws))
                     try:
+                        for context_id in tuple(self._live_call_contexts):
+                            await ws.send(json.dumps({"event": "call.resume", "context_id": context_id}))
                         while not self._stop.is_set():
                             msg = await ws.recv()
                             data = json.loads(msg)
+                            event = data.get("event")
+                            context_id = data.get("context_id")
+                            if event == "call.ping" and isinstance(context_id, str) and context_id:
+                                await ws.send(json.dumps({"event": "call.pong", "context_id": context_id}))
+                            elif event == "call.accepted" and isinstance(context_id, str) and context_id:
+                                self._live_call_contexts.add(context_id)
+                            elif event in {"call.hangup", "call.declined", "call.timeout", "call.rejected", "call.cancelled"}:
+                                if isinstance(context_id, str):
+                                    self._live_call_contexts.discard(context_id)
                             if data.get("event") == "task_result":
                                 task_data = data.get("data", {})
                                 if isinstance(task_data, dict) and isinstance(task_data.get("result_payload"), str):
@@ -1409,6 +1421,12 @@ class MEPClient:
         if self._active_ws is None:
             return False
         await self._active_ws.send(json.dumps(payload))
+        event = payload.get("event")
+        context_id = payload.get("context_id")
+        if event == "call.accept" and isinstance(context_id, str) and context_id:
+            self._live_call_contexts.add(context_id)
+        elif event in {"call.hangup", "call.decline", "call.cancel"} and isinstance(context_id, str):
+            self._live_call_contexts.discard(context_id)
         return True
 
     async def _heartbeat_loop(self, ws) -> None:
