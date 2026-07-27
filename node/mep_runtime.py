@@ -4757,6 +4757,59 @@ class WorkspaceManager:
         except Exception as exc:  # noqa: BLE001
             return -1, str(exc)
 
+    @staticmethod
+    def _canonical_repo_identity(repo_url: str) -> str:
+        """Normalize common Git remote spellings for exact-workspace matching."""
+        normalized = str(repo_url or "").strip().replace("\\", "/").rstrip("/")
+        if not normalized:
+            return ""
+        normalized = re.sub(r"^[a-z][a-z0-9+.-]*://", "", normalized, flags=re.IGNORECASE)
+        normalized = re.sub(r"^[^/@]+@", "", normalized)
+        if ":" in normalized and "/" not in normalized.split(":", 1)[0]:
+            normalized = normalized.replace(":", "/", 1)
+        normalized = normalized.removeprefix("www.")
+        if normalized.lower().endswith(".git"):
+            normalized = normalized[:-4]
+        return normalized.rstrip("/").lower()
+
+    def is_exact_clean_workspace(
+        self,
+        workspace_path: str,
+        repo_url: str,
+        head_sha: str,
+    ) -> bool:
+        """Return true only for a clean local checkout of the requested repo/head.
+
+        Codex-style nodes commonly already run inside the repository being
+        reviewed. Reusing that checkout avoids a redundant network clone, but
+        only when the remote identity, full commit SHA, and worktree cleanliness
+        all match the signed task contract.
+        """
+        candidate = os.path.abspath(str(workspace_path or "").strip())
+        expected_repo = self._canonical_repo_identity(repo_url)
+        expected_head = str(head_sha or "").strip().lower()
+        if (
+            not candidate
+            or not expected_repo
+            or not re.fullmatch(r"[0-9a-f]{40}", expected_head)
+            or not os.path.isdir(os.path.join(candidate, ".git"))
+        ):
+            return False
+        head_code, actual_head = self._run_git(candidate, ["rev-parse", "HEAD"])
+        if head_code != 0 or actual_head.strip().lower() != expected_head:
+            return False
+        remote_code, actual_remote = self._run_git(candidate, ["remote", "get-url", "origin"])
+        if (
+            remote_code != 0
+            or self._canonical_repo_identity(actual_remote) != expected_repo
+        ):
+            return False
+        status_code, status = self._run_git(
+            candidate,
+            ["status", "--porcelain", "--untracked-files=all"],
+        )
+        return status_code == 0 and not status.strip()
+
     def sync_pr_workspace(self, repo_url: str, head_sha: str, head_ref: str, bridge_id: Optional[str] = None) -> tuple[bool, str]:
         """Ensures the local workspace is synced to the target PR branch/commit."""
         # Phase 4 Isolation: Use a specific directory for this bridge_id if provided
@@ -7021,8 +7074,31 @@ class RuntimeNode:
             bridge_id = interbot_message.get("trace_id") or interbot_message.get("task", {}).get("inputs", {}).get("bridge_metadata", {}).get("bridge_id")
 
             if repo_url and head_sha and head_ref:
-                print(f"[mep workspace] auto-syncing for task={task_id[:8]} bridge_id={bridge_id}")
-                ok, path_or_err = await asyncio.to_thread(self.workspace.sync_pr_workspace, repo_url, head_sha, head_ref, bridge_id=bridge_id)
+                local_workspace = str(getattr(self.adapter, "workspace", "") or "").strip()
+                reuse_local = bool(
+                    local_workspace
+                    and await asyncio.to_thread(
+                        self.workspace.is_exact_clean_workspace,
+                        local_workspace,
+                        repo_url,
+                        head_sha,
+                    )
+                )
+                if reuse_local:
+                    ok, path_or_err = True, os.path.abspath(local_workspace)
+                    print(
+                        f"[mep workspace] reusing exact clean adapter workspace "
+                        f"for task={task_id[:8]} path={path_or_err}"
+                    )
+                else:
+                    print(f"[mep workspace] auto-syncing for task={task_id[:8]} bridge_id={bridge_id}")
+                    ok, path_or_err = await asyncio.to_thread(
+                        self.workspace.sync_pr_workspace,
+                        repo_url,
+                        head_sha,
+                        head_ref,
+                        bridge_id=bridge_id,
+                    )
                 if ok:
                     print(f"[mep workspace] synced to {path_or_err}")
                     workspace_path = path_or_err

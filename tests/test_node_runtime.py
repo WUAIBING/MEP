@@ -2584,6 +2584,46 @@ class TestRuntimeWebSocketLoop(unittest.TestCase):
         )
         complete_mock.assert_called_once_with("task_bridge_review", "reply")
 
+    def test_process_task_reuses_exact_clean_adapter_workspace_before_network_sync(self):
+        node = _runtime_node()
+        task_data = TestRuntimeReviewPrompts._bridge_review_task_data()
+        payload = json.loads(task_data["payload"])
+        payload["task"]["inputs"]["github"].update(
+            {
+                "repo_clone_url": "https://github.com/WUAIBING/MEP.git",
+                "head_sha": "a" * 40,
+                "head_ref": "feature/test",
+            }
+        )
+        task_data["payload"] = json.dumps(payload)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            os.makedirs(os.path.join(tmpdir, "bridge"), exist_ok=True)
+            os.makedirs(os.path.join(tmpdir, "tests"), exist_ok=True)
+            with open(os.path.join(tmpdir, "bridge", "github_to_mep.py"), "w", encoding="utf-8") as handle:
+                handle.write("def local_exact_head():\n    return True\n")
+            with open(os.path.join(tmpdir, "tests", "test_github_bridge.py"), "w", encoding="utf-8") as handle:
+                handle.write("def test_local_exact_head():\n    assert True\n")
+            node.adapter.workspace = tmpdir
+            with (
+                patch.object(node.workspace, "is_exact_clean_workspace", return_value=True) as exact_mock,
+                patch.object(node.workspace, "sync_pr_workspace") as sync_mock,
+                patch.object(node.adapter, "generate_reply", return_value="reply") as adapter_mock,
+                patch.object(node, "complete"),
+            ):
+                asyncio.run(node.process_task(task_data))
+
+        exact_mock.assert_called_once_with(
+            tmpdir,
+            "https://github.com/WUAIBING/MEP.git",
+            "a" * 40,
+        )
+        sync_mock.assert_not_called()
+        _instructions, normalized_task = adapter_mock.call_args.args
+        self.assertEqual(
+            normalized_task["task"]["inputs"]["github"]["local_workspace_path"],
+            os.path.abspath(tmpdir),
+        )
+
     def test_process_task_appends_synced_repo_audit_context_and_inventory(self):
         node = _runtime_node()
         task_data = {
@@ -3975,6 +4015,66 @@ class TestProviderNormalization(unittest.TestCase):
 
 
 class TestWorkspaceReviewContext(unittest.TestCase):
+    def test_exact_clean_workspace_requires_matching_remote_head_and_clean_status(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            os.makedirs(os.path.join(tmp, ".git"))
+            wm = mep_runtime.WorkspaceManager(os.path.join(tmp, "managed"))
+            head = "a" * 40
+            with patch.object(
+                wm,
+                "_run_git",
+                side_effect=[
+                    (0, head),
+                    (0, "git@github.com:WUAIBING/MEP.git"),
+                    (0, ""),
+                ],
+            ) as git_mock:
+                matched = wm.is_exact_clean_workspace(
+                    tmp,
+                    "https://github.com/WUAIBING/MEP.git",
+                    head,
+                )
+
+        self.assertTrue(matched)
+        self.assertEqual(
+            [call.args[1] for call in git_mock.call_args_list],
+            [
+                ["rev-parse", "HEAD"],
+                ["remote", "get-url", "origin"],
+                ["status", "--porcelain", "--untracked-files=all"],
+            ],
+        )
+
+    def test_exact_clean_workspace_rejects_dirty_or_wrong_head_checkout(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            os.makedirs(os.path.join(tmp, ".git"))
+            wm = mep_runtime.WorkspaceManager(os.path.join(tmp, "managed"))
+            head = "b" * 40
+            with patch.object(wm, "_run_git", return_value=(0, "c" * 40)):
+                self.assertFalse(
+                    wm.is_exact_clean_workspace(
+                        tmp,
+                        "https://github.com/WUAIBING/MEP.git",
+                        head,
+                    )
+                )
+            with patch.object(
+                wm,
+                "_run_git",
+                side_effect=[
+                    (0, head),
+                    (0, "https://github.com/WUAIBING/MEP"),
+                    (0, " M node/mep_runtime.py"),
+                ],
+            ):
+                self.assertFalse(
+                    wm.is_exact_clean_workspace(
+                        tmp,
+                        "https://github.com/WUAIBING/MEP.git",
+                        head,
+                    )
+                )
+
     def test_build_review_context_includes_full_file_contents(self):
         with tempfile.TemporaryDirectory() as tmp:
             os.makedirs(os.path.join(tmp, "bridge"), exist_ok=True)
