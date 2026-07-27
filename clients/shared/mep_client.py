@@ -48,6 +48,12 @@ class MEPClient:
         self._active_ws = None
         self._heartbeat_task: asyncio.Task | None = None
         self._live_call_contexts: set[str] = set()
+        self._live_call_last_seen: dict[str, float] = {}
+        self._call_resume_pending: dict[str, float] = {}
+        self._call_resume_tasks: set[asyncio.Task] = set()
+        self.call_context_ttl_seconds = self._positive_env_int("MEP_CALL_CONTEXT_TTL_SECONDS", 3600)
+        self.call_context_max = self._positive_env_int("MEP_CALL_CONTEXT_MAX", 64)
+        self.call_resume_ack_timeout_seconds = self._positive_env_int("MEP_CALL_RESUME_ACK_TIMEOUT_SECONDS", 10)
         manifest = load_manifest()
         self._manifest = manifest
         self.hub_url = (
@@ -79,6 +85,56 @@ class MEPClient:
         )
         if self.privacy_mode not in VALID_PRIVACY_MODES:
             self.privacy_mode = PRIVACY_MODE_PREFER_ENCRYPTED
+
+    @staticmethod
+    def _positive_env_int(name: str, default: int) -> int:
+        try:
+            value = int(os.getenv(name, str(default)))
+        except ValueError:
+            return default
+        return value if value > 0 else default
+
+    def _forget_live_call(self, context_id: str) -> None:
+        self._live_call_contexts.discard(context_id)
+        self._live_call_last_seen.pop(context_id, None)
+        self._call_resume_pending.pop(context_id, None)
+
+    def _prune_live_calls(self, now: Optional[float] = None) -> None:
+        observed_at = time.monotonic() if now is None else now
+        expired = [
+            context_id
+            for context_id, last_seen in self._live_call_last_seen.items()
+            if observed_at - last_seen > self.call_context_ttl_seconds
+        ]
+        for context_id in expired:
+            self._forget_live_call(context_id)
+        while len(self._live_call_contexts) > self.call_context_max:
+            oldest = min(
+                self._live_call_contexts,
+                key=lambda context_id: self._live_call_last_seen.get(context_id, 0.0),
+            )
+            self._forget_live_call(oldest)
+
+    def _remember_live_call(self, context_id: str) -> None:
+        self._live_call_contexts.add(context_id)
+        self._live_call_last_seen[context_id] = time.monotonic()
+        self._call_resume_pending.pop(context_id, None)
+        self._prune_live_calls()
+
+    async def _expire_unacknowledged_resume(self, context_id: str, marker: float) -> None:
+        await asyncio.sleep(self.call_resume_ack_timeout_seconds)
+        if self._call_resume_pending.get(context_id) == marker:
+            self._forget_live_call(context_id)
+
+    async def _resume_live_calls(self, ws) -> None:
+        self._prune_live_calls()
+        for context_id in tuple(self._live_call_contexts):
+            await ws.send(json.dumps({"event": "call.resume", "context_id": context_id}))
+            marker = time.monotonic()
+            self._call_resume_pending[context_id] = marker
+            task = asyncio.create_task(self._expire_unacknowledged_resume(context_id, marker))
+            self._call_resume_tasks.add(task)
+            task.add_done_callback(self._call_resume_tasks.discard)
 
     async def register(self) -> dict:
         body = {
@@ -1387,8 +1443,7 @@ class MEPClient:
                     if self.heartbeat_seconds > 0:
                         heartbeat_task = asyncio.create_task(self._heartbeat_loop(ws))
                     try:
-                        for context_id in tuple(self._live_call_contexts):
-                            await ws.send(json.dumps({"event": "call.resume", "context_id": context_id}))
+                        await self._resume_live_calls(ws)
                         while not self._stop.is_set():
                             msg = await ws.recv()
                             data = json.loads(msg)
@@ -1396,11 +1451,26 @@ class MEPClient:
                             context_id = data.get("context_id")
                             if event == "call.ping" and isinstance(context_id, str) and context_id:
                                 await ws.send(json.dumps({"event": "call.pong", "context_id": context_id}))
-                            elif event == "call.accepted" and isinstance(context_id, str) and context_id:
-                                self._live_call_contexts.add(context_id)
-                            elif event in {"call.hangup", "call.declined", "call.timeout", "call.rejected", "call.cancelled"}:
+                                self._remember_live_call(context_id)
+                            elif event in {
+                                "call.accepted",
+                                "call.resumed",
+                                "call.frame",
+                                "call.suspended",
+                            } and isinstance(context_id, str) and context_id:
+                                self._remember_live_call(context_id)
+                            elif event in {
+                                "call.hangup",
+                                "call.declined",
+                                "call.timeout",
+                                "call.rejected",
+                                "call.cancelled",
+                                "call.completed",
+                                "call.ended",
+                                "call.failed",
+                            }:
                                 if isinstance(context_id, str):
-                                    self._live_call_contexts.discard(context_id)
+                                    self._forget_live_call(context_id)
                             if data.get("event") == "task_result":
                                 task_data = data.get("data", {})
                                 if isinstance(task_data, dict) and isinstance(task_data.get("result_payload"), str):
@@ -1424,9 +1494,16 @@ class MEPClient:
         event = payload.get("event")
         context_id = payload.get("context_id")
         if event == "call.accept" and isinstance(context_id, str) and context_id:
-            self._live_call_contexts.add(context_id)
-        elif event in {"call.hangup", "call.decline", "call.cancel"} and isinstance(context_id, str):
-            self._live_call_contexts.discard(context_id)
+            self._remember_live_call(context_id)
+        elif event in {
+            "call.hangup",
+            "call.decline",
+            "call.cancel",
+            "call.completed",
+            "call.ended",
+            "call.failed",
+        } and isinstance(context_id, str):
+            self._forget_live_call(context_id)
         return True
 
     async def _heartbeat_loop(self, ws) -> None:
@@ -1438,6 +1515,8 @@ class MEPClient:
         self._stop.set()
         if self._heartbeat_task and not self._heartbeat_task.done():
             self._heartbeat_task.cancel()
+        for task in tuple(self._call_resume_tasks):
+            task.cancel()
 
     def get_privacy_registry_metadata(self) -> dict:
         return {

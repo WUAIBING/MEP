@@ -437,6 +437,58 @@ class TestCodexCLIAdapter(unittest.TestCase):
 
         self.assertEqual(sent, [{"id": 91, "result": {"decision": "decline"}}])
 
+    def test_app_server_broken_pipe_tears_down_process_and_threads(self):
+        session = mep_runtime._CodexAppServerSession(  # noqa: SLF001
+            command="codex",
+            model="gpt-5.6-sol",
+            workspace=os.getcwd(),
+            env={},
+            timeout_seconds=30,
+            sandbox="read-only",
+            reasoning_effort="low",
+            verbosity="low",
+            use_websockets=False,
+            max_threads=4,
+        )
+
+        class _BrokenStdin:
+            def write(self, _payload):
+                raise BrokenPipeError
+
+            def flush(self):
+                return None
+
+            def close(self):
+                return None
+
+        class _BrokenProcess:
+            pid = 42
+            stdin = _BrokenStdin()
+            stdout = None
+            stderr = None
+
+            def poll(self):
+                return None
+
+        process = _BrokenProcess()
+        session._process = process  # type: ignore[assignment]  # noqa: SLF001
+        session._threads["node_peer:ctx-broken"] = "thread-broken"  # noqa: SLF001
+        task_data = {
+            "id": "task-broken",
+            "consumer_id": "node_peer",
+            "conversation": {"context_id": "ctx-broken"},
+        }
+
+        with (
+            patch.object(session, "_terminate_process_tree") as terminate_mock,
+            self.assertRaisesRegex(mep_runtime._CodexAppServerError, "process_write_failed"),  # noqa: SLF001
+        ):
+            session.invoke("Hello", task_data)
+
+        terminate_mock.assert_called_once_with(process)
+        self.assertIsNone(session._process)  # noqa: SLF001
+        self.assertEqual(session._threads, {})  # noqa: SLF001
+
 
 class TestRuntimeUx(unittest.TestCase):
     def test_status_badges_do_not_mark_heartbeat_or_ai_ready_for_mock_offline_node(self):

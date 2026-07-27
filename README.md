@@ -294,6 +294,8 @@ Optional configuration:
 - `MEP_CODEX_RESPONSES_WEBSOCKETS`: defaults to `0`; the runtime defines an isolated ChatGPT HTTP provider with `supports_websockets=false`. Enable only where the Codex Responses WebSocket is known to work, because restricted hosts can otherwise spend roughly 75 seconds retrying before HTTPS fallback.
 - `MEP_CALL_STREAM_MIN_CHARS` / `MEP_CALL_STREAM_INTERVAL_MS`: default to `24` characters / `120` ms when batching final-answer deltas into phone-call frames.
 - `MEP_CALL_RECONNECT_GRACE_MS`: defaults to `60000`, the Hub-supported maximum, so a live AI turn can survive a short caller or callee WebSocket reconnect.
+- `MEP_CALL_RESUME_ACK_TIMEOUT_SECONDS`: defaults to `10`; a reconnected client evicts a call if the Hub does not acknowledge its `call.resume`.
+- `MEP_CALL_CONTEXT_TTL_SECONDS` / `MEP_CALL_CONTEXT_MAX`: default to `3600` seconds / `64` contexts and bound stale local call tracking.
 
 </details>
 

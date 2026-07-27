@@ -163,6 +163,76 @@ class TestSharedMEPClient(unittest.TestCase):
             {"event": "call.resume", "context_id": "ctx-resume"},
         )
 
+    def test_listener_reconnect_cycle_resumes_only_the_active_call(self):
+        first_ws = _ScriptedWebSocket(
+            [{"event": "call.accepted", "context_id": "ctx-cycle"}]
+        )
+        second_ws = _ScriptedWebSocket(
+            [{"event": "call.resumed", "context_id": "ctx-cycle"}]
+        )
+        observed = []
+
+        async def _run():
+            with (
+                patch("clients.shared.mep_client.MEPIdentity", return_value=_FakeIdentity()),
+                patch(
+                    "clients.shared.mep_client.ws_connect",
+                    side_effect=[first_ws, second_ws],
+                ),
+            ):
+                client = MEPClient("unused.pem")
+                client.heartbeat_seconds = 0
+
+                async def on_result(_data):
+                    return None
+
+                async def on_event(data):
+                    observed.append(data["event"])
+                    if data["event"] == "call.resumed":
+                        client.stop()
+
+                await client.listen_results(on_result, on_event)
+                self.assertEqual(client._live_call_contexts, {"ctx-cycle"})
+
+        asyncio.run(_run())
+        self.assertEqual(observed, ["call.accepted", "call.resumed"])
+        self.assertEqual(
+            json.loads(second_ws.sent[0]),
+            {"event": "call.resume", "context_id": "ctx-cycle"},
+        )
+
+    def test_unacknowledged_resume_is_evicted(self):
+        async def _run():
+            with patch("clients.shared.mep_client.MEPIdentity", return_value=_FakeIdentity()):
+                client = MEPClient("unused.pem")
+                client.call_resume_ack_timeout_seconds = 0.01
+                client._remember_live_call("ctx-stale")
+                ws = _FakeWebSocket()
+
+                await client._resume_live_calls(ws)
+                await asyncio.sleep(0.03)
+
+                self.assertEqual(client._live_call_contexts, set())
+                self.assertEqual(client._call_resume_pending, {})
+
+        asyncio.run(_run())
+
+    def test_live_call_tracking_is_ttl_and_size_bounded(self):
+        with patch("clients.shared.mep_client.MEPIdentity", return_value=_FakeIdentity()):
+            client = MEPClient("unused.pem")
+            client.call_context_max = 2
+            client.call_context_ttl_seconds = 10
+            client._live_call_contexts.update({"ctx-old", "ctx-mid", "ctx-new"})
+            client._live_call_last_seen.update(
+                {"ctx-old": 1.0, "ctx-mid": 5.0, "ctx-new": 9.0}
+            )
+
+            client._prune_live_calls(now=10.0)
+            self.assertEqual(client._live_call_contexts, {"ctx-mid", "ctx-new"})
+
+            client._prune_live_calls(now=20.0)
+            self.assertEqual(client._live_call_contexts, set())
+
     def test_submit_task_can_send_secret_data_offer(self):
         with (
             patch("clients.shared.mep_client.MEPIdentity", return_value=_FakeIdentity()),
