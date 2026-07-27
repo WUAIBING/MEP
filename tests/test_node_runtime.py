@@ -5054,8 +5054,7 @@ class TestWorkspaceReviewContext(unittest.TestCase):
                     "PYTHONPATH": "repo",
                 },
             ),
-            patch("site.getsitepackages", return_value=["C:/python/site-packages"]),
-            patch("site.getusersitepackages", return_value="C:/user/site-packages"),
+            patch("site.getuserbase", return_value="C:/user/python"),
             patch("os.path.isdir", return_value=True),
         ):
             env = mep_runtime.WorkspaceManager._clean_check_env("C:/tmp/mep-review-home")  # noqa: SLF001
@@ -5066,10 +5065,8 @@ class TestWorkspaceReviewContext(unittest.TestCase):
         self.assertIn("PATH", env)
         self.assertEqual(env["HOME"], "C:/tmp/mep-review-home")
         self.assertEqual(env["USERPROFILE"], "C:/tmp/mep-review-home")
-        self.assertEqual(
-            env["PYTHONPATH"].split(os.pathsep),
-            ["repo", "C:/python/site-packages", "C:/user/site-packages"],
-        )
+        self.assertEqual(env["PYTHONPATH"], "repo")
+        self.assertEqual(env["PYTHONUSERBASE"], "C:/user/python")
 
     def test_build_verification_report_runs_pytest_when_enabled(self):
         with tempfile.TemporaryDirectory() as tmp:

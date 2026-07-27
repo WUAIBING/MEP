@@ -5534,23 +5534,20 @@ class WorkspaceManager:
         }
         env = {key: value for key, value in os.environ.items() if key in allowed_passthrough and value}
         # HOME/USERPROFILE are intentionally replaced below, which also hides
-        # Python's per-user site-packages directory on Windows. Preserve only
-        # the already-installed package search roots so allowlisted tools such
-        # as ``python -m pytest`` remain available without forwarding provider
-        # credentials or other deployment environment variables.
+        # Python's per-user site-packages directory on Windows. Preserve the
+        # original Python user base so allowlisted tools such as
+        # ``python -m pytest`` remain available at normal site-package
+        # precedence. Using PYTHONPATH here would put user packages before the
+        # standard library and can let stale backports (for example typing.py)
+        # shadow the interpreter's own modules.
         import site
 
-        python_paths = [item for item in env.get("PYTHONPATH", "").split(os.pathsep) if item]
         try:
-            site_paths = [*site.getsitepackages(), site.getusersitepackages()]
+            user_base = str(site.getuserbase() or "").strip()
         except (AttributeError, OSError):
-            site_paths = []
-        for path in site_paths:
-            normalized = str(path or "").strip()
-            if normalized and os.path.isdir(normalized) and normalized not in python_paths:
-                python_paths.append(normalized)
-        if python_paths:
-            env["PYTHONPATH"] = os.pathsep.join(python_paths)
+            user_base = ""
+        if user_base and os.path.isdir(user_base):
+            env["PYTHONUSERBASE"] = user_base
         env["HOME"] = temp_home
         env["USERPROFILE"] = temp_home
         env["TMPDIR"] = temp_home
