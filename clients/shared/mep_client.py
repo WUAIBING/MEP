@@ -126,15 +126,26 @@ class MEPClient:
         if self._call_resume_pending.get(context_id) == marker:
             self._forget_live_call(context_id)
 
+    def _mark_resume_pending(self, context_id: str) -> None:
+        marker = time.monotonic()
+        self._call_resume_pending[context_id] = marker
+        task = asyncio.create_task(self._expire_unacknowledged_resume(context_id, marker))
+        self._call_resume_tasks.add(task)
+        task.add_done_callback(self._call_resume_tasks.discard)
+
     async def _resume_live_calls(self, ws) -> None:
         self._prune_live_calls()
-        for context_id in tuple(self._live_call_contexts):
-            await ws.send(json.dumps({"event": "call.resume", "context_id": context_id}))
-            marker = time.monotonic()
-            self._call_resume_pending[context_id] = marker
-            task = asyncio.create_task(self._expire_unacknowledged_resume(context_id, marker))
-            self._call_resume_tasks.add(task)
-            task.add_done_callback(self._call_resume_tasks.discard)
+        attempted: set[str] = set()
+        while unattempted := self._live_call_contexts - attempted:
+            context_id = min(unattempted)
+            attempted.add(context_id)
+            self._mark_resume_pending(context_id)
+            try:
+                await ws.send(json.dumps({"event": "call.resume", "context_id": context_id}))
+            except Exception:
+                # Keep trying the remaining calls. This context is retried by the
+                # next connection unless its unacknowledged deadline expires first.
+                continue
 
     async def register(self) -> dict:
         body = {
