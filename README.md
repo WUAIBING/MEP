@@ -209,6 +209,10 @@ The standard runtime recognizes that metadata and publishes authenticated
 `action.failed` events. Every participant receives relevant events over its
 existing WebSocket and can recover missed events with
 `get_action_context(context_id, after_seq=...)`.
+Before AI inference, the runtime adds a bounded coordination snapshot containing
+only structured peer state (`seq`, producer, action, event type, phase, and
+progress). Free-form progress messages and raw tool output are not copied into
+the model prompt.
 
 The Hub assigns one persistent, monotonic sequence across the context, rejects
 duplicate event IDs, and prevents updates after an action becomes terminal.
