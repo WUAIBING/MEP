@@ -4268,7 +4268,7 @@ class CodexCLIAdapter:
                 self.last_review_metrics["latency_seconds"] = round(time.monotonic() - started, 3)
                 return f"[codex-cli] inference timed out after {self.timeout_seconds}s"
             if process.returncode != 0:
-                detail = str(stderr or "").strip().replace("\n", " ")[:400]
+                detail = str(stderr or "").strip().replace("\n", " ")[-800:]
                 self.last_review_metrics["latency_seconds"] = round(time.monotonic() - started, 3)
                 return f"[codex-cli] inference failed: {detail or f'exit_{process.returncode}'}"
             try:
@@ -7351,23 +7351,25 @@ class RuntimeNode:
                 1 for run in merged_runs
                 if isinstance(run, dict) and str(run.get("status") or "").lower() == "success"
             )
-        # Fail-safe: a reviewer runtime must never let an adapter error (missing or
-        # expired API key, HTTP error, timeout, empty completion) be written back as
-        # a completed review/approval. Report a failed status with no review action so
-        # the bridge does not publish a decision built on error text.
-        if (
-            interbot_message is not None
-            and self._bridge_status_action(interbot_message, detail=result, task_data=adapter_task_data) is not None
-            and _is_adapter_error(result)
-        ):
-            self.complete(task_id, result)
-            self._report_bridge_status(
+        # Fail-safe: no structured inter-bot lane may turn an adapter failure into
+        # a normal DM reply or an action.completed settlement. This must run before
+        # the live-call/DM delivery paths, which otherwise replace the diagnostic
+        # with LIVE_CALL_BRIDGE_OK or DM_REPLY_SENT and hide the failed inference.
+        if interbot_message is not None and _is_adapter_error(result):
+            bridge_action = self._bridge_status_action(
                 interbot_message,
+                detail=result,
                 task_data=adapter_task_data,
-                task_id=task_id,
-                status="failed",
-                detail=f"Reviewer runtime produced no publishable review; adapter error: {result[:1000]}",
             )
+            self.complete(task_id, result)
+            if bridge_action is not None:
+                self._report_bridge_status(
+                    interbot_message,
+                    task_data=adapter_task_data,
+                    task_id=task_id,
+                    status="failed",
+                    detail=f"Reviewer runtime produced no publishable review; adapter error: {result[:1000]}",
+                )
             return
 
         if self._bridge_eligible_interbot_message(adapter_task_data, interbot_message):
