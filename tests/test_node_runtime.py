@@ -4017,7 +4017,10 @@ class TestProviderNormalization(unittest.TestCase):
 class TestWorkspaceReviewContext(unittest.TestCase):
     def test_exact_clean_workspace_requires_matching_remote_head_and_clean_status(self):
         with tempfile.TemporaryDirectory() as tmp:
-            os.makedirs(os.path.join(tmp, ".git"))
+            # Linked Git worktrees (including Codex worktrees) use a .git file
+            # pointing at the primary repository rather than a .git directory.
+            with open(os.path.join(tmp, ".git"), "w", encoding="utf-8") as handle:
+                handle.write("gitdir: C:/repo/.git/worktrees/review\n")
             wm = mep_runtime.WorkspaceManager(os.path.join(tmp, "managed"))
             head = "a" * 40
             with patch.object(

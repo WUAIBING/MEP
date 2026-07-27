@@ -4726,7 +4726,14 @@ class WorkspaceManager:
         self.base_dir = os.path.abspath(base_dir)
         os.makedirs(self.base_dir, exist_ok=True)
 
-    def _run_git(self, cwd: str, args: list[str], *, timeout_seconds: int = 60) -> tuple[int, str]:
+    def _run_git(
+        self,
+        cwd: str,
+        args: list[str],
+        *,
+        timeout_seconds: int = 60,
+        include_stderr: bool = True,
+    ) -> tuple[int, str]:
         try:
             # Sanitize environment for git subprocesses to prevent
             # hostile repo hooks/config from leaking secrets or executing
@@ -4753,7 +4760,8 @@ class WorkspaceManager:
                 timeout=timeout_seconds,
                 env=safe_env,
             )
-            return result.returncode, (result.stdout + result.stderr).strip()
+            output = result.stdout + result.stderr if include_stderr else result.stdout
+            return result.returncode, output.strip()
         except Exception as exc:  # noqa: BLE001
             return -1, str(exc)
 
@@ -4792,13 +4800,21 @@ class WorkspaceManager:
             not candidate
             or not expected_repo
             or not re.fullmatch(r"[0-9a-f]{40}", expected_head)
-            or not os.path.isdir(os.path.join(candidate, ".git"))
+            or not os.path.exists(os.path.join(candidate, ".git"))
         ):
             return False
-        head_code, actual_head = self._run_git(candidate, ["rev-parse", "HEAD"])
+        head_code, actual_head = self._run_git(
+            candidate,
+            ["rev-parse", "HEAD"],
+            include_stderr=False,
+        )
         if head_code != 0 or actual_head.strip().lower() != expected_head:
             return False
-        remote_code, actual_remote = self._run_git(candidate, ["remote", "get-url", "origin"])
+        remote_code, actual_remote = self._run_git(
+            candidate,
+            ["remote", "get-url", "origin"],
+            include_stderr=False,
+        )
         if (
             remote_code != 0
             or self._canonical_repo_identity(actual_remote) != expected_repo
@@ -4807,6 +4823,7 @@ class WorkspaceManager:
         status_code, status = self._run_git(
             candidate,
             ["status", "--porcelain", "--untracked-files=all"],
+            include_stderr=False,
         )
         return status_code == 0 and not status.strip()
 
