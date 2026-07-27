@@ -291,6 +291,29 @@ class TestCodexCLIAdapter(unittest.TestCase):
         self.assertIn("timed out after 1s", reply)
         terminate_mock.assert_called_once()
 
+    def test_failed_codex_exec_reports_stderr_tail_not_startup_banner(self):
+        adapter = mep_runtime.CodexCLIAdapter(
+            command="codex",
+            workspace=os.getcwd(),
+            use_app_server=False,
+        )
+
+        class _FailedCodexProcess:
+            returncode = 1
+            pid = 457
+
+            def __init__(self, _command, **_kwargs):
+                pass
+
+            def communicate(self, _prompt, timeout):
+                return "", "OpenAI Codex startup banner\n" + ("x" * 900) + "\nFINAL_PROVIDER_ERROR"
+
+        with patch("node.mep_runtime.subprocess.Popen", side_effect=_FailedCodexProcess):
+            reply = adapter.generate_reply("message", {"id": "task-dm", "bounty": 0.0})
+
+        self.assertIn("FINAL_PROVIDER_ERROR", reply)
+        self.assertNotIn("startup banner", reply)
+
     def test_app_server_streams_final_deltas_and_records_warm_thread_metrics(self):
         adapter = mep_runtime.CodexCLIAdapter(command="codex", workspace=os.getcwd())
         observed = {}
@@ -2093,6 +2116,90 @@ class TestRuntimeWebSocketLoop(unittest.TestCase):
         self.assertEqual(published[1][2]["phase"], "inference")
         self.assertEqual(published[2][2]["progress"], 100)
         self.assertNotIn("task_action_progress", node._task_action_contexts)  # noqa: SLF001
+
+    def test_interbot_adapter_error_fails_action_before_dm_or_call_delivery(self):
+        node = _runtime_node()
+        task_data = {
+            "id": "task_action_adapter_error",
+            "bounty": 0.0,
+            "payload": json.dumps(
+                {
+                    "spec_version": "mep.interbot.v1",
+                    "message_id": "msg-action-adapter-error",
+                    "trace_id": "trace-action-adapter-error",
+                    "source": {"node_id": "node_peer"},
+                    "target": {"node_id": node.node_id},
+                    "conversation": {
+                        "context_id": "action-context-error",
+                        "turn_type": "review_request",
+                        "turn_index": 1,
+                    },
+                    "intent": {"type": "review.request", "priority": "high"},
+                    "task": {
+                        "instructions": "Review this change.",
+                        "inputs": {
+                            "action_context": {
+                                "spec_version": "mep.action.v1",
+                                "context_id": "action-context-error",
+                                "action_id": "review-runtime",
+                            },
+                            "session_safety": {
+                                "max_turns": 4,
+                                "max_duration_seconds": 300,
+                                "checkpoint_interval": 4,
+                                "started_at_ms": 1,
+                            },
+                        },
+                    },
+                    "economics": {"bounty_seconds": 0.0, "currency": "SECONDS"},
+                    "delivery": {"reply_mode": "new_dm", "settlement_mode": "task_result"},
+                }
+            ),
+        }
+        published = []
+
+        def capture(metadata, event_type, **kwargs):
+            published.append((metadata, event_type, kwargs))
+            return True
+
+        async def run():
+            with (
+                patch.object(
+                    node.adapter,
+                    "generate_reply",
+                    return_value="[codex-cli] inference failed: provider unavailable",
+                ),
+                patch.object(node, "_post_action_event_sync", side_effect=capture),
+                patch.object(
+                    node,
+                    "_submit_safe_structured_dm_reply",
+                    new=AsyncMock(),
+                ) as dm_reply_mock,
+                patch.object(
+                    node,
+                    "_attempt_live_call_bridge",
+                    new=AsyncMock(),
+                ) as call_bridge_mock,
+                patch(
+                    "node.mep_runtime._safe_request",
+                    return_value=(200, {"status": "completed"}, ""),
+                ) as request_mock,
+            ):
+                await node.process_task(task_data)
+                if node._background_tasks:  # noqa: SLF001
+                    await asyncio.gather(*list(node._background_tasks))  # noqa: SLF001
+                return dm_reply_mock, call_bridge_mock, request_mock
+
+        dm_reply_mock, call_bridge_mock, request_mock = asyncio.run(run())
+
+        self.assertEqual(
+            [event_type for _metadata, event_type, _kwargs in published],
+            ["action.started", "action.progress", "action.failed"],
+        )
+        dm_reply_mock.assert_not_awaited()
+        call_bridge_mock.assert_not_awaited()
+        completed_payload = json.loads(request_mock.call_args.kwargs["data_body"])
+        self.assertTrue(mep_runtime._is_adapter_error(completed_payload["result_payload"]))  # noqa: SLF001
 
     def test_process_task_failure_boundary_publishes_terminal_failure(self):
         node = _runtime_node()
