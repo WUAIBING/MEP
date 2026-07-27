@@ -592,8 +592,8 @@ def init_db():
             status TEXT NOT NULL,
             max_events INTEGER NOT NULL,
             next_seq INTEGER NOT NULL,
-            created_at REAL NOT NULL,
-            updated_at REAL NOT NULL
+            created_at DOUBLE PRECISION NOT NULL,
+            updated_at DOUBLE PRECISION NOT NULL
         )
     ''')
     cursor.execute('''
@@ -611,7 +611,7 @@ def init_db():
             message TEXT,
             progress INTEGER,
             artifacts_json TEXT NOT NULL,
-            created_at REAL NOT NULL,
+            created_at DOUBLE PRECISION NOT NULL,
             PRIMARY KEY (context_id, seq),
             UNIQUE (context_id, event_id)
         )
@@ -620,6 +620,30 @@ def init_db():
         CREATE INDEX IF NOT EXISTS idx_action_events_context_action
         ON action_events (context_id, action_id, seq)
     ''')
+    if _is_postgres():
+        for table_name, column_name in (
+            ("action_contexts", "created_at"),
+            ("action_contexts", "updated_at"),
+            ("action_events", "created_at"),
+        ):
+            cursor.execute(
+                """
+                SELECT data_type
+                FROM information_schema.columns
+                WHERE table_name = %s AND column_name = %s
+                """,
+                (table_name, column_name),
+            )
+            row = cursor.fetchone()
+            if row and row[0] == "real":
+                cursor.execute(
+                    f"""
+                    ALTER TABLE {table_name}
+                    ALTER COLUMN {column_name}
+                    TYPE DOUBLE PRECISION
+                    USING {column_name}::double precision
+                    """
+                )
     conn.commit()
     _release_conn(conn)
     global FINANCIAL_NS_BACKFILL_REPORT

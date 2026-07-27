@@ -3343,6 +3343,14 @@ class TestActionProgressV1(unittest.TestCase):
         )
 
     def test_persistent_lifecycle_replay_visibility_and_idempotency(self):
+        conn = db._get_conn()
+        action_event_columns = {
+            row[1]: row[2].upper()
+            for row in conn.execute("PRAGMA table_info(action_events)").fetchall()
+        }
+        db._release_conn(conn)
+        self.assertEqual(action_event_columns["created_at"], "DOUBLE PRECISION")
+
         owner = _make_identity()
         worker_a = _make_identity()
         worker_b = _make_identity()
@@ -3410,6 +3418,11 @@ class TestActionProgressV1(unittest.TestCase):
         replay = replay_resp.json()
         self.assertEqual(replay["latest_seq"], 3)
         self.assertEqual([event["seq"] for event in replay["events"]], [1, 3])
+        self.assertAlmostEqual(
+            replay["events"][0]["created_at"],
+            started_resp.json()["event"]["created_at"],
+            places=6,
+        )
 
         worker_b_replay = client.get(
             f"/actions/contexts/{context_id}?after_seq=1&limit=20",

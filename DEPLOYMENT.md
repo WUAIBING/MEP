@@ -216,7 +216,11 @@ The release deploy script does seven things:
 4. Creates or reuses a fresh release checkout under `~/mep-hub/releases/<sha>`
 5. Reuses the shared `.env` file and `hub_data` directory instead of copying production state into the repo tree
 6. Starts `mep-hub` with a fixed compose project name such as `mep` so the Hub reconnects to the production `postgres` network instead of creating a new isolated network
-7. Calls `http://127.0.0.1:8000/version` and verifies the live Hub reports the same `build_sha`
+7. Polls `http://127.0.0.1:8000/version` through the container startup window and verifies the live Hub reports the same `build_sha`
+
+The smoke check defaults to 30 attempts one second apart. Override
+`MEP_DEPLOY_VERSION_ATTEMPTS` and `MEP_DEPLOY_VERSION_RETRY_SECONDS` when a host
+has a longer cold-start window.
 
 If you need to deploy an exact merged commit instead of `origin/main`:
 

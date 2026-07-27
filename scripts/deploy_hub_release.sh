@@ -15,6 +15,8 @@ SHARED_HUB_DATA_DIR="${MEP_DEPLOY_HUB_DATA_DIR:-$LIVE_REPO_DIR/hub_data}"
 COMPOSE_PROJECT_NAME="${MEP_DEPLOY_COMPOSE_PROJECT_NAME:-mep}"
 VERSION_URL="${MEP_DEPLOY_VERSION_URL:-http://127.0.0.1:8000/version}"
 ALLOW_DIRTY_LIVE_TREE="${MEP_DEPLOY_ALLOW_DIRTY_LIVE_TREE:-0}"
+VERSION_ATTEMPTS="${MEP_DEPLOY_VERSION_ATTEMPTS:-30}"
+VERSION_RETRY_SECONDS="${MEP_DEPLOY_VERSION_RETRY_SECONDS:-1}"
 
 require_tool() {
   if ! command -v "$1" >/dev/null 2>&1; then
@@ -112,9 +114,16 @@ prepare_release_checkout() {
 verify_version() {
   local expected_sha="$1"
   local version_json=""
+  local attempt=1
 
-  version_json="$(curl -fsS "$VERSION_URL")"
-  VERSION_JSON="$version_json" python3 - "$expected_sha" <<'PY'
+  if ! [[ "$VERSION_ATTEMPTS" =~ ^[1-9][0-9]*$ ]]; then
+    echo "MEP_DEPLOY_VERSION_ATTEMPTS must be a positive integer" >&2
+    return 1
+  fi
+
+  while (( attempt <= VERSION_ATTEMPTS )); do
+    if version_json="$(curl -fsS "$VERSION_URL" 2>/dev/null)"; then
+      if VERSION_JSON="$version_json" python3 - "$expected_sha" <<'PY'
 import json
 import os
 import sys
@@ -129,6 +138,18 @@ if payload.get("build_sha") != expected_sha:
 
 print(json.dumps(payload, indent=2))
 PY
+      then
+        return 0
+      fi
+    fi
+    if (( attempt < VERSION_ATTEMPTS )); then
+      sleep "$VERSION_RETRY_SECONDS"
+    fi
+    attempt=$((attempt + 1))
+  done
+
+  echo "deploy smoke check failed after $VERSION_ATTEMPTS attempts: $VERSION_URL" >&2
+  return 1
 }
 
 require_tool git
