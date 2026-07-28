@@ -52,6 +52,7 @@ class MEPClient:
         self.session.trust_env = False
         self.task_channels: dict[str, str] = {}
         self._stop = asyncio.Event()
+        self._purchase_lock = asyncio.Lock()
         self._active_ws = None
         self.connection_id: Optional[str] = None
         self.connection_epoch: Optional[int] = None
@@ -500,6 +501,46 @@ class MEPClient:
         return {"status_code": 200, "json": decision.as_wire_dict()}
 
     async def submit_compute_task_ns(
+        self,
+        payload: str,
+        price_ns: str | int,
+        *,
+        policy: OwnerPurchasePolicy,
+        model_requirement: Optional[str] = None,
+        target_node: Optional[str] = None,
+        expected_output: Optional[dict[str, Any]] = None,
+        intent_type: str = "analysis.request",
+        intent_priority: Optional[str] = None,
+        task_title: Optional[str] = None,
+        task_inputs: Optional[dict[str, Any]] = None,
+        payload_uri: Optional[str] = None,
+        expires_in_seconds: Optional[int] = None,
+        bargaining_round: int = 0,
+        human_approved: bool = False,
+        idempotency_key: Optional[str] = None,
+    ) -> dict:
+        """Serialize policy preflight and submission for this client instance."""
+
+        async with self._purchase_lock:
+            return await self._submit_compute_task_ns_unlocked(
+                payload,
+                price_ns,
+                policy=policy,
+                model_requirement=model_requirement,
+                target_node=target_node,
+                expected_output=expected_output,
+                intent_type=intent_type,
+                intent_priority=intent_priority,
+                task_title=task_title,
+                task_inputs=task_inputs,
+                payload_uri=payload_uri,
+                expires_in_seconds=expires_in_seconds,
+                bargaining_round=bargaining_round,
+                human_approved=human_approved,
+                idempotency_key=idempotency_key,
+            )
+
+    async def _submit_compute_task_ns_unlocked(
         self,
         payload: str,
         price_ns: str | int,

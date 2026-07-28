@@ -111,6 +111,21 @@ def test_bargaining_round_limit_is_deterministic():
     assert decision.reason == "bargaining_round_limit_exceeded"
 
 
+def test_policy_rejects_fractional_bargaining_round_limit():
+    with pytest.raises(PurchasePolicyError, match="max_bargaining_rounds"):
+        _policy(max_bargaining_rounds=2.9)
+
+
+def test_human_approval_requires_real_boolean():
+    with pytest.raises(PurchasePolicyError, match="human_approved must be a boolean"):
+        evaluate_purchase(
+            balance_ns="10000000000",
+            provider_prices_ns=["3000000000"],
+            policy=_policy(human_approval_above_ns="2000000000"),
+            human_approved="false",
+        )
+
+
 def test_wire_policy_and_decision_keep_ns_as_strings():
     policy = _policy(human_approval_above_ns="2000000000")
     decision = evaluate_purchase(

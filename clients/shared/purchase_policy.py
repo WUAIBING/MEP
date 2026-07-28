@@ -44,6 +44,12 @@ def parse_non_negative_ns(value: Any, field_name: str) -> int:
     return parsed
 
 
+def parse_non_negative_int(value: Any, field_name: str) -> int:
+    """Parse a canonical non-negative policy count without coercion."""
+
+    return parse_non_negative_ns(value, field_name)
+
+
 def format_mep_seconds(amount_ns: int) -> str:
     """Render an internal MEP_NS amount for humans without float arithmetic."""
 
@@ -114,12 +120,10 @@ class OwnerPurchasePolicy:
             else parse_non_negative_ns(approval_raw, "human_approval_above_ns")
         )
         bargaining_raw = raw.get("max_bargaining_rounds", 2)
-        if isinstance(bargaining_raw, bool):
-            raise PurchasePolicyError("max_bargaining_rounds must be an integer")
-        try:
-            bargaining_rounds = int(bargaining_raw)
-        except (TypeError, ValueError) as exc:
-            raise PurchasePolicyError("max_bargaining_rounds must be an integer") from exc
+        bargaining_rounds = parse_non_negative_int(
+            bargaining_raw,
+            "max_bargaining_rounds",
+        )
         return cls(
             max_total_price_ns=max_total,
             max_price_per_provider_ns=max_per_provider,
@@ -198,6 +202,8 @@ def evaluate_purchase(
         raise PurchasePolicyError("bargaining_round must be an integer")
     if bargaining_round < 0:
         raise PurchasePolicyError("bargaining_round must be non-negative")
+    if not isinstance(human_approved, bool):
+        raise PurchasePolicyError("human_approved must be a boolean")
 
     total_price = sum(prices)
     spendable = max(0, balance - policy.minimum_reserve_ns)

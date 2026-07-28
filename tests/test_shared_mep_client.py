@@ -1,6 +1,8 @@
 import asyncio
 import json
 import os
+import threading
+import time
 import unittest
 import urllib.parse
 from unittest.mock import patch
@@ -302,6 +304,66 @@ class TestSharedMEPClient(unittest.TestCase):
         self.assertEqual(result["status_code"], 403)
         self.assertEqual(result["json"]["reason"], "per_provider_price_limit_exceeded")
         session.post.assert_not_called()
+
+    def test_concurrent_compute_submissions_serialize_reserve_preflight(self):
+        class _BalanceAwareSession:
+            def __init__(self):
+                self.trust_env = False
+                self.post_count = 0
+                self.lock = threading.Lock()
+
+            def get(self, *_args, **_kwargs):
+                with self.lock:
+                    balance_ns = 10_000_000_000 - self.post_count * 3_000_000_000
+                return _FakeResponse(
+                    json_data={
+                        "node_id": "node_consumer",
+                        "balance_ns": str(balance_ns),
+                        "currency": "MEP_NS",
+                    }
+                )
+
+            def post(self, *_args, **_kwargs):
+                time.sleep(0.05)
+                with self.lock:
+                    self.post_count += 1
+                return _FakeResponse()
+
+        session = _BalanceAwareSession()
+        with (
+            patch("clients.shared.mep_client.MEPIdentity", return_value=_FakeIdentity()),
+            patch("clients.shared.mep_client.requests.Session", return_value=session),
+        ):
+            client = MEPClient("unused.pem")
+            policy = OwnerPurchasePolicy.from_mapping(
+                {
+                    "max_total_price_ns": "3000000000",
+                    "max_price_per_provider_ns": "3000000000",
+                    "minimum_reserve_ns": "5000000000",
+                    "currency": "MEP_NS",
+                }
+            )
+
+            async def run_both():
+                return await asyncio.gather(
+                    client.submit_compute_task_ns(
+                        "first",
+                        "3000000000",
+                        policy=policy,
+                    ),
+                    client.submit_compute_task_ns(
+                        "second",
+                        "3000000000",
+                        policy=policy,
+                    ),
+                )
+
+            first, second = asyncio.run(run_both())
+
+        self.assertEqual(first["status_code"], 200)
+        self.assertEqual(second["status_code"], 403)
+        self.assertEqual(second["json"]["reason"], "insufficient_spendable_balance")
+        self.assertEqual(session.post_count, 1)
 
     def test_action_context_helpers_use_signed_persistent_endpoints(self):
         with (

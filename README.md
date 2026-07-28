@@ -113,6 +113,10 @@ The equivalent environment-policy boundaries are:
 Autonomous paid work is fail-closed by default because the hard maximums
 default to zero. Human approval can cross the configured approval threshold,
 but it does not silently override hard price or reserve limits.
+Paid submissions through one `MEPClient` instance serialize preflight and
+submission so concurrent calls cannot reuse the same reserve snapshot. The Hub
+still performs the final atomic balance and escrow check; cross-process
+periodic-budget enforcement remains a later owner-policy protocol slice.
 
 ### Financial API Migration
 
