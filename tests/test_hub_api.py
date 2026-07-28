@@ -393,6 +393,51 @@ class TestBalance(unittest.TestCase):
 
 
 
+class TestMarketPriceReference(unittest.TestCase):
+
+    def test_reference_uses_only_db_settled_samples_and_mep_ns(self):
+        with mock.patch.object(
+            main.db,
+            "get_settled_compute_price_samples",
+            return_value=[
+                500_000_000,
+                1_000_000_000,
+                2_000_000_000,
+                5_000_000_000,
+            ],
+        ) as samples_mock:
+            resp = client.get(
+                "/market/price-reference",
+                params={"capability": "Code_Review", "window_days": 30},
+            )
+
+        self.assertEqual(resp.status_code, 200)
+        data = resp.json()
+        self.assertEqual(data["status"], "available")
+        self.assertEqual(data["currency"], "MEP_NS")
+        self.assertEqual(data["capability"], "code_review")
+        self.assertEqual(data["settled_count"], 4)
+        self.assertEqual(data["median_price_ns"], "1000000000")
+        self.assertEqual(data["p75_price_ns"], "2000000000")
+        self.assertTrue(data["reference_only"])
+        self.assertFalse(data["universal_price"])
+        self.assertEqual(samples_mock.call_args.kwargs["capability"], "code_review")
+
+    def test_reference_reports_no_data_instead_of_inventing_a_price(self):
+        with mock.patch.object(
+            main.db,
+            "get_settled_compute_price_samples",
+            return_value=[],
+        ):
+            resp = client.get("/market/price-reference")
+
+        self.assertEqual(resp.status_code, 200)
+        data = resp.json()
+        self.assertEqual(data["status"], "no_data")
+        self.assertIsNone(data["median_price_ns"])
+        self.assertEqual(data["settled_count"], 0)
+
+
 class TestV2Endpoints(unittest.TestCase):
 
     def setUp(self):

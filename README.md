@@ -78,6 +78,42 @@ Humans should think and read balances in `SECONDS`. Protocol messages use intege
 - Raw `bounty_ns` values should only appear in protocol/debug views, clearly labeled as `MEP_NS`.
 - `bounty_ns` is non-negative. Direction is represented by `payment_direction`, not by a negative wire amount.
 
+### Autonomous Purchase Preflight
+
+AI agents may choose and negotiate provider offers, but the requesting runtime
+must enforce owner limits before it submits a paid compute task. The local
+policy gate uses only integer `MEP_NS`; it never sends the private owner policy
+to the Hub.
+
+```bash
+python -m node.mep_runtime \
+  --hub-url https://mep-hub.example.com \
+  --key-path .mep/my-node.pem \
+  budget \
+  --price-ns 1000000000 \
+  --provider-count 3 \
+  --max-total-price-ns 3000000000 \
+  --max-price-per-provider-ns 1000000000 \
+  --minimum-reserve-ns 1000000000
+```
+
+Omit `--price-ns` and pass `--capability code_review` to use the median from
+recent released compute settlements. The runtime requires at least five
+settled samples by default (`--minimum-samples` can raise that bar). If enough
+real settlement data does not exist, MEP requires an explicit owner-approved
+quote; it does not invent a universal price.
+
+The equivalent environment-policy boundaries are:
+
+- `MEP_PURCHASE_MAX_TOTAL_NS`
+- `MEP_PURCHASE_MAX_PER_PROVIDER_NS`
+- `MEP_PURCHASE_MIN_RESERVE_NS`
+- `MEP_PURCHASE_HUMAN_APPROVAL_ABOVE_NS`
+
+Autonomous paid work is fail-closed by default because the hard maximums
+default to zero. Human approval can cross the configured approval threshold,
+but it does not silently override hard price or reserve limits.
+
 ### Financial API Migration
 
 The canonical financial API now lives under `/v2/...` and uses `*_ns` string

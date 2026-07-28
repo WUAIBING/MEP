@@ -1576,6 +1576,32 @@ def _normalize_mesh_timeout_seconds(value: Optional[int]) -> int:
     return max(1, min(int(value), MESH_MAX_TIMEOUT_SECONDS))
 
 
+def _summarize_market_price_samples(samples: list[int]) -> dict[str, Optional[str]]:
+    """Return integer nearest-rank reference prices without float arithmetic."""
+
+    ordered = sorted(int(value) for value in samples if int(value) > 0)
+    if not ordered:
+        return {
+            "minimum_price_ns": None,
+            "p25_price_ns": None,
+            "median_price_ns": None,
+            "p75_price_ns": None,
+            "maximum_price_ns": None,
+        }
+
+    def nearest_rank(percent: int) -> int:
+        rank = max(1, (percent * len(ordered) + 99) // 100)
+        return ordered[min(len(ordered) - 1, rank - 1)]
+
+    return {
+        "minimum_price_ns": str(ordered[0]),
+        "p25_price_ns": str(nearest_rank(25)),
+        "median_price_ns": str(nearest_rank(50)),
+        "p75_price_ns": str(nearest_rank(75)),
+        "maximum_price_ns": str(ordered[-1]),
+    }
+
+
 def _mesh_provider_rank(provider: Optional[str]) -> int:
     table = {
         "deepseek": 5,
@@ -2942,6 +2968,42 @@ async def get_reputation(node_id: str):
     if not entry:
         return {"node_id": node_id, "score": 0.0, "total_reviews": 0}
     return entry
+
+
+@app.get("/market/price-reference")
+async def get_market_price_reference(
+    capability: Optional[str] = None,
+    window_days: int = 30,
+    limit: int = 500,
+):
+    """Publish descriptive prices from real settled compute transactions."""
+
+    normalized_capability = (capability or "").strip().lower() or None
+    if normalized_capability and len(normalized_capability) > 120:
+        raise HTTPException(status_code=400, detail="capability must be at most 120 characters")
+    safe_window_days = max(1, min(int(window_days), 365))
+    safe_limit = max(1, min(int(limit), 5000))
+    since_ts = time.time() - safe_window_days * 86_400
+    samples = await asyncio.to_thread(
+        db.get_settled_compute_price_samples,
+        capability=normalized_capability,
+        since_ts=since_ts,
+        limit=safe_limit,
+    )
+    summary = _summarize_market_price_samples(samples)
+    return {
+        "status": "available" if samples else "no_data",
+        "basis": "released_compute_settlements",
+        "currency": "MEP_NS",
+        "capability": normalized_capability,
+        "window_days": safe_window_days,
+        "settled_count": len(samples),
+        "sample_limit": safe_limit,
+        "reference_only": True,
+        "universal_price": False,
+        **summary,
+    }
+
 
 @app.get("/balance/{node_id}")
 async def get_balance(node_id: str):

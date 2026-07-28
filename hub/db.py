@@ -1884,6 +1884,64 @@ def get_last_completed_task_time() -> Optional[float]:
     _release_conn(conn)
     return float(row[0]) if row else None
 
+
+def get_settled_compute_price_samples(
+    *,
+    capability: Optional[str] = None,
+    since_ts: Optional[float] = None,
+    limit: int = 500,
+) -> list[int]:
+    """Return recent released compute prices in canonical integer MEP_NS.
+
+    A completed task is not sufficient by itself: the escrow must also be
+    released. Refunded, disputed, zero-bounty chat, and data-market records do
+    not become market price signals.
+    """
+
+    safe_limit = max(1, min(int(limit), 5000))
+    normalized_capability = (capability or "").strip().lower() or None
+    clauses = [
+        "t.status = 'completed'",
+        "t.bounty_ns IS NOT NULL",
+        "t.bounty_ns > 0",
+        "e.status = 'released'",
+    ]
+    params: list = []
+    placeholder = _sql_placeholder()
+    if normalized_capability:
+        clauses.append(f"LOWER(t.model_requirement) = {placeholder}")
+        params.append(normalized_capability)
+    if since_ts is not None:
+        clauses.append(f"t.updated_at >= {placeholder}")
+        params.append(float(since_ts))
+    params.append(safe_limit)
+    sql = f"""
+        SELECT t.bounty_ns
+        FROM tasks t
+        INNER JOIN escrows e ON e.task_id = t.task_id
+        WHERE {' AND '.join(clauses)}
+        ORDER BY t.updated_at DESC
+        LIMIT {placeholder}
+    """
+    conn = _get_conn()
+    cursor = conn.cursor()
+    cursor.execute(sql, tuple(params))
+    rows = cursor.fetchall()
+    _release_conn(conn)
+    samples: list[int] = []
+    for row in rows:
+        value = row[0]
+        if isinstance(value, bool):
+            continue
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError):
+            continue
+        if parsed > 0:
+            samples.append(parsed)
+    return samples
+
+
 def check_database_health() -> dict:
     conn = None
     try:

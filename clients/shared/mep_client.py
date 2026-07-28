@@ -11,6 +11,13 @@ import requests
 from clients.shared.dm_crypto import decode_dm_envelope, decrypt_dm_payload, encode_dm_envelope, encrypt_dm_payload
 from clients.shared.identity import MEPIdentity
 from clients.shared.manifest import load_manifest
+from clients.shared.purchase_policy import (
+    CURRENCY_MEP_NS,
+    OwnerPurchasePolicy,
+    PurchasePolicyError,
+    evaluate_purchase,
+    parse_non_negative_ns,
+)
 from node.task_envelope import build_task_envelope
 from node.ws_connect import ws_connect
 
@@ -426,6 +433,183 @@ class MEPClient:
             timeout=20,
         )
         return {"status_code": response.status_code, "json": response.json()}
+
+    async def get_balance_ns(self) -> dict:
+        """Read the canonical v2 balance without a float boundary conversion."""
+
+        payload_str = ""
+        headers = self._auth_headers(payload_str)
+        response = await asyncio.to_thread(
+            self.session.get,
+            f"{self.hub_url}/v2/balance/{self.node_id}",
+            headers=headers,
+            timeout=20,
+        )
+        return {"status_code": response.status_code, "json": response.json()}
+
+    async def evaluate_purchase_plan(
+        self,
+        provider_prices_ns: list[str | int],
+        policy: OwnerPurchasePolicy,
+        *,
+        bargaining_round: int = 0,
+        human_approved: bool = False,
+    ) -> dict:
+        """Evaluate AI-selected quotes against the local owner policy.
+
+        This is a preflight gate. The Hub remains the final atomic balance and
+        escrow authority when the task is submitted.
+        """
+
+        balance_response = await self.get_balance_ns()
+        if balance_response["status_code"] != 200:
+            return {
+                "status_code": balance_response["status_code"],
+                "json": {
+                    "status": "rejected",
+                    "reason": "balance_lookup_failed",
+                    "detail": balance_response.get("json"),
+                },
+            }
+        balance_payload = balance_response.get("json") or {}
+        if balance_payload.get("currency") != CURRENCY_MEP_NS:
+            return {
+                "status_code": 502,
+                "json": {
+                    "status": "rejected",
+                    "reason": "unexpected_balance_currency",
+                },
+            }
+        try:
+            decision = evaluate_purchase(
+                balance_ns=balance_payload.get("balance_ns"),
+                provider_prices_ns=provider_prices_ns,
+                policy=policy,
+                bargaining_round=bargaining_round,
+                human_approved=human_approved,
+            )
+        except PurchasePolicyError as exc:
+            return {
+                "status_code": 400,
+                "json": {
+                    "status": "rejected",
+                    "reason": "invalid_purchase_plan",
+                    "detail": str(exc),
+                },
+            }
+        return {"status_code": 200, "json": decision.as_wire_dict()}
+
+    async def submit_compute_task_ns(
+        self,
+        payload: str,
+        price_ns: str | int,
+        *,
+        policy: OwnerPurchasePolicy,
+        model_requirement: Optional[str] = None,
+        target_node: Optional[str] = None,
+        expected_output: Optional[dict[str, Any]] = None,
+        intent_type: str = "analysis.request",
+        intent_priority: Optional[str] = None,
+        task_title: Optional[str] = None,
+        task_inputs: Optional[dict[str, Any]] = None,
+        payload_uri: Optional[str] = None,
+        expires_in_seconds: Optional[int] = None,
+        bargaining_round: int = 0,
+        human_approved: bool = False,
+        idempotency_key: Optional[str] = None,
+    ) -> dict:
+        """Submit paid compute only after deterministic local authorization."""
+
+        try:
+            canonical_price_ns = parse_non_negative_ns(price_ns, "price_ns")
+        except PurchasePolicyError as exc:
+            return {
+                "status_code": 400,
+                "json": {
+                    "status": "rejected",
+                    "reason": "invalid_price",
+                    "detail": str(exc),
+                },
+            }
+        if canonical_price_ns == 0:
+            return {
+                "status_code": 400,
+                "json": {
+                    "status": "rejected",
+                    "reason": "compute_price_must_be_positive",
+                },
+            }
+
+        authorization = await self.evaluate_purchase_plan(
+            [canonical_price_ns],
+            policy,
+            bargaining_round=bargaining_round,
+            human_approved=human_approved,
+        )
+        authorization_payload = authorization.get("json") or {}
+        if authorization["status_code"] != 200:
+            return authorization
+        if authorization_payload.get("status") != "approved":
+            return {
+                "status_code": (
+                    428
+                    if authorization_payload.get("status") == "approval_required"
+                    else 403
+                ),
+                "json": {
+                    **authorization_payload,
+                    "local_policy": True,
+                },
+            }
+
+        task_body: dict[str, Any] = {
+            "instructions": payload,
+            "expected_output": expected_output or {"result_type": "text"},
+        }
+        if task_title:
+            task_body["title"] = task_title
+        if task_inputs:
+            task_body["inputs"] = task_inputs
+        intent: dict[str, Any] = {"type": intent_type}
+        if intent_priority:
+            intent["priority"] = intent_priority
+        body: dict[str, Any] = {
+            "source": {"node_id": self.node_id},
+            "intent": intent,
+            "task": task_body,
+            "economics": {
+                "bounty_ns": str(canonical_price_ns),
+                "currency": CURRENCY_MEP_NS,
+                "market": "compute",
+                "payment_direction": "sender_to_receiver",
+            },
+        }
+        if target_node or model_requirement:
+            body["routing"] = {}
+            if target_node:
+                body["routing"]["target_node_id"] = target_node
+            if model_requirement:
+                body["routing"]["target_capability"] = model_requirement
+        if payload_uri is not None:
+            body["payload_uri"] = payload_uri
+        if expires_in_seconds is not None:
+            body["expires_in_seconds"] = expires_in_seconds
+
+        payload_str = json.dumps(body)
+        headers = self._auth_headers(payload_str)
+        if idempotency_key:
+            headers["X-MEP-Idempotency-Key"] = idempotency_key
+        response = await asyncio.to_thread(
+            self.session.post,
+            f"{self.hub_url}/v2/tasks/submit",
+            data=payload_str,
+            headers=headers,
+            timeout=20,
+        )
+        result = response.json()
+        if isinstance(result, dict):
+            result.setdefault("purchase_authorization", authorization_payload)
+        return {"status_code": response.status_code, "json": result}
 
     async def create_brainstorm_session(
         self,
