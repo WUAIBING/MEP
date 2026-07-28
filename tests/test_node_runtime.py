@@ -4033,7 +4033,28 @@ class TestAdapterErrorDetection(unittest.TestCase):
         )
         self.assertTrue(mep_runtime._is_adapter_error("[codex-cli] inference failed: invalid UTF-8"))  # noqa: SLF001
         self.assertTrue(mep_runtime._is_adapter_error("[codex-cli] inference timed out after 60s"))  # noqa: SLF001
+        self.assertTrue(mep_runtime._is_adapter_error("[minimaxi] MiniMax-M3 timed out"))  # noqa: SLF001
         self.assertTrue(mep_runtime._is_adapter_error(""))  # noqa: SLF001
+
+    def test_provider_model_timeout_publishes_failed_action_terminal(self):
+        node = _runtime_node()
+        node._task_action_contexts["task-timeout"] = {  # noqa: SLF001
+            "spec_version": "mep.action.v1",
+            "context_id": "action-context-timeout",
+            "action_id": "review-timeout",
+        }
+
+        with (
+            patch(
+                "node.mep_runtime._safe_request",
+                return_value=(200, {"status": "completed"}, ""),
+            ),
+            patch.object(node, "_schedule_action_event") as event_mock,
+        ):
+            node.complete("task-timeout", "[minimaxi] MiniMax-M3 timed out")
+
+        self.assertEqual(event_mock.call_args.args[1], "action.failed")
+        self.assertEqual(event_mock.call_args.kwargs["phase"], "complete")
 
     def test_is_adapter_error_allows_real_reviews(self):
         self.assertFalse(  # noqa: SLF001
