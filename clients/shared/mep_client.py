@@ -46,6 +46,22 @@ class MEPClient:
         self.task_channels: dict[str, str] = {}
         self._stop = asyncio.Event()
         self._active_ws = None
+        self.connection_id: Optional[str] = None
+        self.connection_epoch: Optional[int] = None
+        configured_lease_protocol = os.getenv("MEP_WS_LEASE_PROTOCOL", "v1").strip().lower()
+        self.connection_lease_protocol = (
+            "v1" if configured_lease_protocol == "v1" else "legacy"
+        )
+        self.ws_takeover = os.getenv("MEP_WS_TAKEOVER", "").strip().lower() in (
+            "1",
+            "true",
+            "yes",
+            "on",
+        )
+        self.duplicate_connection_backoff_seconds = self._positive_env_int(
+            "MEP_DUPLICATE_CONNECTION_BACKOFF_SECONDS",
+            30,
+        )
         self._heartbeat_task: asyncio.Task | None = None
         self._live_call_contexts: set[str] = set()
         self._live_call_last_seen: dict[str, float] = {}
@@ -169,6 +185,51 @@ class MEPClient:
         headers = self.identity.get_auth_headers(payload_str)
         headers["Content-Type"] = "application/json"
         return headers
+
+    def bind_connection_lease(self, payload: dict[str, Any]) -> dict[str, Any]:
+        bound = dict(payload)
+        if self.connection_id:
+            bound["connection_id"] = self.connection_id
+        return bound
+
+    def websocket_uri(self) -> str:
+        ts = str(int(time.time()))
+        if self.connection_lease_protocol != "v1":
+            query = urllib.parse.urlencode(
+                {
+                    "timestamp": ts,
+                    "signature": self.identity.sign(self.node_id, ts),
+                }
+            )
+            return f"{self.ws_url}/ws/{self.node_id}?{query}"
+        takeover = int(self.ws_takeover)
+        auth_payload = (
+            f"{self.node_id}|lease={self.connection_lease_protocol}|"
+            f"takeover={takeover}"
+        )
+        query = urllib.parse.urlencode(
+            {
+                "timestamp": ts,
+                "signature": self.identity.sign(auth_payload, ts),
+                "lease_protocol": self.connection_lease_protocol,
+                "takeover": takeover,
+            }
+        )
+        return f"{self.ws_url}/ws/{self.node_id}?{query}"
+
+    def observe_connection_event(self, data: Any) -> bool:
+        if not isinstance(data, dict):
+            return False
+        event = data.get("event")
+        if event == "connection.ready":
+            connection_id = data.get("connection_id")
+            epoch = data.get("epoch")
+            if isinstance(connection_id, str) and connection_id:
+                self.connection_id = connection_id
+            if isinstance(epoch, int) and not isinstance(epoch, bool):
+                self.connection_epoch = epoch
+            return True
+        return event == "connection.rejected"
 
     async def heartbeat_loop(self, availability: str = "online") -> None:
         while not self._stop.is_set():
@@ -1551,9 +1612,8 @@ class MEPClient:
         on_event: Optional[Callable[[dict], Awaitable[None]]] = None,
     ) -> None:
         while not self._stop.is_set():
-            ts = str(int(time.time()))
-            sig = urllib.parse.quote(self.identity.sign(self.node_id, ts))
-            uri = f"{self.ws_url}/ws/{self.node_id}?timestamp={ts}&signature={sig}"
+            uri = self.websocket_uri()
+            duplicate_rejected = False
             try:
                 async with ws_connect(uri) as ws:
                     self._active_ws = ws
@@ -1566,6 +1626,10 @@ class MEPClient:
                             msg = await ws.recv()
                             data = json.loads(msg)
                             event = data.get("event")
+                            if self.observe_connection_event(data):
+                                if event == "connection.rejected":
+                                    duplicate_rejected = True
+                                continue
                             context_id = data.get("context_id")
                             if event == "call.ping" and isinstance(context_id, str) and context_id:
                                 await ws.send(json.dumps({"event": "call.pong", "context_id": context_id}))
@@ -1603,7 +1667,11 @@ class MEPClient:
                             await asyncio.gather(heartbeat_task, return_exceptions=True)
             except Exception:
                 self._active_ws = None
-                await asyncio.sleep(2)
+                await asyncio.sleep(
+                    self.duplicate_connection_backoff_seconds
+                    if duplicate_rejected
+                    else 2
+                )
 
     async def send_ws_event(self, payload: dict[str, Any]) -> bool:
         if self._active_ws is None:

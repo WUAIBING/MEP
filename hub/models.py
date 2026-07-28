@@ -38,6 +38,7 @@ class TaskBid(BaseModel):
 class TaskResult(BaseModel):
     task_id: str
     provider_id: str
+    connection_id: Optional[str] = Field(default=None, max_length=128)
     result_payload: Optional[str] = None
     result_uri: Optional[str] = None  # IPFS or HTTP link to result payload
     in_reply_to: Optional[str] = None

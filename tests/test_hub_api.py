@@ -7,6 +7,7 @@ No running server or Postgres needed; uses SQLite backend automatically.
 """
 
 import base64
+import asyncio
 
 from contextlib import contextmanager
 
@@ -80,6 +81,19 @@ class _FakeWebSocket:
     async def send_json(self, payload):
 
         self.sent.append(payload)
+
+
+class _LeaseWebSocket(_FakeWebSocket):
+
+    def __init__(self):
+
+        super().__init__()
+
+        self.closed = []
+
+    async def close(self, code=1000, reason=None):
+
+        self.closed.append({"code": code, "reason": reason})
 
 
 
@@ -4297,3 +4311,182 @@ class TestAutomatedVerifier(unittest.TestCase):
 
 
         self.assertEqual(verify_resp.status_code, 400, f"Expected rejection: {verify_resp.text}")
+
+
+class TestNodeConnectionLeases(unittest.TestCase):
+
+    def setUp(self):
+
+        main.connected_nodes.clear()
+
+        main.node_connection_leases.clear()
+
+        main.node_connection_epochs.clear()
+
+        main.node_duplicate_connection_rejections.clear()
+
+        main.duplicate_connection_rejections_total = 0
+
+    def tearDown(self):
+
+        main.connected_nodes.clear()
+
+        main.node_connection_leases.clear()
+
+        main.node_connection_epochs.clear()
+
+        main.node_duplicate_connection_rejections.clear()
+
+        main.duplicate_connection_rejections_total = 0
+
+    def test_first_owner_wins_and_duplicate_is_observable(self):
+
+        first = _LeaseWebSocket()
+
+        duplicate = _LeaseWebSocket()
+
+        claimed, lease, displaced = asyncio.run(
+            main._claim_node_connection(
+                "node_lease",
+                first,
+                protocol="v1",
+                takeover=False,
+                client_host="127.0.0.1",
+            )
+        )
+
+        duplicate_claimed, current, duplicate_displaced = asyncio.run(
+            main._claim_node_connection(
+                "node_lease",
+                duplicate,
+                protocol="v1",
+                takeover=False,
+                client_host="127.0.0.2",
+            )
+        )
+
+        self.assertTrue(claimed)
+
+        self.assertEqual(lease["epoch"], 1)
+
+        self.assertIsNone(displaced)
+
+        self.assertFalse(duplicate_claimed)
+
+        self.assertEqual(current["epoch"], 1)
+
+        self.assertIsNone(duplicate_displaced)
+
+        self.assertIs(main.connected_nodes["node_lease"], first)
+
+        self.assertEqual(main.node_duplicate_connection_rejections["node_lease"], 1)
+
+        self.assertEqual(main.duplicate_connection_rejections_total, 1)
+
+    def test_signed_takeover_displaces_owner_without_stale_cleanup(self):
+
+        first = _LeaseWebSocket()
+
+        replacement = _LeaseWebSocket()
+
+        claimed, first_lease, _ = asyncio.run(
+            main._claim_node_connection(
+                "node_lease",
+                first,
+                protocol="v1",
+                takeover=False,
+                client_host=None,
+            )
+        )
+
+        replacement_claimed, replacement_lease, displaced = asyncio.run(
+            main._claim_node_connection(
+                "node_lease",
+                replacement,
+                protocol="v1",
+                takeover=True,
+                client_host=None,
+            )
+        )
+
+        asyncio.run(main._close_displaced_connection(displaced))
+
+        stale_released = asyncio.run(main._release_node_connection("node_lease", first))
+
+        self.assertTrue(claimed)
+
+        self.assertTrue(replacement_claimed)
+
+        self.assertEqual(first_lease["epoch"], 1)
+
+        self.assertEqual(replacement_lease["epoch"], 2)
+
+        self.assertTrue(replacement_lease["takeover"])
+
+        self.assertIs(displaced, first)
+
+        self.assertEqual(first.closed[0]["code"], 4410)
+
+        self.assertFalse(stale_released)
+
+        self.assertIs(main.connected_nodes["node_lease"], replacement)
+
+        self.assertTrue(main.node_connection_leases["node_lease"]["active"])
+
+    def test_task_result_requires_current_v1_connection_id(self):
+
+        websocket = _LeaseWebSocket()
+
+        _, lease, _ = asyncio.run(
+            main._claim_node_connection(
+                "node_lease",
+                websocket,
+                protocol="v1",
+                takeover=False,
+                client_host=None,
+            )
+        )
+
+        with self.assertRaises(main.HTTPException) as missing:
+
+            asyncio.run(main._enforce_task_completion_lease("node_lease", None))
+
+        with self.assertRaises(main.HTTPException) as stale:
+
+            asyncio.run(main._enforce_task_completion_lease("node_lease", "old-connection"))
+
+        asyncio.run(
+            main._enforce_task_completion_lease(
+                "node_lease",
+                lease["connection_id"],
+            )
+        )
+
+        self.assertEqual(missing.exception.status_code, 409)
+
+        self.assertEqual(stale.exception.status_code, 409)
+
+    def test_takeover_intent_is_cryptographically_bound(self):
+
+        self.assertEqual(
+            main._connection_lease_auth_payload("node_lease", "v1", False),
+            "node_lease|lease=v1|takeover=0",
+        )
+
+        self.assertEqual(
+            main._connection_lease_auth_payload("node_lease", "v1", True),
+            "node_lease|lease=v1|takeover=1",
+        )
+
+        self.assertEqual(
+            main._connection_lease_auth_payload("node_lease", "", False),
+            "node_lease",
+        )
+
+        self.assertIsNone(
+            main._connection_lease_auth_payload("node_lease", "", True)
+        )
+
+        self.assertIsNone(
+            main._connection_lease_auth_payload("node_lease", "v2", False)
+        )

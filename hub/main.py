@@ -63,12 +63,128 @@ app = FastAPI(title="MEP Hub", description="The Time Exchange Clearinghouse", ve
 active_tasks: Dict[str, dict] = {}
 completed_tasks: Dict[str, dict] = {}
 connected_nodes: Dict[str, WebSocket] = {}
+node_connection_leases: Dict[str, dict[str, Any]] = {}
+node_connection_epochs: Dict[str, int] = {}
+node_duplicate_connection_rejections: Dict[str, int] = {}
+duplicate_connection_rejections_total = 0
 rate_limits: Dict[str, List[float]] = {}
 task_lock = asyncio.Lock()
 node_lock = asyncio.Lock()
 mesh_lock = asyncio.Lock()
 
 CALL_RELAY_ENABLED = os.getenv("MEP_CALL_RELAY_ENABLED", "1") not in ("0", "false", "False")
+CONNECTION_LEASE_PROTOCOL = "v1"
+ENFORCE_CONNECTION_LEASE_RESULTS = os.getenv(
+    "MEP_ENFORCE_CONNECTION_LEASE_RESULTS",
+    "true",
+).lower() in ("1", "true", "yes", "on")
+
+
+def _connection_lease_auth_payload(node_id: str, protocol: str, takeover: bool) -> Optional[str]:
+    normalized_protocol = str(protocol or "").strip().lower()
+    if normalized_protocol == CONNECTION_LEASE_PROTOCOL:
+        return f"{node_id}|lease={CONNECTION_LEASE_PROTOCOL}|takeover={int(takeover)}"
+    if normalized_protocol or takeover:
+        return None
+    return node_id
+
+
+def _public_connection_lease(lease: Optional[dict[str, Any]]) -> dict[str, Any]:
+    if not isinstance(lease, dict):
+        return {}
+    return {
+        "epoch": lease.get("epoch"),
+        "protocol": lease.get("protocol"),
+        "connected_at": lease.get("connected_at"),
+        "last_activity": lease.get("last_activity"),
+        "active": bool(lease.get("active")),
+        "takeover": bool(lease.get("takeover")),
+    }
+
+
+def _deactivate_connection_lease_locked(node_id: str) -> None:
+    lease = node_connection_leases.get(node_id)
+    if isinstance(lease, dict):
+        lease["active"] = False
+        lease["disconnected_at"] = time.time()
+
+
+async def _claim_node_connection(
+    node_id: str,
+    websocket: WebSocket,
+    *,
+    protocol: str,
+    takeover: bool,
+    client_host: Optional[str],
+) -> tuple[bool, dict[str, Any], Optional[WebSocket]]:
+    """Atomically claim one live connection owner for a cryptographic node ID."""
+    global duplicate_connection_rejections_total
+
+    now = time.time()
+    async with node_lock:
+        existing = connected_nodes.get(node_id)
+        current_lease = node_connection_leases.get(node_id)
+        if existing is not None and existing is not websocket and not takeover:
+            duplicate_connection_rejections_total += 1
+            node_duplicate_connection_rejections[node_id] = (
+                node_duplicate_connection_rejections.get(node_id, 0) + 1
+            )
+            return False, _public_connection_lease(current_lease), None
+
+        epoch = node_connection_epochs.get(node_id, 0) + 1
+        node_connection_epochs[node_id] = epoch
+        lease = {
+            "connection_id": str(uuid.uuid4()),
+            "epoch": epoch,
+            "protocol": (
+                CONNECTION_LEASE_PROTOCOL
+                if str(protocol or "").strip().lower() == CONNECTION_LEASE_PROTOCOL
+                else "legacy"
+            ),
+            "connected_at": now,
+            "last_activity": now,
+            "active": True,
+            "takeover": bool(existing is not None and takeover),
+            "client_host": client_host,
+        }
+        connected_nodes[node_id] = websocket
+        node_connection_leases[node_id] = lease
+        return True, dict(lease), existing if existing is not websocket else None
+
+
+async def _release_node_connection(node_id: str, websocket: WebSocket) -> bool:
+    """Release only when websocket still owns the node's current lease."""
+    async with node_lock:
+        if connected_nodes.get(node_id) is not websocket:
+            return False
+        del connected_nodes[node_id]
+        _deactivate_connection_lease_locked(node_id)
+        return True
+
+
+async def _close_displaced_connection(websocket: Optional[WebSocket]) -> None:
+    if websocket is None:
+        return
+    try:
+        await websocket.close(code=4410, reason="Node identity lease taken over")
+    except Exception:
+        pass
+
+
+async def _enforce_task_completion_lease(node_id: str, connection_id: Optional[str]) -> None:
+    """Reject results from displaced v1 connections while keeping legacy compatibility."""
+    if not ENFORCE_CONNECTION_LEASE_RESULTS:
+        return
+    async with node_lock:
+        lease = dict(node_connection_leases.get(node_id) or {})
+    if not lease or lease.get("protocol") != CONNECTION_LEASE_PROTOCOL:
+        return
+    expected = str(lease.get("connection_id") or "")
+    supplied = str(connection_id or "")
+    if not supplied:
+        raise HTTPException(status_code=409, detail="Active node connection lease is required")
+    if not expected or not hmac.compare_digest(expected, supplied):
+        raise HTTPException(status_code=409, detail="Stale node connection lease")
 
 
 def _hub_build_info() -> dict[str, str]:
@@ -95,6 +211,7 @@ async def _call_relay_send(node_id: str, message: dict) -> bool:
         async with node_lock:
             if connected_nodes.get(node_id) is ws:
                 del connected_nodes[node_id]
+                _deactivate_connection_lease_locked(node_id)
         return False
 
 
@@ -286,8 +403,13 @@ DEGRADED_THRESHOLD_SECONDS = float(os.getenv("MEP_DEGRADED_THRESHOLD_SECONDS", "
 
 
 async def _track_node_activity(node_id: str):
+    observed_at = time.time()
     async with node_activity_lock:
-        node_last_activity[node_id] = time.time()
+        node_last_activity[node_id] = observed_at
+    async with node_lock:
+        lease = node_connection_leases.get(node_id)
+        if isinstance(lease, dict) and lease.get("active"):
+            lease["last_activity"] = observed_at
 
 
 async def _sweep_node_activity():
@@ -1921,6 +2043,7 @@ async def _sweep_assigned_timeouts():
                         async with node_lock:
                             if connected_nodes.get(node_id) is ws:
                                 del connected_nodes[node_id]
+                                _deactivate_connection_lease_locked(node_id)
                 log_event("task_requeued_timeout", f"Task {task['task_id'][:8]} requeued after timeout", task_id=task["task_id"], consumer_id=task["consumer_id"], bounty=task["bounty"], rebroadcast_count=rebroadcast_count + 1)
                 continue
         if not db.expire_task_if_assigned(task["task_id"], now):
@@ -2052,6 +2175,9 @@ async def shutdown_hub():
     async with node_lock:
         sockets = list(connected_nodes.values())
         connected_nodes.clear()
+        for lease in node_connection_leases.values():
+            lease["active"] = False
+            lease["disconnected_at"] = time.time()
     for socket in sockets:
         try:
             await socket.close(code=1001, reason="Hub shutting down")
@@ -2449,6 +2575,7 @@ async def brainstorm_post(
             async with node_lock:
                 if connected_nodes.get(node_id) is ws:
                     del connected_nodes[node_id]
+                    _deactivate_connection_lease_locked(node_id)
     return {"status": "success", "message_id": message_id, "delivered_to": delivered_to}
 
 
@@ -2628,6 +2755,7 @@ async def action_event_post(
             async with node_lock:
                 if connected_nodes.get(node_id) is ws:
                     del connected_nodes[node_id]
+                    _deactivate_connection_lease_locked(node_id)
             return None
 
     delivery_results = await asyncio.gather(
@@ -2977,6 +3105,7 @@ async def submit_task(
                 async with node_lock:
                     if connected_nodes.get(target_node) is target_ws:
                         del connected_nodes[target_node]
+                        _deactivate_connection_lease_locked(target_node)
                 return {"status": "error", "detail": "Target node disconnected"}
         # Target offline. For zero-bounty direct messages, store-and-forward the DM
         # so it is delivered when the target reconnects (voicemail, not a dropped
@@ -3025,6 +3154,7 @@ async def submit_task(
             async with node_lock:
                 if connected_nodes.get(node_id) is ws:
                     del connected_nodes[node_id]
+                    _deactivate_connection_lease_locked(node_id)
 
     response_payload = {"status": "success", "task_id": task_id}
     if not candidate_nodes and FEDERATION_ENABLED:
@@ -3240,6 +3370,7 @@ async def _finalize_settled_task(settled: dict, task_id: str, provider_id: str, 
             async with node_lock:
                 if connected_nodes.get(consumer_id) is consumer_ws:
                     del connected_nodes[consumer_id]
+                    _deactivate_connection_lease_locked(consumer_id)
 
     return settled["response"]
 
@@ -3252,6 +3383,7 @@ async def complete_task(
 ):
     if authenticated_node != result.provider_id:
         raise HTTPException(status_code=403, detail="Cannot complete tasks on behalf of another node")
+    await _enforce_task_completion_lease(result.provider_id, result.connection_id)
 
     normalized_result_uri = _normalize_artifact_uri(result.result_uri, "result_uri")
     result_payload = result.result_payload or ""
@@ -3613,6 +3745,9 @@ async def health_check():
     db_health = db.check_database_health()
     async with node_lock:
         online_count = len(connected_nodes)
+        active_lease_count = sum(
+            1 for lease in node_connection_leases.values() if lease.get("active")
+        )
     async with registry_reconcile_lock:
         reconcile_snapshot = dict(registry_reconcile_metrics)
     async with task_lock:
@@ -3623,6 +3758,8 @@ async def health_check():
         "database": db_health,
         "metrics": {
             "connected_nodes": online_count,
+            "active_connection_leases": active_lease_count,
+            "duplicate_connection_rejections": duplicate_connection_rejections_total,
             "active_tasks": active_count,
             "completed_task_cache": completed_count,
             "registry_reconcile": reconcile_snapshot,
@@ -3652,6 +3789,10 @@ class DiagnosticResponse(BaseModel):
     last_heartbeat: Optional[float] = None
     ws_connected: bool = False
     connected_since: Optional[float] = None
+    connection_epoch: Optional[int] = None
+    connection_protocol: Optional[str] = None
+    connection_lease_active: Optional[bool] = None
+    duplicate_connections_rejected: int = 0
     last_ws_activity: Optional[float] = None
     auth_ok: Optional[bool] = None
     error: Optional[str] = None
@@ -3825,7 +3966,10 @@ async def diagnostic(
         registry = db.get_registry(node_id)
         if not registry:
             return DiagnosticResponse(error="node_not_found", node_id=node_id)
-        ws_connected = node_id in connected_nodes
+        async with node_lock:
+            ws_connected = node_id in connected_nodes
+            lease = _public_connection_lease(node_connection_leases.get(node_id))
+            duplicate_rejections = node_duplicate_connection_rejections.get(node_id, 0)
         async with node_activity_lock:
             last_ws = node_last_activity.get(node_id)
         return DiagnosticResponse(
@@ -3834,6 +3978,11 @@ async def diagnostic(
             availability=registry.get("availability"),
             last_heartbeat=registry.get("updated_at"),
             ws_connected=ws_connected,
+            connected_since=lease.get("connected_at"),
+            connection_epoch=lease.get("epoch"),
+            connection_protocol=lease.get("protocol"),
+            connection_lease_active=bool(lease.get("active")) if lease else False,
+            duplicate_connections_rejected=duplicate_rejections,
             last_ws_activity=last_ws,
         )
 
@@ -3851,7 +4000,10 @@ async def diagnostic(
         if not auth.verify_signature(pub_pem, requesting_node, ts, sig):
             raise HTTPException(status_code=401, detail="Invalid cryptographic signature.")
 
-        ws_connected = requesting_node in connected_nodes
+        async with node_lock:
+            ws_connected = requesting_node in connected_nodes
+            lease = _public_connection_lease(node_connection_leases.get(requesting_node))
+            duplicate_rejections = node_duplicate_connection_rejections.get(requesting_node, 0)
         async with node_activity_lock:
             last_ws = node_last_activity.get(requesting_node)
         registry = db.get_registry(requesting_node)
@@ -3862,7 +4014,11 @@ async def diagnostic(
             availability=registry.get("availability") if registry else None,
             last_heartbeat=registry.get("updated_at") if registry else None,
             ws_connected=ws_connected,
-            connected_since=None,
+            connected_since=lease.get("connected_at"),
+            connection_epoch=lease.get("epoch"),
+            connection_protocol=lease.get("protocol"),
+            connection_lease_active=bool(lease.get("active")) if lease else False,
+            duplicate_connections_rejected=duplicate_rejections,
             last_ws_activity=last_ws,
             auth_ok=True,
         )
@@ -4216,6 +4372,8 @@ async def websocket_endpoint(
     node_id: str,
     timestamp: Optional[str] = None,
     signature: Optional[str] = None,
+    lease_protocol: Optional[str] = None,
+    takeover: Optional[str] = None,
     x_mep_timestamp: Optional[str] = Header(default=None),
     x_mep_signature: Optional[str] = Header(default=None),
 ):
@@ -4252,16 +4410,73 @@ async def websocket_endpoint(
         await websocket.close(code=4001, reason="Unknown Node ID")
         return
 
-    if not auth.verify_signature(pub_pem, node_id, ws_timestamp, ws_signature):
+    takeover_requested = str(takeover or "").strip().lower() in ("1", "true", "yes", "on")
+    auth_payload = _connection_lease_auth_payload(
+        node_id,
+        str(lease_protocol or ""),
+        takeover_requested,
+    )
+    if auth_payload is None or not auth.verify_signature(
+        pub_pem,
+        auth_payload,
+        ws_timestamp,
+        ws_signature,
+    ):
         await websocket.close(code=4002, reason="Invalid Signature")
         return
 
     await websocket.accept()
-    async with node_lock:
-        connected_nodes[node_id] = websocket
-    db.update_registry_availability(node_id, "online", time.time())
-    await _flush_queued_dms(node_id, websocket)
+    claimed, lease, displaced = await _claim_node_connection(
+        node_id,
+        websocket,
+        protocol=str(lease_protocol or ""),
+        takeover=takeover_requested,
+        client_host=client_host,
+    )
+    if not claimed:
+        log_event(
+            "duplicate_node_connection_rejected",
+            f"Rejected duplicate live connection for {node_id}",
+            node_id=node_id,
+            current_epoch=lease.get("epoch"),
+            current_protocol=lease.get("protocol"),
+            client_host=client_host,
+        )
+        try:
+            await websocket.send_json(
+                {
+                    "event": "connection.rejected",
+                    "reason": "node_identity_already_connected",
+                    "current_epoch": lease.get("epoch"),
+                    "takeover_supported": True,
+                }
+            )
+            await websocket.close(code=4409, reason="Node identity already connected")
+        except Exception:
+            pass
+        return
+
+    if displaced is not None:
+        log_event(
+            "node_connection_taken_over",
+            f"Connection lease for {node_id} moved to epoch {lease['epoch']}",
+            node_id=node_id,
+            connection_epoch=lease["epoch"],
+            client_host=client_host,
+        )
+        await _close_displaced_connection(displaced)
     try:
+        await websocket.send_json(
+            {
+                "event": "connection.ready",
+                "connection_id": lease["connection_id"],
+                "epoch": lease["epoch"],
+                "lease_protocol": lease["protocol"],
+                "takeover": bool(lease.get("takeover")),
+            }
+        )
+        db.update_registry_availability(node_id, "online", time.time())
+        await _flush_queued_dms(node_id, websocket)
         while True:
             raw = await websocket.receive_text()
             await _track_node_activity(node_id)
@@ -4270,9 +4485,17 @@ async def websocket_endpoint(
                 if event is not None:
                     await call_relay.handle(node_id, event)
     except WebSocketDisconnect:
-        async with node_lock:
-            if connected_nodes.get(node_id) is websocket:
-                del connected_nodes[node_id]
-        db.update_registry_availability(node_id, "offline", time.time())
-        if CALL_RELAY_ENABLED:
-            await call_relay.on_node_disconnect(node_id)
+        pass
+    except Exception as exc:
+        log_event(
+            "node_websocket_error",
+            f"WebSocket loop failed for {node_id}: {exc}",
+            node_id=node_id,
+            connection_epoch=lease.get("epoch"),
+        )
+    finally:
+        released = await _release_node_connection(node_id, websocket)
+        if released:
+            db.update_registry_availability(node_id, "offline", time.time())
+            if CALL_RELAY_ENABLED:
+                await call_relay.on_node_disconnect(node_id)

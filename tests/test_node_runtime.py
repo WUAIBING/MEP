@@ -6,6 +6,7 @@ import os
 import tempfile
 import threading
 import unittest
+import urllib.parse
 from typing import Any, Optional
 from unittest.mock import AsyncMock, patch
 
@@ -2023,6 +2024,75 @@ class TestRuntimeReviewPrompts(unittest.TestCase):
 
 
 class TestRuntimeWebSocketLoop(unittest.TestCase):
+    def test_v1_websocket_uri_signs_takeover_intent(self):
+        node = _runtime_node()
+        node._ws_takeover = True  # noqa: SLF001
+
+        uri = urllib.parse.urlparse(node._ws_uri())  # noqa: SLF001
+        query = urllib.parse.parse_qs(uri.query)
+
+        self.assertEqual(query["lease_protocol"], ["v1"])
+        self.assertEqual(query["takeover"], ["1"])
+        self.assertEqual(query["signature"], ["sig"])
+
+    def test_legacy_websocket_uri_supports_rolling_hub_upgrade(self):
+        node = _runtime_node()
+        node._connection_lease_protocol = "legacy"  # noqa: SLF001
+
+        uri = urllib.parse.urlparse(node._ws_uri())  # noqa: SLF001
+        query = urllib.parse.parse_qs(uri.query)
+
+        self.assertNotIn("lease_protocol", query)
+        self.assertNotIn("takeover", query)
+        self.assertEqual(query["signature"], ["sig"])
+
+    def test_connection_ready_updates_result_fence(self):
+        node = _runtime_node()
+
+        asyncio.run(
+            node.handle_ws_event(
+                {
+                    "event": "connection.ready",
+                    "connection_id": "connection-runtime",
+                    "epoch": 9,
+                }
+            )
+        )
+
+        self.assertEqual(node._connection_id, "connection-runtime")  # noqa: SLF001
+        self.assertEqual(node._connection_epoch, 9)  # noqa: SLF001
+
+    def test_completion_includes_current_connection_id(self):
+        node = _runtime_node()
+        node._connection_id = "connection-runtime"  # noqa: SLF001
+
+        with patch(
+            "node.mep_runtime._safe_request",
+            return_value=(200, {"status": "completed"}, ""),
+        ) as request_mock:
+            node.complete("task-runtime", "done")
+
+        payload = json.loads(request_mock.call_args.kwargs["data_body"])
+        self.assertEqual(payload["connection_id"], "connection-runtime")
+
+    def test_duplicate_lease_handshake_stops_pending_task_recovery(self):
+        node = _runtime_node()
+        ws = _FakeWebSocket(
+            [
+                json.dumps(
+                    {
+                        "event": "connection.rejected",
+                        "reason": "node_identity_already_connected",
+                        "current_epoch": 4,
+                    }
+                )
+            ]
+        )
+
+        accepted = asyncio.run(node._prime_connection_lease(ws))  # noqa: SLF001
+
+        self.assertFalse(accepted)
+
     def test_idle_timeout_pings_without_reconnecting(self):
         node = _runtime_node()
         task_payload = json.dumps({"event": "rfc", "data": {"id": "task_compute", "bounty": 1.0}})
@@ -2046,6 +2116,7 @@ class TestRuntimeWebSocketLoop(unittest.TestCase):
         async def _run() -> asyncio.Task:
             with (
                 patch.object(node, "register", return_value=(True, "registered")),
+                patch.object(node, "_prime_connection_lease", new=AsyncMock(return_value=True)),
                 patch.object(node, "_recv_loop", side_effect=_recv_loop),
                 patch("node.ws_connect.ws_connect", return_value=_FakeConnectContext(_FakeWebSocket([]))),
                 patch("builtins.print") as print_mock,
@@ -2357,6 +2428,7 @@ class TestRuntimeWebSocketLoop(unittest.TestCase):
         async def _run() -> int:
             with (
                 patch.object(node, "register", return_value=(True, "registered")),
+                patch.object(node, "_prime_connection_lease", new=AsyncMock(return_value=True)),
                 patch.object(node, "_recover_pending_tasks", new=AsyncMock()) as recover_mock,
                 patch.object(node, "_recv_loop", side_effect=_recv_loop),
                 patch("node.ws_connect.ws_connect", return_value=_FakeConnectContext(_FakeWebSocket([]))),
