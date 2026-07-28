@@ -649,6 +649,152 @@ class TestRuntimeUx(unittest.TestCase):
         self.assertEqual(doctor_mock.call_count, 1)
         self.assertEqual(run_mock.call_count, 1)
 
+    def test_budget_reports_zero_three_bot_rounds_at_five_seconds_each(self):
+        args = argparse.Namespace(
+            hub_url="http://hub",
+            key_path="C:/tmp/test_key.pem",
+            provider_count=3,
+            price_ns="5000000000",
+            capability=None,
+            window_days=30,
+            sample_limit=500,
+            minimum_samples=5,
+            max_total_price_ns="20000000000",
+            max_price_per_provider_ns="5000000000",
+            minimum_reserve_ns="0",
+            human_approval_above_ns=None,
+            max_bargaining_rounds=2,
+            bargaining_round=0,
+            human_approved=False,
+        )
+        with (
+            patch("node.mep_runtime.MEPIdentity", return_value=_FakeIdentity()),
+            patch(
+                "node.mep_runtime._safe_request",
+                return_value=(
+                    200,
+                    {
+                        "node_id": "node_runtime",
+                        "balance_ns": "10000000000",
+                        "currency": "MEP_NS",
+                    },
+                    "",
+                ),
+            ),
+            patch("builtins.print") as print_mock,
+        ):
+            code = mep_runtime.cmd_budget(args)
+
+        self.assertEqual(code, 4)
+        printed = "\n".join(str(call.args[0]) for call in print_mock.call_args_list if call.args)
+        self.assertIn("total=15000000000 MEP_NS", printed)
+        self.assertIn("full_rounds_affordable=0", printed)
+        self.assertIn("reason=insufficient_spendable_balance", printed)
+
+    def test_budget_can_use_settled_market_median_inside_owner_policy(self):
+        args = argparse.Namespace(
+            hub_url="http://hub",
+            key_path="C:/tmp/test_key.pem",
+            provider_count=3,
+            price_ns=None,
+            capability="code_review",
+            window_days=30,
+            sample_limit=500,
+            minimum_samples=5,
+            max_total_price_ns="3000000000",
+            max_price_per_provider_ns="1000000000",
+            minimum_reserve_ns="1000000000",
+            human_approval_above_ns=None,
+            max_bargaining_rounds=2,
+            bargaining_round=0,
+            human_approved=False,
+        )
+        with (
+            patch("node.mep_runtime.MEPIdentity", return_value=_FakeIdentity()),
+            patch(
+                "node.mep_runtime._safe_request",
+                side_effect=[
+                    (
+                        200,
+                        {
+                            "node_id": "node_runtime",
+                            "balance_ns": "10000000000",
+                            "currency": "MEP_NS",
+                        },
+                        "",
+                    ),
+                    (
+                        200,
+                        {
+                            "status": "available",
+                            "currency": "MEP_NS",
+                            "settled_count": 12,
+                            "median_price_ns": "1000000000",
+                        },
+                        "",
+                    ),
+                ],
+            ),
+            patch("builtins.print") as print_mock,
+        ):
+            code = mep_runtime.cmd_budget(args)
+
+        self.assertEqual(code, 0)
+        printed = "\n".join(str(call.args[0]) for call in print_mock.call_args_list if call.args)
+        self.assertIn("source=settled_market_median", printed)
+        self.assertIn("decision=approved", printed)
+
+    def test_budget_refuses_under_sampled_market_price(self):
+        args = mep_runtime.build_parser().parse_args(
+            [
+                "--hub-url",
+                "http://hub",
+                "--key-path",
+                "C:/tmp/test_key.pem",
+                "budget",
+                "--capability",
+                "code_review",
+                "--max-total-price-ns",
+                "3000000000",
+                "--max-price-per-provider-ns",
+                "1000000000",
+            ]
+        )
+        with (
+            patch("node.mep_runtime.MEPIdentity", return_value=_FakeIdentity()),
+            patch(
+                "node.mep_runtime._safe_request",
+                side_effect=[
+                    (
+                        200,
+                        {
+                            "node_id": "node_runtime",
+                            "balance_ns": "10000000000",
+                            "currency": "MEP_NS",
+                        },
+                        "",
+                    ),
+                    (
+                        200,
+                        {
+                            "status": "available",
+                            "currency": "MEP_NS",
+                            "settled_count": 1,
+                            "median_price_ns": "1000000000",
+                        },
+                        "",
+                    ),
+                ],
+            ),
+            patch("builtins.print") as print_mock,
+        ):
+            code = mep_runtime.cmd_budget(args)
+
+        self.assertEqual(code, 2)
+        printed = "\n".join(str(call.args[0]) for call in print_mock.call_args_list if call.args)
+        self.assertIn("only 1 settled sample(s)", printed)
+        self.assertIn("explicit owner-approved quote", printed)
+
     def test_runtime_register_includes_alias_and_x25519_public_key(self):
         node = _runtime_node()
         with patch("node.mep_runtime._safe_request", return_value=(200, {"node_id": node.node_id, "balance": 10.0}, "")) as request_mock:
@@ -706,6 +852,21 @@ class TestRuntimeUx(unittest.TestCase):
         self.assertEqual(ollama_args.adapter, "ollama")
         self.assertEqual(openai_args.adapter, "openai")
         self.assertEqual(codex_args.adapter, "codex")
+
+        budget_args = parser.parse_args(
+            [
+                "budget",
+                "--price-ns",
+                "1000000000",
+                "--provider-count",
+                "3",
+                "--max-total-price-ns",
+                "3000000000",
+            ]
+        )
+        self.assertEqual(budget_args.price_ns, "1000000000")
+        self.assertEqual(budget_args.provider_count, 3)
+        self.assertIs(budget_args.func, mep_runtime.cmd_budget)
 
     def test_run_with_unavailable_codex_cli_fails_closed(self):
         args = argparse.Namespace(

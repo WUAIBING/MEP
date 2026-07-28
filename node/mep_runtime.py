@@ -66,6 +66,23 @@ try:
 except ImportError:  # pragma: no cover - direct file execution from node/ may not see repo root
     _shared_has_partial_diff_caveat = None
 
+try:
+    from clients.shared.purchase_policy import (
+        CURRENCY_MEP_NS,
+        OwnerPurchasePolicy,
+        PurchasePolicyError,
+        evaluate_purchase,
+        format_mep_seconds,
+        parse_non_negative_ns,
+    )
+except ImportError:  # pragma: no cover - direct file execution from node/ may not see repo root
+    CURRENCY_MEP_NS = "MEP_NS"
+    OwnerPurchasePolicy = None  # type: ignore[assignment]
+    PurchasePolicyError = ValueError  # type: ignore[assignment,misc]
+    evaluate_purchase = None  # type: ignore[assignment]
+    format_mep_seconds = None  # type: ignore[assignment]
+    parse_non_negative_ns = None  # type: ignore[assignment]
+
 
 def _fallback_has_partial_diff_caveat(text: str) -> bool:
     lowered = str(text or "").strip().lower()
@@ -7815,6 +7832,138 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_budget(args: argparse.Namespace) -> int:
+    """Evaluate a proposed autonomous hire without moving any credits."""
+
+    if (
+        OwnerPurchasePolicy is None
+        or evaluate_purchase is None
+        or parse_non_negative_ns is None
+        or format_mep_seconds is None
+    ):
+        print("[mep budget] purchase policy support is unavailable")
+        return 2
+    if args.provider_count < 1:
+        print("[mep budget] provider_count must be at least 1")
+        return 2
+    if args.minimum_samples < 1:
+        print("[mep budget] minimum_samples must be at least 1")
+        return 2
+
+    identity = MEPIdentity(args.key_path)
+    balance_url = f"{args.hub_url.rstrip('/')}/v2/balance/{identity.node_id}"
+    code, balance_payload, raw = _safe_request("GET", balance_url)
+    if code != 200 or not balance_payload:
+        print(f"[mep budget] balance lookup failed status={code} detail={raw}")
+        return 2
+    if balance_payload.get("currency") != CURRENCY_MEP_NS:
+        print("[mep budget] balance lookup returned an unexpected currency")
+        return 2
+
+    price_source = "explicit"
+    price_raw = args.price_ns
+    if price_raw is None:
+        query = {
+            "window_days": args.window_days,
+            "limit": args.sample_limit,
+        }
+        if args.capability:
+            query["capability"] = args.capability
+        reference_url = (
+            f"{args.hub_url.rstrip('/')}/market/price-reference?"
+            f"{urllib.parse.urlencode(query)}"
+        )
+        reference_code, reference, reference_raw = _safe_request("GET", reference_url)
+        if reference_code != 200 or not reference:
+            print(
+                f"[mep budget] price reference failed status={reference_code} "
+                f"detail={reference_raw}"
+            )
+            return 2
+        settled_count = int(reference.get("settled_count") or 0)
+        if settled_count < args.minimum_samples:
+            capability = args.capability or "all compute"
+            print(
+                f"[mep budget] price reference has only {settled_count} settled sample(s) "
+                f"for {capability}; minimum={args.minimum_samples}"
+            )
+            print("[mep budget] pass --price-ns with an explicit owner-approved quote")
+            return 2
+        price_raw = reference.get("median_price_ns")
+        if price_raw is None:
+            capability = args.capability or "all compute"
+            print(f"[mep budget] no settled price reference is available for {capability}")
+            print("[mep budget] pass --price-ns with an explicit owner-approved quote")
+            return 2
+        price_source = "settled_market_median"
+
+    max_total_raw = (
+        args.max_total_price_ns
+        if args.max_total_price_ns is not None
+        else os.getenv("MEP_PURCHASE_MAX_TOTAL_NS", "0")
+    )
+    max_per_provider_raw = (
+        args.max_price_per_provider_ns
+        if args.max_price_per_provider_ns is not None
+        else os.getenv("MEP_PURCHASE_MAX_PER_PROVIDER_NS", str(max_total_raw))
+    )
+    reserve_raw = (
+        args.minimum_reserve_ns
+        if args.minimum_reserve_ns is not None
+        else os.getenv("MEP_PURCHASE_MIN_RESERVE_NS", "0")
+    )
+    approval_raw = (
+        args.human_approval_above_ns
+        if args.human_approval_above_ns is not None
+        else (os.getenv("MEP_PURCHASE_HUMAN_APPROVAL_ABOVE_NS") or None)
+    )
+
+    try:
+        price_ns = parse_non_negative_ns(price_raw, "price_ns")
+        if price_ns == 0:
+            raise PurchasePolicyError("price_ns must be greater than zero for compute work")
+        policy = OwnerPurchasePolicy.from_mapping(
+            {
+                "currency": CURRENCY_MEP_NS,
+                "max_total_price_ns": max_total_raw,
+                "max_price_per_provider_ns": max_per_provider_raw,
+                "minimum_reserve_ns": reserve_raw,
+                "human_approval_above_ns": approval_raw,
+                "max_bargaining_rounds": args.max_bargaining_rounds,
+            }
+        )
+        decision = evaluate_purchase(
+            balance_ns=balance_payload.get("balance_ns"),
+            provider_prices_ns=[price_ns] * args.provider_count,
+            policy=policy,
+            bargaining_round=args.bargaining_round,
+            human_approved=args.human_approved,
+        )
+    except PurchasePolicyError as exc:
+        print(f"[mep budget] invalid policy or amount: {exc}")
+        return 2
+
+    print(
+        f"[mep budget] balance={decision.balance_ns} MEP_NS "
+        f"({format_mep_seconds(decision.balance_ns)} SECONDS)"
+    )
+    print(
+        f"[mep budget] quote={price_ns} MEP_NS/provider "
+        f"providers={args.provider_count} total={decision.total_price_ns} MEP_NS "
+        f"source={price_source}"
+    )
+    print(
+        f"[mep budget] reserve={decision.minimum_reserve_ns} MEP_NS "
+        f"full_rounds_affordable={decision.full_rounds_affordable}"
+    )
+    print(f"[mep budget] decision={decision.status} reason={decision.reason}")
+    if decision.status == "approved":
+        return 0
+    if decision.status == "approval_required":
+        return 3
+    return 4
+
+
 def cmd_run(args: argparse.Namespace) -> int:
     _ensure_key_parent(args.key_path)
     if args.adapter == "codex":
@@ -7964,6 +8113,33 @@ def build_parser() -> argparse.ArgumentParser:
     status_p = sub.add_parser("status", help="Show quick node readiness badges.")
     status_p.add_argument("--require-online", action="store_true", help="Return non-zero unless all badges pass.")
     status_p.set_defaults(func=cmd_status)
+
+    budget_p = sub.add_parser(
+        "budget",
+        help="Preflight an autonomous provider purchase in exact MEP_NS.",
+    )
+    budget_p.add_argument(
+        "--price-ns",
+        default=None,
+        help="Explicit per-provider quote in MEP_NS; otherwise use the settled market median.",
+    )
+    budget_p.add_argument(
+        "--capability",
+        default=None,
+        help="Capability used to query the settled market price reference.",
+    )
+    budget_p.add_argument("--provider-count", type=int, default=1)
+    budget_p.add_argument("--max-total-price-ns", default=None)
+    budget_p.add_argument("--max-price-per-provider-ns", default=None)
+    budget_p.add_argument("--minimum-reserve-ns", default=None)
+    budget_p.add_argument("--human-approval-above-ns", default=None)
+    budget_p.add_argument("--max-bargaining-rounds", type=int, default=2)
+    budget_p.add_argument("--bargaining-round", type=int, default=0)
+    budget_p.add_argument("--human-approved", action="store_true")
+    budget_p.add_argument("--window-days", type=int, default=30)
+    budget_p.add_argument("--sample-limit", type=int, default=500)
+    budget_p.add_argument("--minimum-samples", type=int, default=5)
+    budget_p.set_defaults(func=cmd_budget)
 
     doctor_p = sub.add_parser("doctor", help="Run onboarding diagnostics against Hub.")
     doctor_p.add_argument("--auth-status", default="ok", help="Override auth status signal.")

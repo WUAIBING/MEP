@@ -201,6 +201,60 @@ class TestDualWriteConsistency(unittest.TestCase):
         self.assertEqual(amount_ns, 3000000000)
         self.db._release_conn(conn)
 
+    def test_market_price_samples_include_only_released_compute_escrow(self):
+        self.db.create_task(
+            "released_review",
+            "consumer",
+            "review",
+            1.0,
+            "completed",
+            None,
+            "code_review",
+            100.0,
+        )
+        self.db.create_escrow("released_review", "consumer", 1.0, 100.0)
+        self.db.create_task(
+            "released_test",
+            "consumer",
+            "test",
+            2.0,
+            "completed",
+            None,
+            "testing",
+            101.0,
+        )
+        self.db.create_escrow("released_test", "consumer", 2.0, 101.0)
+        self.db.create_task(
+            "held_review",
+            "consumer",
+            "review",
+            3.0,
+            "completed",
+            None,
+            "code_review",
+            102.0,
+        )
+        self.db.create_escrow("held_review", "consumer", 3.0, 102.0)
+
+        conn = self.db._get_conn()
+        cursor = conn.cursor()
+        cursor.execute(
+            "UPDATE escrows SET status = 'released' WHERE task_id IN (?, ?)",
+            ("released_review", "released_test"),
+        )
+        conn.commit()
+        self.db._release_conn(conn)
+
+        all_samples = self.db.get_settled_compute_price_samples(since_ts=0, limit=10)
+        review_samples = self.db.get_settled_compute_price_samples(
+            capability="CODE_REVIEW",
+            since_ts=0,
+            limit=10,
+        )
+
+        self.assertCountEqual(all_samples, [1_000_000_000, 2_000_000_000])
+        self.assertEqual(review_samples, [1_000_000_000])
+
 
 if __name__ == "__main__":
     unittest.main()
