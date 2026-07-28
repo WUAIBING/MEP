@@ -4313,6 +4313,76 @@ class TestAutomatedVerifier(unittest.TestCase):
         self.assertEqual(verify_resp.status_code, 400, f"Expected rejection: {verify_resp.text}")
 
 
+class TestValidationErrorResponses(unittest.TestCase):
+
+    def test_raw_bytes_are_removed_from_validation_error_response(self):
+
+        error = main.RequestValidationError(
+            [
+                {
+                    "type": "model_attributes_type",
+                    "loc": ("body",),
+                    "msg": "Input should be a valid dictionary",
+                    "input": b'{"signed":"private task body"}',
+                }
+            ],
+            body=b'{"signed":"private task body"}',
+        )
+
+        response = asyncio.run(main.validation_exception_handler(None, error))
+
+        payload = json.loads(response.body.decode("utf-8"))
+
+        self.assertEqual(response.status_code, 422)
+
+        self.assertEqual(payload["status"], "error")
+
+        self.assertEqual(
+            payload["detail"],
+            [
+                {
+                    "type": "model_attributes_type",
+                    "loc": ["body"],
+                    "msg": "Input should be a valid dictionary",
+                }
+            ],
+        )
+
+        self.assertNotIn("private task body", response.body.decode("utf-8"))
+
+    def test_signed_json_without_content_type_returns_422_not_500(self):
+
+        private_key, pub_pem, node_id = _make_identity()
+
+        _register(pub_pem)
+
+        body = json.dumps(
+            {
+                "task_id": "missing-task",
+                "provider_id": node_id,
+                "result_payload": "done",
+            }
+        )
+
+        headers = _auth_headers(private_key, node_id, body)
+
+        headers.pop("Content-Type")
+
+        response = client.post(
+            "/tasks/complete",
+            content=body.encode("utf-8"),
+            headers=headers,
+        )
+
+        self.assertEqual(response.status_code, 422, response.text)
+
+        payload = response.json()
+
+        self.assertEqual(payload["status"], "error")
+
+        self.assertNotIn("input", payload["detail"][0])
+
+
 class TestNodeConnectionLeases(unittest.TestCase):
 
     def setUp(self):

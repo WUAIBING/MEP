@@ -620,6 +620,34 @@ def _normalize_error_detail(detail):
         return detail
     return str(detail)
 
+
+def _safe_validation_errors(exc: RequestValidationError) -> list[dict[str, Any]]:
+    """Return stable 422 details without echoing raw request bodies."""
+    safe_errors: list[dict[str, Any]] = []
+    for error in exc.errors():
+        location = error.get("loc")
+        if isinstance(location, (list, tuple)):
+            safe_location = [
+                value if isinstance(value, (str, int)) else str(value)
+                for value in location
+            ]
+        else:
+            safe_location = [str(location)] if location is not None else []
+        safe_error: dict[str, Any] = {
+            "type": str(error.get("type") or "validation_error"),
+            "loc": safe_location,
+            "msg": str(error.get("msg") or "Request validation failed"),
+        }
+        context = error.get("ctx")
+        if isinstance(context, dict) and context:
+            safe_error["ctx"] = {
+                str(key): str(value)
+                for key, value in context.items()
+            }
+        safe_errors.append(safe_error)
+    return safe_errors
+
+
 @app.exception_handler(HTTPException)
 async def http_exception_handler(_: Request, exc: HTTPException):
     return JSONResponse(
@@ -631,7 +659,7 @@ async def http_exception_handler(_: Request, exc: HTTPException):
 async def validation_exception_handler(_: Request, exc: RequestValidationError):
     return JSONResponse(
         status_code=422,
-        content={"status": "error", "detail": exc.errors()}
+        content={"status": "error", "detail": _safe_validation_errors(exc)}
     )
 
 @app.exception_handler(Exception)

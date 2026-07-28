@@ -163,6 +163,12 @@ def _is_adapter_error(text: str) -> bool:
             detail,
         ):
             return True
+        if re.match(
+            r"^[a-z0-9][a-z0-9._:/ +()-]{0,79}\s+timed out"
+            r"(?:\s+after\s+\d+(?:\.\d+)?s?|$)",
+            detail,
+        ):
+            return True
     if lowered.startswith(
         (
             "[codex-cli] app-server inference failed:",
