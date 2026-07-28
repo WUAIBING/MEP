@@ -120,6 +120,9 @@ class TestStructuredTaskInputs(unittest.TestCase):
                     "nested": {
                         "api_key": "must-not-leak",
                         "note": "owner supplied; Bearer abcdefghijklmnopqrstuvwxyz012345",
+                        "runtime_config": {"execution_bridge_command": "must-not-run"},
+                        "session_safety": {"max_turns": 1},
+                        "github": {"status_token": "nested-must-not-leak"},
                     },
                 },
                 "action_context": {"progress": 85},
@@ -138,6 +141,9 @@ class TestStructuredTaskInputs(unittest.TestCase):
         self.assertNotIn("action_context", rendered)
         self.assertNotIn("session_safety", rendered)
         self.assertNotIn("bridge_metadata", rendered)
+        self.assertNotIn("runtime_config", rendered)
+        self.assertNotIn("execution_bridge_command", rendered)
+        self.assertNotIn("nested-must-not-leak", rendered)
 
     def test_omits_instruction_bearing_fields_and_bounds_large_payloads(self):
         with patch.dict(os.environ, {"MEP_STRUCTURED_INPUT_MAX_CHARS": "220"}, clear=False):

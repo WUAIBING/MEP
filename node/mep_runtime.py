@@ -258,11 +258,11 @@ def _structured_input_key(key: Any) -> str:
     return re.sub(r"[^a-z0-9]+", "_", str(key or "").strip().lower()).strip("_")
 
 
-def _structured_input_key_is_blocked(key: Any, *, root: bool) -> bool:
+def _structured_input_key_is_blocked(key: Any) -> bool:
     normalized = _structured_input_key(key)
     if not normalized:
         return True
-    if root and normalized in _STRUCTURED_INPUT_INTERNAL_KEYS:
+    if normalized in _STRUCTURED_INPUT_INTERNAL_KEYS:
         return True
     if normalized in _STRUCTURED_INPUT_INSTRUCTION_KEYS:
         return True
@@ -288,7 +288,7 @@ def _sanitize_structured_input_value(value: Any, *, depth: int = 0) -> Any:
         sanitized: dict[str, Any] = {}
         items = sorted(value.items(), key=lambda item: str(item[0]))
         for raw_key, raw_value in items[:40]:
-            if _structured_input_key_is_blocked(raw_key, root=False):
+            if _structured_input_key_is_blocked(raw_key):
                 continue
             key = str(raw_key).strip()[:120]
             if not key or key in sanitized:
@@ -314,7 +314,7 @@ def _render_structured_task_inputs(inputs: Any) -> str:
         return ""
     visible: dict[str, Any] = {}
     for raw_key, raw_value in sorted(inputs.items(), key=lambda item: str(item[0])):
-        if _structured_input_key_is_blocked(raw_key, root=True):
+        if _structured_input_key_is_blocked(raw_key):
             continue
         key = str(raw_key).strip()[:120]
         if not key or key in visible:
