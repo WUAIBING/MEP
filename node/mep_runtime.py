@@ -5717,6 +5717,17 @@ class RuntimeNode:
         self.call_reconnect_grace_ms = _env_positive_int("MEP_CALL_RECONNECT_GRACE_MS", 60000)
         self._ws: Any = None
         self._ws_ready = asyncio.Event()
+        self._connection_id = ""
+        self._connection_epoch: Optional[int] = None
+        configured_lease_protocol = os.getenv("MEP_WS_LEASE_PROTOCOL", "v1").strip().lower()
+        self._connection_lease_protocol = (
+            "v1" if configured_lease_protocol == "v1" else "legacy"
+        )
+        self._ws_takeover = _env_truthy("MEP_WS_TAKEOVER", "0")
+        self._duplicate_connection_backoff_seconds = _env_positive_int(
+            "MEP_DUPLICATE_CONNECTION_BACKOFF_SECONDS",
+            30,
+        )
         self._background_tasks: set[asyncio.Task[Any]] = set()
         self._pending_call_bridges: dict[str, asyncio.Future[dict[str, Any]]] = {}
         self._live_call_peers: dict[str, str] = {}
@@ -6223,6 +6234,7 @@ class RuntimeNode:
                 "task_id": task_id,
                 "provider_id": self.node_id,
                 "result_payload": result_payload,
+                **({"connection_id": self._connection_id} if self._connection_id else {}),
             }
         )
         code, _body, raw = _safe_request(
@@ -7564,12 +7576,48 @@ class RuntimeNode:
 
     def _ws_uri(self) -> str:
         ts = str(int(time.time()))
-        sig = urllib.parse.quote(self.identity.sign(self.node_id, ts))
-        return f"{self.ws_url}/ws/{self.node_id}?timestamp={ts}&signature={sig}"
+        if self._connection_lease_protocol != "v1":
+            query = urllib.parse.urlencode(
+                {
+                    "timestamp": ts,
+                    "signature": self.identity.sign(self.node_id, ts),
+                }
+            )
+            return f"{self.ws_url}/ws/{self.node_id}?{query}"
+        takeover = int(self._ws_takeover)
+        auth_payload = (
+            f"{self.node_id}|lease={self._connection_lease_protocol}|"
+            f"takeover={takeover}"
+        )
+        query = urllib.parse.urlencode(
+            {
+                "timestamp": ts,
+                "signature": self.identity.sign(auth_payload, ts),
+                "lease_protocol": self._connection_lease_protocol,
+                "takeover": takeover,
+            }
+        )
+        return f"{self.ws_url}/ws/{self.node_id}?{query}"
 
     async def handle_ws_event(self, data: dict[str, Any]) -> None:
         event = data.get("event")
-        if event == "rfc":
+        if event == "connection.ready":
+            connection_id = data.get("connection_id")
+            epoch = data.get("epoch")
+            if isinstance(connection_id, str) and connection_id:
+                self._connection_id = connection_id
+            if isinstance(epoch, int) and not isinstance(epoch, bool):
+                self._connection_epoch = epoch
+            print(
+                f"[mep run] connection lease ready node={self.node_id} "
+                f"epoch={self._connection_epoch}"
+            )
+        elif event == "connection.rejected":
+            print(
+                f"[mep run] duplicate connection rejected node={self.node_id} "
+                f"current_epoch={data.get('current_epoch')}"
+            )
+        elif event == "rfc":
             task = data.get("data", {})
             task_id = str(task.get("id") or "")
             if task_id and self.should_bid(task):
@@ -7593,6 +7641,16 @@ class RuntimeNode:
                 continue
             await self.handle_ws_event(json.loads(msg))
 
+    async def _prime_connection_lease(self, ws: Any) -> bool:
+        """Consume Hub's lease handshake before recovering or completing tasks."""
+        try:
+            msg = await asyncio.wait_for(ws.recv(), timeout=5.0)
+        except asyncio.TimeoutError:
+            return True
+        data = json.loads(msg)
+        await self.handle_ws_event(data)
+        return data.get("event") != "connection.rejected"
+
     async def run_forever(self) -> int:
         try:
             try:
@@ -7614,15 +7672,22 @@ class RuntimeNode:
                 try:
                     async with ws_connect(uri) as ws:
                         self._ws = ws
-                        self._ws_ready.set()
                         print(f"[mep run] connected ws node={self.node_id}")
+                        if not await self._prime_connection_lease(ws):
+                            await asyncio.sleep(self._duplicate_connection_backoff_seconds)
+                            continue
+                        self._ws_ready.set()
                         await self._recover_pending_tasks()
                         await self._recv_loop(ws)
                 except KeyboardInterrupt:
                     self.running = False
                 except Exception as exc:  # noqa: BLE001
                     print(f"[mep run] websocket reconnect after error: {exc}")
-                    await asyncio.sleep(3.0)
+                    await asyncio.sleep(
+                        self._duplicate_connection_backoff_seconds
+                        if getattr(exc, "code", None) == 4409
+                        else 3.0
+                    )
                 finally:
                     self._ws = None
                     self._ws_ready.clear()

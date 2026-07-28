@@ -1,6 +1,8 @@
 import asyncio
 import json
+import os
 import unittest
+import urllib.parse
 from unittest.mock import patch
 
 from clients.shared.mep_client import MEPClient
@@ -64,6 +66,94 @@ class _SelectivelyFailingWebSocket(_FakeWebSocket):
 
 
 class TestSharedMEPClient(unittest.TestCase):
+    def test_websocket_uri_binds_takeover_to_v1_signature(self):
+        with (
+            patch("clients.shared.mep_client.MEPIdentity", return_value=_FakeIdentity()),
+            patch.dict(os.environ, {"MEP_WS_TAKEOVER": "1"}, clear=False),
+        ):
+            client = MEPClient("unused.pem")
+            uri = urllib.parse.urlparse(client.websocket_uri())
+
+        query = urllib.parse.parse_qs(uri.query)
+        self.assertEqual(query["lease_protocol"], ["v1"])
+        self.assertEqual(query["takeover"], ["1"])
+        self.assertEqual(
+            query["signature"],
+            [f"sig:node_consumer|lease=v1|takeover=1:{query['timestamp'][0]}"],
+        )
+
+    def test_legacy_websocket_uri_supports_rolling_hub_upgrade(self):
+        with (
+            patch("clients.shared.mep_client.MEPIdentity", return_value=_FakeIdentity()),
+            patch.dict(os.environ, {"MEP_WS_LEASE_PROTOCOL": "legacy"}, clear=False),
+        ):
+            client = MEPClient("unused.pem")
+            uri = urllib.parse.urlparse(client.websocket_uri())
+
+        query = urllib.parse.parse_qs(uri.query)
+        self.assertNotIn("lease_protocol", query)
+        self.assertNotIn("takeover", query)
+        self.assertEqual(
+            query["signature"],
+            [f"sig:node_consumer:{query['timestamp'][0]}"],
+        )
+
+    def test_connection_ready_binds_task_results_to_current_lease(self):
+        with patch("clients.shared.mep_client.MEPIdentity", return_value=_FakeIdentity()):
+            client = MEPClient("unused.pem")
+
+        consumed = client.observe_connection_event(
+            {
+                "event": "connection.ready",
+                "connection_id": "connection-123",
+                "epoch": 7,
+            }
+        )
+
+        self.assertTrue(consumed)
+        self.assertEqual(client.connection_id, "connection-123")
+        self.assertEqual(client.connection_epoch, 7)
+        self.assertEqual(
+            client.bind_connection_lease({"task_id": "task-1"}),
+            {"task_id": "task-1", "connection_id": "connection-123"},
+        )
+
+    def test_listener_consumes_lease_handshake_before_application_events(self):
+        ws = _ScriptedWebSocket(
+            [
+                {
+                    "event": "connection.ready",
+                    "connection_id": "connection-123",
+                    "epoch": 3,
+                },
+                {"event": "call.ping", "context_id": "ctx-ping"},
+            ]
+        )
+        observed = []
+
+        async def _run():
+            with (
+                patch("clients.shared.mep_client.MEPIdentity", return_value=_FakeIdentity()),
+                patch("clients.shared.mep_client.ws_connect", return_value=ws),
+            ):
+                client = MEPClient("unused.pem")
+                client.heartbeat_seconds = 0
+
+                async def on_result(_data):
+                    return None
+
+                async def on_event(data):
+                    observed.append(data)
+                    client.stop()
+
+                await client.listen_results(on_result, on_event)
+                return client
+
+        client = asyncio.run(_run())
+        self.assertEqual(client.connection_id, "connection-123")
+        self.assertEqual(client.connection_epoch, 3)
+        self.assertEqual([event["event"] for event in observed], ["call.ping"])
+
     def test_submit_task_uses_spec_shaped_envelope(self):
         with (
             patch("clients.shared.mep_client.MEPIdentity", return_value=_FakeIdentity()),

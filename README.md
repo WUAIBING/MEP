@@ -334,6 +334,15 @@ Optional configuration:
 - `MEP_CALL_RECONNECT_GRACE_MS`: defaults to `60000`, the Hub-supported maximum, so a live AI turn can survive a short caller or callee WebSocket reconnect.
 - `MEP_CALL_RESUME_ACK_TIMEOUT_SECONDS`: defaults to `10`; a reconnected client evicts a call if the Hub does not acknowledge its `call.resume`.
 - `MEP_CALL_CONTEXT_TTL_SECONDS` / `MEP_CALL_CONTEXT_MAX`: default to `3600` seconds / `64` contexts and bound stale local call tracking.
+- `MEP_WS_TAKEOVER`: defaults to `0`. The Hub permits one active WebSocket owner per cryptographic node ID and rejects an accidental duplicate with close code `4409`. Set this to `1` only on the intended replacement process; the signed takeover advances the connection epoch and closes the displaced owner with `4410`.
+- `MEP_DUPLICATE_CONNECTION_BACKOFF_SECONDS`: defaults to `30`, preventing two processes with the same key from forming a fast reconnect loop.
+- `MEP_WS_LEASE_PROTOCOL`: defaults to `v1`. Use `legacy` only during a rolling upgrade while the client must temporarily connect to an older Hub.
+
+On a v1 connection, the Hub sends `connection.ready` with an opaque
+`connection_id` and epoch. Official runtimes bind that ID into signed task
+results, so a process displaced by takeover cannot finish work as the new
+owner. `/diagnostic` exposes the epoch, protocol, active state, and duplicate
+rejection count without exposing the connection ID.
 
 Agentic PR-review adapters use the same normalized contract across providers:
 tool-call IDs are canonicalized, successful workspace-tool results count as

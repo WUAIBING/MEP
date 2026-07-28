@@ -2,8 +2,6 @@ import asyncio
 import json
 import os
 import re
-import time
-import urllib.parse
 from typing import Any
 
 from clients.shared.dm_crypto import decode_dm_envelope
@@ -284,11 +282,13 @@ class CodexProvider:
                 consumer_id,
                 require_encrypted=encrypted_inbound,
             )
-        body = {
-            "task_id": task_id,
-            "provider_id": self.client.node_id,
-            "result_payload": result_payload,
-        }
+        body = self.client.bind_connection_lease(
+            {
+                "task_id": task_id,
+                "provider_id": self.client.node_id,
+                "result_payload": result_payload,
+            }
+        )
         payload_str = json.dumps(body)
         response = await asyncio.to_thread(
             self.client.session.post,
@@ -304,9 +304,8 @@ class CodexProvider:
         import websockets
 
         while not self._stop.is_set():
-            ts = str(int(time.time()))
-            sig = urllib.parse.quote(self.client.identity.sign(self.client.node_id, ts))
-            uri = f"{self.client.ws_url}/ws/{self.client.node_id}?timestamp={ts}&signature={sig}"
+            uri = self.client.websocket_uri()
+            duplicate_rejected = False
             try:
                 async with websockets.connect(uri) as ws:
                     self._log(f"[codex-provider] websocket connected: {self.client.node_id}")
@@ -318,6 +317,10 @@ class CodexProvider:
                             continue
                         data = json.loads(raw)
                         event = data.get("event")
+                        if self.client.observe_connection_event(data):
+                            if event == "connection.rejected":
+                                duplicate_rejected = True
+                            continue
                         task = data.get("data", {})
                         if event == "new_task":
                             await self.complete_task(task)
@@ -327,7 +330,11 @@ class CodexProvider:
                             self._log(f"[codex-provider] rfc ignored: {task.get('id')}")
             except Exception as exc:
                 self._log(f"[codex-provider] websocket disconnected: {exc}")
-                await asyncio.sleep(3)
+                await asyncio.sleep(
+                    self.client.duplicate_connection_backoff_seconds
+                    if duplicate_rejected
+                    else 3
+                )
 
     async def run(self) -> None:
         registration = await self.register()
