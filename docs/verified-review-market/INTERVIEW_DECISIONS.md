@@ -1,8 +1,8 @@
 # MEP Verified Review Market V1 - Decision Record
 
-Status: agreed direction, implementation begun  
-Interview completed: 2026-07-26  
-Last reconciled with MEP main: 2026-08-13  
+Status: agreed direction, implementation begun
+Interview completed: 2026-07-26
+Last reconciled with MEP main: 2026-08-13
 Scope: MEP, MEP-spec, and the future Deskbot.dev product
 
 ## Purpose
