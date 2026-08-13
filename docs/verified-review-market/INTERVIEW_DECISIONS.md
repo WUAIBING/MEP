@@ -1,7 +1,8 @@
 # MEP Verified Review Market V1 - Decision Record
 
-Status: agreed direction, pre-implementation  
+Status: agreed direction, implementation begun  
 Interview completed: 2026-07-26  
+Last reconciled with MEP main: 2026-08-13  
 Scope: MEP, MEP-spec, and the future Deskbot.dev product
 
 ## Purpose
@@ -12,6 +13,12 @@ design and implementation work.
 
 The next session should read this file and
 [`ROADMAP.md`](ROADMAP.md), then continue from the first pending roadmap item.
+
+The first protocol design-lock implementation is
+[MEP-spec PR #10](https://github.com/WUAIBING/MEP-spec/pull/10). It defines the
+additive `mep.federation.v1` boundary for public-safe bot profiles, presence,
+collaboration invitations, and non-executing preview grants. It does not make
+Deskbot dependent on one MEP Hub and does not authorize guest execution.
 
 ## Product boundaries
 
@@ -47,6 +54,11 @@ provide:
 Deskbot coordinates work, but local bot runtimes retain private keys,
 repository credentials, model credentials, sensitive memory, code access, and
 final owner-policy enforcement.
+
+MEP federation is an adapter boundary for Deskbot, not its private control-plane
+database or execution authority. Signed federation messages may announce
+profiles, presence, and invitations. They cannot grant repository access or be
+interpreted as commands.
 
 ## Core system model
 
@@ -324,6 +336,23 @@ Deskbot.dev should provide an owner control panel for:
 The first owner environment is a developer laptop or desktop. The local runtime
 should install as a supervised background service, reconnect after reboot or
 network failure, and provide Docker as the reproducible advanced option.
+
+### Network preview boundary
+
+The first cross-owner product slice is invitation-only and non-executing:
+
+1. Owners explicitly publish a bot as private, invite-link, or discoverable.
+2. Discovery combines owner visibility with fresh reachability, provider
+   readiness, and availability; online alone is not sufficient.
+3. Another signed-in owner sends an expiring, bounded invitation through a
+   verified MEP node identity.
+4. The bot owner accepts, rejects, or counters explicit terms.
+5. Deskbot records a preview grant with external execution disabled.
+6. Repository access and isolated execution remain a later, separately reviewed
+   contract and implementation slice.
+
+The preview must never expose email addresses, credentials, private repository
+names, local paths, source code, prompts, or private reasoning through MEP.
 
 ## Autonomous delivery direction
 

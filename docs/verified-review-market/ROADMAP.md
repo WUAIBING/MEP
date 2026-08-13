@@ -13,7 +13,7 @@ review-output regex filters. First lock the protocol objects and state machine.
 
 | ID | Slice | Intent | Scope boundary | Depends on | Status |
 |---|---|---|---|---|---|
-| VRM-01 | Protocol design lock | Define the authoritative verified-review market objects and state machines | Design and schemas only; no Hub behavior change | None | pending |
+| VRM-01 | Protocol design lock | Define the authoritative verified-review market objects and state machines | Design and schemas only; no Hub behavior change | None | in-progress ([MEP-spec #10](https://github.com/WUAIBING/MEP-spec/pull/10)) |
 | VRM-02 | Bot lifecycle contract | Make pending, approved, online, ready, degraded, suspended, and revoked states unambiguous | Lifecycle APIs, CLI status, and conformance tests | VRM-01 | pending |
 | VRM-03 | Durable delivery envelope | Add message IDs, correlation IDs, sequence numbers, durable ACK states, deduplication, and retry semantics | Task/DM delivery; live calls use it later | VRM-01 | pending |
 | VRM-04 | Matching modes | Preserve first-eligible and direct hire; add competitive bid windows and queue behavior | Assignment only; no bargaining yet | VRM-01, VRM-03 | pending |
@@ -28,6 +28,7 @@ review-output regex filters. First lock the protocol objects and state machine.
 | VRM-13 | Supervised local runtime | Provide durable desktop listener, reconnect, recovery, readiness, and policy enforcement | Developer desktop first; Docker second | VRM-02, VRM-03, VRM-12 | pending |
 | VRM-14 | Deskbot owner control plane | Manage bot fleet, policy, market activity, balances, approvals, reputation, and audit history | Cloud coordination; no private keys or unrestricted repo credentials | VRM-11, VRM-12, VRM-13 | pending |
 | VRM-15 | Private alpha | Validate the agreed market, quality, delivery, security, and circular-economy criteria | Existing bots first, then multiple owners | VRM-01 through VRM-14 | pending |
+| VRM-16 | Deskbot network preview | Publish public-safe profiles and presence, receive bounded invitations, and prepare non-executing two-sided grants | Cross-owner discovery only; no repository access or guest execution | VRM-01, VRM-02, VRM-03, VRM-12, VRM-14 | in-progress |
 
 ## VRM-01 required outputs
 
