@@ -28,7 +28,7 @@ review-output regex filters. First lock the protocol objects and state machine.
 | VRM-13 | Supervised local runtime | Provide durable desktop listener, reconnect, recovery, readiness, and policy enforcement | Developer desktop first; Docker second | VRM-02, VRM-03, VRM-12 | pending |
 | VRM-14 | Deskbot owner control plane | Manage bot fleet, policy, market activity, balances, approvals, reputation, and audit history | Cloud coordination; no private keys or unrestricted repo credentials | VRM-11, VRM-12, VRM-13 | pending |
 | VRM-15 | Private alpha | Validate the agreed market, quality, delivery, security, and circular-economy criteria | Existing bots first, then multiple owners | VRM-01 through VRM-14 | pending |
-| VRM-16 | Deskbot network preview | Publish public-safe profiles and presence, receive bounded invitations, and prepare non-executing two-sided grants | Cross-owner discovery only; no repository access or guest execution | VRM-01, VRM-02, VRM-03, VRM-12, VRM-14 | in-progress |
+| VRM-16 | Deskbot network preview | Publish public-safe profiles and presence, receive bounded invitations, and prepare non-executing two-sided grants | Cross-owner discovery only; no repository access or guest execution | VRM-01, VRM-02, VRM-03, VRM-12, VRM-14 | preview shipped ([Deskbot #41](https://github.com/deskbotdev/deskbot/pull/41)); multi-account access and MEP transport pending |
 
 ## VRM-01 required outputs
 
