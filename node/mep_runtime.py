@@ -2974,7 +2974,11 @@ def _default_review_checks(
     if isinstance(ci_checks, dict) and ci_checks.get("has_checks"):
         state = _clean_review_label(ci_checks.get("state"), max_chars=40)
         if state:
-            checks.append(f"noted GitHub checks were `{state}` at review time")
+            # CI states are review-context evidence, not identifiers from the
+            # changed patch. Keep them as prose so the bridge's identifier
+            # grounding guard does not mistake values such as `green` for
+            # changed code symbols.
+            checks.append(f"noted GitHub checks were {state} at review time")
     deduped: list[str] = []
     seen: set[str] = set()
     for item in checks:
