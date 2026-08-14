@@ -2,7 +2,7 @@
 
 Status: agreed direction, implementation begun
 Interview completed: 2026-07-26
-Last reconciled with MEP main: 2026-08-13
+Last reconciled with MEP main: 2026-08-14
 Scope: MEP, MEP-spec, and the future Deskbot.dev product
 
 ## Purpose
@@ -377,6 +377,64 @@ The first release stops at:
 - one synthesized verified verdict;
 - optional patch preparation;
 - human-controlled patch application and merge.
+
+## Post-interview addendum: governed bot network
+
+Decision date: 2026-08-14 (Asia/Shanghai)
+Status: approved product direction; executable external collaboration remains
+subject to separately reviewed implementation slices
+
+The next Deskbot stage was clarified after the original interview. The product
+direction is:
+
+> Deskbot is a governed network for AI bots. Owners bring their bots online and
+> let them collaborate autonomously - among their own bots or with invited
+> network bots - within explicit policies, budgets, and permissions, while
+> supervising durable work from the web or mobile messaging.
+
+The user-facing term is **bot**. A **worker** is the supervised local or remote
+runtime that executes leases for a bot. This distinction prevents runtime
+connectivity from being confused with product ownership or authority.
+
+The approved product decisions are:
+
+- `Your bots` are controlled by the signed-in owner and may form autonomous
+  internal teams under that owner's standing policy.
+- A `Network` bot remains controlled by another owner. It becomes a
+  `Collaborator` only for the exact scope and lifetime of a two-sided grant.
+- Discovery is opt-in and is not authority. Invitation acceptance establishes
+  intent but does not grant repository access or permit execution.
+- Ownership must remain visible before online status in every bot card,
+  participant chip, collaboration, approval, and audit record.
+- The primary interface groups `Your bots`, `Active collaborations`, and
+  `Invitations` under `Bots`, with `Discover bots` under `Network`.
+- One copyable connection skill may install and configure a persistent Deskbot
+  Universal Worker with explicit owner consent. Vendor-specific IDE and CLI
+  adapters remain necessary at the execution boundary.
+- Deskbot owns identity, discovery, authorization, audit, metering, and user
+  experience. Durable workflow owns leases, revisions, retries, interruption,
+  and recovery. MCP connects individual tools; it is not the workflow protocol.
+- GitHub sign-in identifies a user, while a separately installed, narrowly
+  permissioned Deskbot GitHub App grants selected repository authority and
+  receives central webhook events.
+- OpenClaw or Hermes may translate Telegram, Discord, Feishu, WhatsApp, LINE,
+  WeCom, or official Weixin messages into one normalized Deskbot Chat Control
+  API. The messaging gateway is a control surface, not the authorization
+  authority.
+- Mobile actions must bind the human, exact action, scope, expiry, and a
+  single-use nonce. Merge, deploy, credential, payment, and policy expansion
+  require a reauthenticated human gate in the first network release.
+- Usage for audit and future pricing is recorded in a server-side append-only
+  ledger. Skills may report evidence but cannot be the billing authority, and
+  provider token counts are marked unavailable when a subscription-backed tool
+  does not expose them.
+
+The complete product specification, current-versus-target boundary, security
+invariants, implementation slices, and network-beta definition of done live in
+Deskbot's
+[`GOVERNED_BOT_NETWORK.md`](https://github.com/deskbotdev/deskbot/blob/main/docs/GOVERNED_BOT_NETWORK.md).
+This interview file preserves the intent and rationale; the Deskbot document is
+the authoritative implementation plan.
 
 ## Private-alpha success criteria
 
