@@ -1708,8 +1708,8 @@ class GitHubToMEPBridgeService:
             compact["changed_files"] = compact_files
         return compact
 
-    @staticmethod
-    def _build_hunk_contexts(changed_file_entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    @classmethod
+    def _build_hunk_contexts(cls, changed_file_entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
         contexts: list[dict[str, Any]] = []
         for entry in changed_file_entries:
             if not isinstance(entry, dict):
@@ -1720,7 +1720,8 @@ class GitHubToMEPBridgeService:
                 continue
             hunk_header = ""
             changed_lines: list[str] = []
-            for line in patch_text.splitlines():
+            patch_lines = patch_text.splitlines()
+            for line in patch_lines:
                 if line.startswith("@@") and not hunk_header:
                     hunk_header = line.strip()
                     continue
@@ -1731,6 +1732,25 @@ class GitHubToMEPBridgeService:
                     changed_lines.append(clipped)
                 if len(changed_lines) >= 3:
                     break
+            changed_identifiers = cls._extract_changed_identifiers(
+                patch_text,
+                include_inline_code=cls._is_docs_only_path(filename),
+            )
+            for identifier in changed_identifiers:
+                if len(changed_lines) >= 6:
+                    break
+                evidence_line = next(
+                    (
+                        line[:160].rstrip()
+                        for line in patch_lines
+                        if line.startswith(("+", "-"))
+                        and not line.startswith(("+++", "---"))
+                        and identifier in line
+                    ),
+                    "",
+                )
+                if evidence_line and evidence_line not in changed_lines:
+                    changed_lines.append(evidence_line)
             if not hunk_header and not changed_lines:
                 continue
             contexts.append(
@@ -1795,7 +1815,11 @@ class GitHubToMEPBridgeService:
         )
 
     @staticmethod
-    def _extract_changed_identifiers(patch_text: str) -> list[str]:
+    def _extract_changed_identifiers(
+        patch_text: str,
+        *,
+        include_inline_code: bool = False,
+    ) -> list[str]:
         if not patch_text:
             return []
         identifiers: list[str] = []
@@ -1817,6 +1841,13 @@ class GitHubToMEPBridgeService:
                     identifiers.append(identifier)
                     seen.add(identifier)
                 break
+            if include_inline_code:
+                for identifier in re.findall(r"`([A-Za-z_][A-Za-z0-9_]*)`", line):
+                    if identifier not in seen:
+                        identifiers.append(identifier)
+                        seen.add(identifier)
+                    if len(identifiers) >= 12:
+                        break
             if len(identifiers) >= 12:
                 break
         return identifiers
@@ -1863,7 +1894,10 @@ class GitHubToMEPBridgeService:
             status = str(entry.get("status") or "").strip().lower()
             include_identifiers = not (status == "removed" and cls._is_test_path(filename))
             if include_identifiers:
-                for identifier in cls._extract_changed_identifiers(patch_text):
+                for identifier in cls._extract_changed_identifiers(
+                    patch_text,
+                    include_inline_code=cls._is_docs_only_path(filename),
+                ):
                     if identifier not in seen_identifiers:
                         changed_identifiers.append(identifier)
                         seen_identifiers.add(identifier)
@@ -2535,33 +2569,44 @@ class GitHubToMEPBridgeService:
     def _extract_review_section_text(detail: str, label: str) -> str:
         if not detail:
             return ""
-        match = re.search(rf"{re.escape(label)}:\s*(.+)", detail, re.IGNORECASE)
-        if not match:
+        match = re.search(rf"(?im)^\s*{re.escape(label)}:\s*(.+)$", detail)
+        if match:
+            return str(match.group(1) or "").strip()
+        heading = re.search(rf"(?im)^\s*#{{1,6}}\s*{re.escape(label)}\s*$", detail)
+        if not heading:
             return ""
-        return str(match.group(1) or "").strip()
+        trailing = detail[heading.end() :]
+        next_heading = re.search(r"(?m)^\s*#{1,6}\s+", trailing)
+        if next_heading:
+            trailing = trailing[: next_heading.start()]
+        return trailing.strip()
 
     @classmethod
     def _split_review_section_items(cls, text: str) -> list[str]:
         if not text:
             return []
         parts: list[str] = []
-        current: list[str] = []
-        in_backticks = False
-        for char in str(text):
-            if char == "`":
-                in_backticks = not in_backticks
+        for raw_line in str(text).splitlines() or [str(text)]:
+            line = re.sub(r"^\s*(?:[-*]\s+|\d+\.\s+)", "", raw_line).strip()
+            if not line:
+                continue
+            current: list[str] = []
+            in_backticks = False
+            for char in line:
+                if char == "`":
+                    in_backticks = not in_backticks
+                    current.append(char)
+                    continue
+                if char == "," and not in_backticks:
+                    part = "".join(current).strip()
+                    if part:
+                        parts.append(part)
+                    current = []
+                    continue
                 current.append(char)
-                continue
-            if char == "," and not in_backticks:
-                part = "".join(current).strip()
-                if part:
-                    parts.append(part)
-                current = []
-                continue
-            current.append(char)
-        trailing = "".join(current).strip()
-        if trailing:
-            parts.append(trailing)
+            trailing = "".join(current).strip()
+            if trailing:
+                parts.append(trailing)
         return parts
 
     @staticmethod
@@ -2904,7 +2949,43 @@ class GitHubToMEPBridgeService:
             r"recommend(?:ation|ed)?|invariant|finding|issue|concern|gap|"
             r"should be|must be|broken|incorrect|unsafe|missing)",
         )
-        has_findings_proxy = bool(_HAS_FINDINGS_PROXY_RE.search(detail or ""))
+        evidence_sections = {
+            "risk areas checked",
+            "risk areas covered",
+            "lenses inspected",
+            "lenses audited",
+            "areas checked",
+            "areas audited",
+            "audited lenses",
+            "checks performed",
+            "checks run",
+            "checks executed",
+            "checks completed",
+            "verifications",
+            "verification steps",
+            "changed identifiers verified",
+            "why no finding",
+        }
+        current_section = ""
+        has_findings_proxy = False
+        for line in str(detail or "").splitlines():
+            heading = re.match(r"^\s*#{1,6}\s*(.+?)\s*$", line)
+            if heading:
+                current_section = str(heading.group(1) or "").strip().rstrip(":").lower()
+            else:
+                section_label = re.match(
+                    r"^\s*(Risk areas checked|Risk areas covered|Lenses inspected|Lenses audited|"
+                    r"Areas checked|Areas audited|Audited lenses|Checks performed|Checks run|"
+                    r"Checks executed|Checks completed|Verifications|Verification steps|"
+                    r"Changed identifiers verified|Why no finding)\s*:",
+                    line,
+                    re.IGNORECASE,
+                )
+                if section_label:
+                    current_section = str(section_label.group(1) or "").strip().lower()
+            if current_section not in evidence_sections and _HAS_FINDINGS_PROXY_RE.search(line):
+                has_findings_proxy = True
+                break
         has_findings = (
             "## review findings" in lowered
             or bool(self._extract_review_finding_entries(detail or ""))
@@ -2959,6 +3040,8 @@ class GitHubToMEPBridgeService:
         unsupported_verified_identifiers: list[str] = []
         for item in verified_identifiers:
             identifier_tokens = self._extract_identifier_tokens(item)
+            if not identifier_tokens and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", item):
+                identifier_tokens = {item.lower()}
             if not item or not identifier_tokens:
                 continue
             if all(token in changed_text for token in identifier_tokens):
