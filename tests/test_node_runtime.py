@@ -1706,6 +1706,44 @@ class TestRuntimeReviewPrompts(unittest.TestCase):
 
         self.assertEqual(action, "approved")
 
+    def test_approval_bridge_action_accepts_markdown_heading_sections(self):
+        task_data = self._bridge_review_task_data(
+            intent_type="code.review.approve",
+            changed_identifiers=["Network", "Collaborator"],
+            touched_paths=["docs/verified-review-market/INTERVIEW_DECISIONS.md"],
+            touched_tests=[],
+            changed_files=[
+                {
+                    "filename": "docs/verified-review-market/INTERVIEW_DECISIONS.md",
+                    "patch_excerpt": (
+                        "+A `Network` bot remains controlled by its owner.\n"
+                        "+It becomes a `Collaborator` only for a scoped grant.\n"
+                    ),
+                }
+            ],
+            ci_checks={"has_checks": True, "state": "green", "all_green": True},
+        )
+        detail = (
+            "## Review Summary\n\n"
+            "The `Network` and `Collaborator` definitions are low-risk.\n\n"
+            "## Touched paths reviewed\n\n"
+            "docs/verified-review-market/INTERVIEW_DECISIONS.md\n\n"
+            "## Risk areas checked\n\n"
+            "Ownership boundary and collaboration authority.\n\n"
+            "## Checks performed\n\n"
+            "Read the exact changed wording and confirmed green tests.\n\n"
+            "## Changed identifiers verified\n\n"
+            "Network and Collaborator."
+        )
+
+        action = mep_runtime.RuntimeNode._bridge_status_action(  # noqa: SLF001
+            mep_runtime._interbot_message_from_task_data(task_data),  # noqa: SLF001
+            detail=detail,
+            task_data=task_data,
+        )
+
+        self.assertEqual(action, "approved")
+
     def test_approval_bridge_action_downgrades_when_runtime_tool_evidence_is_weak(self):
         task_data = self._bridge_review_task_data(
             intent_type="code.review.approve",

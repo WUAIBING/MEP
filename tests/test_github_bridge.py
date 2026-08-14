@@ -2475,6 +2475,111 @@ class TestGitHubToMEPBridge(unittest.TestCase):
         self.assertFalse(review_package["reviewability"]["publish_no_finding"])
         self.assertIn("Reviewability assessment:", review_package["instructions_context"])
 
+    def test_docs_review_package_extracts_inline_identifiers_and_preserves_evidence(self):
+        self._set_pr_review_package(
+            [
+                {
+                    "filename": "docs/verified-review-market/INTERVIEW_DECISIONS.md",
+                    "status": "modified",
+                    "additions": 12,
+                    "deletions": 0,
+                    "changes": 12,
+                    "patch": (
+                        "@@ -1,2 +1,12 @@\n"
+                        "+## Governed bot network\n"
+                        "+Introductory context.\n"
+                        "+More context.\n"
+                        "+A `Network` bot remains controlled by its owner.\n"
+                        "+It becomes a `Collaborator` only for a scoped grant.\n"
+                    ),
+                }
+            ],
+            pr_body="Documents the governed bot network boundary.",
+        )
+
+        review_package = self.service._fetch_pr_review_package("WUAIBING/MEP", 355)
+
+        self.assertEqual(
+            review_package["risk_pack"]["changed_identifiers"],
+            ["Network", "Collaborator"],
+        )
+        hunk_lines = review_package["hunk_contexts"][0]["changed_lines"]
+        self.assertTrue(any("`Network`" in line for line in hunk_lines))
+        self.assertTrue(any("`Collaborator`" in line for line in hunk_lines))
+
+    def test_status_callback_publishes_grounded_docs_approval_with_inline_identifiers(self):
+        self._set_pr_review_package(
+            [
+                {
+                    "filename": "docs/verified-review-market/INTERVIEW_DECISIONS.md",
+                    "status": "modified",
+                    "additions": 12,
+                    "deletions": 0,
+                    "changes": 12,
+                    "patch": (
+                        "@@ -1,2 +1,12 @@\n"
+                        "+## Governed bot network\n"
+                        "+A `Network` bot remains controlled by its owner.\n"
+                        "+It becomes a `Collaborator` only for a scoped grant.\n"
+                    ),
+                }
+            ],
+            pr_body="Documents the governed bot network boundary.",
+            checks_payload={
+                "total_count": 1,
+                "check_runs": [
+                    {
+                        "name": "test (ubuntu-latest, 3.10)",
+                        "status": "completed",
+                        "conclusion": "success",
+                    }
+                ],
+            },
+        )
+        response = self._post_webhook(
+            _issue_comment_payload("@Hub-Sentinel approve this PR", delivery_number=355),
+            delivery_id="delivery-docs-approval",
+        )
+        self.assertEqual(response.status_code, 200)
+        bridge_id = response.json()["bridge_id"]
+        self._flush_context(response.json()["context_id"])
+
+        token = self.service._generate_status_token(bridge_id, "node_target")
+        status_response = self.client.post(
+            "/bridge/status",
+            json={
+                "bridge_id": bridge_id,
+                "status": "completed",
+                "target_node_id": "node_target",
+                "task_id": "task-docs-approval",
+                "action": "approved",
+                "detail": (
+                    "## Review Summary\n\n"
+                    "The `Network` and `Collaborator` definitions are low-risk and internally consistent.\n\n"
+                    "Observation: `Network` and `Collaborator` preserve the ownership boundary.\n\n"
+                    "## Touched paths reviewed\n\n"
+                    "`docs/verified-review-market/INTERVIEW_DECISIONS.md`\n\n"
+                    "## Changed identifiers verified\n\n"
+                    "- `Network`\n"
+                    "- `Collaborator`\n\n"
+                    "## Risk areas checked\n\n"
+                    "- ownership boundary\n"
+                    "- collaboration authority\n\n"
+                    "## Checks performed\n\n"
+                    "- reviewed the changed wording\n"
+                    "- confirmed green tests"
+                ),
+            },
+            headers={"Authorization": f"Bearer {token}"},
+        )
+
+        self.assertEqual(status_response.status_code, 200, status_response.text)
+        self.assertEqual(len(self.github_session.posts), 1)
+        self.assertEqual(self.github_session.posts[0]["json"]["event"], "APPROVE")
+        trial = self.store.get_execution(bridge_id)["review_result"]
+        self.assertEqual(trial["changed_token_sample"], ["collaborator", "network"])
+        self.assertEqual(trial["resolved_action"], "approved")
+
     def test_status_callback_suppresses_low_signal_no_finding_without_retry(self):
         self._set_pr_review_package(
             [
