@@ -1872,6 +1872,29 @@ class TestRuntimeReviewPrompts(unittest.TestCase):
         self.assertIn("reviewed the changed diff for `bridge/github_to_mep.py`", rendered)
         self.assertIn("verified changed identifiers `_build_review_trial_result`, `list_review_trials` against the supplied review context", rendered)
 
+    def test_structured_review_renders_ci_state_as_context_evidence_not_code_identifier(self):
+        rendered = mep_runtime._render_structured_review_with_task_data(  # noqa: SLF001
+            (
+                '{"summary":"Checked the documentation-only network vocabulary update.",'
+                '"observation":"`Network` and `Collaborator` remain scoped to the changed decision record.",'
+                '"touched_paths":["docs/verified-review-market/INTERVIEW_DECISIONS.md"],'
+                '"risk_areas_checked":["terminology consistency"],'
+                '"verified_identifiers":["Network","Collaborator"],'
+                '"findings":[],"approval_recommendation":"approve"}'
+            ),
+            max_chars=1000,
+            task_data=self._bridge_review_task_data(
+                intent_type="code.review.approve",
+                changed_identifiers=["Network", "Collaborator"],
+                touched_paths=["docs/verified-review-market/INTERVIEW_DECISIONS.md"],
+                touched_tests=[],
+                ci_checks={"has_checks": True, "state": "green", "all_green": True},
+            ),
+        )
+
+        self.assertIn("noted GitHub checks were green at review time", rendered)
+        self.assertNotIn("GitHub checks were `green`", rendered)
+
     def test_clean_review_label_drops_partial_trailing_word_when_clipped(self):
         cleaned = mep_runtime._clean_review_label(  # noqa: SLF001
             "Confirmed that _filter_review_list_to_allowed uses exact matching and avoids trailing filteri",
