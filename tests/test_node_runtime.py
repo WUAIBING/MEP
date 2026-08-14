@@ -1706,6 +1706,44 @@ class TestRuntimeReviewPrompts(unittest.TestCase):
 
         self.assertEqual(action, "approved")
 
+    def test_approval_bridge_action_accepts_markdown_heading_sections(self):
+        task_data = self._bridge_review_task_data(
+            intent_type="code.review.approve",
+            changed_identifiers=["Network", "Collaborator"],
+            touched_paths=["docs/verified-review-market/INTERVIEW_DECISIONS.md"],
+            touched_tests=[],
+            changed_files=[
+                {
+                    "filename": "docs/verified-review-market/INTERVIEW_DECISIONS.md",
+                    "patch_excerpt": (
+                        "+A `Network` bot remains controlled by its owner.\n"
+                        "+It becomes a `Collaborator` only for a scoped grant.\n"
+                    ),
+                }
+            ],
+            ci_checks={"has_checks": True, "state": "green", "all_green": True},
+        )
+        detail = (
+            "## Review Summary\n\n"
+            "The `Network` and `Collaborator` definitions are low-risk.\n\n"
+            "## Touched paths reviewed\n\n"
+            "docs/verified-review-market/INTERVIEW_DECISIONS.md\n\n"
+            "## Risk areas checked\n\n"
+            "Ownership boundary and collaboration authority.\n\n"
+            "## Checks performed\n\n"
+            "Read the exact changed wording and confirmed green tests.\n\n"
+            "## Changed identifiers verified\n\n"
+            "Network and Collaborator."
+        )
+
+        action = mep_runtime.RuntimeNode._bridge_status_action(  # noqa: SLF001
+            mep_runtime._interbot_message_from_task_data(task_data),  # noqa: SLF001
+            detail=detail,
+            task_data=task_data,
+        )
+
+        self.assertEqual(action, "approved")
+
     def test_approval_bridge_action_downgrades_when_runtime_tool_evidence_is_weak(self):
         task_data = self._bridge_review_task_data(
             intent_type="code.review.approve",
@@ -1833,6 +1871,29 @@ class TestRuntimeReviewPrompts(unittest.TestCase):
         self.assertNotIn("imagined_guard", rendered)
         self.assertIn("reviewed the changed diff for `bridge/github_to_mep.py`", rendered)
         self.assertIn("verified changed identifiers `_build_review_trial_result`, `list_review_trials` against the supplied review context", rendered)
+
+    def test_structured_review_renders_ci_state_as_context_evidence_not_code_identifier(self):
+        rendered = mep_runtime._render_structured_review_with_task_data(  # noqa: SLF001
+            (
+                '{"summary":"Checked the documentation-only network vocabulary update.",'
+                '"observation":"`Network` and `Collaborator` remain scoped to the changed decision record.",'
+                '"touched_paths":["docs/verified-review-market/INTERVIEW_DECISIONS.md"],'
+                '"risk_areas_checked":["terminology consistency"],'
+                '"verified_identifiers":["Network","Collaborator"],'
+                '"findings":[],"approval_recommendation":"approve"}'
+            ),
+            max_chars=1000,
+            task_data=self._bridge_review_task_data(
+                intent_type="code.review.approve",
+                changed_identifiers=["Network", "Collaborator"],
+                touched_paths=["docs/verified-review-market/INTERVIEW_DECISIONS.md"],
+                touched_tests=[],
+                ci_checks={"has_checks": True, "state": "green", "all_green": True},
+            ),
+        )
+
+        self.assertIn("noted GitHub checks were green at review time", rendered)
+        self.assertNotIn("GitHub checks were `green`", rendered)
 
     def test_clean_review_label_drops_partial_trailing_word_when_clipped(self):
         cleaned = mep_runtime._clean_review_label(  # noqa: SLF001

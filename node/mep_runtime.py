@@ -1778,6 +1778,15 @@ def _review_text_has_anchor(text: str, *, touched_paths: list[str], identifiers:
     return False
 
 
+def _review_detail_has_section(text: str, label: str) -> bool:
+    return bool(
+        re.search(
+            rf"(?im)^\s*(?:#{{1,6}}\s*)?{re.escape(label)}(?:\s*:|\s*$)",
+            str(text or ""),
+        )
+    )
+
+
 def _approval_detail_supports_publishable_approval(
     detail: Optional[str],
     *,
@@ -1788,9 +1797,12 @@ def _approval_detail_supports_publishable_approval(
         return False
     if "## Review Findings" in text:
         return False
-    if "## Review Summary" not in text or "Touched paths reviewed:" not in text:
+    if "## Review Summary" not in text or not _review_detail_has_section(text, "Touched paths reviewed"):
         return False
-    if "Checks performed:" not in text or "Risk areas checked:" not in text:
+    if not _review_detail_has_section(text, "Checks performed") or not _review_detail_has_section(
+        text,
+        "Risk areas checked",
+    ):
         return False
     github_inputs = _review_github_inputs(task_data or {})
     touched_tests = _clean_review_list(github_inputs.get("touched_tests"), max_items=3, max_chars=120)
@@ -1805,10 +1817,10 @@ def _approval_detail_supports_publishable_approval(
         task_data=task_data,
     )
     touched_paths = _clean_review_list(github_inputs.get("touched_paths"), max_items=4, max_chars=120)
-    if touched_tests and "Tests reviewed:" not in text:
+    if touched_tests and not _review_detail_has_section(text, "Tests reviewed"):
         return False
     if changed_identifiers:
-        if "Changed identifiers verified:" not in text:
+        if not _review_detail_has_section(text, "Changed identifiers verified"):
             return False
         if not _review_text_has_anchor(
             text,
@@ -2962,7 +2974,11 @@ def _default_review_checks(
     if isinstance(ci_checks, dict) and ci_checks.get("has_checks"):
         state = _clean_review_label(ci_checks.get("state"), max_chars=40)
         if state:
-            checks.append(f"noted GitHub checks were `{state}` at review time")
+            # CI states are review-context evidence, not identifiers from the
+            # changed patch. Keep them as prose so the bridge's identifier
+            # grounding guard does not mistake values such as `green` for
+            # changed code symbols.
+            checks.append(f"noted GitHub checks were {state} at review time")
     deduped: list[str] = []
     seen: set[str] = set()
     for item in checks:
