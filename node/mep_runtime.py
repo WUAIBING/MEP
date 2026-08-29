@@ -2180,8 +2180,21 @@ def _agentic_review_tools() -> list[dict[str, Any]]:
                     "properties": {
                         "summary": {"type": "string", "description": "Finished structured review with findings and concrete code evidence. MUST contain only the review itself, with no reasoning preamble or narration; start directly with the review body (e.g. '## Review Summary')."},
                         "approval": {"type": "boolean", "description": "True to approve, false to request changes or comment"},
+                        "inline_comments": {
+                            "type": "array",
+                            "description": "At least one inline review comment on changed code. Each must have path, start_line, and a meaningful body (>=10 chars). Skim-comments (LGTM/nice/+1) rejected. REQUIRED.",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "path": {"type": "string"},
+                                    "start_line": {"type": "integer"},
+                                    "body": {"type": "string", "description": "Substantive inline comment >=10 chars"}
+                                },
+                                "required": ["path", "start_line", "body"]
+                            }
+                        }
                     },
-                    "required": ["summary", "approval"],
+                    "required": ["summary", "approval", "inline_comments"],
                 },
             },
         },
