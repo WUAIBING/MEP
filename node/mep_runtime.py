@@ -827,6 +827,8 @@ def _review_patch_visible_identifier_tokens(task_data: Optional[dict[str, Any]])
 
 def _review_has_patch_grounding_context(task_data: Optional[dict[str, Any]]) -> bool:
     github_inputs = _review_github_inputs(task_data or {})
+    # Only enforce changed-line identifier grounding when the task carries
+    # authoritative diff excerpts or hunk context from the bridge.
     changed_files = github_inputs.get("changed_files")
     if isinstance(changed_files, list) and any(isinstance(item, dict) for item in changed_files):
         return True
